@@ -1,0 +1,73 @@
+# Enhanced configuration for image processing pipeline with GUI definitions
+initial_segmentation:
+  name: "Initial Segmentation"
+  parameters:
+    intensity_threshold:
+      label: "Intensity Threshold"
+      type: "float"
+      value: 0.9
+      min: 0.0
+      max: 1.0
+      step: 0.01
+    min_volume:
+      label: "Minimum Volume (px)"
+      type: "int"
+      value: 500
+      min: 1
+      max: 10000
+      step: 10
+    downsample_factor:
+      label: "Downsample Factor"
+      type: "int"
+      value: 2
+      min: 1
+      max: 4
+      step: 1
+
+merge_rois:
+  name: "Merge ROIs"
+  parameters:
+    min_distance:
+      label: "Minimum Distance"
+      type: "int"
+      value: 10
+      min: 1
+      max: 100
+      step: 1
+    min_intensity_ratio:
+      label: "Minimum Intensity Ratio"
+      type: "float"
+      value: 0.3
+      min: 0.0
+      max: 1.0
+      step: 0.05
+
+split_rois:
+  name: "Split ROIs"
+  parameters:
+    mean_guess:
+      label: "Mean Volume Guess"
+      type: "int"
+      value: 5000
+      min: 1000
+      max: 10000
+      step: 100
+    std_guess:
+      label: "Standard Deviation Guess"
+      type: "int"
+      value: 2500
+      min: 500
+      max: 5000
+      step: 100
+    max_iters:
+      label: "Maximum Iterations"
+      type: "int"
+      value: 10
+      min: 1
+      max: 50
+      step: 1
+
+voxel_dimensions:
+  x: 471.4
+  y: 471.4
+  z: 1
