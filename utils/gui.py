@@ -10,6 +10,7 @@ from tkinter import filedialog, Tk
 
 from utils.initial_segmentation import *
 from utils.split_rois import *
+from utils.segmenter import *
 
 import yaml
 from typing import Dict, Any
@@ -116,13 +117,25 @@ class DynamicGUIManager:
                 
                 # Get current parameter values
                 current_values = self.get_current_values()
+
+                #Create the first pass params dictionary:
+                self.first_pass_params = {
+                    "min_distance": current_values.get("min_distance"),
+                    "min_size": current_values.get("min_size"),
+                    "contrast_threshold_factor": current_values.get("contrast_threshold_factor"),
+                    "spacing": [self.config.get('voxel_dimensions', {}).get('z', 1), self.x_spacing, self.x_spacing],
+                    "anisotropy_normalization_degree": current_values.get("anisotropy_normalization_degree")
+                }
+
+                labeled_cells, first_pass_params = segment_nuclei(self.image_stack, first_pass=None,
+                  smooth_sigma=[0, 0.5, 1.0, 2.0],
+                  min_distance=self.first_pass_params['min_distance'],
+                  min_size=self.first_pass_params['min_size'],
+                  contrast_threshold_factor=self.first_pass_params['contrast_threshold_factor'],
+                  spacing=[self.config.get('voxel_dimensions', {}).get('z', 1), self.x_spacing, self.x_spacing],
+                  anisotropy_normalization_degree=self.first_pass_params['anisotropy_normalization_degree'])
                 
-                labeled_cells = intensity_based_segmentation(
-                    self.image_stack,
-                    slice_settings=self.slice_settings,
-                    temp_dir=self.processed_dir,
-                    downsample_factor=current_values.get("downsample_factor", 2)
-                )
+                self.first_pass_params = first_pass_params
                 
                 np.save(segmented_cells_path, labeled_cells)
                 self.viewer.add_labels(
@@ -147,14 +160,15 @@ class DynamicGUIManager:
                 current_values = self.get_current_values()
                 
                 labeled_cells = np.load(segmented_cells_path)
-                merged_roi_array = split_merged_masks(labeled_cells, 
-                                                        self.enhanced_stack, 
-                                                        min_distance=current_values.get("min_distance", 10), 
-                                                        min_intensity_ratio=current_values.get("min_intensity_ratio", 0.3),
-                                                        min_volume=current_values.get("min_volume", 100), 
-                                                        min_solidity=current_values.get("min_solidity", 0.1)
-                )
                 
+
+                merged_roi_array = segment_nuclei(self.image_stack, first_pass=labeled_cells, first_pass_params=self.first_pass_params,
+                  smooth_sigma=[0, 0.5, 1.0, 2.0],
+                  min_distance=current_values.get("min_distance", 10),
+                  min_size=current_values.get("min_size", 100),
+                  contrast_threshold_factor=current_values.get("contrast_threshold_factor", 1.5),
+                  spacing=[self.config.get('voxel_dimensions', {}).get('z', 1), self.x_spacing, self.x_spacing],
+                  anisotropy_normalization_degree=current_values.get("anisotropy_normalization_degree", 1.0))
                 
                 # Save the merged array
                 merged_roi_array.tofile(merged_roi_array_loc)
@@ -342,18 +356,16 @@ class DynamicGUIManager:
         try:
             image_slice = self.enhanced_stack[slice_index]
             downsampled = downsample_stack(image_slice[None, ...], factor=downsample_factor)[0]
-            enhanced = downsampled
-            seed_threshold = intensity_threshold * np.max(enhanced)
-            seeds = np.argwhere(enhanced >= seed_threshold)
+            seed_threshold = intensity_threshold * np.max(downsampled)
+            seeds = np.argwhere(downsampled >= seed_threshold)
 
-            mask = np.zeros_like(enhanced, dtype=np.int32)
+            mask = np.zeros_like(downsampled, dtype=np.int32)
             for seed in seeds:
-                if enhanced[tuple(seed)] >= seed_threshold:
+                if downsampled[tuple(seed)] >= seed_threshold:
                     mask[tuple(seed)] = 1
             mask = morphology.binary_dilation(mask)
             labeled_mask = label(mask)
             filtered_mask = morphology.remove_small_objects(labeled_mask, min_size=min_volume)
-
             if downsample_factor > 1:
                 filtered_mask = upsample_stack(filtered_mask, image_slice.shape)
 
