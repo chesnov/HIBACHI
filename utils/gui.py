@@ -6,11 +6,13 @@ import napari
 from skimage import morphology
 from magicgui import magicgui
 from skimage.measure import label
-from tkinter import filedialog, Tk
+from PyQt5.QtWidgets import QApplication, QFileDialog, QInputDialog, QMessageBox
+import sys
+os.environ["QT_SCALE_FACTOR"] = "1.5"
 
-from utils.initial_segmentation import *
-from utils.split_rois import *
-from utils.segmenter import *
+from utils.ramified_segmenter import *
+from utils.nuclear_segmenter import *
+from utils.calculate_features import *
 
 import yaml
 from typing import Dict, Any
@@ -51,30 +53,27 @@ def create_parameter_widget(param_name: str, param_config: Dict[str, Any], callb
     return widget
 
 class DynamicGUIManager:
-    def __init__(self, viewer, config, image_stack, file_loc):
+    def __init__(self, viewer, config, image_stack, file_loc, processing_mode):
         self.viewer = viewer
         self.config = config
         self.image_stack = image_stack
         self.file_loc = file_loc
+        self.processing_mode = processing_mode  # 'nuclei' or 'ramified'
         self.current_widgets = {}
         self.current_step = {"value": 0}
-        self.processing_steps = ["initial_segmentation", "merge_rois", "split_rois"]
+        self.processing_steps = ["initial_segmentation", "refine_rois", "calculate_features"]
         self.parameter_values = {}
         self.active_dock_widgets = set()
         
         # Set up processing directory
         self.inputdir = os.path.dirname(self.file_loc)
         self.basename = os.path.basename(self.file_loc).split('.')[0]
-        self.processed_dir = os.path.join(self.inputdir, f"{self.basename}_processed")
+        self.processed_dir = os.path.join(self.inputdir, f"{self.basename}_processed_{self.processing_mode}")
         if not os.path.exists(self.processed_dir):
             os.makedirs(self.processed_dir)
         
         # Initialize processing state
         self.initial_segmentation = np.zeros_like(self.image_stack, dtype=np.int32)
-        self.slice_settings = {}
-        
-        # Set up image enhancement
-        self.enhanced_stack = adaptive_contrast_enhancement(self.image_stack)
         
         # Initialize viewer layers
         self._initialize_layers()
@@ -83,34 +82,34 @@ class DynamicGUIManager:
     def cleanup_step(self, step_number):
         """Clean up the results and layers from a specific step"""
         if step_number == 1:
-            if "Intermediate segmentation 1" in self.viewer.layers:
-                self.viewer.layers.remove("Intermediate segmentation 1")
-            segmented_cells_path = os.path.join(self.processed_dir, "segmented_cells.npy")
+            layer_name = "Intermediate segmentation"
+            if layer_name in self.viewer.layers:
+                self.viewer.layers.remove(layer_name)
+            segmented_cells_path = os.path.join(self.processed_dir, f"segmented_{self.processing_mode}.npy")
             if os.path.exists(segmented_cells_path):
                 os.remove(segmented_cells_path)
 
         elif step_number == 2:
-            if "Intermediate segmentation 2" in self.viewer.layers:
-                self.viewer.layers.remove("Intermediate segmentation 2")
-            merged_roi_array_loc = os.path.join(self.processed_dir, "merged_roi_array_optimized.dat")
+            layer_name = "Final segmentation"
+            if layer_name in self.viewer.layers:
+                self.viewer.layers.remove(layer_name)
+            merged_roi_array_loc = os.path.join(self.processed_dir, f"merged_roi_array_optimized_{self.processing_mode}.dat")
             if os.path.exists(merged_roi_array_loc):
                 os.remove(merged_roi_array_loc)
-
+        
         elif step_number == 3:
-            if "Segmentation without large volumes" in self.viewer.layers:
-                self.viewer.layers.remove("Segmentation without large volumes")
-            updated_stack_loc = os.path.join(self.processed_dir, "updated_stack.npy")
-            if os.path.exists(updated_stack_loc):
-                os.remove(updated_stack_loc)
+            connections_layer = "Closest Points Connections"
+            if connections_layer in self.viewer.layers:
+                self.viewer.layers.remove(connections_layer)
 
 
     def execute_processing_step(self):
-        """Execute the next step in the processing pipeline"""
+        """Execute the next step in the processing pipeline based on the selected processing mode"""
         try:
             if self.current_step["value"] == 0:
                 # Step 1: Initial cell segmentation
-                print("Running initial cell segmentation...")
-                segmented_cells_path = os.path.join(self.processed_dir, "segmented_cells.npy")
+                print(f"Running initial {self.processing_mode} segmentation...")
+                segmented_cells_path = os.path.join(self.processed_dir, f"segmented_{self.processing_mode}.npy")
                 
                 # Remove existing results if present
                 self.cleanup_step(1)
@@ -118,75 +117,90 @@ class DynamicGUIManager:
                 # Get current parameter values
                 current_values = self.get_current_values()
 
-                #Create the first pass params dictionary:
-                self.first_pass_params = {
-                    "min_distance": current_values.get("min_distance"),
-                    "min_size": current_values.get("min_size"),
-                    "contrast_threshold_factor": current_values.get("contrast_threshold_factor"),
-                    "spacing": [self.config.get('voxel_dimensions', {}).get('z', 1), self.x_spacing, self.x_spacing],
-                    "anisotropy_normalization_degree": current_values.get("anisotropy_normalization_degree")
-                }
-
-                labeled_cells, first_pass_params = segment_nuclei(self.image_stack, first_pass=None,
-                  smooth_sigma=[0, 0.5, 1.0, 2.0],
-                  min_distance=self.first_pass_params['min_distance'],
-                  min_size=self.first_pass_params['min_size'],
-                  contrast_threshold_factor=self.first_pass_params['contrast_threshold_factor'],
-                  spacing=[self.config.get('voxel_dimensions', {}).get('z', 1), self.x_spacing, self.x_spacing],
-                  anisotropy_normalization_degree=self.first_pass_params['anisotropy_normalization_degree'])
-                
-                self.first_pass_params = first_pass_params
+                if self.processing_mode == 'nuclei':
+                    # Process nuclei
+                    labeled_cells, first_pass_params = segment_nuclei(self.image_stack, first_pass=None,
+                      smooth_sigma=[0, 0.5, 1.0, 2.0],
+                      min_distance=current_values.get("min_distance"),
+                      min_size=current_values.get("min_size"),
+                      contrast_threshold_factor=current_values.get("contrast_threshold_factor"),
+                      spacing=[self.config.get('voxel_dimensions', {}).get('z', 1), self.x_spacing, self.x_spacing],
+                      anisotropy_normalization_degree=current_values.get("anisotropy_normalization_degree"))
+                    
+                    self.first_pass_params = first_pass_params
+                    
+                else:  # ramified mode
+                    # Process ramified cells
+                    labeled_cells, first_pass_params = segment_microglia(self.image_stack, 
+                     first_pass=None,
+                     first_pass_params=None,
+                     tubular_scales=[current_values.get("tubular_scales", 2)],
+                     smooth_sigma=current_values.get("smooth_sigma", 1.0),
+                     min_size=current_values.get("min_size", 100),
+                     min_cell_body_size=current_values.get("min_cell_body_size", 200),
+                     spacing=[self.config.get('voxel_dimensions', {}).get('z', 1), self.x_spacing, self.x_spacing],
+                     anisotropy_normalization_degree=current_values.get("anisotropy_normalization_degree", 0.2),
+                     threshold_method='otsu',
+                     sensitivity=current_values.get("sensitivity", 0.2),
+                     extract_features=False)
                 
                 np.save(segmented_cells_path, labeled_cells)
                 self.viewer.add_labels(
                     labeled_cells,
-                    name="Intermediate segmentation 1",
+                    name="Intermediate segmentation",
                     scale=(self.z_scale_factor, 1, 1)
                 )
                 
                 self.current_step["value"] += 1
-                self.create_step_widgets("merge_rois")
+                self.create_step_widgets("refine_rois")
 
             elif self.current_step["value"] == 1:
-                # Step 2: Split large ROIs
-                print("Splitting large ROIs...")
-                segmented_cells_path = os.path.join(self.processed_dir, "segmented_cells.npy")
-                merged_roi_array_loc = os.path.join(self.processed_dir, "merged_roi_array_optimized.dat")
+                # Step 2: Refine ROIs
+                print(f"Refining {self.processing_mode} ROIs...")
                 
                 # Remove existing results if present
                 self.cleanup_step(2)
                 
                 # Get current parameter values
                 current_values = self.get_current_values()
-                
+                segmented_cells_path = os.path.join(self.processed_dir, f"segmented_{self.processing_mode}.npy")
                 labeled_cells = np.load(segmented_cells_path)
                 
-
-                merged_roi_array = segment_nuclei(self.image_stack, first_pass=labeled_cells, first_pass_params=self.first_pass_params,
-                  smooth_sigma=[0, 0.5, 1.0, 2.0],
-                  min_distance=current_values.get("min_distance", 10),
-                  min_size=current_values.get("min_size", 100),
-                  contrast_threshold_factor=current_values.get("contrast_threshold_factor", 1.5),
-                  spacing=[self.config.get('voxel_dimensions', {}).get('z', 1), self.x_spacing, self.x_spacing],
-                  anisotropy_normalization_degree=current_values.get("anisotropy_normalization_degree", 1.0))
+                if self.processing_mode == 'nuclei':
+                    # Refine nuclear ROIs
+                    merged_roi_array = segment_nuclei(self.image_stack, first_pass=labeled_cells, first_pass_params=self.first_pass_params,
+                      smooth_sigma=[0, 0.5, 1.0, 2.0],
+                      min_distance=current_values.get("min_distance", 10),
+                      min_size=current_values.get("min_size", 100),
+                      contrast_threshold_factor=current_values.get("contrast_threshold_factor", 1.5),
+                      spacing=[self.config.get('voxel_dimensions', {}).get('z', 1), self.x_spacing, self.x_spacing],
+                      anisotropy_normalization_degree=current_values.get("anisotropy_normalization_degree", 1.0))
+                else:
+                    # Refine ramified ROIs
+                    merged_roi_array = segment_ramified_cells(self.image_stack, first_pass=labeled_cells, first_pass_params=self.first_pass_params,
+                      smooth_sigma=[0, 0.5, 1.0, 2.0],
+                      min_distance=current_values.get("min_distance", 10),
+                      min_size=current_values.get("min_size", 100),
+                      contrast_threshold_factor=current_values.get("contrast_threshold_factor", 1.5),
+                      spacing=[self.config.get('voxel_dimensions', {}).get('z', 1), self.x_spacing, self.x_spacing],
+                      connectivity=current_values.get("connectivity", 3))
                 
                 # Save the merged array
+                merged_roi_array_loc = os.path.join(self.processed_dir, f"merged_roi_array_optimized_{self.processing_mode}.dat")
                 merged_roi_array.tofile(merged_roi_array_loc)
                 
                 self.viewer.add_labels(
                     merged_roi_array,
-                    name="Intermediate segmentation 2",
+                    name="Final segmentation",
                     scale=(self.z_scale_factor, 1, 1)
                 )
                 
                 self.current_step["value"] += 1
-                self.create_step_widgets("split_rois")
+                self.create_step_widgets("calculate_features")
 
             elif self.current_step["value"] == 2:
-                # Step 3: Split large ROIs
-                print("Splitting large ROIs...")
-                merged_roi_array_loc = os.path.join(self.processed_dir, "merged_roi_array_optimized.dat")
-                updated_stack_loc = os.path.join(self.processed_dir, "updated_stack.npy")
+                # Step 3: Calculate features
+                print(f"Calculating {self.processing_mode} features...")
                 
                 # Remove existing results if present
                 self.cleanup_step(3)
@@ -194,27 +208,37 @@ class DynamicGUIManager:
                 # Get current parameter values
                 current_values = self.get_current_values()
                 
+                merged_roi_array_loc = os.path.join(self.processed_dir, f"merged_roi_array_optimized_{self.processing_mode}.dat")
                 merged_roi_array = np.memmap(
                     merged_roi_array_loc,
                     dtype=np.int32,
                     mode='r',
                     shape=self.image_stack.shape
                 )
+
+                if self.processing_mode == 'nuclei':
+                    # Calculate features for nuclei
+                    distances_matrix, points_matrix, lines = shortest_distance(merged_roi_array, 
+                                                                spacing=[self.config.get('voxel_dimensions', {}).get('z', 1), self.x_spacing, self.x_spacing])
+                else:
+                    # Calculate features for ramified cells - using different parameters or methods
+                    distances_matrix, points_matrix, lines = calculate_ramified_features(merged_roi_array, 
+                                                                spacing=[self.config.get('voxel_dimensions', {}).get('z', 1), self.x_spacing, self.x_spacing],
+                                                                branch_threshold=current_values.get("branch_threshold", 10))
                 
-                updated_stack = split_large_rois_with_intensity(
-                    merged_roi_array,
-                    self.config['voxel_dimensions']['z'],
-                    self.x_spacing,
-                    mean_guess=current_values.get("mean_guess", 5000),
-                    std_guess=current_values.get("std_guess", 2500),
-                    tempdir=self.processed_dir,
-                    max_iters=current_values.get("max_iters", 10)
-                )
-                
-                np.save(updated_stack_loc, updated_stack)
-                self.viewer.add_labels(
-                    updated_stack,
-                    name="Segmentation without large volumes",
+                # Save results
+                distances_matrix_loc = os.path.join(self.processed_dir, f"distances_matrix_{self.processing_mode}.csv")
+                points_matrix_loc = os.path.join(self.processed_dir, f"points_matrix_{self.processing_mode}.csv")
+                np.savetxt(distances_matrix_loc, distances_matrix, delimiter=",")
+                np.savetxt(points_matrix_loc, points_matrix, delimiter=",")
+
+                # Add the lines connecting closest points as shapes in Napari
+                self.viewer.add_shapes(
+                    lines,
+                    shape_type='line',
+                    edge_color='red',
+                    edge_width=1.5,
+                    name="Closest Points Connections",
                     scale=(self.z_scale_factor, 1, 1)
                 )
                 
@@ -228,12 +252,12 @@ class DynamicGUIManager:
                 print("All processing steps completed.")
                 
         except Exception as e:
-            print(f"Error during processing step {self.current_step['value']}: {str(e)}")
+            print(f"Error during {self.processing_mode} processing step {self.current_step['value']}: {str(e)}")
             raise
 
     def save_updated_config(self):
         """Save the current configuration to a YAML file"""
-        config_save_path = os.path.join(self.processed_dir, "processing_config.yaml")
+        config_save_path = os.path.join(self.processed_dir, f"processing_config_{self.processing_mode}.yaml")
         with open(config_save_path, 'w') as file:
             yaml.dump(self.config, file, default_flow_style=False)
 
@@ -254,19 +278,22 @@ class DynamicGUIManager:
         self.current_widgets.clear()
 
     def create_step_widgets(self, step_name: str):
-        """Create all widgets for a processing step"""
+        """Create all widgets for a processing step based on the processing mode"""
         try:
             # Remove existing widgets
             self.clear_current_widgets()
             
+            # Determine the actual config key based on processing mode
+            config_key = f"{step_name}_{self.processing_mode}" if f"{step_name}_{self.processing_mode}" in self.config else step_name
+            
             # Create new widgets for each parameter in the step
-            if step_name not in self.config:
-                print(f"Warning: {step_name} not found in config")
+            if config_key not in self.config:
+                print(f"Warning: {config_key} not found in config")
                 return
                 
-            step_config = self.config[step_name]
+            step_config = self.config[config_key]
             if "parameters" not in step_config:
-                print(f"Warning: no parameters found for {step_name}")
+                print(f"Warning: no parameters found for {config_key}")
                 return
             
             # Reset parameter values for this step
@@ -276,7 +303,7 @@ class DynamicGUIManager:
             for param_name, param_config in step_config["parameters"].items():
                 try:
                     # Create callback for this specific parameter
-                    callback = lambda value, pn=param_name: self.parameter_changed(step_name, pn, value)
+                    callback = lambda value, pn=param_name: self.parameter_changed(config_key, pn, value)
                     
                     # Create widget
                     widget = create_parameter_widget(param_name, param_config, callback)
@@ -287,25 +314,6 @@ class DynamicGUIManager:
                     self.parameter_values[param_name] = param_config["value"]
                 except Exception as e:
                     print(f"Error creating widget for {param_name}: {str(e)}")
-            
-            # Add Update Mask button for initial segmentation
-            if step_name == "initial_segmentation":
-                try:
-                    @magicgui(call_button="Update Mask")
-                    def update_mask():
-                        slice_idx = self.viewer.dims.current_step[0]
-                        params = self.get_current_values()
-                        self.apply_mask(
-                            slice_idx,
-                            params["intensity_threshold"],
-                            params["min_volume"],
-                            params["downsample_factor"]
-                        )
-                    
-                    dock_widget = self.viewer.window.add_dock_widget(update_mask, area="right")
-                    self.current_widgets[dock_widget] = update_mask
-                except Exception as e:
-                    print(f"Error creating update mask widget: {str(e)}")
                     
         except Exception as e:
             print(f"Error in create_step_widgets: {str(e)}")
@@ -331,17 +339,7 @@ class DynamicGUIManager:
         # Add layers
         self.viewer.add_image(
             self.image_stack, 
-            name="Original stack", 
-            scale=(self.z_scale_factor, 1, 1)
-        )
-        self.viewer.add_image(
-            self.enhanced_stack, 
-            name="Enhanced stack", 
-            scale=(self.z_scale_factor, 1, 1)
-        )
-        self.viewer.add_labels(
-            self.initial_segmentation, 
-            name="Initial segmentation", 
+            name=f"Original stack ({self.processing_mode} mode)", 
             scale=(self.z_scale_factor, 1, 1)
         )
         
@@ -350,144 +348,95 @@ class DynamicGUIManager:
         if step_name in self.config and "parameters" in self.config[step_name]:
             self.config[step_name]["parameters"][param_name]["value"] = value
             self.parameter_values[param_name] = value
-        
-    def apply_mask(self, slice_index, intensity_threshold, min_volume, downsample_factor):
-        """Generate and apply the segmentation mask for a given slice."""
-        try:
-            image_slice = self.enhanced_stack[slice_index]
-            downsampled = downsample_stack(image_slice[None, ...], factor=downsample_factor)[0]
-            seed_threshold = intensity_threshold * np.max(downsampled)
-            seeds = np.argwhere(downsampled >= seed_threshold)
-
-            mask = np.zeros_like(downsampled, dtype=np.int32)
-            for seed in seeds:
-                if downsampled[tuple(seed)] >= seed_threshold:
-                    mask[tuple(seed)] = 1
-            mask = morphology.binary_dilation(mask)
-            labeled_mask = label(mask)
-            filtered_mask = morphology.remove_small_objects(labeled_mask, min_size=min_volume)
-            if downsample_factor > 1:
-                filtered_mask = upsample_stack(filtered_mask, image_slice.shape)
-
-            self.initial_segmentation[slice_index] = filtered_mask
-            self.viewer.layers["Initial segmentation"].data = self.initial_segmentation
-            self.slice_settings[slice_index] = {
-                "intensity_threshold": intensity_threshold,
-                "min_volume": min_volume,
-                "downsample_factor": downsample_factor
-            }
-            
-        except Exception as e:
-            print(f"Error in apply_mask: {str(e)}")
-
 
     def get_current_values(self) -> Dict[str, Any]:
         """Get current values for all parameters in the current step"""
         return self.parameter_values.copy()
-        
-    def apply_initial_segmentation(self, values):
-        """Apply initial segmentation with current parameters"""
-        slice_idx = self.viewer.dims.current_step[0]
-        self.apply_mask(
-            slice_idx, 
-            values["intensity_threshold"],
-            values["min_volume"],
-            values["downsample_factor"]
-        )
-
-    def apply_merge_rois(self, values):
-        """Apply ROI merging with current parameters from the GUI"""
-        if "Intermediate segmentation 1" not in self.viewer.layers:
-            print("Error: Previous segmentation layer not found")
-            return
-            
-        labeled_cells = self.viewer.layers["Intermediate segmentation 1"].data
-        
-        merged_roi_array = split_merged_masks(
-            labeled_cells,
-            self.enhanced_stack,
-            min_distance=values["min_distance"],
-            min_intensity_ratio=values["min_intensity_ratio"]
-        )
-        
-        self.viewer.add_labels(
-            merged_roi_array, 
-            name="Intermediate segmentation 2", 
-            scale=(self.z_scale_factor, 1, 1)
-        )
-
-    def apply_split_rois(self, values):
-        """Apply ROI splitting with current parameters from the GUI"""
-        if "Intermediate segmentation 2" not in self.viewer.layers:
-            print("Error: Previous segmentation layer not found")
-            return
-            
-        merged_roi_array = self.viewer.layers["Intermediate segmentation 2"].data
-        
-        updated_stack = split_large_rois_with_intensity(
-            merged_roi_array,
-            self.config['voxel_dimensions']['z'],
-            self.x_spacing,
-            mean_guess=values["mean_guess"],
-            std_guess=values["std_guess"],
-            tempdir=self.processed_dir,
-            max_iters=values["max_iters"]
-        )
-        
-        self.viewer.add_labels(
-            updated_stack, 
-            name="Segmentation without large volumes", 
-            scale=(self.z_scale_factor, 1, 1)
-        )
+    
 
 def interactive_segmentation_with_config():
     """
-    Launch interactive segmentation with dynamic GUI based on YAML configuration
+    Launch interactive segmentation with dynamic GUI based on YAML configuration with PyQt5 dialogs
     """
-    # First prompt for config file
-    Tk().withdraw()
-    config_path = filedialog.askopenfilename(
-        title="Select config YAML file (optional)", 
-        filetypes=[("YAML files", "*.yaml *.yml"), ("All files", "*.*")]
+    # Create PyQt5 app instance if it doesn't exist
+    app = QApplication.instance()
+    if app is None:
+        app = QApplication(sys.argv)
+    
+    # Prompt for config file
+    config_path, _ = QFileDialog.getOpenFileName(
+        None,
+        "Select config YAML file",
+        "",
+        "YAML files (*.yaml *.yml);;All files (*.*)"
     )
     
     # Load or create config
-    if config_path:
+    if config_path and os.path.exists(config_path):
         with open(config_path, 'r') as file:
             config = yaml.safe_load(file)
     else:
-        print("No config file selected. Please select a config file.")
+        QMessageBox.critical(None, "Error", "No config file selected. Please select a config file.")
         return
     
-    # Prompt for input file
-    file_loc = filedialog.askopenfilename(
-        title="Select a .tif file", 
-        filetypes=[("TIFF files", "*.tif")]
+    # Prompt for processing mode selection
+    processing_modes = ["nuclei", "ramified"]
+    processing_mode_idx, ok = QInputDialog.getItem(
+        None, 
+        "Processing Mode",
+        "Select processing mode:",
+        ["Nuclear morphology", "Ramified morphology"],
+        0,  # Default to first item
+        False  # Not editable
     )
-    if not file_loc:
-        print("No file selected. Exiting.")
+    
+    if not ok:
+        QMessageBox.warning(None, "Warning", "No processing mode selected. Exiting.")
+        return
+    
+    # Convert selection to mode string
+    processing_mode = processing_modes[0] if "Nuclear" in processing_mode_idx else processing_modes[1]
+    print(f"Selected processing mode: {processing_mode}")
+    
+    # Prompt for input file
+    file_loc, _ = QFileDialog.getOpenFileName(
+        None,
+        "Select a .tif file",
+        "",
+        "TIFF files (*.tif);;All files (*.*)"
+    )
+    
+    if not file_loc or not os.path.exists(file_loc):
+        QMessageBox.warning(None, "Warning", "No file selected. Exiting.")
         return
 
-    # Create processed directory
+    # Create processed directory with mode suffix
     inputdir = os.path.dirname(file_loc)
     basename = os.path.basename(file_loc).split('.')[0]
-    processed_dir = os.path.join(inputdir, f"{basename}_processed")
+    processed_dir = os.path.join(inputdir, f"{basename}_processed_{processing_mode}")
     if not os.path.exists(processed_dir):
         os.makedirs(processed_dir)
 
     # Load the .tif file
-    image_stack = tiff.imread(file_loc)
-    print(f"Loaded stack with shape {image_stack.shape}")
+    try:
+        image_stack = tiff.imread(file_loc)
+        print(f"Loaded stack with shape {image_stack.shape}")
+    except Exception as e:
+        QMessageBox.critical(None, "Error", f"Failed to load TIFF file: {str(e)}")
+        return
 
-    # Initialize viewer and GUI manager
-    viewer = napari.Viewer()
-    gui_manager = DynamicGUIManager(viewer, config, image_stack, file_loc)
+    # Initialize viewer and GUI manager with processing mode
+    viewer = napari.Viewer(title=f"Microscopy Analysis - {processing_mode.capitalize()} Mode")
+    gui_manager = DynamicGUIManager(viewer, config, image_stack, file_loc, processing_mode)
     
     @magicgui(call_button="Continue Processing")
     def continue_processing():
         """Execute the next step in the processing pipeline"""
-        gui_manager.execute_processing_step()
-        update_navigation_buttons()
+        try:
+            gui_manager.execute_processing_step()
+            update_navigation_buttons()
+        except Exception as e:
+            QMessageBox.critical(None, "Processing Error", f"Error during processing: {str(e)}")
 
     @magicgui(call_button="Previous Step")
     def go_to_previous_step():
