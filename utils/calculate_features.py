@@ -5,6 +5,7 @@ import os
 import tempfile
 import time
 import psutil
+import pandas as pd
 
 def extract_surface_points_worker(args):
     """Worker function to extract surface points from a mask with careful handling of boundaries"""
@@ -296,4 +297,572 @@ def shortest_distance(segmented_array, spacing=(1.0, 1.0, 1.0),
     print(f"Finished all calculations in {elapsed:.1f} seconds")
     
     lines = shortest_distance_points(final_distances, final_points)
+
+    #Convert both final_distances and final_points into dataframes with the appropriate column names
+    final_distances = pd.DataFrame(final_distances, index=labels, columns=labels)
+    final_points = pd.DataFrame(final_points, index=labels, columns=labels)
+
     return final_distances, final_points, lines
+
+def calculate_volume(segmented_array, spacing=(1.0, 1.0, 1.0)):
+    """
+    Calculate the volume of each mask in a 3D segmented array in cubic microns.
+    
+    Parameters:
+    -----------
+    segmented_array : numpy.ndarray
+        3D numpy array (z, x, y) containing integer labels for each mask.
+        0 is assumed to be the background.
+    spacing : tuple
+        Tuple of (z_spacing, x_spacing, y_spacing) in microns.
+    
+    Returns:
+    --------
+    volume_df : pandas.DataFrame
+        DataFrame with columns:
+        - label: Mask label
+        - volume_um3: Volume in cubic microns
+        - surface_area_um2: Surface area in square microns (estimated)
+        - voxel_count: Number of voxels in the mask
+        - bounding_box_volume_um3: Volume of the bounding box in cubic microns
+        - sphericity: Ratio comparing the shape to a sphere (1.0 is perfect sphere)
+    """
+    # Get unique labels excluding background (0)
+    labels = np.unique(segmented_array)
+    labels = labels[labels > 0]
+    
+    # Calculate voxel volume in cubic microns
+    voxel_volume = spacing[0] * spacing[1] * spacing[2]
+    
+    # Initialize results lists
+    label_ids = []
+    volumes = []
+    surface_areas = []
+    voxel_counts = []
+    bbox_volumes = []
+    sphericity = []
+    
+    # Calculate metrics for each mask
+    for label in labels:
+        # Create binary mask
+        mask = (segmented_array == label)
+        
+        # Count voxels in this mask
+        voxel_count = np.sum(mask)
+        
+        # Calculate volume in cubic microns
+        volume = voxel_count * voxel_volume
+        
+        # Get bounding box dimensions
+        z_indices, x_indices, y_indices = np.where(mask)
+        if len(z_indices) > 0:
+            z_min, z_max = np.min(z_indices), np.max(z_indices)
+            x_min, x_max = np.min(x_indices), np.max(x_indices)
+            y_min, y_max = np.min(y_indices), np.max(y_indices)
+            
+            # Calculate bounding box volume in cubic microns
+            bbox_volume = (z_max - z_min + 1) * spacing[0] * \
+                          (x_max - x_min + 1) * spacing[1] * \
+                          (y_max - y_min + 1) * spacing[2]
+        else:
+            bbox_volume = 0
+        
+        # Estimate surface area using the boundary voxels
+        # Initialize surface array
+        surface = np.zeros_like(mask, dtype=bool)
+        
+        # More careful boundary detection that handles array dimensions correctly
+        z_max, x_max, y_max = mask.shape
+        
+        # Check Z direction
+        if z_max > 1:  # Only process if there's more than one Z slice
+            surface[:-1, :, :] |= (mask[:-1, :, :] & ~mask[1:, :, :])
+            surface[1:, :, :] |= (mask[1:, :, :] & ~mask[:-1, :, :])
+        
+        # Check X direction
+        surface[:, :-1, :] |= (mask[:, :-1, :] & ~mask[:, 1:, :])
+        surface[:, 1:, :] |= (mask[:, 1:, :] & ~mask[:, :-1, :])
+        
+        # Check Y direction
+        surface[:, :, :-1] |= (mask[:, :, :-1] & ~mask[:, :, 1:])
+        surface[:, :, 1:] |= (mask[:, :, 1:] & ~mask[:, :, :-1])
+        
+        # Count surface voxels
+        surface_voxels = np.sum(surface)
+        
+        # Estimate surface area
+        # We use a simple approximation based on the voxel faces
+        avg_face_area = ((spacing[0] * spacing[1]) + 
+                          (spacing[0] * spacing[2]) + 
+                          (spacing[1] * spacing[2])) / 3
+        surface_area = surface_voxels * avg_face_area
+        
+        # Calculate sphericity
+        # Formula: π^(1/3) * (6 * Volume)^(2/3) / Surface Area
+        # A perfect sphere has sphericity = 1.0
+        if surface_area > 0:
+            sph = np.pi**(1/3) * (6 * volume)**(2/3) / surface_area
+        else:
+            sph = 0
+        
+        # Store results
+        label_ids.append(label)
+        volumes.append(volume)
+        surface_areas.append(surface_area)
+        voxel_counts.append(voxel_count)
+        bbox_volumes.append(bbox_volume)
+        sphericity.append(sph)
+    
+    # Create DataFrame
+    volume_df = pd.DataFrame({
+        'label': label_ids,
+        'volume_um3': volumes,
+        'surface_area_um2': surface_areas,
+        'voxel_count': voxel_counts,
+        'bounding_box_volume_um3': bbox_volumes,
+        'sphericity': sphericity
+    })
+    
+    return volume_df
+
+def extract_skeleton(segmented_array, label=None, spacing=(1.0, 1.0, 1.0)):
+    """
+    Extract the skeleton of masks in a 3D segmented array.
+    
+    Parameters:
+    -----------
+    segmented_array : numpy.ndarray
+        3D numpy array (z, x, y) containing integer labels for each mask.
+        0 is assumed to be the background.
+    label : int, optional
+        Specific label to skeletonize. If None, all masks are processed.
+    spacing : tuple
+        Tuple of (z_spacing, x_spacing, y_spacing) in microns.
+    
+    Returns:
+    --------
+    skeleton_df : pandas.DataFrame
+        DataFrame with basic skeleton information
+    skeleton_objects : dict
+        Dictionary where keys are mask labels and values are tuples of:
+        (skeleton_mask, skeleton_coords, skeleton_graph)
+    """
+    # Get labels to process
+    if label is not None:
+        labels = [label]
+    else:
+        labels = np.unique(segmented_array)
+        labels = labels[labels > 0]
+    
+    skeletons = {}
+    
+    # Initialize lists for DataFrame
+    label_ids = []
+    skeleton_points = []
+    skeleton_lengths = []
+    
+    for lbl in labels:
+        # Create binary mask for this label
+        mask = (segmented_array == lbl)
+        
+        # Skeletonize the mask
+        skeleton = skeletonize_3d(mask)
+        
+        # Get coordinates of skeleton points
+        z_coords, x_coords, y_coords = np.where(skeleton)
+        skeleton_coords = np.column_stack((z_coords, x_coords, y_coords))
+        
+        # Convert to micron coordinates
+        skeleton_coords_microns = skeleton_coords * np.array(spacing)
+        
+        # Create a graph representation of the skeleton
+        G = nx.Graph()
+        
+        # Add nodes for each skeleton point
+        for i, coord in enumerate(skeleton_coords_microns):
+            G.add_node(i, pos=coord)
+        
+        # Add edges between adjacent skeleton points
+        # We consider two points adjacent if they are within √3 voxels of each other
+        # (this covers all 26-connected neighbors in 3D)
+        for i, coord1 in enumerate(skeleton_coords):
+            for j, coord2 in enumerate(skeleton_coords):
+                if i < j:  # To avoid duplicate edges
+                    # Calculate Euclidean distance in voxel space
+                    dist = np.sqrt(np.sum((coord1 - coord2) ** 2))
+                    if dist <= np.sqrt(3):
+                        # Calculate actual distance in microns
+                        dist_microns = np.sqrt(np.sum(((coord1 - coord2) * np.array(spacing)) ** 2))
+                        G.add_edge(i, j, weight=dist_microns)
+        
+        # Calculate total skeleton length
+        total_length = sum(data['weight'] for _, _, data in G.edges(data=True))
+        
+        # Store results
+        skeletons[lbl] = (skeleton, skeleton_coords_microns, G)
+        label_ids.append(lbl)
+        skeleton_points.append(len(skeleton_coords))
+        skeleton_lengths.append(total_length)
+    
+    # Create DataFrame
+    skeleton_df = pd.DataFrame({
+        'label': label_ids,
+        'skeleton_points': skeleton_points,
+        'skeleton_length_um': skeleton_lengths
+    })
+    
+    return skeleton_df, skeletons
+
+def analyze_ramification(skeleton_graph, node_positions=None):
+    """
+    Analyze the ramification of a skeleton graph.
+    
+    Parameters:
+    -----------
+    skeleton_graph : networkx.Graph
+        Graph representation of the skeleton.
+    node_positions : dict, optional
+        Dictionary mapping node IDs to 3D coordinates in microns.
+    
+    Returns:
+    --------
+    stats : dict
+        Dictionary of ramification statistics.
+    branch_df : pandas.DataFrame
+        DataFrame containing information about individual branches.
+    endpoint_df : pandas.DataFrame
+        DataFrame containing information about individual endpoints.
+    """
+    if not nx.is_connected(skeleton_graph):
+        # If graph is not connected, find the largest connected component
+        largest_cc = max(nx.connected_components(skeleton_graph), key=len)
+        skeleton_graph = skeleton_graph.subgraph(largest_cc).copy()
+    
+    # Calculate node degrees
+    degrees = dict(skeleton_graph.degree())
+    
+    # Identify branch points (degree > 2) and endpoints (degree == 1)
+    branch_points = [node for node, degree in degrees.items() if degree > 2]
+    endpoints = [node for node, degree in degrees.items() if degree == 1]
+    
+    # Get node positions if available
+    if node_positions is None:
+        node_positions = nx.get_node_attributes(skeleton_graph, 'pos')
+    
+    # Calculate total length of all branches
+    total_length = sum(data['weight'] for _, _, data in skeleton_graph.edges(data=True))
+    
+    # Find the longest path between any two endpoints
+    longest_path = []
+    max_path_length = 0
+    longest_path_endpoints = (None, None)
+    
+    if len(endpoints) >= 2:
+        for i, start in enumerate(endpoints):
+            for end in endpoints[i+1:]:
+                try:
+                    path = nx.shortest_path(skeleton_graph, start, end, weight='weight')
+                    path_length = nx.path_weight(skeleton_graph, path, weight='weight')
+                    
+                    if path_length > max_path_length:
+                        max_path_length = path_length
+                        longest_path = path
+                        longest_path_endpoints = (start, end)
+                except nx.NetworkXNoPath:
+                    continue
+    
+    # Initialize branch data lists
+    branch_ids = []
+    branch_src_types = []
+    branch_dst_types = []
+    branch_lengths = []
+    branch_tortuosity = []  # Ratio of path length to Euclidean distance
+    
+    # Initialize endpoint data lists
+    endpoint_ids = []
+    endpoint_x = []
+    endpoint_y = []
+    endpoint_z = []
+    endpoint_distance_to_soma = []  # Using center of mass as proxy for soma
+    
+    # Calculate center of mass as proxy for soma
+    if node_positions:
+        center_of_mass = np.mean([pos for pos in node_positions.values()], axis=0)
+    else:
+        center_of_mass = np.zeros(3)
+    
+    # Analyze each endpoint
+    for i, ep in enumerate(endpoints):
+        if ep in node_positions:
+            pos = node_positions[ep]
+            endpoint_ids.append(i)
+            endpoint_x.append(pos[0])
+            endpoint_y.append(pos[1])
+            endpoint_z.append(pos[2])
+            
+            # Calculate distance to center of mass
+            dist_to_soma = np.sqrt(np.sum((pos - center_of_mass)**2))
+            endpoint_distance_to_soma.append(dist_to_soma)
+    
+    # Analyze branches
+    branch_id = 0
+    analyzed_paths = set()
+    
+    # First analyze branches from branch points to endpoints
+    for bp in branch_points:
+        for ep in endpoints:
+            if bp == ep:
+                continue
+                
+            # Create a unique identifier for this path
+            path_key = tuple(sorted([bp, ep]))
+            if path_key in analyzed_paths:
+                continue
+            
+            try:
+                path = nx.shortest_path(skeleton_graph, bp, ep, weight='weight')
+                
+                # Skip if path includes another branch point
+                has_other_bp = False
+                for node in path[1:-1]:  # Exclude source and destination
+                    if node in branch_points:
+                        has_other_bp = True
+                        break
+                
+                if not has_other_bp:
+                    path_length = nx.path_weight(skeleton_graph, path, weight='weight')
+                    
+                    # Calculate Euclidean distance if positions are available
+                    if node_positions and bp in node_positions and ep in node_positions:
+                        euclidean_dist = np.sqrt(np.sum((node_positions[bp] - node_positions[ep])**2))
+                        tort = path_length / euclidean_dist if euclidean_dist > 0 else 1.0
+                    else:
+                        tort = 1.0
+                    
+                    branch_ids.append(branch_id)
+                    branch_src_types.append('branch_point')
+                    branch_dst_types.append('endpoint')
+                    branch_lengths.append(path_length)
+                    branch_tortuosity.append(tort)
+                    
+                    branch_id += 1
+                    analyzed_paths.add(path_key)
+            except nx.NetworkXNoPath:
+                continue
+    
+    # Analyze branches between branch points
+    for i, bp1 in enumerate(branch_points):
+        for bp2 in branch_points[i+1:]:
+            # Create a unique identifier for this path
+            path_key = tuple(sorted([bp1, bp2]))
+            if path_key in analyzed_paths:
+                continue
+            
+            try:
+                path = nx.shortest_path(skeleton_graph, bp1, bp2, weight='weight')
+                
+                # Skip if path includes another branch point
+                has_other_bp = False
+                for node in path[1:-1]:  # Exclude source and destination
+                    if node in branch_points and node != bp1 and node != bp2:
+                        has_other_bp = True
+                        break
+                
+                if not has_other_bp:
+                    path_length = nx.path_weight(skeleton_graph, path, weight='weight')
+                    
+                    # Calculate Euclidean distance if positions are available
+                    if node_positions and bp1 in node_positions and bp2 in node_positions:
+                        euclidean_dist = np.sqrt(np.sum((node_positions[bp1] - node_positions[bp2])**2))
+                        tort = path_length / euclidean_dist if euclidean_dist > 0 else 1.0
+                    else:
+                        tort = 1.0
+                    
+                    branch_ids.append(branch_id)
+                    branch_src_types.append('branch_point')
+                    branch_dst_types.append('branch_point')
+                    branch_lengths.append(path_length)
+                    branch_tortuosity.append(tort)
+                    
+                    branch_id += 1
+                    analyzed_paths.add(path_key)
+            except nx.NetworkXNoPath:
+                continue
+    
+    # Create stats dictionary
+    stats = {
+        'num_nodes': len(skeleton_graph.nodes),
+        'num_branch_points': len(branch_points),
+        'num_endpoints': len(endpoints),
+        'total_skeleton_length': total_length,
+        'longest_path_length': max_path_length,
+        'avg_branch_length': np.mean(branch_lengths) if branch_lengths else 0,
+        'max_branch_length': np.max(branch_lengths) if branch_lengths else 0,
+        'min_branch_length': np.min(branch_lengths) if branch_lengths else 0,
+        'avg_tortuosity': np.mean(branch_tortuosity) if branch_tortuosity else 1.0,
+        'branch_count': len(branch_lengths)
+    }
+    
+    # Create branch DataFrame
+    branch_df = pd.DataFrame({
+        'branch_id': branch_ids,
+        'source_type': branch_src_types,
+        'destination_type': branch_dst_types,
+        'length_um': branch_lengths,
+        'tortuosity': branch_tortuosity
+    })
+    
+    # Create endpoint DataFrame
+    endpoint_df = pd.DataFrame({
+        'endpoint_id': endpoint_ids,
+        'x_um': endpoint_x,
+        'y_um': endpoint_y,
+        'z_um': endpoint_z,
+        'distance_to_soma_um': endpoint_distance_to_soma
+    })
+    
+    return stats, branch_df, endpoint_df
+
+def calculate_ramification_stats(segmented_array, spacing=(1.0, 1.0, 1.0), labels=None):
+    """
+    Calculate ramification statistics for masks in a 3D segmented array.
+    
+    Parameters:
+    -----------
+    segmented_array : numpy.ndarray
+        3D numpy array (z, x, y) containing integer labels for each mask.
+        0 is assumed to be the background.
+    spacing : tuple
+        Tuple of (z_spacing, x_spacing, y_spacing) in microns.
+    labels : list, optional
+        Specific labels to analyze. If None, all masks are processed.
+    
+    Returns:
+    --------
+    ramification_summary_df : pandas.DataFrame
+        DataFrame with summary statistics for each mask.
+    branch_data_df : pandas.DataFrame
+        DataFrame with detailed information about each branch.
+    endpoint_data_df : pandas.DataFrame
+        DataFrame with detailed information about each endpoint.
+    """
+    # Determine which labels to process
+    if labels is None:
+        unique_labels = np.unique(segmented_array)
+        labels = unique_labels[unique_labels > 0]
+    
+    # Extract skeletons for all required labels
+    _, skeletons = extract_skeleton(segmented_array, label=None, spacing=spacing)
+    
+    # Initialize lists for summary DataFrame
+    label_ids = []
+    num_nodes = []
+    num_branch_points = []
+    num_endpoints = []
+    total_lengths = []
+    longest_path_lengths = []
+    avg_branch_lengths = []
+    max_branch_lengths = []
+    min_branch_lengths = []
+    avg_tortuosities = []
+    branch_counts = []
+    
+    # Initialize DataFrames for branch and endpoint data
+    all_branch_data = []
+    all_endpoint_data = []
+    
+    # Calculate ramification statistics for each mask
+    for label in labels:
+        if label in skeletons:
+            _, skeleton_coords, skeleton_graph = skeletons[label]
+            
+            # Create node positions dictionary
+            node_positions = {}
+            for i, coord in enumerate(skeleton_coords):
+                node_positions[i] = coord
+            
+            # Analyze ramification
+            stats, branch_df, endpoint_df = analyze_ramification(skeleton_graph, node_positions)
+            
+            # Add label column to branch and endpoint DataFrames
+            branch_df['label'] = label
+            endpoint_df['label'] = label
+            
+            # Store results
+            label_ids.append(label)
+            num_nodes.append(stats['num_nodes'])
+            num_branch_points.append(stats['num_branch_points'])
+            num_endpoints.append(stats['num_endpoints'])
+            total_lengths.append(stats['total_skeleton_length'])
+            longest_path_lengths.append(stats['longest_path_length'])
+            avg_branch_lengths.append(stats['avg_branch_length'])
+            max_branch_lengths.append(stats['max_branch_length'])
+            min_branch_lengths.append(stats['min_branch_length'])
+            avg_tortuosities.append(stats['avg_tortuosity'])
+            branch_counts.append(stats['branch_count'])
+            
+            # Add to all data
+            all_branch_data.append(branch_df)
+            all_endpoint_data.append(endpoint_df)
+        else:
+            print(f"Warning: Label {label} not found in the segmented array.")
+    
+    # Create summary DataFrame
+    ramification_summary_df = pd.DataFrame({
+        'label': label_ids,
+        'num_skeleton_nodes': num_nodes,
+        'num_branch_points': num_branch_points,
+        'num_endpoints': num_endpoints,
+        'total_skeleton_length_um': total_lengths,
+        'longest_path_length_um': longest_path_lengths,
+        'avg_branch_length_um': avg_branch_lengths,
+        'max_branch_length_um': max_branch_lengths,
+        'min_branch_length_um': min_branch_lengths,
+        'avg_tortuosity': avg_tortuosities,
+        'branch_count': branch_counts
+    })
+    
+    # Combine all branch and endpoint data
+    branch_data_df = pd.concat(all_branch_data) if all_branch_data else pd.DataFrame()
+    endpoint_data_df = pd.concat(all_endpoint_data) if all_endpoint_data else pd.DataFrame()
+    
+    return ramification_summary_df, branch_data_df, endpoint_data_df
+
+def analyze_segmentation(segmented_array, spacing=(1.0, 1.0, 1.0), calculate_skeletons=True):
+    """
+    Comprehensive analysis of a 3D segmented array, combining volume and ramification metrics.
+    
+    Parameters:
+    -----------
+    segmented_array : numpy.ndarray
+        3D numpy array (z, x, y) containing integer labels for each mask.
+        0 is assumed to be the background.
+    spacing : tuple
+        Tuple of (z_spacing, x_spacing, y_spacing) in microns.
+    calculate_skeletons : bool
+        Whether to calculate skeleton-based metrics (which can be time-consuming).
+    
+    Returns:
+    --------
+    metrics_df : pandas.DataFrame
+        DataFrame with combined metrics for each mask.
+    ramification_metrics : tuple
+        Tuple of (ramification_summary_df, branch_data_df, endpoint_data_df) if calculate_skeletons=True,
+        otherwise None.
+    """
+    # Calculate volume metrics
+    volume_df = calculate_volume(segmented_array, spacing=spacing)
+    
+    if calculate_skeletons:
+        # Calculate ramification stats
+        ramification_summary_df, branch_data_df, endpoint_data_df = calculate_ramification_stats(
+            segmented_array, spacing=spacing)
+        
+        # Merge volume and ramification metrics
+        metrics_df = pd.merge(volume_df, ramification_summary_df, on='label', how='outer')
+        ramification_metrics = (ramification_summary_df, branch_data_df, endpoint_data_df)
+    else:
+        metrics_df = volume_df
+        ramification_metrics = None
+    
+    return metrics_df, ramification_metrics

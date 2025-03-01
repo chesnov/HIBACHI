@@ -124,7 +124,7 @@ class DynamicGUIManager:
                       min_distance=current_values.get("min_distance"),
                       min_size=current_values.get("min_size"),
                       contrast_threshold_factor=current_values.get("contrast_threshold_factor"),
-                      spacing=[self.config.get('voxel_dimensions', {}).get('z', 1), self.x_spacing, self.x_spacing],
+                      spacing=[self.z_spacing, self.x_spacing, self.y_spacing],
                       anisotropy_normalization_degree=current_values.get("anisotropy_normalization_degree"))
                     
                     self.first_pass_params = first_pass_params
@@ -133,14 +133,12 @@ class DynamicGUIManager:
                     # Process ramified cells
                     labeled_cells, first_pass_params = segment_microglia(self.image_stack, 
                      first_pass=None,
-                     first_pass_params=None,
                      tubular_scales=[current_values.get("tubular_scales", 2)],
                      smooth_sigma=current_values.get("smooth_sigma", 1.0),
                      min_size=current_values.get("min_size", 100),
                      min_cell_body_size=current_values.get("min_cell_body_size", 200),
-                     spacing=[self.config.get('voxel_dimensions', {}).get('z', 1), self.x_spacing, self.x_spacing],
+                     spacing=[self.z_spacing, self.x_spacing, self.y_spacing],
                      anisotropy_normalization_degree=current_values.get("anisotropy_normalization_degree", 0.2),
-                     threshold_method='otsu',
                      sensitivity=current_values.get("sensitivity", 0.2),
                      extract_features=False)
                 
@@ -173,17 +171,20 @@ class DynamicGUIManager:
                       min_distance=current_values.get("min_distance", 10),
                       min_size=current_values.get("min_size", 100),
                       contrast_threshold_factor=current_values.get("contrast_threshold_factor", 1.5),
-                      spacing=[self.config.get('voxel_dimensions', {}).get('z', 1), self.x_spacing, self.x_spacing],
+                      spacing=[self.z_spacing, self.x_spacing, self.y_spacing],
                       anisotropy_normalization_degree=current_values.get("anisotropy_normalization_degree", 1.0))
                 else:
                     # Refine ramified ROIs
-                    merged_roi_array = segment_ramified_cells(self.image_stack, first_pass=labeled_cells, first_pass_params=self.first_pass_params,
-                      smooth_sigma=[0, 0.5, 1.0, 2.0],
-                      min_distance=current_values.get("min_distance", 10),
-                      min_size=current_values.get("min_size", 100),
-                      contrast_threshold_factor=current_values.get("contrast_threshold_factor", 1.5),
-                      spacing=[self.config.get('voxel_dimensions', {}).get('z', 1), self.x_spacing, self.x_spacing],
-                      connectivity=current_values.get("connectivity", 3))
+                    merged_roi_array = segment_microglia(self.image_stack, 
+                     first_pass=labeled_cells,
+                     tubular_scales=[current_values.get("tubular_scales", 2)],
+                     smooth_sigma=current_values.get("smooth_sigma", 1.0),
+                     min_size=current_values.get("min_size", 100),
+                     min_cell_body_size=current_values.get("min_cell_body_size", 200),
+                     spacing=[self.z_spacing, self.x_spacing, self.y_spacing],
+                     anisotropy_normalization_degree=current_values.get("anisotropy_normalization_degree", 0.2),
+                     sensitivity=current_values.get("sensitivity", 0.2),
+                     extract_features=False)
                 
                 # Save the merged array
                 merged_roi_array_loc = os.path.join(self.processed_dir, f"merged_roi_array_optimized_{self.processing_mode}.dat")
@@ -219,18 +220,29 @@ class DynamicGUIManager:
                 if self.processing_mode == 'nuclei':
                     # Calculate features for nuclei
                     distances_matrix, points_matrix, lines = shortest_distance(merged_roi_array, 
-                                                                spacing=[self.config.get('voxel_dimensions', {}).get('z', 1), self.x_spacing, self.x_spacing])
+                                                                spacing=[self.z_spacing, self.x_spacing, self.y_spacing])
+                    metrics_df, ramification_metrics = analyze_segmentation(merged_roi_array, 
+                                                                            spacing=[self.z_spacing, self.x_spacing, self.y_spacing], 
+                                                                            calculate_skeletons=False)
                 else:
                     # Calculate features for ramified cells - using different parameters or methods
-                    distances_matrix, points_matrix, lines = calculate_ramified_features(merged_roi_array, 
-                                                                spacing=[self.config.get('voxel_dimensions', {}).get('z', 1), self.x_spacing, self.x_spacing],
-                                                                branch_threshold=current_values.get("branch_threshold", 10))
+                    distances_matrix, points_matrix, lines = shortest_distance(merged_roi_array, 
+                                                                spacing=[self.z_spacing, self.x_spacing, self.y_spacing])
+                    metrics_df, ramification_metrics = analyze_segmentation(merged_roi_array, 
+                                                                            spacing=[self.z_spacing, self.x_spacing, self.y_spacing], 
+                                                                            calculate_skeletons=True)
                 
                 # Save results
                 distances_matrix_loc = os.path.join(self.processed_dir, f"distances_matrix_{self.processing_mode}.csv")
                 points_matrix_loc = os.path.join(self.processed_dir, f"points_matrix_{self.processing_mode}.csv")
-                np.savetxt(distances_matrix_loc, distances_matrix, delimiter=",")
-                np.savetxt(points_matrix_loc, points_matrix, delimiter=",")
+                metrics_df_loc = os.path.join(self.processed_dir, f"metrics_df_{self.processing_mode}.csv")
+                ramification_metrics_loc = os.path.join(self.processed_dir, f"ramification_metrics_{self.processing_mode}.csv")
+                #save distances_matrix and points_matrix as pandas dataframes
+                distances_matrix.to_csv(distances_matrix_loc)
+                points_matrix.to_csv(points_matrix_loc)
+                metrics_df.to_csv(metrics_df_loc)
+                if ramification_metrics is not None:
+                    ramification_metrics.to_csv(ramification_metrics_loc)
 
                 # Add the lines connecting closest points as shapes in Napari
                 self.viewer.add_shapes(
@@ -334,7 +346,9 @@ class DynamicGUIManager:
         voxel_y = self.config.get('voxel_dimensions', {}).get('y', 1)
         voxel_z = self.config.get('voxel_dimensions', {}).get('z', 1)
         self.x_spacing = voxel_x / self.image_stack.shape[1]
-        self.z_scale_factor = voxel_z/self.x_spacing
+        self.y_spacing = voxel_y / self.image_stack.shape[2]
+        self.z_spacing = voxel_z / self.image_stack.shape[0]
+        self.z_scale_factor = self.z_spacing/self.x_spacing
         
         # Add layers
         self.viewer.add_image(
