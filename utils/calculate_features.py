@@ -6,6 +6,9 @@ import tempfile
 import time
 import psutil
 import pandas as pd
+from skimage.morphology import skeletonize
+import networkx as nx
+from tqdm import tqdm
 
 def extract_surface_points_worker(args):
     """Worker function to extract surface points from a mask with careful handling of boundaries"""
@@ -298,11 +301,18 @@ def shortest_distance(segmented_array, spacing=(1.0, 1.0, 1.0),
     
     lines = shortest_distance_points(final_distances, final_points)
 
+    #Final points is a 3D array where the first two dimensions are the mask labels and the third dimension is the coordinates of the two points;
+    #Let's convert it to a pandas dataframe with 4 columns: mask1, mask2, point1, point2
+    final_points_df = pd.DataFrame(final_points.reshape(-1, 6), columns=['mask1_z', 'mask1_x', 'mask1_y', 'mask2_z', 'mask2_x', 'mask2_y'])
+    final_points_df['mask1'] = np.repeat(labels, len(labels))
+    final_points_df['mask2'] = np.tile(labels, len(labels))
+    final_points_df = final_points_df[['mask1', 'mask2', 'mask1_z', 'mask1_x', 'mask1_y', 'mask2_z', 'mask2_x', 'mask2_y']]
+
+
     #Convert both final_distances and final_points into dataframes with the appropriate column names
     final_distances = pd.DataFrame(final_distances, index=labels, columns=labels)
-    final_points = pd.DataFrame(final_points, index=labels, columns=labels)
 
-    return final_distances, final_points, lines
+    return final_distances, final_points_df, lines
 
 def calculate_volume(segmented_array, spacing=(1.0, 1.0, 1.0)):
     """
@@ -343,7 +353,7 @@ def calculate_volume(segmented_array, spacing=(1.0, 1.0, 1.0)):
     sphericity = []
     
     # Calculate metrics for each mask
-    for label in labels:
+    for label in tqdm(labels):
         # Create binary mask
         mask = (segmented_array == label)
         
@@ -466,7 +476,7 @@ def extract_skeleton(segmented_array, label=None, spacing=(1.0, 1.0, 1.0)):
         mask = (segmented_array == lbl)
         
         # Skeletonize the mask
-        skeleton = skeletonize_3d(mask)
+        skeleton = skeletonize(mask)
         
         # Get coordinates of skeleton points
         z_coords, x_coords, y_coords = np.where(skeleton)
@@ -725,7 +735,7 @@ def analyze_ramification(skeleton_graph, node_positions=None):
 
 def calculate_ramification_stats(segmented_array, spacing=(1.0, 1.0, 1.0), labels=None):
     """
-    Calculate ramification statistics for masks in a 3D segmented array.
+    Calculate ramification statistics for masks in a 3D segmented array with improved memory efficiency.
     
     Parameters:
     -----------
@@ -746,40 +756,39 @@ def calculate_ramification_stats(segmented_array, spacing=(1.0, 1.0, 1.0), label
     endpoint_data_df : pandas.DataFrame
         DataFrame with detailed information about each endpoint.
     """
+    import numpy as np
+    import pandas as pd
+    import gc  # For garbage collection
+    from tqdm import tqdm
+    
     # Determine which labels to process
     if labels is None:
         unique_labels = np.unique(segmented_array)
         labels = unique_labels[unique_labels > 0]
     
-    # Extract skeletons for all required labels
-    _, skeletons = extract_skeleton(segmented_array, label=None, spacing=spacing)
+    # Initialize DataFrames for results
+    ramification_summary_rows = []
+    branch_data_dfs = []
+    endpoint_data_dfs = []
     
-    # Initialize lists for summary DataFrame
-    label_ids = []
-    num_nodes = []
-    num_branch_points = []
-    num_endpoints = []
-    total_lengths = []
-    longest_path_lengths = []
-    avg_branch_lengths = []
-    max_branch_lengths = []
-    min_branch_lengths = []
-    avg_tortuosities = []
-    branch_counts = []
-    
-    # Initialize DataFrames for branch and endpoint data
-    all_branch_data = []
-    all_endpoint_data = []
-    
-    # Calculate ramification statistics for each mask
-    for label in labels:
-        if label in skeletons:
-            _, skeleton_coords, skeleton_graph = skeletons[label]
+    # Process one label at a time
+    for label in tqdm(labels):
+        # Extract mask for current label only
+        mask = segmented_array == label
+        
+        # Skip if mask is empty
+        if not np.any(mask):
+            print(f"Warning: Label {label} not found in the segmented array.")
+            continue
+        
+        # Extract skeleton for the current label only
+        _, skeleton_result = extract_skeleton(mask, label=1, spacing=spacing)
+        
+        if 1 in skeleton_result:  # The label will be 1 since we made a binary mask
+            _, skeleton_coords, skeleton_graph = skeleton_result[1]
             
             # Create node positions dictionary
-            node_positions = {}
-            for i, coord in enumerate(skeleton_coords):
-                node_positions[i] = coord
+            node_positions = {i: coord for i, coord in enumerate(skeleton_coords)}
             
             # Analyze ramification
             stats, branch_df, endpoint_df = analyze_ramification(skeleton_graph, node_positions)
@@ -788,43 +797,41 @@ def calculate_ramification_stats(segmented_array, spacing=(1.0, 1.0, 1.0), label
             branch_df['label'] = label
             endpoint_df['label'] = label
             
-            # Store results
-            label_ids.append(label)
-            num_nodes.append(stats['num_nodes'])
-            num_branch_points.append(stats['num_branch_points'])
-            num_endpoints.append(stats['num_endpoints'])
-            total_lengths.append(stats['total_skeleton_length'])
-            longest_path_lengths.append(stats['longest_path_length'])
-            avg_branch_lengths.append(stats['avg_branch_length'])
-            max_branch_lengths.append(stats['max_branch_length'])
-            min_branch_lengths.append(stats['min_branch_length'])
-            avg_tortuosities.append(stats['avg_tortuosity'])
-            branch_counts.append(stats['branch_count'])
+            # Store results in row format
+            ramification_summary_rows.append({
+                'label': label,
+                'num_skeleton_nodes': stats['num_nodes'],
+                'num_branch_points': stats['num_branch_points'],
+                'num_endpoints': stats['num_endpoints'],
+                'total_skeleton_length_um': stats['total_skeleton_length'],
+                'longest_path_length_um': stats['longest_path_length'],
+                'avg_branch_length_um': stats['avg_branch_length'],
+                'max_branch_length_um': stats['max_branch_length'],
+                'min_branch_length_um': stats['min_branch_length'],
+                'avg_tortuosity': stats['avg_tortuosity'],
+                'branch_count': stats['branch_count']
+            })
             
-            # Add to all data
-            all_branch_data.append(branch_df)
-            all_endpoint_data.append(endpoint_df)
+            # Save dataframes for this label
+            branch_data_dfs.append(branch_df)
+            endpoint_data_dfs.append(endpoint_df)
+            
+            # Clean up to free memory
+            del skeleton_coords, skeleton_graph, node_positions
+            gc.collect()
         else:
-            print(f"Warning: Label {label} not found in the segmented array.")
+            print(f"Warning: Failed to extract skeleton for label {label}.")
+        
+        # Clean up the mask to free memory
+        del mask
+        gc.collect()
     
-    # Create summary DataFrame
-    ramification_summary_df = pd.DataFrame({
-        'label': label_ids,
-        'num_skeleton_nodes': num_nodes,
-        'num_branch_points': num_branch_points,
-        'num_endpoints': num_endpoints,
-        'total_skeleton_length_um': total_lengths,
-        'longest_path_length_um': longest_path_lengths,
-        'avg_branch_length_um': avg_branch_lengths,
-        'max_branch_length_um': max_branch_lengths,
-        'min_branch_length_um': min_branch_lengths,
-        'avg_tortuosity': avg_tortuosities,
-        'branch_count': branch_counts
-    })
+    # Create summary DataFrame from collected rows
+    ramification_summary_df = pd.DataFrame(ramification_summary_rows)
     
     # Combine all branch and endpoint data
-    branch_data_df = pd.concat(all_branch_data) if all_branch_data else pd.DataFrame()
-    endpoint_data_df = pd.concat(all_endpoint_data) if all_endpoint_data else pd.DataFrame()
+    branch_data_df = pd.concat(branch_data_dfs) if branch_data_dfs else pd.DataFrame()
+    endpoint_data_df = pd.concat(endpoint_data_dfs) if endpoint_data_dfs else pd.DataFrame()
     
     return ramification_summary_df, branch_data_df, endpoint_data_df
 
@@ -851,10 +858,12 @@ def analyze_segmentation(segmented_array, spacing=(1.0, 1.0, 1.0), calculate_ske
         otherwise None.
     """
     # Calculate volume metrics
+    print("Calculating volume metrics...")
     volume_df = calculate_volume(segmented_array, spacing=spacing)
     
     if calculate_skeletons:
         # Calculate ramification stats
+        print("Calculating ramification metrics...")
         ramification_summary_df, branch_data_df, endpoint_data_df = calculate_ramification_stats(
             segmented_array, spacing=spacing)
         

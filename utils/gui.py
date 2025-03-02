@@ -52,6 +52,29 @@ def create_parameter_widget(param_name: str, param_config: Dict[str, Any], callb
     
     return widget
 
+def check_processing_state(processed_dir, processing_mode):
+    """
+    Check the processing state by looking for checkpoint files
+    Returns the current step number (0, 1, 2, or 3) based on found files
+    """
+    # Check for step 3 completion (feature calculation)
+    metrics_df_loc = os.path.join(processed_dir, f"metrics_df_{processing_mode}.csv")
+    if os.path.exists(metrics_df_loc):
+        return 3  # All steps completed
+    
+    # Check for step 2 completion (refined ROIs)
+    merged_roi_array_loc = os.path.join(processed_dir, f"merged_roi_array_optimized_{processing_mode}.dat")
+    if os.path.exists(merged_roi_array_loc):
+        return 2  # Ready for feature calculation
+    
+    # Check for step 1 completion (initial segmentation)
+    segmented_cells_path = os.path.join(processed_dir, f"segmented_{processing_mode}.npy")
+    if os.path.exists(segmented_cells_path):
+        return 1  # Ready for ROI refinement
+    
+    # No checkpoints found
+    return 0  # Ready for initial segmentation
+
 class DynamicGUIManager:
     def __init__(self, viewer, config, image_stack, file_loc, processing_mode):
         self.viewer = viewer
@@ -77,8 +100,241 @@ class DynamicGUIManager:
         
         # Initialize viewer layers
         self._initialize_layers()
-
-
+        
+        # Check for existing processed files and restore state
+        self.restore_from_checkpoint()
+    
+    def restore_from_checkpoint(self):
+        """Check for existing processed files and restore the processing state"""
+        checkpoint_step = check_processing_state(self.processed_dir, self.processing_mode)
+        
+        # If checkpoints exist, ask user if they want to resume
+        if checkpoint_step > 0:
+            step_names = {
+                1: "initial segmentation",
+                2: "ROI refinement",
+                3: "feature calculation"
+            }
+            
+            if checkpoint_step == 3:
+                # All processing completed
+                msg = QMessageBox()
+                msg.setIcon(QMessageBox.Question)
+                msg.setWindowTitle("Resume Processing")
+                msg.setText(f"All processing steps already completed for this {self.processing_mode} dataset.")
+                msg.setInformativeText("Do you want to view the results or restart processing?")
+                view_button = msg.addButton("View Results", QMessageBox.YesRole)
+                restart_button = msg.addButton("Restart Processing", QMessageBox.NoRole)
+                msg.setDefaultButton(view_button)
+                msg.exec_()
+                
+                if msg.clickedButton() == view_button:
+                    # Load existing data and set current step
+                    self.load_checkpoint_data(checkpoint_step)
+                    self.current_step["value"] = checkpoint_step
+                else:
+                    # User chose to restart - confirm deletion
+                    self._confirm_restart()
+            else:
+                # Partial processing completed
+                msg = QMessageBox()
+                msg.setIcon(QMessageBox.Question)
+                msg.setWindowTitle("Resume Processing")
+                msg.setText(f"Found checkpoint after {step_names[checkpoint_step]}.")
+                msg.setInformativeText("Do you want to resume from this point?")
+                resume_button = msg.addButton("Resume", QMessageBox.YesRole)
+                restart_button = msg.addButton("Restart", QMessageBox.NoRole)
+                msg.setDefaultButton(resume_button)
+                msg.exec_()
+                
+                if msg.clickedButton() == resume_button:
+                    # Load existing data and set current step
+                    self.load_checkpoint_data(checkpoint_step)
+                    self.current_step["value"] = checkpoint_step
+                    
+                    # Setup widgets for the next step
+                    if checkpoint_step < 3:
+                        self.create_step_widgets(self.processing_steps[checkpoint_step])
+                else:
+                    # User chose to restart - confirm deletion
+                    self._confirm_restart()
+        else:
+            # No checkpoints found, start from the beginning
+            self.create_step_widgets("initial_segmentation")
+        
+    def _confirm_restart(self):
+        """Confirm and handle restarting from scratch"""
+        confirm_box = QMessageBox()
+        confirm_box.setIcon(QMessageBox.Warning)
+        confirm_box.setWindowTitle("Confirm Restart")
+        confirm_box.setText("This will delete all existing processed files.")
+        confirm_box.setInformativeText("Are you sure you want to restart?")
+        
+        yes_button = confirm_box.addButton("Yes, delete files", QMessageBox.YesRole)
+        no_button = confirm_box.addButton("No, keep files", QMessageBox.NoRole)
+        confirm_box.setDefaultButton(no_button)
+        
+        confirm_box.exec_()
+        
+        if confirm_box.clickedButton() == yes_button:
+            # Delete all existing processed files
+            self.delete_checkpoint_files()
+            self.current_step["value"] = 0
+            self.create_step_widgets("initial_segmentation")
+        else:
+            # User canceled deletion, load checkpoint data anyway
+            checkpoint_step = check_processing_state(self.processed_dir, self.processing_mode)
+            self.load_checkpoint_data(checkpoint_step)
+            self.current_step["value"] = checkpoint_step
+            if checkpoint_step < 3:
+                self.create_step_widgets(self.processing_steps[checkpoint_step])
+    
+    def delete_checkpoint_files(self):
+        """Delete all checkpoint files for the current processing mode"""
+        files_to_delete = [
+            os.path.join(self.processed_dir, f"segmented_{self.processing_mode}.npy"),
+            os.path.join(self.processed_dir, f"merged_roi_array_optimized_{self.processing_mode}.dat"),
+            os.path.join(self.processed_dir, f"distances_matrix_{self.processing_mode}.csv"),
+            os.path.join(self.processed_dir, f"points_matrix_{self.processing_mode}.csv"),
+            os.path.join(self.processed_dir, f"metrics_df_{self.processing_mode}.csv"),
+            os.path.join(self.processed_dir, f"ramification_metrics_{self.processing_mode}.csv"),
+            os.path.join(self.processed_dir, f"processing_config_{self.processing_mode}.yaml")
+        ]
+        
+        for file_path in files_to_delete:
+            if os.path.exists(file_path):
+                try:
+                    if file_path.endswith('.dat'):
+                        # For memory-mapped files we need to ensure they're closed
+                        # This is a simple approach - in production you might need more robust handling
+                        import gc
+                        gc.collect()  # Force garbage collection to close any open handles
+                    os.remove(file_path)
+                    print(f"Deleted: {file_path}")
+                except Exception as e:
+                    print(f"Failed to delete {file_path}: {str(e)}")
+    
+    def load_checkpoint_data(self, checkpoint_step):
+        """Load data from checkpoint files and restore the appropriate visualization layers"""
+        try:
+            if checkpoint_step >= 1:
+                # Load and display initial segmentation
+                segmented_cells_path = os.path.join(self.processed_dir, f"segmented_{self.processing_mode}.npy")
+                if os.path.exists(segmented_cells_path):
+                    labeled_cells = np.load(segmented_cells_path)
+                    # Check if layer already exists
+                    if "Intermediate segmentation" not in self.viewer.layers:
+                        self.viewer.add_labels(
+                            labeled_cells,
+                            name="Intermediate segmentation",
+                            scale=(self.z_scale_factor, 1, 1)
+                        )
+                    print(f"Loaded initial segmentation from checkpoint with {np.max(labeled_cells)} objects")
+                    
+                    # If this is a nuclei segmentation, we need to also load the first_pass_params
+                    if self.processing_mode == 'nuclei':
+                        # Try to load first_pass_params from config if available
+                        config_file = os.path.join(self.processed_dir, f"processing_config_{self.processing_mode}.yaml")
+                        if os.path.exists(config_file):
+                            with open(config_file, 'r') as file:
+                                saved_config = yaml.safe_load(file)
+                                if 'first_pass_params' in saved_config:
+                                    self.first_pass_params = saved_config['first_pass_params']
+                
+            if checkpoint_step >= 2:
+                # Load and display refined ROIs
+                merged_roi_array_loc = os.path.join(self.processed_dir, f"merged_roi_array_optimized_{self.processing_mode}.dat")
+                if os.path.exists(merged_roi_array_loc):
+                    # Map the file for memory efficiency
+                    merged_roi_array = np.memmap(
+                        merged_roi_array_loc,
+                        dtype=np.int32,
+                        mode='r',
+                        shape=self.image_stack.shape
+                    )
+                    # Check if layer already exists
+                    if "Final segmentation" not in self.viewer.layers:
+                        self.viewer.add_labels(
+                            merged_roi_array,
+                            name="Final segmentation",
+                            scale=(self.z_scale_factor, 1, 1)
+                        )
+                    print(f"Loaded refined ROIs from checkpoint")
+            
+            if checkpoint_step >= 3:
+                # If features are calculated, load and display connections
+                distances_matrix_loc = os.path.join(self.processed_dir, f"distances_matrix_{self.processing_mode}.csv")
+                points_matrix_loc = os.path.join(self.processed_dir, f"points_matrix_{self.processing_mode}.csv")
+                
+                if os.path.exists(distances_matrix_loc) and os.path.exists(points_matrix_loc):
+                    # We need to reconstruct the lines for visualization
+                    import pandas as pd
+                    distances_matrix = pd.read_csv(distances_matrix_loc, index_col=0)
+                    points_matrix = pd.read_csv(points_matrix_loc, index_col=0)
+                    
+                    # Recreate the lines connecting closest points
+                    lines = []
+                    for i in range(1, len(distances_matrix.columns)):
+                        source_cell = int(distances_matrix.columns[i])
+                        if source_cell in points_matrix.index:
+                            source_coords = [
+                                float(points_matrix.loc[source_cell, 'z']),
+                                float(points_matrix.loc[source_cell, 'y']), 
+                                float(points_matrix.loc[source_cell, 'x'])
+                            ]
+                            
+                            # Get the closest cell
+                            closest_cell = int(distances_matrix.iloc[0, i])
+                            if closest_cell in points_matrix.index:
+                                target_coords = [
+                                    float(points_matrix.loc[closest_cell, 'z']),
+                                    float(points_matrix.loc[closest_cell, 'y']), 
+                                    float(points_matrix.loc[closest_cell, 'x'])
+                                ]
+                                lines.append(np.array([source_coords, target_coords]))
+                    
+                    # Check if layer already exists
+                    if "Closest Points Connections" not in self.viewer.layers and lines:
+                        self.viewer.add_shapes(
+                            lines,
+                            shape_type='line',
+                            edge_color='red',
+                            edge_width=1.5,
+                            name="Closest Points Connections",
+                            scale=(self.z_scale_factor, 1, 1)
+                        )
+                    print(f"Loaded feature data and connections from checkpoint")
+                    
+                    # Show a summary of the metrics
+                    metrics_df_loc = os.path.join(self.processed_dir, f"metrics_df_{self.processing_mode}.csv")
+                    if os.path.exists(metrics_df_loc):
+                        metrics_df = pd.read_csv(metrics_df_loc)
+                        num_cells = len(metrics_df)
+                        print(f"Analysis complete: {num_cells} {self.processing_mode} cells analyzed")
+                        
+                        # For ramified cells, also show ramification metrics
+                        ramification_metrics_loc = os.path.join(self.processed_dir, f"ramification_metrics_{self.processing_mode}.csv")
+                        if os.path.exists(ramification_metrics_loc) and self.processing_mode == 'ramified':
+                            ramification_df = pd.read_csv(ramification_metrics_loc)
+                            print(f"Ramification metrics available for {len(ramification_df)} cells")
+            
+            config_file = os.path.join(self.processed_dir, f"processing_config_{self.processing_mode}.yaml")
+            if os.path.exists(config_file):
+                with open(config_file, 'r') as file:
+                    saved_config = yaml.safe_load(file)
+                    # Update only the relevant sections of the config
+                    for key in saved_config:
+                        if key in self.config:
+                            self.config[key] = saved_config[key]
+                    print(f"Loaded saved configuration parameters")
+            
+        except Exception as e:
+            print(f"Error loading checkpoint data: {str(e)}")
+            raise
+            
+        except Exception as e:
+            print(f"Error loading checkpoint data: {str(e)}")
+            raise
     def cleanup_step(self, step_number):
         """Clean up the results and layers from a specific step"""
         if step_number == 1:
@@ -242,7 +498,13 @@ class DynamicGUIManager:
                 points_matrix.to_csv(points_matrix_loc)
                 metrics_df.to_csv(metrics_df_loc)
                 if ramification_metrics is not None:
-                    ramification_metrics.to_csv(ramification_metrics_loc)
+                    ramification_summary_df, branch_data_df, endpoint_data_df = ramification_metrics
+                    ramification_summary_loc = os.path.join(self.processed_dir, f"ramification_summary_{self.processing_mode}.csv")
+                    branch_data_loc = os.path.join(self.processed_dir, f"branch_data_{self.processing_mode}.csv")
+                    endpoint_data_loc = os.path.join(self.processed_dir, f"endpoint_data_{self.processing_mode}.csv")
+                    ramification_summary_df.to_csv(ramification_summary_loc)
+                    branch_data_df.to_csv(branch_data_loc)  
+                    endpoint_data_df.to_csv(endpoint_data_loc)
 
                 # Add the lines connecting closest points as shapes in Napari
                 self.viewer.add_shapes(
@@ -268,10 +530,19 @@ class DynamicGUIManager:
             raise
 
     def save_updated_config(self):
-        """Save the current configuration to a YAML file"""
+        """Save the current configuration to a YAML file in the output directory"""
         config_save_path = os.path.join(self.processed_dir, f"processing_config_{self.processing_mode}.yaml")
+        
+        # Prepare updated config
+        updated_config = self.config.copy()
+        
+        # Make sure 'mode' is preserved
+        if 'mode' not in updated_config:
+            updated_config['mode'] = self.processing_mode
+        
         with open(config_save_path, 'w') as file:
-            yaml.dump(self.config, file, default_flow_style=False)
+            yaml.dump(updated_config, file, default_flow_style=False)
+        print(f"Configuration saved to {config_save_path}")
 
     def clear_current_widgets(self):
         """Remove all current widgets"""
@@ -377,41 +648,6 @@ def interactive_segmentation_with_config():
     if app is None:
         app = QApplication(sys.argv)
     
-    # Prompt for config file
-    config_path, _ = QFileDialog.getOpenFileName(
-        None,
-        "Select config YAML file",
-        "",
-        "YAML files (*.yaml *.yml);;All files (*.*)"
-    )
-    
-    # Load or create config
-    if config_path and os.path.exists(config_path):
-        with open(config_path, 'r') as file:
-            config = yaml.safe_load(file)
-    else:
-        QMessageBox.critical(None, "Error", "No config file selected. Please select a config file.")
-        return
-    
-    # Prompt for processing mode selection
-    processing_modes = ["nuclei", "ramified"]
-    processing_mode_idx, ok = QInputDialog.getItem(
-        None, 
-        "Processing Mode",
-        "Select processing mode:",
-        ["Nuclear morphology", "Ramified morphology"],
-        0,  # Default to first item
-        False  # Not editable
-    )
-    
-    if not ok:
-        QMessageBox.warning(None, "Warning", "No processing mode selected. Exiting.")
-        return
-    
-    # Convert selection to mode string
-    processing_mode = processing_modes[0] if "Nuclear" in processing_mode_idx else processing_modes[1]
-    print(f"Selected processing mode: {processing_mode}")
-    
     # Prompt for input file
     file_loc, _ = QFileDialog.getOpenFileName(
         None,
@@ -424,13 +660,60 @@ def interactive_segmentation_with_config():
         QMessageBox.warning(None, "Warning", "No file selected. Exiting.")
         return
 
+    # Find YAML file in the same directory as the TIF file
+    input_dir = os.path.dirname(file_loc)
+    yaml_files = [f for f in os.listdir(input_dir) if f.endswith(('.yaml', '.yml'))]
+    
+    if not yaml_files:
+        QMessageBox.critical(None, "Error", "No YAML configuration file found in the same directory as the TIF file.")
+        return
+    
+    if len(yaml_files) > 1:
+        QMessageBox.critical(None, "Error", f"Multiple YAML files found in the directory. Please keep only one YAML file.")
+        return
+    
+    config_path = os.path.join(input_dir, yaml_files[0])
+    
+    # Load config
+    try:
+        with open(config_path, 'r') as file:
+            config = yaml.safe_load(file)
+    except Exception as e:
+        QMessageBox.critical(None, "Error", f"Failed to load YAML file: {str(e)}")
+        return
+    
+    # Extract processing mode from config
+    if 'mode' not in config:
+        QMessageBox.critical(None, "Error", "The YAML file does not contain a 'mode' field. Please add 'mode: nuclei' or 'mode: ramified' to the YAML file.")
+        return
+    
+    processing_mode = config['mode']
+    if processing_mode not in ["nuclei", "ramified"]:
+        QMessageBox.critical(None, "Error", f"Invalid processing mode '{processing_mode}' in YAML file. Mode must be 'nuclei' or 'ramified'.")
+        return
+    
+    print(f"Using processing mode from config: {processing_mode}")
+    
     # Create processed directory with mode suffix
-    inputdir = os.path.dirname(file_loc)
     basename = os.path.basename(file_loc).split('.')[0]
-    processed_dir = os.path.join(inputdir, f"{basename}_processed_{processing_mode}")
+    processed_dir = os.path.join(input_dir, f"{basename}_processed_{processing_mode}")
     if not os.path.exists(processed_dir):
         os.makedirs(processed_dir)
-
+    
+    # Check for existing processed files and config in the processed directory
+    output_config_path = os.path.join(processed_dir, f"processing_config_{processing_mode}.yaml")
+    
+    # Check if we should use the config from the checkpoint
+    checkpoint_step = check_processing_state(processed_dir, processing_mode)
+    if checkpoint_step > 0 and os.path.exists(output_config_path):
+        try:
+            with open(output_config_path, 'r') as file:
+                config = yaml.safe_load(file)
+            print(f"Loaded configuration from checkpoint at step {checkpoint_step}")
+        except Exception as e:
+            print(f"Warning: Failed to load config from checkpoint: {str(e)}")
+            # Continue with the original config if checkpoint config fails to load
+    
     # Load the .tif file
     try:
         image_stack = tiff.imread(file_loc)
@@ -441,7 +724,41 @@ def interactive_segmentation_with_config():
 
     # Initialize viewer and GUI manager with processing mode
     viewer = napari.Viewer(title=f"Microscopy Analysis - {processing_mode.capitalize()} Mode")
-    gui_manager = DynamicGUIManager(viewer, config, image_stack, file_loc, processing_mode)
+    
+    # Create a modified DynamicGUIManager that updates the config file after each step
+    class ModifiedGUIManager(DynamicGUIManager):
+        def __init__(self, viewer, config, image_stack, file_loc, processing_mode, original_config_path):
+            super().__init__(viewer, config, image_stack, file_loc, processing_mode)
+            self.original_config_path = original_config_path
+            
+        def execute_processing_step(self):
+            """Override to save config after each step"""
+            result = super().execute_processing_step()
+            # Save updated config after each step
+            self.save_updated_config()
+            return result
+            
+        def save_updated_config(self):
+            """Save the current configuration to a YAML file in the output directory"""
+            config_save_path = os.path.join(self.processed_dir, f"processing_config_{self.processing_mode}.yaml")
+            # Create a new config with updated values but preserve the original structure
+            updated_config = self.config.copy()
+            # Keep the mode in the saved config
+            if 'mode' not in updated_config and hasattr(self, 'original_config_path'):
+                try:
+                    with open(self.original_config_path, 'r') as file:
+                        orig_config = yaml.safe_load(file)
+                        if 'mode' in orig_config:
+                            updated_config['mode'] = orig_config['mode']
+                except Exception:
+                    pass
+            
+            with open(config_save_path, 'w') as file:
+                yaml.dump(updated_config, file, default_flow_style=False)
+            print(f"Saved updated configuration to {config_save_path}")
+    
+    # Use the modified GUI manager
+    gui_manager = ModifiedGUIManager(viewer, config, image_stack, file_loc, processing_mode, config_path)
     
     @magicgui(call_button="Continue Processing")
     def continue_processing():
@@ -472,9 +789,8 @@ def interactive_segmentation_with_config():
     previous_step_button = go_to_previous_step
     viewer.window.add_dock_widget(continue_processing_button, area="right")
     viewer.window.add_dock_widget(previous_step_button, area="right")
+    
+    # Initialize button states
     update_navigation_buttons()
-
-    # Create initial GUI widgets
-    gui_manager.create_step_widgets("initial_segmentation")
 
     napari.run()

@@ -1,4 +1,6 @@
 # Enhanced configuration for image processing pipeline with GUI definitions
+mode: "ramified"
+
 initial_segmentation:
   name: "Initial Segmentation"
   parameters:
