@@ -15,6 +15,8 @@ from multiprocessing import shared_memory
 import time
 import psutil
 from shutil import rmtree
+seed = 42
+np.random.seed(seed)         # For NumPy
 
 
 def downsample_for_isotropic(volume, spacing, anisotropy_normalization_degree=1.0):

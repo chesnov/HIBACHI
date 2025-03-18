@@ -9,6 +9,8 @@ import pandas as pd
 from skimage.morphology import skeletonize
 import networkx as nx
 from tqdm import tqdm
+seed = 42
+np.random.seed(seed)         # For NumPy
 
 def extract_surface_points_worker(args):
     """Worker function to extract surface points from a mask with careful handling of boundaries"""
@@ -456,6 +458,9 @@ def extract_skeleton(segmented_array, label=None, spacing=(1.0, 1.0, 1.0)):
     skeleton_objects : dict
         Dictionary where keys are mask labels and values are tuples of:
         (skeleton_mask, skeleton_coords, skeleton_graph)
+    skeleton_array : numpy.ndarray
+        3D array with the same shape as segmented_array, containing skeletons 
+        with original mask labels
     """
     # Get labels to process
     if label is not None:
@@ -463,6 +468,9 @@ def extract_skeleton(segmented_array, label=None, spacing=(1.0, 1.0, 1.0)):
     else:
         labels = np.unique(segmented_array)
         labels = labels[labels > 0]
+    
+    # Create a skeleton array with the same shape as input
+    skeleton_array = np.zeros_like(segmented_array)
     
     skeletons = {}
     
@@ -477,6 +485,9 @@ def extract_skeleton(segmented_array, label=None, spacing=(1.0, 1.0, 1.0)):
         
         # Skeletonize the mask
         skeleton = skeletonize(mask)
+        
+        # Add skeleton to skeleton_array with the original label
+        skeleton_array[skeleton] = lbl
         
         # Get coordinates of skeleton points
         z_coords, x_coords, y_coords = np.where(skeleton)
@@ -521,7 +532,7 @@ def extract_skeleton(segmented_array, label=None, spacing=(1.0, 1.0, 1.0)):
         'skeleton_length_um': skeleton_lengths
     })
     
-    return skeleton_df, skeletons
+    return skeleton_df, skeletons, skeleton_array
 
 def analyze_ramification(skeleton_graph, node_positions=None):
     """
@@ -733,7 +744,7 @@ def analyze_ramification(skeleton_graph, node_positions=None):
     
     return stats, branch_df, endpoint_df
 
-def calculate_ramification_stats(segmented_array, spacing=(1.0, 1.0, 1.0), labels=None):
+def calculate_ramification_stats(segmented_array, spacing=(1.0, 1.0, 1.0), labels=None, skeleton_export_path=None):
     """
     Calculate ramification statistics for masks in a 3D segmented array with improved memory efficiency.
     
@@ -746,6 +757,9 @@ def calculate_ramification_stats(segmented_array, spacing=(1.0, 1.0, 1.0), label
         Tuple of (z_spacing, x_spacing, y_spacing) in microns.
     labels : list, optional
         Specific labels to analyze. If None, all masks are processed.
+    skeleton_export_path : str, optional
+        Path to export a memory-mapped numpy array of skeletons.
+        If None, skeletons will be kept in memory.
     
     Returns:
     --------
@@ -755,6 +769,8 @@ def calculate_ramification_stats(segmented_array, spacing=(1.0, 1.0, 1.0), label
         DataFrame with detailed information about each branch.
     endpoint_data_df : pandas.DataFrame
         DataFrame with detailed information about each endpoint.
+    skeleton_array : numpy.memmap or numpy.ndarray
+        Memory-mapped or in-memory array containing skeletons of all masks.
     """
     import numpy as np
     import pandas as pd
@@ -765,6 +781,20 @@ def calculate_ramification_stats(segmented_array, spacing=(1.0, 1.0, 1.0), label
     if labels is None:
         unique_labels = np.unique(segmented_array)
         labels = unique_labels[unique_labels > 0]
+    
+    # Prepare skeleton export array
+    if skeleton_export_path:
+        # Create memory-mapped array for skeletons
+        skeleton_array = np.memmap(
+            skeleton_export_path, 
+            dtype=segmented_array.dtype, 
+            mode='w+', 
+            shape=segmented_array.shape
+        )
+        skeleton_array[:] = 0  # Initialize with zeros
+    else:
+        # Create in-memory array for skeletons
+        skeleton_array = np.zeros_like(segmented_array)
     
     # Initialize DataFrames for results
     ramification_summary_rows = []
@@ -782,10 +812,13 @@ def calculate_ramification_stats(segmented_array, spacing=(1.0, 1.0, 1.0), label
             continue
         
         # Extract skeleton for the current label only
-        _, skeleton_result = extract_skeleton(mask, label=1, spacing=spacing)
+        _, skeleton_result, label_skeleton = extract_skeleton(mask, label=1, spacing=spacing)
         
         if 1 in skeleton_result:  # The label will be 1 since we made a binary mask
             _, skeleton_coords, skeleton_graph = skeleton_result[1]
+            
+            # Add label's skeleton to the full skeleton array
+            skeleton_array[label_skeleton == 1] = label
             
             # Create node positions dictionary
             node_positions = {i: coord for i, coord in enumerate(skeleton_coords)}
@@ -817,7 +850,7 @@ def calculate_ramification_stats(segmented_array, spacing=(1.0, 1.0, 1.0), label
             endpoint_data_dfs.append(endpoint_df)
             
             # Clean up to free memory
-            del skeleton_coords, skeleton_graph, node_positions
+            del skeleton_coords, skeleton_graph, node_positions, label_skeleton
             gc.collect()
         else:
             print(f"Warning: Failed to extract skeleton for label {label}.")
@@ -833,9 +866,41 @@ def calculate_ramification_stats(segmented_array, spacing=(1.0, 1.0, 1.0), label
     branch_data_df = pd.concat(branch_data_dfs) if branch_data_dfs else pd.DataFrame()
     endpoint_data_df = pd.concat(endpoint_data_dfs) if endpoint_data_dfs else pd.DataFrame()
     
-    return ramification_summary_df, branch_data_df, endpoint_data_df
+    return ramification_summary_df, branch_data_df, endpoint_data_df, skeleton_array
 
-def analyze_segmentation(segmented_array, spacing=(1.0, 1.0, 1.0), calculate_skeletons=True):
+def calculate_depth_df(segmented_array, spacing=(1.0, 1.0, 1.0)):
+    """
+    Calculate the depth of each mask in a 3D segmented array in microns.
+    
+    Parameters:
+    -----------
+    segmented_array : numpy.ndarray
+        3D numpy array (z, x, y) containing integer labels for each mask.
+        0 is assumed to be the background.
+    spacing : tuple
+        Tuple of (z_spacing, x_spacing, y_spacing) in microns.
+    Returns:
+    --------
+    depth_df : pandas.DataFrame
+        DataFrame with columns:
+        - label: Mask label
+        - depth_um: Depth in microns
+    """
+    #Calculate the depth of each mask
+    depth_df = pd.DataFrame()
+    for label in tqdm(np.unique(segmented_array)):
+        if label == 0:
+            continue
+        mask = (segmented_array == label)
+        z_indices, _, _ = np.where(mask)
+        #Get the median z index
+        median_z = np.median(z_indices)
+        depth = median_z * spacing[0]
+        temp_df = pd.DataFrame({'label': [label], 'depth_um': [depth]})
+        depth_df = pd.concat([depth_df, temp_df])
+    return depth_df
+
+def analyze_segmentation(segmented_array, spacing=(1.0, 1.0, 1.0), calculate_skeletons=True, skeleton_export_path=None):
     """
     Comprehensive analysis of a 3D segmented array, combining volume and ramification metrics.
     
@@ -848,14 +913,16 @@ def analyze_segmentation(segmented_array, spacing=(1.0, 1.0, 1.0), calculate_ske
         Tuple of (z_spacing, x_spacing, y_spacing) in microns.
     calculate_skeletons : bool
         Whether to calculate skeleton-based metrics (which can be time-consuming).
+    skeleton_export_path : str, optional
+        Path to export a memory-mapped numpy array of skeletons.
     
     Returns:
     --------
     metrics_df : pandas.DataFrame
         DataFrame with combined metrics for each mask.
     ramification_metrics : tuple
-        Tuple of (ramification_summary_df, branch_data_df, endpoint_data_df) if calculate_skeletons=True,
-        otherwise None.
+        Tuple of (ramification_summary_df, branch_data_df, endpoint_data_df, skeleton_array) 
+        if calculate_skeletons=True, otherwise None.
     """
     # Calculate volume metrics
     print("Calculating volume metrics...")
@@ -864,12 +931,15 @@ def analyze_segmentation(segmented_array, spacing=(1.0, 1.0, 1.0), calculate_ske
     if calculate_skeletons:
         # Calculate ramification stats
         print("Calculating ramification metrics...")
-        ramification_summary_df, branch_data_df, endpoint_data_df = calculate_ramification_stats(
-            segmented_array, spacing=spacing)
+        ramification_summary_df, branch_data_df, endpoint_data_df, skeleton_array = calculate_ramification_stats(
+            segmented_array, 
+            spacing=spacing, 
+            skeleton_export_path=skeleton_export_path
+        )
         
         # Merge volume and ramification metrics
         metrics_df = pd.merge(volume_df, ramification_summary_df, on='label', how='outer')
-        ramification_metrics = (ramification_summary_df, branch_data_df, endpoint_data_df)
+        ramification_metrics = (ramification_summary_df, branch_data_df, endpoint_data_df, skeleton_array)
     else:
         metrics_df = volume_df
         ramification_metrics = None

@@ -10,6 +10,9 @@ from PyQt5.QtWidgets import QApplication, QFileDialog, QInputDialog, QMessageBox
 import sys
 os.environ["QT_SCALE_FACTOR"] = "1.5"
 
+seed = 42
+np.random.seed(seed)         # For NumPy
+
 from utils.ramified_segmenter import *
 from utils.nuclear_segmenter import *
 from utils.calculate_features import *
@@ -63,12 +66,12 @@ def check_processing_state(processed_dir, processing_mode):
         return 3  # All steps completed
     
     # Check for step 2 completion (refined ROIs)
-    merged_roi_array_loc = os.path.join(processed_dir, f"merged_roi_array_optimized_{processing_mode}.dat")
+    merged_roi_array_loc = os.path.join(processed_dir, f"final_segmentation_{processing_mode}.dat")
     if os.path.exists(merged_roi_array_loc):
         return 2  # Ready for feature calculation
     
     # Check for step 1 completion (initial segmentation)
-    segmented_cells_path = os.path.join(processed_dir, f"segmented_{processing_mode}.npy")
+    segmented_cells_path = os.path.join(processed_dir, f"initial_segmentation_{processing_mode}.npy")
     if os.path.exists(segmented_cells_path):
         return 1  # Ready for ROI refinement
     
@@ -192,12 +195,13 @@ class DynamicGUIManager:
     def delete_checkpoint_files(self):
         """Delete all checkpoint files for the current processing mode"""
         files_to_delete = [
-            os.path.join(self.processed_dir, f"segmented_{self.processing_mode}.npy"),
-            os.path.join(self.processed_dir, f"merged_roi_array_optimized_{self.processing_mode}.dat"),
+            os.path.join(self.processed_dir, f"initial_segmentation_{self.processing_mode}.npy"),
+            os.path.join(self.processed_dir, f"final_segmentation_{self.processing_mode}.dat"),
             os.path.join(self.processed_dir, f"distances_matrix_{self.processing_mode}.csv"),
             os.path.join(self.processed_dir, f"points_matrix_{self.processing_mode}.csv"),
             os.path.join(self.processed_dir, f"metrics_df_{self.processing_mode}.csv"),
             os.path.join(self.processed_dir, f"ramification_metrics_{self.processing_mode}.csv"),
+            os.path.join(self.processed_dir, f"cell_bodies_{self.processing_mode}.npy"),
             os.path.join(self.processed_dir, f"processing_config_{self.processing_mode}.yaml")
         ]
         
@@ -219,7 +223,7 @@ class DynamicGUIManager:
         try:
             if checkpoint_step >= 1:
                 # Load and display initial segmentation
-                segmented_cells_path = os.path.join(self.processed_dir, f"segmented_{self.processing_mode}.npy")
+                segmented_cells_path = os.path.join(self.processed_dir, f"initial_segmentation_{self.processing_mode}.npy")
                 if os.path.exists(segmented_cells_path):
                     labeled_cells = np.load(segmented_cells_path)
                     # Check if layer already exists
@@ -243,8 +247,17 @@ class DynamicGUIManager:
                 
             if checkpoint_step >= 2:
                 # Load and display refined ROIs
-                merged_roi_array_loc = os.path.join(self.processed_dir, f"merged_roi_array_optimized_{self.processing_mode}.dat")
+                merged_roi_array_loc = os.path.join(self.processed_dir, f"final_segmentation_{self.processing_mode}.dat")
                 if os.path.exists(merged_roi_array_loc):
+                    segmented_somas_loc = os.path.join(self.processed_dir, f"cell_bodies_{self.processing_mode}.npy")
+                    if os.path.exists(segmented_somas_loc):
+                        cell_bodies = np.fromfile(segmented_somas_loc, dtype=np.int32).reshape(self.image_stack.shape)
+                        if "Cell bodies" not in self.viewer.layers:
+                            self.viewer.add_labels(
+                                cell_bodies,
+                                name="Cell bodies",
+                                scale=(self.z_scale_factor, 1, 1)
+                            )
                     # Map the file for memory efficiency
                     merged_roi_array = np.memmap(
                         merged_roi_array_loc,
@@ -265,44 +278,37 @@ class DynamicGUIManager:
                 # If features are calculated, load and display connections
                 distances_matrix_loc = os.path.join(self.processed_dir, f"distances_matrix_{self.processing_mode}.csv")
                 points_matrix_loc = os.path.join(self.processed_dir, f"points_matrix_{self.processing_mode}.csv")
+                depth_df_loc = os.path.join(self.processed_dir, f"depth_df_{self.processing_mode}.csv")
                 
                 if os.path.exists(distances_matrix_loc) and os.path.exists(points_matrix_loc):
                     # We need to reconstruct the lines for visualization
                     import pandas as pd
-                    distances_matrix = pd.read_csv(distances_matrix_loc, index_col=0)
-                    points_matrix = pd.read_csv(points_matrix_loc, index_col=0)
                     
-                    # Recreate the lines connecting closest points
-                    lines = []
-                    for i in range(1, len(distances_matrix.columns)):
-                        source_cell = int(distances_matrix.columns[i])
-                        if source_cell in points_matrix.index:
-                            source_coords = [
-                                float(points_matrix.loc[source_cell, 'z']),
-                                float(points_matrix.loc[source_cell, 'y']), 
-                                float(points_matrix.loc[source_cell, 'x'])
-                            ]
-                            
-                            # Get the closest cell
-                            closest_cell = int(distances_matrix.iloc[0, i])
-                            if closest_cell in points_matrix.index:
-                                target_coords = [
-                                    float(points_matrix.loc[closest_cell, 'z']),
-                                    float(points_matrix.loc[closest_cell, 'y']), 
-                                    float(points_matrix.loc[closest_cell, 'x'])
-                                ]
-                                lines.append(np.array([source_coords, target_coords]))
+                    # Load lines from CSV into pandas df and convert into np array with shape (n_labels, 2, 3)
+                    lines_loc = os.path.join(self.processed_dir, f"lines_{self.processing_mode}.csv")
+                    lines = pd.read_csv(lines_loc, header=None).values.reshape(-1, 2, 3)
                     
                     # Check if layer already exists
-                    if "Closest Points Connections" not in self.viewer.layers and lines:
+                    if "Closest Points Connections" not in self.viewer.layers:
                         self.viewer.add_shapes(
                             lines,
                             shape_type='line',
                             edge_color='red',
-                            edge_width=1.5,
+                            edge_width=1,
                             name="Closest Points Connections",
                             scale=(self.z_scale_factor, 1, 1)
                         )
+
+                    #Load the skeleton array
+                    skeleton_array_loc = os.path.join(self.processed_dir, f"skeleton_array_{self.processing_mode}.npy")
+                    if os.path.exists(skeleton_array_loc):
+                        skeleton_array = np.load(skeleton_array_loc)
+                        if "Skeletons" not in self.viewer.layers:
+                            self.viewer.add_labels(
+                                skeleton_array,
+                                name="Skeletons",
+                                scale=(self.z_scale_factor, 1, 1)
+                            )
                     print(f"Loaded feature data and connections from checkpoint")
                     
                     # Show a summary of the metrics
@@ -317,6 +323,11 @@ class DynamicGUIManager:
                         if os.path.exists(ramification_metrics_loc) and self.processing_mode == 'ramified':
                             ramification_df = pd.read_csv(ramification_metrics_loc)
                             print(f"Ramification metrics available for {len(ramification_df)} cells")
+                    #check if the depth_df exists
+                    if not os.path.exists(depth_df_loc):
+                        #call the function to calculate the depth_df
+                        depth_df = calculate_depth_df(merged_roi_array, [self.z_spacing, self.x_spacing, self.y_spacing])
+                        depth_df.to_csv(depth_df_loc)
             
             config_file = os.path.join(self.processed_dir, f"processing_config_{self.processing_mode}.yaml")
             if os.path.exists(config_file):
@@ -341,7 +352,7 @@ class DynamicGUIManager:
             layer_name = "Intermediate segmentation"
             if layer_name in self.viewer.layers:
                 self.viewer.layers.remove(layer_name)
-            segmented_cells_path = os.path.join(self.processed_dir, f"segmented_{self.processing_mode}.npy")
+            segmented_cells_path = os.path.join(self.processed_dir, f"initial_segmentation_{self.processing_mode}.npy")
             if os.path.exists(segmented_cells_path):
                 os.remove(segmented_cells_path)
 
@@ -349,23 +360,57 @@ class DynamicGUIManager:
             layer_name = "Final segmentation"
             if layer_name in self.viewer.layers:
                 self.viewer.layers.remove(layer_name)
-            merged_roi_array_loc = os.path.join(self.processed_dir, f"merged_roi_array_optimized_{self.processing_mode}.dat")
+            merged_roi_array_loc = os.path.join(self.processed_dir, f"final_segmentation_{self.processing_mode}.dat")
             if os.path.exists(merged_roi_array_loc):
                 os.remove(merged_roi_array_loc)
+            cell_bodies_loc = os.path.join(self.processed_dir, f"cell_bodies_{self.processing_mode}.npy")
+            if os.path.exists(cell_bodies_loc):
+                os.remove(cell_bodies_loc)
+            if "Cell bodies" in self.viewer.layers:
+                self.viewer.layers.remove("Cell bodies")
         
         elif step_number == 3:
             connections_layer = "Closest Points Connections"
             if connections_layer in self.viewer.layers:
                 self.viewer.layers.remove(connections_layer)
+            skeletons_layer = "Skeletons"
+            if skeletons_layer in self.viewer.layers:
+                self.viewer.layers.remove(skeletons_layer)
+            metrics_df_loc = os.path.join(self.processed_dir, f"metrics_df_{self.processing_mode}.csv")
+            if os.path.exists(metrics_df_loc):
+                os.remove(metrics_df_loc)
+            ramification_metrics_loc = os.path.join(self.processed_dir, f"ramification_summary_{self.processing_mode}.csv")
+            if os.path.exists(ramification_metrics_loc):
+                os.remove(ramification_metrics_loc)
+            lines_loc = os.path.join(self.processed_dir, f"lines_{self.processing_mode}.csv")
+            if os.path.exists(lines_loc):
+                os.remove(lines_loc)
+            skeleton_array_loc = os.path.join(self.processed_dir, f"skeleton_array_{self.processing_mode}.npy")
+            if os.path.exists(skeleton_array_loc):
+                os.remove(skeleton_array_loc)
+            branch_data_loc = os.path.join(self.processed_dir, f"branch_data_{self.processing_mode}.csv")
+            if os.path.exists(branch_data_loc):
+                os.remove(branch_data_loc)
+            endpoint_data_loc = os.path.join(self.processed_dir, f"endpoint_data_{self.processing_mode}.csv")
+            if os.path.exists(endpoint_data_loc):
+                os.remove(endpoint_data_loc)
+            points_data_loc = os.path.join(self.processed_dir, f"points_matrix_{self.processing_mode}.csv")
+            if os.path.exists(points_data_loc):
+                os.remove(points_data_loc)
+            distances_matrix_loc = os.path.join(self.processed_dir, f"distances_matrix_{self.processing_mode}.csv")
+            if os.path.exists(distances_matrix_loc):
+                os.remove(distances_matrix_loc)
 
 
     def execute_processing_step(self):
         """Execute the next step in the processing pipeline based on the selected processing mode"""
+        #Start timer to measure how long this step takes
+        start_time = time.time()
         try:
             if self.current_step["value"] == 0:
                 # Step 1: Initial cell segmentation
                 print(f"Running initial {self.processing_mode} segmentation...")
-                segmented_cells_path = os.path.join(self.processed_dir, f"segmented_{self.processing_mode}.npy")
+                segmented_cells_path = os.path.join(self.processed_dir, f"initial_segmentation_{self.processing_mode}.npy")
                 
                 # Remove existing results if present
                 self.cleanup_step(1)
@@ -387,16 +432,15 @@ class DynamicGUIManager:
                     
                 else:  # ramified mode
                     # Process ramified cells
-                    labeled_cells, first_pass_params = segment_microglia(self.image_stack, 
-                     first_pass=None,
-                     tubular_scales=[current_values.get("tubular_scales", 2)],
-                     smooth_sigma=current_values.get("smooth_sigma", 1.0),
-                     min_size=current_values.get("min_size", 100),
-                     min_cell_body_size=current_values.get("min_cell_body_size", 200),
-                     spacing=[self.z_spacing, self.x_spacing, self.y_spacing],
-                     anisotropy_normalization_degree=current_values.get("anisotropy_normalization_degree", 0.2),
-                     sensitivity=current_values.get("sensitivity", 0.2),
-                     extract_features=False)
+                    labeled_cells, first_pass_params = segment_microglia_first_pass(
+                                                            self.image_stack,
+                                                            tubular_scales=[current_values.get("tubular_scales", 2)],
+                                                            smooth_sigma=current_values.get("smooth_sigma", 1.0),
+                                                            min_size=current_values.get("min_size", 100),
+                                                            spacing=[self.z_spacing, self.x_spacing, self.y_spacing],
+                                                            anisotropy_normalization_degree=current_values.get("anisotropy_normalization_degree", 0.2),
+                                                            sensitivity=current_values.get("sensitivity", 0.2)
+                                                        )
                 
                 np.save(segmented_cells_path, labeled_cells)
                 self.viewer.add_labels(
@@ -417,7 +461,7 @@ class DynamicGUIManager:
                 
                 # Get current parameter values
                 current_values = self.get_current_values()
-                segmented_cells_path = os.path.join(self.processed_dir, f"segmented_{self.processing_mode}.npy")
+                segmented_cells_path = os.path.join(self.processed_dir, f"initial_segmentation_{self.processing_mode}.npy")
                 labeled_cells = np.load(segmented_cells_path)
                 
                 if self.processing_mode == 'nuclei':
@@ -431,19 +475,21 @@ class DynamicGUIManager:
                       anisotropy_normalization_degree=current_values.get("anisotropy_normalization_degree", 1.0))
                 else:
                     # Refine ramified ROIs
-                    merged_roi_array = segment_microglia(self.image_stack, 
-                     first_pass=labeled_cells,
-                     tubular_scales=[current_values.get("tubular_scales", 2)],
-                     smooth_sigma=current_values.get("smooth_sigma", 1.0),
-                     min_size=current_values.get("min_size", 100),
-                     min_cell_body_size=current_values.get("min_cell_body_size", 200),
-                     spacing=[self.z_spacing, self.x_spacing, self.y_spacing],
-                     anisotropy_normalization_degree=current_values.get("anisotropy_normalization_degree", 0.2),
-                     sensitivity=current_values.get("sensitivity", 0.2),
-                     extract_features=False)
+                    cell_bodies = extract_soma_masks(labeled_cells, current_values.get("small_object_percentile"), current_values.get("thickness_percentile"))
+                    merged_roi_array = separate_multi_soma_cells(labeled_cells, self.image_stack, cell_bodies, current_values.get('min_size_threshold'))
+
+                    self.viewer.add_labels(
+                        cell_bodies,
+                        name="Cell bodies",
+                        scale=(self.z_scale_factor, 1, 1)
+                    )
+
+                    #Save the cell bodies
+                    cell_bodies_loc = os.path.join(self.processed_dir, f"cell_bodies_{self.processing_mode}.npy")
+                    cell_bodies.tofile(cell_bodies_loc)
                 
                 # Save the merged array
-                merged_roi_array_loc = os.path.join(self.processed_dir, f"merged_roi_array_optimized_{self.processing_mode}.dat")
+                merged_roi_array_loc = os.path.join(self.processed_dir, f"final_segmentation_{self.processing_mode}.dat")
                 merged_roi_array.tofile(merged_roi_array_loc)
                 
                 self.viewer.add_labels(
@@ -465,7 +511,7 @@ class DynamicGUIManager:
                 # Get current parameter values
                 current_values = self.get_current_values()
                 
-                merged_roi_array_loc = os.path.join(self.processed_dir, f"merged_roi_array_optimized_{self.processing_mode}.dat")
+                merged_roi_array_loc = os.path.join(self.processed_dir, f"final_segmentation_{self.processing_mode}.dat")
                 merged_roi_array = np.memmap(
                     merged_roi_array_loc,
                     dtype=np.int32,
@@ -498,7 +544,7 @@ class DynamicGUIManager:
                 points_matrix.to_csv(points_matrix_loc)
                 metrics_df.to_csv(metrics_df_loc)
                 if ramification_metrics is not None:
-                    ramification_summary_df, branch_data_df, endpoint_data_df = ramification_metrics
+                    ramification_summary_df, branch_data_df, endpoint_data_df, skeleton_array = ramification_metrics
                     ramification_summary_loc = os.path.join(self.processed_dir, f"ramification_summary_{self.processing_mode}.csv")
                     branch_data_loc = os.path.join(self.processed_dir, f"branch_data_{self.processing_mode}.csv")
                     endpoint_data_loc = os.path.join(self.processed_dir, f"endpoint_data_{self.processing_mode}.csv")
@@ -506,12 +552,28 @@ class DynamicGUIManager:
                     branch_data_df.to_csv(branch_data_loc)  
                     endpoint_data_df.to_csv(endpoint_data_loc)
 
+                    #Save the skeleton array
+                    skeleton_array_loc = os.path.join(self.processed_dir, f"skeleton_array_{self.processing_mode}.npy")
+                    np.save(skeleton_array_loc, skeleton_array)
+
+                    #Save the lines into a csv file
+                    lines_loc = os.path.join(self.processed_dir, f"lines_{self.processing_mode}.csv")
+                    with open(lines_loc, 'w') as f:
+                        for line in lines:
+                            f.write(f"{line[0][0]},{line[0][1]},{line[0][2]},{line[1][0]},{line[1][1]},{line[1][2]}\n")
+
+                    self.viewer.add_labels(
+                        skeleton_array,
+                        name="Skeletons",
+                        scale=(self.z_scale_factor, 1, 1)
+                    )
+
                 # Add the lines connecting closest points as shapes in Napari
                 self.viewer.add_shapes(
                     lines,
                     shape_type='line',
                     edge_color='red',
-                    edge_width=1.5,
+                    edge_width=1,
                     name="Closest Points Connections",
                     scale=(self.z_scale_factor, 1, 1)
                 )
@@ -528,6 +590,10 @@ class DynamicGUIManager:
         except Exception as e:
             print(f"Error during {self.processing_mode} processing step {self.current_step['value']}: {str(e)}")
             raise
+        finally:
+            #End timer
+            end_time = time.time()
+            print(f"Step {self.current_step['value']} took {end_time - start_time} seconds")
 
     def save_updated_config(self):
         """Save the current configuration to a YAML file in the output directory"""

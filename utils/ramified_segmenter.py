@@ -23,6 +23,11 @@ from skimage.filters import frangi, sato
 from concurrent.futures import ProcessPoolExecutor
 import multiprocessing
 from functools import partial
+import skimage.measure as measure
+from skimage.measure import regionprops
+from skimage.measure import regionprops_table
+seed = 42
+np.random.seed(seed)         # For NumPy
 
 from utils.nuclear_segmenter import downsample_for_isotropic, upsample_segmentation
 
@@ -565,670 +570,245 @@ def segment_microglia_first_pass(volume,
     
     return upsampled_first_pass, first_pass_params
 
-def extract_cell_bodies_and_processes(segmentation, volume, min_body_size=200):
+
+def extract_soma_masks(segmentation_mask, 
+                      small_object_percentile=50,  # Changed to percentile
+                      thickness_percentile=80):
     """
-    Separate microglia cell bodies from processes based on intensity and size.
+    Memory-efficient soma extraction with percentile-based small object removal and label reassignment.
     
     Parameters:
-    -----------
-    segmentation : ndarray
-        Labeled segmentation volume
-    volume : ndarray
-        Original intensity volume
-    min_body_size : int
-        Minimum size for a cell body in voxels
-    
-    Returns:
-    --------
-    cell_bodies : ndarray
-        Binary mask of cell bodies
-    processes : ndarray
-        Binary mask of processes
+    - segmentation_mask: 3D numpy array with labeled segments
+    - small_object_percentile: Percentile of object volumes to keep (e.g., 50 keeps top 50%)
+    - thickness_percentile: Percentile for thickness-based soma detection
     """
-    from skimage.measure import regionprops
-    from scipy.ndimage import label
     
-    # Create output masks
-    cell_bodies = np.zeros_like(segmentation, dtype=bool)
-    processes = np.zeros_like(segmentation, dtype=bool)
+    # Create output soma mask
+    soma_mask = np.zeros_like(segmentation_mask, dtype=np.int32)
     
-    # For each segmented object
-    for region in regionprops(segmentation, intensity_image=volume):
-        label_id = region.label
-        region_mask = segmentation == label_id
+    # Get unique labels, excluding background
+    unique_labels = np.unique(segmentation_mask)[1:]
+    
+    # Keep track of the next available label for reassignment
+    next_label = np.max(unique_labels) + 1 if len(unique_labels) > 0 else 1
+    
+    # Process each label
+    for label in tqdm(unique_labels):
+        # Extract current cell mask
+        cell_mask = segmentation_mask == label
         
-        # Get intensity and shape features
-        mean_intensity = region.mean_intensity
-        area = region.area
+        # Get bounding box for the cell
+        props = regionprops(cell_mask.astype(int))[0]
+        bbox = props.bbox
         
-        # Create distance map from border (higher in center)
-        from scipy.ndimage import distance_transform_edt
-        distance_map = distance_transform_edt(region_mask)
+        # Extract subvolumes using bounding box with padding
+        z_min, y_min, x_min, z_max, y_max, x_max = bbox
+        z_min = max(0, z_min - 2)
+        y_min = max(0, y_min - 2)
+        x_min = max(0, x_min - 2)
+        z_max = min(segmentation_mask.shape[0], z_max + 2)
+        y_max = min(segmentation_mask.shape[1], y_max + 2)
+        x_max = min(segmentation_mask.shape[2], x_max + 2)
         
-        # Create a mask for the core of the region (potential cell body)
-        # Higher threshold for larger regions
-        body_threshold = max(0.5, min(0.7, 0.3 + 0.4 * (area / 5000)))
-        max_distance = np.max(distance_map)
-        if max_distance > 0:
-            body_candidate = distance_map > (body_threshold * max_distance)
+        # Extract subarrays
+        cell_mask_subvolume = cell_mask[z_min:z_max, y_min:y_max, x_min:x_max]
+        
+        # Compute distance transform on cell mask subvolume
+        distance_map = ndimage.distance_transform_edt(cell_mask_subvolume)
+        
+        # Compute thickness threshold
+        thickness_threshold = np.percentile(distance_map[cell_mask_subvolume], thickness_percentile)
+        
+        # Create max thickness mask
+        max_thickness_mask = np.zeros_like(distance_map, dtype=bool)
+        max_thickness_mask[np.logical_and(distance_map >= thickness_threshold, cell_mask_subvolume)] = True
+        
+        # Label connected components in the subvolume
+        labeled_somas, num_features = ndimage.label(max_thickness_mask)
+        
+        # If no somas detected, skip to next label
+        if num_features == 0:
+            continue
+        
+        # Map back to full volume
+        full_max_thickness_mask = np.zeros_like(cell_mask, dtype=np.int32)
+        full_max_thickness_mask[z_min:z_max, y_min:y_max, x_min:x_max] = labeled_somas
+        
+        # Get properties of connected components
+        soma_props = regionprops(full_max_thickness_mask)
+        
+        # If only one object, keep it regardless of size
+        if num_features == 1:
+            soma_mask[full_max_thickness_mask > 0] = label
+        else:
+            # Compute volumes of all objects
+            volumes = [prop.area for prop in soma_props]
             
-            # Only keep if large enough
-            from skimage.measure import label
-            labeled_bodies, num_bodies = label(body_candidate)
+            # Calculate the volume threshold based on percentile
+            volume_threshold = np.percentile(volumes, small_object_percentile)
             
-            for body_id in range(1, num_bodies + 1):
-                body_mask = labeled_bodies == body_id
-                if np.sum(body_mask) >= min_body_size:
-                    # This is a cell body
-                    cell_bodies[body_mask] = True
-        
-        # The rest are processes
-        process_mask = region_mask & ~cell_bodies
-        processes[process_mask] = True
+            # Filter objects above the percentile and reassign labels
+            for prop in soma_props:
+                if prop.area >= volume_threshold:  # Keep if above threshold
+                    soma_mask[full_max_thickness_mask == prop.label] = next_label
+                    next_label += 1
     
-    return cell_bodies, processes
+    return soma_mask
 
-
-def split_merged_microglia(original_volume, segmented_mask, 
-                                          min_intensity_variation=0.1,
-                                          min_concavity_ratio=0.7,
-                                          watershed_compactness=0.6,
-                                          min_object_size=50,
-                                          max_split_iterations=2,
-                                          spacing=(1.0, 1.0, 1.0),
-                                          chunk_size=None,
-                                          max_ram_gb=4):
+def separate_multi_soma_cells(segmentation_mask, intensity_volume, soma_mask, min_size_threshold=100):
     """
-    Memory-efficient function to split merged microglia cells based on intensity and shape information.
-    Processes individual objects one at a time and uses temporary files for large arrays.
+    Separates cell segmentations with multiple somas into distinct masks by using watershed
+    transform with distance transforms to ensure separation along thinnest regions between somas.
     
     Parameters:
-    -----------
-    original_volume : ndarray
-        Original 3D intensity volume
-    segmented_mask : ndarray
-        Integer-labeled segmentation mask from first pass segmentation
-    min_intensity_variation : float
-        Minimum variation in intensity required to consider splitting a cell (0-1)
-    min_concavity_ratio : float
-        Minimum concavity ratio to consider splitting a cell (0-1)
-    watershed_compactness : float
-        Compactness parameter for watershed algorithm (0-1)
-    min_object_size : int
-        Minimum size (in voxels) for an object to be considered valid after splitting
-    max_split_iterations : int
-        Maximum number of times to attempt splitting a single object
-    spacing : tuple
-        Voxel spacing (z, y, x) in physical units
-    chunk_size : tuple or None
-        Size of chunks to process (z, y, x). If None, automatically determined.
-    max_ram_gb : float
-        Maximum RAM to use in GB
-        
+    - segmentation_mask: 3D numpy array with labeled cell segments
+    - intensity_volume: 3D numpy array with original intensity values
+    - soma_mask: 3D numpy array with labeled soma segments (output from extract_soma_masks)
+    - min_size_threshold: Minimum voxel size for a separated component (smaller ones are merged unless original)
+    
     Returns:
-    --------
-    refined_mask : ndarray
-        Refined segmentation mask with split cells
-    split_stats : dict
-        Statistics about the splitting process
+    - separated_mask: 3D numpy array with updated cell segmentations
     """
     import numpy as np
-    import os
-    import tempfile
-    from shutil import rmtree
-    from scipy import ndimage as ndi
-    from skimage.feature import peak_local_max
+    from scipy import ndimage
+    from skimage.measure import regionprops
     from skimage.segmentation import watershed
-    from skimage.measure import label
     from tqdm import tqdm
-    import gc
-    import psutil
-    import warnings
     
-    # Suppress specific warnings that might occur during processing
-    warnings.filterwarnings("ignore", category=RuntimeWarning)
+    # Create output mask, initially copying the original segmentation
+    separated_mask = np.copy(segmentation_mask).astype(np.int32)
     
-    # Function to report memory usage
-    def get_memory_usage_mb():
-        return psutil.Process().memory_info().rss / (1024 * 1024)
+    # Get unique cell labels and their original sizes from segmentation_mask
+    unique_cell_labels = np.unique(segmentation_mask)[1:]
+    original_sizes = {lbl: np.sum(segmentation_mask == lbl) for lbl in unique_cell_labels}
     
-    print(f"Starting memory-efficient cell splitting process...")
-    print(f"Initial memory usage: {get_memory_usage_mb():.2f} MB")
+    # Keep track of the next available label
+    next_label = np.max(segmentation_mask) + 1 if len(unique_cell_labels) > 0 else 1
     
-    # Determine the maximum cell label
-    max_label = int(np.max(segmented_mask))
-    print(f"Processing {max_label} potential objects...")
-    
-    # Statistics dictionary
-    split_stats = {
-        'original_cell_count': max_label,
-        'cells_evaluated': 0,
-        'cells_split': 0,
-        'total_new_cells': 0,
-        'splits_by_intensity': 0,
-        'splits_by_shape': 0
-    }
-    
-    # Create a memory-mapped array for the refined mask
-    temp_dir = tempfile.mkdtemp()
-    refined_mask_path = os.path.join(temp_dir, 'refined_mask.dat')
-    refined_mask = np.memmap(refined_mask_path, dtype=np.int32, mode='w+', shape=segmented_mask.shape)
-    
-    # Copy original segmentation to memory-mapped array in chunks
-    chunk_z = min(50, segmented_mask.shape[0])
-    for z in range(0, segmented_mask.shape[0], chunk_z):
-        end_z = min(z + chunk_z, segmented_mask.shape[0])
-        refined_mask[z:end_z] = segmented_mask[z:end_z]
-    refined_mask.flush()
-    
-    # Extract bounding boxes for all objects to process them individually
-    print("Extracting object bounding boxes...")
-    object_bbox_dict = {}
-    
-    # Process in z-chunks to save memory
-    for z in tqdm(range(0, segmented_mask.shape[0], chunk_z)):
-        end_z = min(z + chunk_z, segmented_mask.shape[0])
-        chunk = segmented_mask[z:end_z]
+    # Process each cell
+    for cell_label in tqdm(unique_cell_labels):
+        # Extract current cell mask
+        cell_mask = segmentation_mask == cell_label
         
-        # Get unique labels in this chunk
-        unique_labels = np.unique(chunk)
-        unique_labels = unique_labels[unique_labels > 0]  # Skip background
+        # Get bounding box for the cell
+        props = regionprops(cell_mask.astype(int))[0]
+        bbox = props.bbox
+        z_min, y_min, x_min, z_max, y_max, x_max = bbox
         
-        for label in unique_labels:
-            # Extract coordinates for this label in the chunk
-            mask = chunk == label
-            if np.any(mask):
-                z_indices, y_indices, x_indices = np.where(mask)
-                
-                # Adjust z coordinates
-                z_indices += z
-                
-                # Update or initialize bounding box
-                if label in object_bbox_dict:
-                    # Update existing bounding box
-                    bbox = object_bbox_dict[label]
-                    bbox['z_min'] = min(bbox['z_min'], np.min(z_indices))
-                    bbox['z_max'] = max(bbox['z_max'], np.max(z_indices))
-                    bbox['y_min'] = min(bbox['y_min'], np.min(y_indices))
-                    bbox['y_max'] = max(bbox['y_max'], np.max(y_indices))
-                    bbox['x_min'] = min(bbox['x_min'], np.min(x_indices))
-                    bbox['x_max'] = max(bbox['x_max'], np.max(x_indices))
+        # Add slight padding
+        z_min = max(0, z_min - 2)
+        y_min = max(0, y_min - 2)
+        x_min = max(0, x_min - 2)
+        z_max = min(segmentation_mask.shape[0], z_max + 2)
+        y_max = min(segmentation_mask.shape[1], y_max + 2)
+        x_max = min(segmentation_mask.shape[2], x_max + 2)
+        
+        # Extract subvolumes
+        cell_mask_sub = cell_mask[z_min:z_max, y_min:y_max, x_min:x_max]
+        intensity_sub = intensity_volume[z_min:z_max, y_min:y_max, x_min:x_max]
+        cell_soma_sub = soma_mask[z_min:z_max, y_min:y_max, x_min:x_max] * cell_mask_sub
+        
+        # Get unique soma labels within this cell, excluding background
+        soma_labels = np.unique(cell_soma_sub)[1:]
+        
+        # Skip if no somas or only one soma
+        if len(soma_labels) <= 1:
+            continue
+        
+        # Number of somas
+        num_somas = len(soma_labels)
+        print(f"Cell {cell_label} has {num_somas} somas, separating...")
+        
+        # Create markers for watershed segmentation
+        # First, ensure soma regions are well defined
+        soma_markers = np.zeros_like(cell_mask_sub, dtype=np.int32)
+        for i, soma_label in enumerate(soma_labels):
+            # Mark each soma with a unique index starting from 1
+            soma_region = cell_soma_sub == soma_label
+            # Dilate soma slightly to ensure good markers
+            soma_region = ndimage.binary_dilation(soma_region, iterations=1)
+            soma_markers[soma_region] = i + 1
+        
+        # Compute distance transform of the cell mask
+        # This helps identify thin regions (smaller distance values)
+        # The negative distance transform has peaks at the center of large regions
+        distance_transform = ndimage.distance_transform_edt(cell_mask_sub)
+        
+        # Create a special weighting for somas to avoid cutting through them
+        # Make distances through somas artificially high
+        soma_weighting = np.zeros_like(distance_transform)
+        for soma_label in soma_labels:
+            soma_region = cell_soma_sub == soma_label
+            soma_weighting[soma_region] = 1000  # Very high value to avoid cutting through somas
+        
+        # Modified distance transform that penalizes paths through somas
+        modified_distance = distance_transform + soma_weighting
+        
+        # Apply watershed with markers (somas) and weights (distance transform)
+        # This will separate along the thinnest regions (valleys in the distance transform)
+        watershed_result = watershed(modified_distance, soma_markers, mask=cell_mask_sub)
+        
+        # Create temp_mask with watershed result
+        temp_mask = np.zeros_like(watershed_result, dtype=np.int32)
+        label_map = [cell_label] + [next_label + i for i in range(num_somas - 1)]
+        
+        # Map watershed labels to cell labels
+        for i in range(num_somas):
+            region_mask = watershed_result == (i + 1)
+            temp_mask[region_mask] = label_map[i]
+        
+        # Ensure continuity: Check for discontinuous components
+        for i, lbl in enumerate(label_map):
+            lbl_mask = temp_mask == lbl
+            labeled_components, num_components = ndimage.label(lbl_mask)
+            if num_components > 1:
+                print(f"Warning: soma {i} of cell {cell_label} is discontinuous, merging...")
+                props = regionprops(labeled_components)
+                main_component = max(props, key=lambda p: p.area).label
+                main_mask = labeled_components == main_component
+                for prop in props:
+                    if prop.label != main_component:
+                        dilated = ndimage.binary_dilation(labeled_components == prop.label, iterations=1)
+                        touching_labels = np.unique(temp_mask[dilated & (labeled_components != prop.label)])
+                        valid_touching = [l for l in touching_labels if l != 0 and l != lbl]
+                        if valid_touching:
+                            temp_mask[labeled_components == prop.label] = valid_touching[0]
+                        else:
+                            temp_mask[labeled_components == prop.label] = lbl
+                            temp_mask[main_mask] = lbl
+        
+        # Enforce size threshold, preserving original small regions
+        final_labels = np.unique(temp_mask)[1:]  # Exclude background
+        for lbl in final_labels:
+            lbl_mask = temp_mask == lbl
+            size = np.sum(lbl_mask)
+            if size < min_size_threshold and size != original_sizes.get(lbl, float('inf')):
+                print(f"Merging soma {lbl} of cell {cell_label} due to size {size}")
+                # Merge if below threshold and not the original size
+                dilated = ndimage.binary_dilation(lbl_mask, iterations=1)
+                touching_labels = np.unique(temp_mask[dilated & ~lbl_mask])
+                valid_touching = [l for l in touching_labels if l != 0 and np.sum(temp_mask == l) >= min_size_threshold]
+                if valid_touching:
+                    temp_mask[lbl_mask] = valid_touching[0]  # Merge with largest valid neighbor
                 else:
-                    # Initialize new bounding box
-                    object_bbox_dict[label] = {
-                        'z_min': np.min(z_indices),
-                        'z_max': np.max(z_indices),
-                        'y_min': np.min(y_indices),
-                        'y_max': np.max(y_indices),
-                        'x_min': np.min(x_indices),
-                        'x_max': np.max(x_indices)
-                    }
+                    temp_mask[lbl_mask] = label_map[0]  # Merge with original label
         
-        # Clean up
-        del chunk
-        gc.collect()
+        # Update next_label based on used labels
+        used_labels = np.unique(temp_mask)[1:]
+        if len(used_labels) > 0:
+            next_label = max(next_label, np.max(used_labels) + 1)
+        
+        # Map back to full volume
+        # Get the current subvolume from the separated_mask
+        full_subvol = separated_mask[z_min:z_max, y_min:y_max, x_min:x_max]
+        # Only replace voxels that belong to the current cell
+        current_cell_voxels = cell_mask[z_min:z_max, y_min:y_max, x_min:x_max]
+        # Update only the voxels belonging to the current cell
+        full_subvol[current_cell_voxels] = temp_mask[current_cell_voxels]
+        # Write back to the full separated_mask
+        separated_mask[z_min:z_max, y_min:y_max, x_min:x_max] = full_subvol
     
-    # Calculate size-limited concavity using distance transform instead of full convex hull
-    def calculate_efficient_concavity(binary_obj, spacing):
-        """Calculate concavity using distance transform method instead of convex hull."""
-        # Calculate distance transform
-        distance = ndi.distance_transform_edt(binary_obj, sampling=spacing)
-        
-        # Find the maximum distance (approximates the radius of the largest inscribed sphere)
-        max_distance = np.max(distance)
-        
-        # Count voxels near the boundary (distance < threshold)
-        boundary_threshold = max_distance * 0.2  # Adjust this parameter as needed
-        boundary_voxels = np.sum((distance < boundary_threshold) & binary_obj)
-        
-        # Calculate ratio of boundary voxels to total voxels
-        total_voxels = np.sum(binary_obj)
-        boundary_ratio = boundary_voxels / max(total_voxels, 1)
-        
-        # High boundary ratio indicates more complex/concave shape
-        # Scale to similar range as convex hull based concavity
-        concavity_estimate = min(0.9, boundary_ratio * 1.5)
-        
-        return concavity_estimate
-    
-    # Calculate intensity variation in a memory-efficient way
-    def calculate_intensity_variation(binary_obj, intensity_data):
-        """Calculate intensity variation for an object."""
-        # Extract only values where the binary object is True
-        obj_values = intensity_data[binary_obj]
-        
-        # Calculate statistics
-        if len(obj_values) > 0:
-            intensity_std = np.std(obj_values)
-            intensity_mean = np.mean(obj_values)
-            return intensity_std / max(intensity_mean, 1e-6)
-        else:
-            return 0.0
-    
-    # Determine if an object should be split based on shape and intensity
-    def should_split_object(obj_binary, obj_intensity, obj_size):
-        """Determine if an object should be split based on shape and intensity."""
-        # Check object size
-        if obj_size < min_object_size * 2:  # Object must be at least 2x min size
-            return False, None
-        
-        # Calculate intensity variation
-        intensity_variation = calculate_intensity_variation(obj_binary, obj_intensity)
-        
-        # Calculate shape concavity (efficient method)
-        concavity = calculate_efficient_concavity(obj_binary, spacing)
-        
-        # Create split criteria
-        split_by_intensity = intensity_variation > min_intensity_variation
-        split_by_shape = concavity > min_concavity_ratio
-        
-        # Determine split method
-        split_method = None
-        if split_by_intensity and split_by_shape:
-            split_method = 'both'
-        elif split_by_intensity:
-            split_method = 'intensity'
-        elif split_by_shape:
-            split_method = 'shape'
-            
-        return (split_by_intensity or split_by_shape), split_method
-    
-    # Split function using efficient methods
-    def split_object_efficient(obj_binary, obj_intensity, obj_label, method):
-        """Split an object using watershed with memory efficiency in mind."""
-        # Create distance map for watershed
-        if method == 'shape' or method == 'both':
-            # Distance transform based
-            distance = ndi.distance_transform_edt(obj_binary, sampling=spacing)
-        else:
-            # Intensity based
-            distance = obj_intensity.copy()
-            if np.max(distance) > np.min(distance):
-                distance = (distance - np.min(distance)) / (np.max(distance) - np.min(distance))
-            distance = distance * obj_binary  # Mask to object
-            distance = 1 - distance  # Invert for watershed
-        
-        # Find markers for watershed (seed points)
-        # For shape-based splitting
-        if method == 'shape':
-            # More conservative for memory efficiency
-            min_distance = max(2, int(np.cbrt(np.sum(obj_binary) / 75)))
-            coordinates = peak_local_max(
-                distance, 
-                footprint=np.ones((3, 3, 3)),
-                labels=obj_binary.astype(np.int32),  # Cast to int32 to avoid warning
-                min_distance=min_distance
-            )
-
-        elif method == 'intensity':
-            # For intensity-based
-            min_distance = max(2, int(np.cbrt(np.sum(obj_binary) / 50)))
-            coordinates = peak_local_max(
-                -obj_intensity, 
-                footprint=np.ones((3, 3, 3)),
-                labels=obj_binary.astype(np.int32),  # Cast to int32 to avoid warning
-                min_distance=min_distance
-            )
-            
-        else:  # 'both'
-            # Combine intensity and shape
-            combined_surface = distance.copy()
-            # Normalize intensity
-            norm_intensity = obj_intensity.copy()
-            if np.max(norm_intensity) > np.min(norm_intensity):
-                norm_intensity = (norm_intensity - np.min(norm_intensity)) / (np.max(norm_intensity) - np.min(norm_intensity))
-            combined_surface = combined_surface * (1 - norm_intensity)
-            min_distance = max(2, int(np.cbrt(np.sum(obj_binary) / 60)))
-            coordinates = peak_local_max(
-                combined_surface, 
-                footprint=np.ones((3, 3, 3)),
-                labels=obj_binary.astype(np.int32),  # Cast to int32 to avoid warning
-                min_distance=min_distance
-            )
-        # Create a mask from the coordinates
-        local_maxi = np.zeros_like(distance, dtype=bool)
-        for coord in coordinates:
-            local_maxi[tuple(coord)] = True
-        
-        # If no or just one marker found, try a simpler approach
-        if np.sum(local_maxi) <= 1:
-            # Get object size to determine number of markers
-            obj_size = np.sum(obj_binary)
-            n_markers = min(4, max(2, int(obj_size / (min_object_size * 3))))
-            
-            # Use simple distance-based seeds
-            if np.max(distance) > 0:
-                # Create markers based on distance thresholds
-                thresholds = np.linspace(0.5 * np.max(distance), 0.95 * np.max(distance), n_markers)
-                local_maxi = np.zeros_like(obj_binary, dtype=bool)
-                
-                for threshold in thresholds:
-                    # Create a marker at high distance values
-                    marker = distance > threshold
-                    # Label connected components
-                    marker_labels, num_markers = ndi.label(marker)
-                    
-                    # If multiple markers, keep the largest one
-                    if num_markers > 0:
-                        sizes = np.bincount(marker_labels.ravel())
-                        largest_marker = np.argmax(sizes[1:]) + 1 if len(sizes) > 1 else 1
-                        centroid = ndi.center_of_mass(marker_labels == largest_marker)
-                        
-                        # Add only the center point to avoid too many markers
-                        try:
-                            z, y, x = int(centroid[0]), int(centroid[1]), int(centroid[2])
-                            if 0 <= z < local_maxi.shape[0] and 0 <= y < local_maxi.shape[1] and 0 <= x < local_maxi.shape[2]:
-                                local_maxi[z, y, x] = True
-                        except:
-                            # If centroid calculation fails, skip this marker
-                            continue
-            
-            # If still no markers, force at least two simple markers using binary erosion
-            if np.sum(local_maxi) <= 1:
-                # Use erosion to create markers (simpler than k-means and uses less memory)
-                from scipy.ndimage import binary_erosion
-                
-                # Create at least two markers using erosion at different levels
-                eroded1 = binary_erosion(obj_binary, iterations=3)
-                eroded2 = binary_erosion(obj_binary, iterations=6)
-                
-                # Find centroids of these eroded regions
-                if np.any(eroded1):
-                    centroid1 = ndi.center_of_mass(eroded1)
-                    try:
-                        z1, y1, x1 = int(centroid1[0]), int(centroid1[1]), int(centroid1[2])
-                        if 0 <= z1 < local_maxi.shape[0] and 0 <= y1 < local_maxi.shape[1] and 0 <= x1 < local_maxi.shape[2]:
-                            local_maxi[z1, y1, x1] = True
-                    except:
-                        pass
-                
-                if np.any(eroded2):
-                    centroid2 = ndi.center_of_mass(eroded2)
-                    try:
-                        z2, y2, x2 = int(centroid2[0]), int(centroid2[1]), int(centroid2[2])
-                        if 0 <= z2 < local_maxi.shape[0] and 0 <= y2 < local_maxi.shape[1] and 0 <= x2 < local_maxi.shape[2]:
-                            local_maxi[z2, y2, x2] = True
-                    except:
-                        pass
-        
-        # Create markers for watershed
-        markers, num_markers = ndi.label(local_maxi)
-        
-        # If still no adequate markers, return False
-        if num_markers <= 1:
-            return False, obj_label
-        
-        # Apply watershed
-        if method == 'shape':
-            # For shape-based, use negative distance
-            ws_labels = watershed(-distance, markers, mask=obj_binary, compactness=watershed_compactness)
-        else:
-            # For intensity or combined, use the original intensity
-            ws_labels = watershed(distance, markers, mask=obj_binary, compactness=watershed_compactness)
-        
-        # Check if watershed actually split the object
-        unique_labels = np.unique(ws_labels)
-        unique_labels = unique_labels[unique_labels > 0]  # Remove background
-        
-        if len(unique_labels) <= 1:  # No split occurred
-            return False, obj_label
-        
-        # Check if all resulting objects meet minimum size
-        valid_split = True
-        for split_label in unique_labels:
-            if np.sum(ws_labels == split_label) < min_object_size:
-                valid_split = False
-                break
-        
-        if not valid_split:
-            return False, obj_label
-        
-        # Get the next available label for new objects
-        next_label = np.max(refined_mask) + 1
-        
-        # Store the split results
-        for i, split_label in enumerate(unique_labels):
-            # Create mask for this split
-            split_mask = ws_labels == split_label
-            
-            # Use original label for first split, new labels for others
-            use_label = obj_label if i == 0 else next_label + i - 1
-            
-            # Update the result
-            obj_binary[split_mask] = use_label
-        
-        # Return success and the highest label used
-        return True, next_label + len(unique_labels) - 2
-    
-    # Process each object individually
-    print("Processing objects...")
-    next_label = max_label + 1
-    
-    # Sort objects by size (largest first) for better potential impact
-    object_sizes = {}
-    for label, bbox in object_bbox_dict.items():
-        z_min, z_max = bbox['z_min'], bbox['z_max'] + 1
-        y_min, y_max = bbox['y_min'], bbox['y_max'] + 1
-        x_min, x_max = bbox['x_min'], bbox['x_max'] + 1
-        
-        # Get a small chunk containing this object
-        chunk_mask = refined_mask[z_min:z_max, y_min:y_max, x_min:x_max].copy()
-        object_sizes[label] = np.sum(chunk_mask == label)
-    
-    # Sort objects by size (process largest first)
-    sorted_labels = sorted(object_sizes.keys(), key=lambda l: object_sizes[l], reverse=True)
-    
-    # Process objects one by one
-    for obj_label in tqdm(sorted_labels):
-        # Skip if this label no longer exists (could be merged/removed already)
-        if obj_label not in object_bbox_dict:
-            continue
-        
-        # Check if memory usage is close to limit
-        current_mem_mb = get_memory_usage_mb()
-        if current_mem_mb > max_ram_gb * 1000:
-            print(f"WARNING: Memory usage ({current_mem_mb:.2f} MB) exceeds limit. Flushing caches...")
-            # Force garbage collection and flush memory-mapped array
-            refined_mask.flush()
-            gc.collect()
-        
-        # Get object bounding box with padding
-        bbox = object_bbox_dict[obj_label]
-        pad = 5  # Add padding for watershed
-        z_min = max(0, bbox['z_min'] - pad)
-        z_max = min(refined_mask.shape[0], bbox['z_max'] + pad + 1)
-        y_min = max(0, bbox['y_min'] - pad)
-        y_max = min(refined_mask.shape[1], bbox['y_max'] + pad + 1)
-        x_min = max(0, bbox['x_min'] - pad)
-        x_max = min(refined_mask.shape[2], bbox['x_max'] + pad + 1)
-        
-        # Get the subvolume containing this object
-        subvolume_mask = refined_mask[z_min:z_max, y_min:y_max, x_min:x_max].copy()
-        object_mask = subvolume_mask == obj_label
-        
-        # Skip if empty (could happen if object was removed in previous operations)
-        if not np.any(object_mask):
-            continue
-        
-        # Get original intensity data for this region
-        intensity_data = original_volume[z_min:z_max, y_min:y_max, x_min:x_max].copy()
-        
-        split_stats['cells_evaluated'] += 1
-        
-        # Determine if this object should be split
-        should_split, split_method = should_split_object(
-            object_mask, 
-            intensity_data,
-            np.sum(object_mask)
-        )
-        
-        if should_split:
-            # Create a working copy of the object mask with label values
-            # Initialize with original label
-            labeled_mask = object_mask.astype(np.int32) * obj_label
-            
-            iteration = 0
-            current_label = obj_label
-            split_success = True
-            
-            # Allow multiple iterations of splitting for complex objects
-            while split_success and iteration < max_split_iterations:
-                # Only process objects with the current label
-                current_obj_mask = labeled_mask == current_label
-                
-                if not np.any(current_obj_mask):
-                    break
-                
-                # Try to split this object
-                split_success, last_label = split_object_efficient(
-                    current_obj_mask,
-                    intensity_data,
-                    current_label,
-                    split_method
-                )
-                
-                if split_success:
-                    # Update the working copy with split results
-                    for i in range(current_label, last_label + 1):
-                        mask_i = current_obj_mask == i
-                        if np.any(mask_i):
-                            labeled_mask[mask_i] = i
-                    
-                    if iteration == 0:
-                        # Count the initial split
-                        split_stats['cells_split'] += 1
-                        if split_method == 'intensity':
-                            split_stats['splits_by_intensity'] += 1
-                        elif split_method == 'shape':
-                            split_stats['splits_by_shape'] += 1
-                        else:  # 'both'
-                            split_stats['splits_by_intensity'] += 1
-                            split_stats['splits_by_shape'] += 1
-                    
-                    # Update stats with new cells created
-                    new_cells = last_label - current_label
-                    split_stats['total_new_cells'] += new_cells
-                    
-                    # Update next label for future processing
-                    next_label = max(next_label, last_label + 1)
-                    
-                    # Update for next iteration
-                    current_label = last_label
-                    iteration += 1
-                
-            # Update the global refined mask with the splits
-            if iteration > 0:  # Only if we actually split something
-                # Get all labels in the split result
-                result_labels = np.unique(labeled_mask)
-                result_labels = result_labels[result_labels > 0]  # Skip background
-                
-                # Update the refined mask with each split
-                for label in result_labels:
-                    label_mask = labeled_mask == label
-                    if np.any(label_mask):
-                        # Create global coordinates mask
-                        global_mask = np.zeros_like(refined_mask, dtype=bool)
-                        global_mask[z_min:z_max, y_min:y_max, x_min:x_max] = label_mask
-                        
-                        # Update refined mask
-                        refined_mask[global_mask] = label
-                
-                # Force flush
-                refined_mask.flush()
-        
-        # Clean up
-        del subvolume_mask, object_mask, intensity_data
-        if 'labeled_mask' in locals():
-            del labeled_mask
-        gc.collect()
-    
-    print(f"Finalizing results...")
-    print(f"Current memory usage: {get_memory_usage_mb():.2f} MB")
-    
-    # Convert memory mapped array to regular numpy array in chunks
-    print("Converting result to numpy array...")
-    result_mask = np.zeros_like(refined_mask, dtype=np.int32)
-    
-    chunk_z = min(50, refined_mask.shape[0])
-    for z in tqdm(range(0, refined_mask.shape[0], chunk_z)):
-        end_z = min(z + chunk_z, refined_mask.shape[0])
-        result_mask[z:end_z] = refined_mask[z:end_z]
-    
-    # Clean up memory mapped array
-    del refined_mask
-    gc.collect()
-    try:
-        os.unlink(refined_mask_path)
-        rmtree(temp_dir)
-    except:
-        pass
-    
-    # Ensure consecutive labeling if needed
-    if np.max(result_mask) > max_label + split_stats['total_new_cells']:
-        print("Ensuring consecutive label indices...")
-        # Get all unique labels
-        all_labels = []
-        for z in range(0, result_mask.shape[0], chunk_z):
-            end_z = min(z + chunk_z, result_mask.shape[0])
-            chunk_labels = np.unique(result_mask[z:end_z])
-            all_labels.extend(chunk_labels)
-        
-        unique_labels = np.unique(all_labels)
-        unique_labels = unique_labels[unique_labels > 0]  # Skip background
-        
-        # Create mapping
-        label_map = {old_label: i+1 for i, old_label in enumerate(unique_labels)}
-        
-        # Apply mapping in chunks
-        temp_result_dir = tempfile.mkdtemp()
-        temp_result_path = os.path.join(temp_result_dir, 'remapped_result.dat')
-        remapped_result = np.memmap(temp_result_path, dtype=np.int32, mode='w+', shape=result_mask.shape)
-        
-        for z in tqdm(range(0, result_mask.shape[0], chunk_z)):
-            end_z = min(z + chunk_z, result_mask.shape[0])
-            chunk = result_mask[z:end_z].copy()
-            
-            # Apply mapping to each value
-            for old_label, new_label in label_map.items():
-                chunk[chunk == old_label] = new_label
-            
-            remapped_result[z:end_z] = chunk
-            remapped_result.flush()
-            
-            # Clean up
-            del chunk
-            gc.collect()
-        
-        # Convert back to numpy array
-        final_result = np.zeros_like(result_mask, dtype=np.int32)
-        for z in range(0, remapped_result.shape[0], chunk_z):
-            end_z = min(z + chunk_z, remapped_result.shape[0])
-            final_result[z:end_z] = remapped_result[z:end_z]
-        
-        # Clean up
-        del remapped_result, result_mask
-        gc.collect()
-        try:
-            os.unlink(temp_result_path)
-            rmtree(temp_result_dir)
-        except:
-            pass
-    else:
-        final_result = result_mask
-    
-    # Update statistics
-    split_stats['final_cell_count'] = len(np.unique(final_result)) - 1  # Subtract 1 for background
-    
-    print(f"Cell splitting complete:")
-    print(f"  Original cells: {split_stats['original_cell_count']}")
-    print(f"  Cells evaluated: {split_stats['cells_evaluated']}")
-    print(f"  Cells split: {split_stats['cells_split']}")
-    print(f"  New cells created: {split_stats['total_new_cells']}")
-    print(f"  Final cell count: {split_stats['final_cell_count']}")
-    print(f"Final memory usage: {get_memory_usage_mb():.2f} MB")
-    
-    return final_result
-
+    return separated_mask
 
 # def merge_segmentations(first_pass, second_pass, min_overlap_ratio=0.5, min_overlap_voxels=20):
 #     """
@@ -1539,97 +1119,3 @@ def split_merged_microglia(original_volume, segmented_mask,
 #     print(f"Final memory usage: {psutil.Process().memory_info().rss / (1024 * 1024):.2f} MB")
     
 #     return result
-
-
-def segment_microglia(volume, 
-                     first_pass=None,
-                     tubular_scales=[0.5, 1.0, 2.0, 3.0],
-                     smooth_sigma=1.0,
-                     min_size=50,
-                     min_cell_body_size=200,
-                     spacing=(1.0, 1.0, 1.0),
-                     anisotropy_normalization_degree=1.0,
-                     sensitivity=0.8,
-                     extract_features=False):
-    """
-    Segment microglia using tubular enhancement and specialized processing for ramified cells.
-    
-    This is a wrapper function that calls either segment_microglia_first_pass or 
-    segment_microglia_second_pass based on the provided parameters.
-    
-    Parameters:
-    -----------
-    volume : ndarray
-        3D input volume
-    first_pass : ndarray or None
-        Initial segmentation from first pass
-    first_pass_params : dict or None
-        Dictionary containing parameters from first pass
-    tubular_scales : list
-        Scales for tubular structure enhancement
-    smooth_sigma : float or list
-        Gaussian smoothing sigma(s)
-    min_size : int
-        Minimum object size in voxels
-    min_cell_body_size : int
-        Minimum size for a cell body in voxels
-    spacing : tuple
-        Original spacing (z, y, x) in physical units
-    anisotropy_normalization_degree : float
-        Degree of anisotropy normalization (0 to 1)
-    threshold_method : str
-        'otsu', 'adaptive', or 'percentage'
-    sensitivity : float
-        Sensitivity factor for thresholding (0-1)
-    extract_features : bool
-        Whether to extract cell bodies and process features
-        
-    Returns:
-    --------
-    If first_pass is None:
-        upsampled_first_pass : ndarray
-            First pass segmentation
-        first_pass_params : dict
-            Parameters from first pass
-    Else:
-        upsampled_segmentation : ndarray
-            Final segmentation after second pass
-        features : dict (optional)
-            Dictionary with cell bodies and processes masks if extract_features=True
-    """
-    if first_pass is None:
-        # First pass mode
-        return segment_microglia_first_pass(
-            volume,
-            tubular_scales=tubular_scales,
-            smooth_sigma=smooth_sigma,
-            min_size=min_size,
-            spacing=spacing,
-            anisotropy_normalization_degree=anisotropy_normalization_degree,
-            sensitivity=sensitivity
-        )
-    else:
-        second_pass = split_merged_microglia(volume, first_pass, 
-                           min_intensity_variation=0.1,
-                           min_concavity_ratio=0.7,
-                           watershed_compactness=0.9,
-                           min_object_size=min_size,
-                           max_split_iterations=3,
-                           spacing=spacing)
-        return second_pass
-        # if extract_features:
-        #     # Extract cell bodies and processes if requested
-        #     cell_bodies, processes = extract_cell_bodies_and_processes(
-        #         first_pass, 
-        #         volume, 
-        #         min_body_size=min_cell_body_size
-        #     )
-            
-        #     features = {
-        #         'cell_bodies': cell_bodies,
-        #         'processes': processes
-        #     }
-            
-        #     return first_pass, features
-        # else:
-        #     return first_pass
