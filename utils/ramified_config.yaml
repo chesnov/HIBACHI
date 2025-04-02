@@ -46,6 +46,20 @@ initial_segmentation:
       min: 0.0
       max: 1.0
       step: 0.1
+    background_level:
+      label: "Background Level"
+      type: "int"
+      value: 50
+      min: 0
+      max: 100
+      step: 1
+    target_level:
+      label: "Target Level"
+      type: "int"
+      value: 75
+      min: 0
+      max: 100
+      step: 1
 
 refine_rois:
   name: "Refine ROIs"

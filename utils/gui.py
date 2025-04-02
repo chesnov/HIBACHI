@@ -1,4 +1,4 @@
-import tifffile as tiff
+
 import numpy as np
 import os
 import plotly.graph_objs as go
@@ -7,76 +7,21 @@ from skimage import morphology
 from magicgui import magicgui
 from skimage.measure import label
 from PyQt5.QtWidgets import QApplication, QFileDialog, QInputDialog, QMessageBox
-import sys
+
 os.environ["QT_SCALE_FACTOR"] = "1.5"
 
 seed = 42
 np.random.seed(seed)         # For NumPy
 
-from utils.ramified_segmenter import *
-from utils.nuclear_segmenter import *
-from utils.calculate_features import *
+from ramified_segmenter import *
+from nuclear_segmenter import *
+from calculate_features import *
+from helper_funcs import create_parameter_widget, check_processing_state, organize_processing_dir
+
 
 import yaml
 from typing import Dict, Any
 
-
-def create_parameter_widget(param_name: str, param_config: Dict[str, Any], callback):
-    """Create a widget for a single parameter"""
-    
-    # Define the function with the appropriate type annotation
-    if param_config["type"] == "float":
-        def parameter_widget(value: float = param_config["value"]):
-            callback(value)  # Modified to only pass the value
-            return value
-    elif param_config["type"] == "int":
-        def parameter_widget(value: int = param_config["value"]):
-            callback(value)  # Modified to only pass the value
-            return value
-    else:
-        def parameter_widget(value: float = param_config["value"]):
-            callback(value)  # Modified to only pass the value
-            return value
-    
-    # Create the widget with magicgui
-    widget = magicgui(
-        parameter_widget,
-        auto_call=True,
-        value={
-            "label": param_config["label"],
-            "min": param_config["min"],
-            "max": param_config["max"],
-            "step": param_config["step"]
-        }
-    )
-    
-    # Store the original parameter name as an attribute
-    widget.param_name = param_name
-    
-    return widget
-
-def check_processing_state(processed_dir, processing_mode):
-    """
-    Check the processing state by looking for checkpoint files
-    Returns the current step number (0, 1, 2, or 3) based on found files
-    """
-    # Check for step 3 completion (feature calculation)
-    metrics_df_loc = os.path.join(processed_dir, f"metrics_df_{processing_mode}.csv")
-    if os.path.exists(metrics_df_loc):
-        return 3  # All steps completed
-    
-    # Check for step 2 completion (refined ROIs)
-    merged_roi_array_loc = os.path.join(processed_dir, f"final_segmentation_{processing_mode}.dat")
-    if os.path.exists(merged_roi_array_loc):
-        return 2  # Ready for feature calculation
-    
-    # Check for step 1 completion (initial segmentation)
-    segmented_cells_path = os.path.join(processed_dir, f"initial_segmentation_{processing_mode}.npy")
-    if os.path.exists(segmented_cells_path):
-        return 1  # Ready for ROI refinement
-    
-    # No checkpoints found
-    return 0  # Ready for initial segmentation
 
 class DynamicGUIManager:
     def __init__(self, viewer, config, image_stack, file_loc, processing_mode):
@@ -439,7 +384,9 @@ class DynamicGUIManager:
                                                             min_size=current_values.get("min_size", 100),
                                                             spacing=[self.z_spacing, self.x_spacing, self.y_spacing],
                                                             anisotropy_normalization_degree=current_values.get("anisotropy_normalization_degree", 0.2),
-                                                            sensitivity=current_values.get("sensitivity", 0.2)
+                                                            sensitivity=current_values.get("sensitivity", 0.2),
+                                                            background_level=current_values.get("background_level", 50),
+                                                            target_level=current_values.get("target_level", 75)
                                                         )
                 
                 np.save(segmented_cells_path, labeled_cells)
@@ -705,158 +652,3 @@ class DynamicGUIManager:
         return self.parameter_values.copy()
     
 
-def interactive_segmentation_with_config():
-    """
-    Launch interactive segmentation with dynamic GUI based on YAML configuration with PyQt5 dialogs
-    """
-    # Create PyQt5 app instance if it doesn't exist
-    app = QApplication.instance()
-    if app is None:
-        app = QApplication(sys.argv)
-    
-    # Prompt for input file
-    file_loc, _ = QFileDialog.getOpenFileName(
-        None,
-        "Select a .tif file",
-        "",
-        "TIFF files (*.tif);;All files (*.*)"
-    )
-    
-    if not file_loc or not os.path.exists(file_loc):
-        QMessageBox.warning(None, "Warning", "No file selected. Exiting.")
-        return
-
-    # Find YAML file in the same directory as the TIF file
-    input_dir = os.path.dirname(file_loc)
-    yaml_files = [f for f in os.listdir(input_dir) if f.endswith(('.yaml', '.yml'))]
-    
-    if not yaml_files:
-        QMessageBox.critical(None, "Error", "No YAML configuration file found in the same directory as the TIF file.")
-        return
-    
-    if len(yaml_files) > 1:
-        QMessageBox.critical(None, "Error", f"Multiple YAML files found in the directory. Please keep only one YAML file.")
-        return
-    
-    config_path = os.path.join(input_dir, yaml_files[0])
-    
-    # Load config
-    try:
-        with open(config_path, 'r') as file:
-            config = yaml.safe_load(file)
-    except Exception as e:
-        QMessageBox.critical(None, "Error", f"Failed to load YAML file: {str(e)}")
-        return
-    
-    # Extract processing mode from config
-    if 'mode' not in config:
-        QMessageBox.critical(None, "Error", "The YAML file does not contain a 'mode' field. Please add 'mode: nuclei' or 'mode: ramified' to the YAML file.")
-        return
-    
-    processing_mode = config['mode']
-    if processing_mode not in ["nuclei", "ramified"]:
-        QMessageBox.critical(None, "Error", f"Invalid processing mode '{processing_mode}' in YAML file. Mode must be 'nuclei' or 'ramified'.")
-        return
-    
-    print(f"Using processing mode from config: {processing_mode}")
-    
-    # Create processed directory with mode suffix
-    basename = os.path.basename(file_loc).split('.')[0]
-    processed_dir = os.path.join(input_dir, f"{basename}_processed_{processing_mode}")
-    if not os.path.exists(processed_dir):
-        os.makedirs(processed_dir)
-    
-    # Check for existing processed files and config in the processed directory
-    output_config_path = os.path.join(processed_dir, f"processing_config_{processing_mode}.yaml")
-    
-    # Check if we should use the config from the checkpoint
-    checkpoint_step = check_processing_state(processed_dir, processing_mode)
-    if checkpoint_step > 0 and os.path.exists(output_config_path):
-        try:
-            with open(output_config_path, 'r') as file:
-                config = yaml.safe_load(file)
-            print(f"Loaded configuration from checkpoint at step {checkpoint_step}")
-        except Exception as e:
-            print(f"Warning: Failed to load config from checkpoint: {str(e)}")
-            # Continue with the original config if checkpoint config fails to load
-    
-    # Load the .tif file
-    try:
-        image_stack = tiff.imread(file_loc)
-        print(f"Loaded stack with shape {image_stack.shape}")
-    except Exception as e:
-        QMessageBox.critical(None, "Error", f"Failed to load TIFF file: {str(e)}")
-        return
-
-    # Initialize viewer and GUI manager with processing mode
-    viewer = napari.Viewer(title=f"Microscopy Analysis - {processing_mode.capitalize()} Mode")
-    
-    # Create a modified DynamicGUIManager that updates the config file after each step
-    class ModifiedGUIManager(DynamicGUIManager):
-        def __init__(self, viewer, config, image_stack, file_loc, processing_mode, original_config_path):
-            super().__init__(viewer, config, image_stack, file_loc, processing_mode)
-            self.original_config_path = original_config_path
-            
-        def execute_processing_step(self):
-            """Override to save config after each step"""
-            result = super().execute_processing_step()
-            # Save updated config after each step
-            self.save_updated_config()
-            return result
-            
-        def save_updated_config(self):
-            """Save the current configuration to a YAML file in the output directory"""
-            config_save_path = os.path.join(self.processed_dir, f"processing_config_{self.processing_mode}.yaml")
-            # Create a new config with updated values but preserve the original structure
-            updated_config = self.config.copy()
-            # Keep the mode in the saved config
-            if 'mode' not in updated_config and hasattr(self, 'original_config_path'):
-                try:
-                    with open(self.original_config_path, 'r') as file:
-                        orig_config = yaml.safe_load(file)
-                        if 'mode' in orig_config:
-                            updated_config['mode'] = orig_config['mode']
-                except Exception:
-                    pass
-            
-            with open(config_save_path, 'w') as file:
-                yaml.dump(updated_config, file, default_flow_style=False)
-            print(f"Saved updated configuration to {config_save_path}")
-    
-    # Use the modified GUI manager
-    gui_manager = ModifiedGUIManager(viewer, config, image_stack, file_loc, processing_mode, config_path)
-    
-    @magicgui(call_button="Continue Processing")
-    def continue_processing():
-        """Execute the next step in the processing pipeline"""
-        try:
-            gui_manager.execute_processing_step()
-            update_navigation_buttons()
-        except Exception as e:
-            QMessageBox.critical(None, "Processing Error", f"Error during processing: {str(e)}")
-
-    @magicgui(call_button="Previous Step")
-    def go_to_previous_step():
-        """Go back one step in the processing pipeline"""
-        if gui_manager.current_step["value"] > 0:
-            gui_manager.current_step["value"] -= 1
-            step_name = gui_manager.processing_steps[gui_manager.current_step["value"]]
-            gui_manager.create_step_widgets(step_name)
-            gui_manager.cleanup_step(gui_manager.current_step["value"] + 1)
-            update_navigation_buttons()
-
-    def update_navigation_buttons():
-        """Update the state of navigation buttons"""
-        previous_step_button.enabled = gui_manager.current_step["value"] > 0
-        continue_processing_button.enabled = gui_manager.current_step["value"] < len(gui_manager.processing_steps)
-
-    # Add navigation buttons
-    continue_processing_button = continue_processing
-    previous_step_button = go_to_previous_step
-    viewer.window.add_dock_widget(continue_processing_button, area="right")
-    viewer.window.add_dock_widget(previous_step_button, area="right")
-    
-    # Initialize button states
-    update_navigation_buttons()
-
-    napari.run()

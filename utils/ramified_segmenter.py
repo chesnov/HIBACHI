@@ -29,7 +29,7 @@ from skimage.measure import regionprops_table
 seed = 42
 np.random.seed(seed)         # For NumPy
 
-from utils.nuclear_segmenter import downsample_for_isotropic, upsample_segmentation
+from nuclear_segmenter import downsample_for_isotropic, upsample_segmentation
 
 def create_memmap(data=None, dtype=None, shape=None, prefix='temp', directory=None):
     """Helper function to create memory-mapped arrays"""
@@ -223,7 +223,9 @@ def segment_microglia_first_pass(volume,
                                min_size=50,  # Smaller than nuclei to capture processes
                                spacing=(1.0, 1.0, 1.0),
                                anisotropy_normalization_degree=1.0,
-                               sensitivity=0.8):  # Higher sensitivity to capture dim processes
+                               sensitivity=0.8,
+                               background_level=50,
+                               target_level=75):  # Higher sensitivity to capture dim processes
     """
     First pass microglia segmentation with focus on capturing processes.
     Memory-optimized version that processes data in chunks.
@@ -258,7 +260,7 @@ def segment_microglia_first_pass(volume,
     from scipy.ndimage import label
     
     # Ensure sensitivity is within expected range
-    sensitivity = max(0.01, min(0.99, sensitivity))
+    sensitivity = max(0.01, min(1.0, sensitivity))
 
     print(f"Initial memory usage: {psutil.Process().memory_info().rss / (1024 * 1024):.2f} MB")
     
@@ -325,6 +327,46 @@ def segment_microglia_first_pass(volume,
     binary_temp_dir = tempfile.mkdtemp()
     binary_path = os.path.join(binary_temp_dir, 'binary.dat')
     binary = np.memmap(binary_path, dtype=np.bool_, mode='w+', shape=enhanced.shape)
+
+    print("Normalizing signal across depth...")
+    normalized_temp_dir = tempfile.mkdtemp()
+    normalized_path = os.path.join(normalized_temp_dir, 'normalized.dat')
+    normalized = np.memmap(normalized_path, dtype=enhanced.dtype, mode='w+', shape=enhanced.shape)
+
+    # Calculate intensity statistics for each z-plane
+    z_stats = []
+    for z in tqdm(range(enhanced.shape[0]), desc="Calculating z-plane statistics"):
+        # Sample the slice to save memory
+        indices = np.random.choice(enhanced.shape[1] * enhanced.shape[2], 
+                                min(10000, enhanced.shape[1] * enhanced.shape[2]), 
+                                replace=False)
+        y_indices, x_indices = np.unravel_index(indices, (enhanced.shape[1], enhanced.shape[2]))
+        samples = enhanced[z, y_indices, x_indices]
+        
+        # Get foreground statistics (pixels above noise level)
+        if len(samples) > 0:
+            noise_level = np.percentile(samples, background_level)  # Assume background is roughly lower half
+            foreground = samples[samples > noise_level]
+            if len(foreground) > 0:
+                z_stats.append((z, np.median(foreground), np.std(foreground)))
+            else:
+                z_stats.append((z, np.median(samples), np.std(samples)))
+        else:
+            z_stats.append((z, 0, 1))  # Fallback values
+
+    # Find target intensity (use statistics from best planes, e.g., top 25%)
+    z_medians = [stat[1] for stat in z_stats]
+    target_intensity = np.percentile(z_medians, target_level)  # Use upper quartile as target
+
+    # Normalize each plane
+    for z, median, std in tqdm(z_stats, desc="Normalizing z-planes"):
+        if median > 0:
+            # Scale factor to match target intensity
+            scale_factor = target_intensity / max(median, 1e-6)
+            # Apply scaling
+            normalized[z] = enhanced[z] * scale_factor
+        else:
+            normalized[z] = enhanced[z]
     
     # Thresholding based on chosen method - process in chunks
     print(f"Applying Otsu thresholding with sensitivity {sensitivity}...")
@@ -332,23 +374,28 @@ def segment_microglia_first_pass(volume,
 
     # For Otsu, we need to compute the global threshold first
     # Sample a subset of the data to calculate threshold (to save memory)
-    sample_size = min(1000000, enhanced.size)
-    indices = np.random.choice(enhanced.size, sample_size, replace=False)
-    flat_indices = np.unravel_index(indices, enhanced.shape)
-    samples = enhanced[flat_indices]
+    sample_size = min(1000000, normalized.size)
+    indices = np.random.choice(normalized.size, sample_size, replace=False)
+    flat_indices = np.unravel_index(indices, normalized.shape)
+    samples = normalized[flat_indices]
     threshold = threshold_otsu(samples)
-    adjusted_threshold = threshold * (2 - sensitivity)
+    adjusted_threshold = threshold * (1 - sensitivity * 0.5)
     
     # Apply threshold in chunks
-    chunk_size = min(50, enhanced.shape[0])
-    for i in tqdm(range(0, enhanced.shape[0], chunk_size)):
-        end_idx = min(i + chunk_size, enhanced.shape[0])
-        binary[i:end_idx] = enhanced[i:end_idx] > adjusted_threshold
+    chunk_size = min(50, normalized.shape[0])
+    for i in tqdm(range(0, normalized.shape[0], chunk_size)):
+        end_idx = min(i + chunk_size, normalized.shape[0])
+        binary[i:end_idx] = normalized[i:end_idx] > adjusted_threshold
     
     # Free memory by releasing enhanced volume
     del enhanced
     gc.collect()
     rmtree(enhanced_temp_dir)
+
+    # Free memory by releasing normalized volume
+    del normalized
+    gc.collect()
+    rmtree(normalized_temp_dir)
     
     # Connect fragmented processes
     print("Connecting fragmented processes...")
@@ -810,312 +857,3 @@ def separate_multi_soma_cells(segmentation_mask, intensity_volume, soma_mask, mi
     
     return separated_mask
 
-# def merge_segmentations(first_pass, second_pass, min_overlap_ratio=0.5, min_overlap_voxels=20):
-#     """
-#     Merge first and second pass segmentations, using second pass to separate merged cells
-#     while preserving all first pass voxels.
-    
-#     Parameters:
-#     -----------
-#     first_pass : ndarray
-#         First pass segmentation (more sensitive, may have merged cells)
-#     second_pass : ndarray
-#         Second pass segmentation (less sensitive, better separated cells)
-#     min_overlap_ratio : float
-#         Minimum ratio of overlap between second pass object and first pass object
-#         to consider them as the same cell
-#     min_overlap_voxels : int
-#         Minimum number of overlapping voxels required
-        
-#     Returns:
-#     --------
-#     merged_segmentation : ndarray
-#         Final segmentation with separated cells and preserved processes
-#     """
-#     import numpy as np
-#     from scipy.ndimage import label
-#     from skimage.measure import regionprops
-#     from collections import defaultdict
-#     import tempfile
-#     import os
-#     import gc
-#     import psutil
-#     from tqdm import tqdm
-    
-#     print(f"Initial memory usage: {psutil.Process().memory_info().rss / (1024 * 1024):.2f} MB")
-#     print("Merging first and second pass segmentations...")
-    
-#     # Create a temporary directory for memory-mapped arrays
-#     temp_dir = tempfile.mkdtemp(prefix='merge_segmentations_')
-    
-#     # Create output memory-mapped array
-#     merged_path = os.path.join(temp_dir, 'merged_segmentation.dat')
-#     merged_segmentation = np.memmap(merged_path, dtype=np.int32, mode='w+', shape=first_pass.shape)
-#     merged_segmentation.fill(0)
-    
-#     # Find overlaps between first and second pass objects
-#     print("Analyzing overlaps between segmentations...")
-    
-#     # Map from first pass label to list of second pass labels that overlap with it
-#     first_to_second_map = defaultdict(list)
-    
-#     # Map from second pass label to list of first pass labels it overlaps with
-#     second_to_first_map = defaultdict(list)
-    
-#     # Map storing overlap sizes
-#     overlap_sizes = {}
-    
-#     # Get unique labels 
-#     first_labels = np.unique(first_pass)
-#     first_labels = first_labels[first_labels > 0]  # Remove background
-    
-#     second_labels = np.unique(second_pass)
-#     second_labels = second_labels[second_labels > 0]  # Remove background
-    
-#     # Calculate sizes of all objects
-#     first_sizes = {}
-#     for label in first_labels:
-#         first_sizes[label] = np.sum(first_pass == label)
-    
-#     second_sizes = {}
-#     for label in second_labels:
-#         second_sizes[label] = np.sum(second_pass == label)
-    
-#     # Process in chunks to save memory
-#     chunk_size = min(50, first_pass.shape[0])
-#     for i in tqdm(range(0, first_pass.shape[0], chunk_size), desc="Computing overlaps"):
-#         end_idx = min(i + chunk_size, first_pass.shape[0])
-        
-#         # Get chunk from both segmentations
-#         first_chunk = first_pass[i:end_idx].copy()
-#         second_chunk = second_pass[i:end_idx].copy()
-        
-#         # For each first pass object in this chunk
-#         for first_label in np.unique(first_chunk):
-#             if first_label == 0:
-#                 continue
-                
-#             first_mask = (first_chunk == first_label)
-            
-#             # Find second pass objects that overlap with this first pass object
-#             overlapping_second_labels = np.unique(second_chunk[first_mask])
-#             overlapping_second_labels = overlapping_second_labels[overlapping_second_labels > 0]
-            
-#             for second_label in overlapping_second_labels:
-#                 # Calculate overlap
-#                 second_mask = (second_chunk == second_label)
-#                 overlap_mask = first_mask & second_mask
-#                 overlap_size = np.sum(overlap_mask)
-                
-#                 # Only consider significant overlaps
-#                 if overlap_size >= min_overlap_voxels:
-#                     # Calculate overlap ratio relative to second pass object
-#                     overlap_ratio = overlap_size / second_sizes[second_label]
-                    
-#                     if overlap_ratio >= min_overlap_ratio:
-#                         # Add to maps
-#                         if second_label not in first_to_second_map[first_label]:
-#                             first_to_second_map[first_label].append(second_label)
-                        
-#                         if first_label not in second_to_first_map[second_label]:
-#                             second_to_first_map[second_label].append(first_label)
-                        
-#                         # Store overlap size
-#                         overlap_sizes[(first_label, second_label)] = overlap_size
-        
-#         # Clean up
-#         del first_chunk, second_chunk
-#         gc.collect()
-    
-#     # Create a mapping from first pass labels to new labels
-#     first_to_new_map = {}
-#     next_label = 1
-    
-#     # Process simple cases first: first pass objects that map to only one second pass object
-#     print("Resolving one-to-one mappings...")
-#     for first_label in first_labels:
-#         overlapping_second = first_to_second_map[first_label]
-        
-#         if len(overlapping_second) == 1:
-#             # One-to-one mapping
-#             second_label = overlapping_second[0]
-            
-#             # Check if this second label maps to only this first label
-#             if len(second_to_first_map[second_label]) == 1:
-#                 # Simple case: direct mapping
-#                 first_to_new_map[first_label] = next_label
-#                 next_label += 1
-    
-#     print("Resolving split objects...")
-#     # Now handle split objects (one first pass object maps to multiple second pass objects)
-#     for first_label in first_labels:
-#         if first_label in first_to_new_map:
-#             continue  # Already handled
-        
-#         overlapping_second = first_to_second_map[first_label]
-        
-#         if len(overlapping_second) > 1:
-#             # First pass object overlaps with multiple second pass objects
-#             # Assign different labels to each part based on second pass
-            
-#             for second_label in overlapping_second:
-#                 # Create a new label for this part
-#                 first_to_new_map[(first_label, second_label)] = next_label
-#                 next_label += 1
-                
-#         elif len(overlapping_second) == 0:
-#             # First pass object doesn't overlap with any second pass object
-#             # Keep it as a separate object
-#             first_to_new_map[first_label] = next_label
-#             next_label += 1
-            
-#         else:
-#             # One-to-one mapping but the second pass object maps to multiple first pass objects
-#             # We'll handle these in the next step
-#             pass
-    
-#     print("Resolving merged objects...")
-#     # Handle merged objects (one second pass object maps to multiple first pass objects)
-#     for second_label in second_labels:
-#         overlapping_first = second_to_first_map[second_label]
-        
-#         # Skip if there's only one or no first pass objects
-#         if len(overlapping_first) <= 1:
-#             continue
-            
-#         # Check if any of these first pass objects are already assigned
-#         unassigned_first = [f for f in overlapping_first if f not in first_to_new_map]
-        
-#         # For each unassigned first pass object
-#         for first_label in unassigned_first:
-#             # Check if this first pass object only overlaps with this second pass object
-#             if len(first_to_second_map[first_label]) == 1:
-#                 # Assign a new label
-#                 first_to_new_map[first_label] = next_label
-#                 next_label += 1
-#             else:
-#                 # This first pass object overlaps with multiple second pass objects
-#                 # It should have been handled in the previous step as a split object
-#                 pass
-    
-#     # Final check for any objects that weren't assigned
-#     print("Assigning any remaining objects...")
-#     for first_label in first_labels:
-#         if first_label not in first_to_new_map and all((first_label, s) not in first_to_new_map for s in first_to_second_map[first_label]):
-#             # Assign a new label
-#             first_to_new_map[first_label] = next_label
-#             next_label += 1
-    
-#     # Now apply the mapping to create the final segmentation
-#     print("Creating final segmentation...")
-#     # Process in chunks to save memory
-#     for i in tqdm(range(0, first_pass.shape[0], chunk_size), desc="Creating merged segmentation"):
-#         end_idx = min(i + chunk_size, first_pass.shape[0])
-        
-#         # Get chunk from both segmentations
-#         first_chunk = first_pass[i:end_idx].copy()
-#         second_chunk = second_pass[i:end_idx].copy()
-        
-#         # Create mask for this chunk
-#         chunk_mask = np.zeros_like(first_chunk, dtype=np.int32)
-        
-#         # Apply mappings for simple cases first
-#         for first_label, new_label in first_to_new_map.items():
-#             if isinstance(first_label, int):  # Simple mapping
-#                 chunk_mask[first_chunk == first_label] = new_label
-        
-#         # Then handle split objects
-#         for key, new_label in first_to_new_map.items():
-#             if isinstance(key, tuple):  # Split object mapping
-#                 first_label, second_label = key
-#                 # Find voxels that belong to both objects
-#                 mask = (first_chunk == first_label) & (second_chunk == second_label)
-#                 chunk_mask[mask] = new_label
-        
-#         # Update output
-#         merged_segmentation[i:end_idx] = chunk_mask
-#         merged_segmentation.flush()
-        
-#         # Clean up
-#         del first_chunk, second_chunk, chunk_mask
-#         gc.collect()
-    
-#     # Fix any remaining unassigned voxels (voxels in first pass but not assigned in merged)
-#     print("Fixing unassigned voxels...")
-#     for i in tqdm(range(0, first_pass.shape[0], chunk_size), desc="Fixing unassigned voxels"):
-#         end_idx = min(i + chunk_size, first_pass.shape[0])
-        
-#         # Get chunks
-#         first_chunk = first_pass[i:end_idx].copy()
-#         merged_chunk = merged_segmentation[i:end_idx].copy()
-        
-#         # Find voxels that have a first pass label but no merged label
-#         unassigned_mask = (first_chunk > 0) & (merged_chunk == 0)
-        
-#         if np.any(unassigned_mask):
-#             # For each unassigned voxel, assign it to the closest assigned voxel
-#             # This is computationally expensive, so we'll use a simple approach
-#             # For each first pass label that has unassigned voxels
-#             for first_label in np.unique(first_chunk[unassigned_mask]):
-#                 # Find the new label for this first pass label if it exists
-#                 new_label = first_to_new_map.get(first_label, None)
-                
-#                 if new_label is not None:
-#                     # Assign all unassigned voxels with this first pass label to the new label
-#                     mask = (first_chunk == first_label) & (merged_chunk == 0)
-#                     merged_chunk[mask] = new_label
-#                 else:
-#                     # This first pass label was split, find the most overlapping second pass label
-#                     best_second_label = None
-#                     best_overlap = 0
-                    
-#                     for second_label in first_to_second_map[first_label]:
-#                         overlap = overlap_sizes.get((first_label, second_label), 0)
-#                         if overlap > best_overlap:
-#                             best_overlap = overlap
-#                             best_second_label = second_label
-                    
-#                     if best_second_label is not None:
-#                         # Use the new label for this combination
-#                         new_label = first_to_new_map.get((first_label, best_second_label), next_label)
-#                         if (first_label, best_second_label) not in first_to_new_map:
-#                             first_to_new_map[(first_label, best_second_label)] = new_label
-#                             next_label += 1
-                            
-#                         # Assign unassigned voxels to this new label
-#                         mask = (first_chunk == first_label) & (merged_chunk == 0)
-#                         merged_chunk[mask] = new_label
-#                     else:
-#                         # Create a new label
-#                         new_label = next_label
-#                         next_label += 1
-#                         first_to_new_map[first_label] = new_label
-                        
-#                         # Assign unassigned voxels to this new label
-#                         mask = (first_chunk == first_label) & (merged_chunk == 0)
-#                         merged_chunk[mask] = new_label
-        
-#         # Update output
-#         merged_segmentation[i:end_idx] = merged_chunk
-#         merged_segmentation.flush()
-        
-#         # Clean up
-#         del first_chunk, merged_chunk
-#         gc.collect()
-    
-#     # Create a copy to return (not memory-mapped)
-#     result = np.zeros_like(merged_segmentation)
-#     for i in range(0, merged_segmentation.shape[0], chunk_size):
-#         end_idx = min(i + chunk_size, merged_segmentation.shape[0])
-#         result[i:end_idx] = merged_segmentation[i:end_idx]
-    
-#     # Clean up
-#     del merged_segmentation
-#     gc.collect()
-#     os.unlink(merged_path)
-#     os.rmdir(temp_dir)
-    
-#     print(f"Merged segmentation complete. Final object count: {np.max(result)}")
-#     print(f"Final memory usage: {psutil.Process().memory_info().rss / (1024 * 1024):.2f} MB")
-    
-#     return result
