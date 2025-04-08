@@ -377,22 +377,30 @@ class DynamicGUIManager:
                     
                 else:  # ramified mode
                     # Process ramified cells
-                    labeled_cells, first_pass_params = segment_microglia_first_pass(
+                    labeled_cells, first_pass_params, edge_mask = segment_microglia_first_pass(
                                                             self.image_stack,
-                                                            tubular_scales=[current_values.get("tubular_scales", 2)],
-                                                            smooth_sigma=current_values.get("smooth_sigma", 1.0),
-                                                            min_size=current_values.get("min_size", 100),
                                                             spacing=[self.z_spacing, self.x_spacing, self.y_spacing],
-                                                            anisotropy_normalization_degree=current_values.get("anisotropy_normalization_degree", 0.2),
+                                                            # tubular_scales=[current_values.get("tubular_scales", 2)],
+                                                            tubular_scales=[0.8, 1, 1.5, 2],
+                                                            smooth_sigma=current_values.get("smooth_sigma", 1.0),
+                                                            connect_max_gap_physical=1,
+                                                            min_size_voxels=current_values.get("min_size", 100),
                                                             sensitivity=current_values.get("sensitivity", 0.2),
                                                             background_level=current_values.get("background_level", 50),
-                                                            target_level=current_values.get("target_level", 75)
+                                                            target_level=current_values.get("target_level", 75),
+                                                            edge_trim_distance_threshold=current_values.get("edge_trim_distance_threshold", 2.0),
                                                         )
                 
                 np.save(segmented_cells_path, labeled_cells)
                 self.viewer.add_labels(
                     labeled_cells,
                     name="Intermediate segmentation",
+                    scale=(self.z_scale_factor, 1, 1)
+                )
+
+                self.viewer.add_image(
+                    edge_mask,
+                    name="Edge Mask",
                     scale=(self.z_scale_factor, 1, 1)
                 )
                 

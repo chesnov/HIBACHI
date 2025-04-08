@@ -1,15 +1,14 @@
 import numpy as np
 from scipy import ndimage
-from scipy.ndimage import gaussian_filter, label, distance_transform_edt, zoom
-from skimage.feature import peak_local_max
-from skimage.filters import frangi, threshold_otsu, threshold_local, sato
-from skimage.morphology import binary_dilation, ball, skeletonize, binary_closing, remove_small_objects
+# Make sure all necessary ndimage functions are imported
+from scipy.ndimage import (gaussian_filter, distance_transform_edt,
+                           binary_erosion, generate_binary_structure)
+from skimage.filters import frangi, threshold_otsu, sato
+from skimage.morphology import convex_hull_image, remove_small_objects
 import tempfile
 import os
 from tqdm import tqdm
-import matplotlib.pyplot as plt
-import multiprocessing as mp
-from multiprocessing import shared_memory
+from multiprocessing import Pool
 import time
 import psutil
 from shutil import rmtree
@@ -20,603 +19,656 @@ import gc
 import numpy as np
 from tqdm import tqdm
 from skimage.filters import frangi, sato
-from concurrent.futures import ProcessPoolExecutor
-import multiprocessing
 from functools import partial
-import skimage.measure as measure
 from skimage.measure import regionprops
-from skimage.measure import regionprops_table
+import math
 seed = 42
 np.random.seed(seed)         # For NumPy
 
-from nuclear_segmenter import downsample_for_isotropic, upsample_segmentation
+# Assuming nuclear_segmenter.py might be needed elsewhere, keep imports
+# from nuclear_segmenter import downsample_for_isotropic, upsample_segmentation
 
+# Helper function for memory mapping (remains the same)
 def create_memmap(data=None, dtype=None, shape=None, prefix='temp', directory=None):
     """Helper function to create memory-mapped arrays"""
     if directory is None:
         directory = tempfile.mkdtemp()
     path = os.path.join(directory, f'{prefix}.dat')
-    
     if data is not None:
-        # Create from existing data
-        shape = data.shape
-        dtype = data.dtype
+        shape = data.shape; dtype = data.dtype
         result = np.memmap(path, dtype=dtype, mode='w+', shape=shape)
-        # Copy data in chunks to reduce peak memory usage
-        chunk_size = min(100, shape[0])
+        chunk_size = min(100, shape[0]) if shape[0] > 0 else 1
         for i in range(0, shape[0], chunk_size):
             end = min(i + chunk_size, shape[0])
             result[i:end] = data[i:end]
         result.flush()
     else:
-        # Create empty memmap
         result = np.memmap(path, dtype=dtype, mode='w+', shape=shape)
-    
     return result, path, directory
 
+def _process_slice_worker(z, input_memmap_info, output_memmap_info,
+                          sigmas_voxel_2d, black_ridges,
+                          frangi_alpha, frangi_beta, frangi_gamma):
+    """Worker function to process a single slice."""
+    try:
+        input_path, input_shape, input_dtype = input_memmap_info
+        output_path, output_shape, output_dtype = output_memmap_info
+        input_memmap = np.memmap(input_path, dtype=input_dtype, mode='r', shape=input_shape)
+        output_memmap = np.memmap(output_path, dtype=output_dtype, mode='r+', shape=output_shape)
+        slice_data = input_memmap[z, :, :].copy()
+        if not np.issubdtype(slice_data.dtype, np.floating): slice_data = slice_data.astype(np.float32)
+        elif slice_data.dtype != np.float32: slice_data = slice_data.astype(np.float32)
+        frangi_result_2d = frangi(slice_data, sigmas=sigmas_voxel_2d, alpha=frangi_alpha, beta=frangi_beta, gamma=frangi_gamma, black_ridges=black_ridges, mode='reflect')
+        sato_result_2d = sato(slice_data, sigmas=sigmas_voxel_2d, black_ridges=black_ridges, mode='reflect')
+        slice_enhanced = np.maximum(frangi_result_2d, sato_result_2d)
+        output_memmap[z, :, :] = slice_enhanced.astype(output_dtype)
+        output_memmap.flush()
+        del slice_data, frangi_result_2d, sato_result_2d, slice_enhanced, input_memmap, output_memmap; gc.collect()
+        return None
+    except Exception as e:
+        print(f"ERROR in worker processing slice {z}: {e}")
+        import traceback; traceback.print_exc(); return f"Error_slice_{z}"
 
-def enhance_tubular_structures(volume, scales, spacing, black_ridges=False):
-    """
-    Enhance tubular/filamentous structures using absolute minimal memory footprint.
-    This function processes one slice at a time, one scale at a time, with no parallelization.
-    
-    Parameters:
-    -----------
-    volume : ndarray
-        3D input volume
-    scales : list
-        List of scales (sigmas) to use for enhancement
-    spacing : tuple
-        Spacing (z, y, x) in physical units
-    black_ridges : bool
-        If True, detect black ridges instead of white ones
-    
-    Returns:
-    --------
-    enhanced : ndarray
-        Enhanced volume with tubular structures highlighted
-    """
-    # Create a temporary directory for memmaps
-    temp_dir = tempfile.mkdtemp(prefix='tubular_enhance_minimal_')
-    
-    # Create output memory-mapped file initialized with zeros
-    output_path = os.path.join(temp_dir, 'enhanced_volume.dat')
-    enhanced = np.memmap(output_path, dtype=np.float32, mode='w+', shape=volume.shape)
-    enhanced.fill(0)
-    enhanced.flush()
-    
-    # Create 2D working space for a single slice
-    z_size, y_size, x_size = volume.shape
-    slice_shape = (y_size, x_size)
-    
-    # Create temporary files for single-slice processing
-    slice_path = os.path.join(temp_dir, 'temp_slice.dat')
-    frangi_path = os.path.join(temp_dir, 'temp_frangi.dat')
-    sato_path = os.path.join(temp_dir, 'temp_sato.dat')
-    result_path = os.path.join(temp_dir, 'temp_result.dat')
-    
-    print("Enhancing tubular structures with ultra-low memory usage...")
-    print(f"Processing {z_size} slices with {len(scales)} scales")
-    
-    # Process each scale
-    for scale_idx, scale in enumerate(scales):
-        print(f"Processing scale {scale} ({scale_idx+1}/{len(scales)})...")
-        
-        # Adjust scale based on spacing
-        scaled_sigma = scale
-        if spacing != (1.0, 1.0, 1.0):
-            min_spacing = min(spacing)
-            scaled_sigma = np.asarray(scale) * min_spacing
-        
-        # Process each slice individually to minimize memory usage
-        for z in tqdm(range(z_size), desc=f"Scale {scale}"):
-            # Extract a single slice from the volume
-            single_slice = volume[z].copy()
-            
-            # Apply filters to the single slice
-            try:
-                # Process with frangi filter
-                frangi_result = frangi(single_slice, 
-                                      sigmas=scaled_sigma,
-                                      black_ridges=black_ridges, 
-                                      mode='reflect')
-                
-                # Process with sato filter
-                sato_result = sato(single_slice, 
-                                  sigmas=scaled_sigma, 
-                                  black_ridges=black_ridges, 
-                                  mode='reflect')
-                
-                # Combine results (take maximum response)
-                result = np.maximum(frangi_result, sato_result)
-                
-                # Update the result in the memory-mapped file
-                current = enhanced[z].copy()
-                enhanced[z] = np.maximum(current, result)
-                enhanced.flush()
-                
-            except Exception as e:
-                print(f"Error processing slice {z}: {e}")
-                # Continue with next slice on error
-            
-            # Explicitly clean up to minimize memory
-            del single_slice, frangi_result, sato_result, result, current
-            gc.collect()
-            
-            # Short delay to allow OS to clean up memory
-            time.sleep(0.05)
-    
-    # Load results from memmap
-    # Create a copy that doesn't depend on the memmap - but do it slice by slice
-    result = np.zeros_like(enhanced)
-    for z in range(z_size):
-        result[z] = enhanced[z]
-        
-    # Delete and close memmap before returning
-    del enhanced
-    gc.collect()
-    
-    return result, temp_dir
+# Parallel slice-wise enhancement function (remains the same)
+def enhance_tubular_structures_slice_by_slice(volume, scales, spacing, black_ridges=False, frangi_alpha=0.5, frangi_beta=0.5, frangi_gamma=15, apply_3d_smoothing=True, smoothing_sigma_phys=0.5, ram_safety_factor=0.8, mem_factor_per_slice=8.0 ):
+    """ Enhance tubular structures slice-by-slice in parallel. """
+    print(f"Starting slice-by-slice (2.5D) tubular enhancement with PARALLEL processing...")
+    print(f"  Volume shape: {volume.shape}, Spacing: {spacing}")
+    print(f"  Initial memory usage: {psutil.Process().memory_info().rss / (1024 * 1024):.2f} MB")
+    spacing = tuple(float(s) for s in spacing); volume_shape = volume.shape
+    slice_shape = volume_shape[1:]; num_slices = volume_shape[0]; xy_spacing = spacing[1:]
+    input_volume_memmap = None; input_memmap_path = None; input_memmap_dir = None; source_volume_cleaned = False
+    if apply_3d_smoothing and smoothing_sigma_phys > 0:
+        print(f"Applying initial 3D smoothing...")
+        sigma_voxel_3d = tuple(smoothing_sigma_phys / s for s in spacing)
+        smooth_temp_dir = tempfile.mkdtemp(prefix="pre_smooth_"); smooth_path = os.path.join(smooth_temp_dir, 'smoothed_3d.dat')
+        smoothed_dtype = np.float32 if not np.issubdtype(volume.dtype, np.floating) else volume.dtype
+        input_volume_memmap = np.memmap(smooth_path, dtype=smoothed_dtype, mode='w+', shape=volume_shape)
+        input_memmap_path = smooth_path; input_memmap_dir = smooth_temp_dir
+        chunk_size_z_smooth = min(50, volume_shape[0]); overlap_z_smooth = math.ceil(3 * sigma_voxel_3d[0])
+        for i in tqdm(range(0, volume_shape[0], chunk_size_z_smooth), desc="3D Pre-Smoothing"):
+            start_read = max(0, i - overlap_z_smooth); end_read = min(volume_shape[0], i + chunk_size_z_smooth + overlap_z_smooth)
+            start_write = i; end_write = min(volume_shape[0], i + chunk_size_z_smooth)
+            local_write_start = start_write - start_read; local_write_end = end_write - start_read
+            if start_read >= end_read: continue
+            chunk = volume[start_read:end_read].astype(smoothed_dtype).copy()
+            smoothed_chunk = gaussian_filter(chunk, sigma=sigma_voxel_3d, mode='reflect')
+            if local_write_end > local_write_start: input_volume_memmap[start_write:end_write, :, :] = smoothed_chunk[local_write_start:local_write_end, :, :]
+            del chunk, smoothed_chunk; gc.collect()
+        input_volume_memmap.flush(); print(f"  3D pre-smoothing done.")
+    else:
+        print("  Skipping initial 3D smoothing.");
+        if isinstance(volume, np.memmap): input_volume_memmap = volume; input_memmap_path = volume.filename
+        else:
+            print(f"  Converting input volume to temporary memmap..."); input_memmap_dir = tempfile.mkdtemp(prefix="input_volume_")
+            input_volume_memmap, input_memmap_path, _ = create_memmap(data=volume, directory=input_memmap_dir)
+            source_volume_cleaned = True
+    avg_xy_spacing = np.mean(xy_spacing); sigmas_voxel_2d = sorted([s / avg_xy_spacing for s in scales])
+    print(f"  Using 2D voxel sigmas: {sigmas_voxel_2d}")
+    output_temp_dir = tempfile.mkdtemp(prefix='tubular_enhance_parallel_'); output_path = os.path.join(output_temp_dir, 'enhanced_volume_parallel.dat')
+    output_dtype = np.float32; output_memmap = np.memmap(output_path, dtype=output_dtype, mode='w+', shape=volume_shape)
+    print(f"  Output memmap created: {output_path}")
+    try:
+        total_cores = os.cpu_count(); max_cpu_workers = max(1, total_cores - 1 if total_cores else 1)
+        available_ram = psutil.virtual_memory().available; usable_ram = available_ram * ram_safety_factor
+        input_dtype_bytes = np.dtype(input_volume_memmap.dtype).itemsize if input_volume_memmap is not None else np.dtype(np.float32).itemsize
+        slice_mem_bytes = slice_shape[0] * slice_shape[1] * input_dtype_bytes; estimated_worker_ram = slice_mem_bytes * mem_factor_per_slice
+        if estimated_worker_ram <= 0: estimated_worker_ram = 1
+        max_mem_workers = max(1, int(usable_ram // estimated_worker_ram)); num_workers = min(max_cpu_workers, max_mem_workers, num_slices)
+        print(f"  Resource Check: Cores={total_cores}, Avail RAM={available_ram / (1024**3):.2f}GB, Use RAM={usable_ram / (1024**3):.2f}GB")
+        print(f"  Est. RAM/worker={estimated_worker_ram / (1024**2):.2f}MB -> Max RAM Workers={max_mem_workers}")
+        print(f"  Using {num_workers} parallel workers.")
+    except Exception as e: print(f"  Warning: Could not determine resources automatically ({e}). Defaulting to 1 worker."); num_workers = 1
+    start_time = time.time(); pool = None
+    try:
+        input_info = (input_memmap_path, input_volume_memmap.shape, input_volume_memmap.dtype); output_info = (output_path, output_memmap.shape, output_dtype)
+        worker_func_partial = partial(_process_slice_worker, input_memmap_info=input_info, output_memmap_info=output_info, sigmas_voxel_2d=sigmas_voxel_2d, black_ridges=black_ridges, frangi_alpha=frangi_alpha, frangi_beta=frangi_beta, frangi_gamma=frangi_gamma)
+        print(f"Processing {num_slices} slices using {num_workers} workers...")
+        with Pool(processes=num_workers) as pool:
+            results = list(tqdm(pool.imap_unordered(worker_func_partial, range(num_slices)), total=num_slices, desc="Applying 2D Filters (Parallel)"))
+        errors = [r for r in results if isinstance(r, str) and r.startswith("Error_slice_")]
+        if errors: print(f"\n!!! Encountered {len(errors)} errors: {errors[:5]}"); raise RuntimeError(f"Parallel slice processing failed.")
+        print(f"Parallel processing finished in {time.time() - start_time:.2f} seconds.")
+    except Exception as e: print(f"An error occurred during parallel processing: {e}"); import traceback; traceback.print_exc(); raise
+    finally:
+        del output_memmap
+        if input_volume_memmap is not None and hasattr(input_volume_memmap, '_mmap'): del input_volume_memmap
+        gc.collect()
+    if source_volume_cleaned and input_memmap_dir:
+        print(f"Cleaning up temporary input volume memmap: {input_memmap_dir}"); 
+        try: rmtree(input_memmap_dir, ignore_errors=True)
+        except Exception as e: print(f"Warning: Could not delete temp input directory {input_memmap_dir}: {e}")
+    elif apply_3d_smoothing and input_memmap_dir:
+         print(f"Cleaning up temporary pre-smoothed volume: {input_memmap_dir}"); 
+         try: rmtree(input_memmap_dir, ignore_errors=True)
+         except Exception as e: print(f"Warning: Could not delete temp smooth directory {input_memmap_dir}: {e}")
+    print("Loading final enhanced result from memmap...")
+    final_enhanced_memmap = np.memmap(output_path, dtype=output_dtype, mode='r', shape=volume_shape)
+    result_in_memory = np.array(final_enhanced_memmap)
+    del final_enhanced_memmap; gc.collect(); print("Final result loaded into memory.")
+    print(f"Final memory usage after slice-wise enhancement: {psutil.Process().memory_info().rss / (1024 * 1024):.2f} MB")
+    return result_in_memory, output_temp_dir
 
-def connect_fragmented_processes(binary_mask, max_gap=3):
-    """
-    Connect fragmented microglia processes by applying morphological operations.
-    Process in chunks to reduce memory usage.
-    
-    Parameters:
-    -----------
-    binary_mask : ndarray
-        Binary segmentation mask
-    max_gap : int
-        Maximum gap to bridge in voxels
-    
-    Returns:
-    --------
-    connected_mask : ndarray
-        Binary mask with connected processes
-    """
-    # Create a temporary directory and a memmap for the result
-    temp_dir = tempfile.mkdtemp()
+def generate_anisotropic_structure(rank, connectivity, spacing):
+    """Generates a connectivity structure based on physical spacing."""
+    if rank != 3: raise ValueError("Only rank 3 supported")
+    base_structure = generate_binary_structure(rank, connectivity)
+    return base_structure
+
+# Connection function (remains the same)
+def connect_fragmented_processes(binary_mask, spacing, max_gap_physical=1.0):
+    """Connect fragmented processes using anisotropic morphological closing."""
+    print(f"Connecting fragmented processes with max physical gap: {max_gap_physical}")
+    print(f"  Input mask shape: {binary_mask.shape}, Spacing: {spacing}")
+    radius_vox = [math.ceil((max_gap_physical / 2) / s) for s in spacing]
+    structure_shape = tuple(2 * r + 1 for r in radius_vox)
+    print(f"  Calculated anisotropic structure shape (voxels): {structure_shape}")
+    structure = np.ones(structure_shape, dtype=bool)
+    temp_dir = tempfile.mkdtemp(prefix="connect_frag_")
     result_path = os.path.join(temp_dir, 'connected_mask.dat')
     connected_mask = np.memmap(result_path, dtype=np.bool_, mode='w+', shape=binary_mask.shape)
-    
-    # Create the structural element
-    struct_element = ball(max_gap)
-    
-    # Process in overlapping chunks to handle boundary effects
-    overlap = max_gap * 2
-    chunk_size = min(50, binary_mask.shape[0])
-    
-    for i in range(0, binary_mask.shape[0], chunk_size - overlap):
-        # Handle boundaries
-        start_idx = max(0, i)
-        end_idx = min(i + chunk_size, binary_mask.shape[0])
-        
-        # Extract chunk with borders if possible
-        chunk_start = max(0, start_idx - overlap)
-        chunk_end = min(binary_mask.shape[0], end_idx + overlap)
-        chunk = binary_mask[chunk_start:chunk_end].copy()
-        
-        # Apply closing
-        closed_chunk = binary_closing(chunk, struct_element)
-        
-        # Determine where to save in the output (remove the borders)
-        save_start = start_idx - chunk_start
-        save_end = save_start + (end_idx - start_idx)
-        
-        # Save to output, avoiding overlap regions for chunks after the first
-        if i == 0:
-            connected_mask[start_idx:end_idx] = closed_chunk[save_start:save_end]
-        else:
-            connected_mask[start_idx:end_idx] = closed_chunk[save_start:save_end]
-        
-        # Clean up
-        del chunk, closed_chunk
-        gc.collect()
-    
-    connected_mask.flush()
+    print("  Applying anisotropic binary closing...")
+    start_time = time.time()
+    try:
+        ndimage.binary_closing(binary_mask, structure=structure, output=connected_mask, border_value=0)
+        connected_mask.flush(); print(f"  Binary closing completed in {time.time() - start_time:.2f} seconds.")
+    except MemoryError: print("  MemoryError during binary closing."); del connected_mask; gc.collect(); rmtree(temp_dir); raise MemoryError("Failed binary closing.") from None
+    except Exception as e: print(f"  Error during binary closing: {e}"); del connected_mask; gc.collect(); rmtree(temp_dir); raise e
     return connected_mask, temp_dir
 
-def segment_microglia_first_pass(volume,
-                               tubular_scales=[0.5, 1.0, 2.0, 3.0],
-                               smooth_sigma=1.0,
-                               min_size=50,  # Smaller than nuclei to capture processes
-                               spacing=(1.0, 1.0, 1.0),
-                               anisotropy_normalization_degree=1.0,
-                               sensitivity=0.8,
-                               background_level=50,
-                               target_level=75):  # Higher sensitivity to capture dim processes
+
+def generate_hull_boundary_and_stack(volume, hull_erosion_iterations=1):
+    """ Generates boundary and hull stack from slice-wise 2D hulls. """
+    # ... (Implementation as provided before) ...
+    print("Generating hull boundary mask AND stack using slice-wise hulls...")
+    original_shape = volume.shape; hull_boundary = None; hull_stack = None
+    print("  Creating tissue mask..."); # ... Otsu logic ...
+    otsu_sample_size = min(2_000_000, volume.size)
+    if otsu_sample_size == volume.size: otsu_samples = volume.ravel()
+    else: otsu_indices = np.random.choice(volume.size, otsu_sample_size, replace=False); otsu_coords = np.unravel_index(otsu_indices, volume.shape); otsu_samples = volume[otsu_coords]
+    if np.all(otsu_samples == otsu_samples[0]): tissue_thresh = otsu_samples[0]; print(f"  Warn: All samples identical ({tissue_thresh}).")
+    else: tissue_thresh = threshold_otsu(otsu_samples)
+    print(f"  Tissue threshold: {tissue_thresh:.2f}"); tissue_mask = volume > tissue_thresh; del otsu_samples; gc.collect()
+    if not np.any(tissue_mask): print("  Warn: Tissue mask empty."); return None, None
+    print("  Calculating 2D convex hull slice-by-slice..."); hull_stack = np.zeros_like(tissue_mask, dtype=bool)
+    for z in tqdm(range(original_shape[0]), desc="  Processing Slices for Hull"):
+        tissue_slice = tissue_mask[z, :, :];
+        if np.any(tissue_slice):
+             if not tissue_slice.flags['C_CONTIGUOUS']: tissue_slice = np.ascontiguousarray(tissue_slice)
+             hull_stack[z, :, :] = convex_hull_image(tissue_slice)
+    del tissue_mask; gc.collect(); print("  Slice-wise hull complete.")
+    if hull_erosion_iterations <= 0: print("  Warn: No hull erosion."); hull_boundary = np.zeros(original_shape, dtype=bool); return hull_boundary, hull_stack
+    print(f"  Eroding 3D hull stack (iter={hull_erosion_iterations})..."); struct_3d = generate_binary_structure(3, 1)
+    eroded_hull_stack = binary_erosion(hull_stack, structure=struct_3d, iterations=hull_erosion_iterations); print("  Erosion complete.")
+    print("  Calculating hull boundary..."); hull_boundary = hull_stack & (~eroded_hull_stack); # Keep hull_stack for return
+    print(f"  Hull boundary mask created ({np.sum(hull_boundary)} voxels).")
+    # Return boundary AND original hull stack (in case caller needs it, though trimming doesn't)
+    return hull_boundary, hull_stack
+
+
+# --- NEW Helper Function: Trim Object Edges ---
+
+def trim_object_edges_by_distance(
+    segmentation,            # Labeled segmentation (modified in-place)
+    hull_boundary_mask,      # Boolean mask of the hull boundary
+    spacing,                 # Voxel spacing for physical distance
+    distance_threshold,      # Physical distance threshold
+    min_remaining_size=10,   # Minimum size for object remnants after trimming
+    chunk_size_z=32          # Chunk size for potential chunked EDT/application
+    ):
     """
-    First pass microglia segmentation with focus on capturing processes.
-    Memory-optimized version that processes data in chunks.
-    
+    Removes voxels from labeled objects that are closer than a threshold
+    distance to the hull boundary. Optionally removes objects that become
+    too small after trimming.
+
     Parameters:
     -----------
-    volume : ndarray
-        3D input volume
-    tubular_scales : list
-        Scales for tubular structure enhancement
-    smooth_sigma : float or list
-        Gaussian smoothing sigma(s)
-    min_size : int
-        Minimum object size in voxels (smaller than for nuclei)
+    segmentation : ndarray (int)
+        The labeled segmentation image. Will be MODIFIED IN-PLACE.
+    hull_boundary_mask : ndarray (bool)
+        Mask where boundary voxels are True.
     spacing : tuple
-        Original spacing (z, y, x) in physical units
-    anisotropy_normalization_degree : float
-        Degree of anisotropy normalization (0 to 1)
-    sensitivity : float
-        Sensitivity factor for thresholding (0-1)
-        For otsu: higher = more sensitive (selects more pixels)
-        For adaptive: higher = less sensitive (selects fewer pixels)
-        For percentage: higher = less sensitive (selects fewer pixels)
-        
+        Physical voxel spacing (z, y, x).
+    distance_threshold : float
+        Physical distance. Voxels closer than this to the boundary will be removed.
+    min_remaining_size : int
+        After trimming, objects smaller than this voxel count will be removed entirely.
+        Set to 0 or less to disable remnant removal.
+    chunk_size_z : int
+        Chunk size along Z for processing distance transform and trimming if
+        full volume calculation fails.
+
     Returns:
     --------
-    upsampled_first_pass : ndarray
-        First pass segmentation resampled to original volume shape
-    first_pass_params : dict
-        Dictionary containing parameters from first pass for use in second pass
+    trimmed_voxels_mask : ndarray (bool)
+        A boolean mask indicating which voxels were removed (set to 0).
     """
-    from scipy.ndimage import label
-    
-    # Ensure sensitivity is within expected range
-    sensitivity = max(0.01, min(1.0, sensitivity))
+    print(f"\n--- Trimming object edges closer than {distance_threshold:.2f} units to hull boundary ---")
+    original_shape = segmentation.shape
+    trimmed_voxels_mask = np.zeros(original_shape, dtype=bool) # Track what was removed
 
-    print(f"Initial memory usage: {psutil.Process().memory_info().rss / (1024 * 1024):.2f} MB")
-    
-    # Create a params dictionary to store parameters
-    first_pass_params = {
-        'anisotropy_normalization_degree': anisotropy_normalization_degree,
-        'tubular_scales': tubular_scales,
-        'smooth_sigma': smooth_sigma,
-        'min_size': min_size,
-        'spacing': spacing,
-        'sensitivity': sensitivity
-    }
-    print(f"\nStarting first pass microglia segmentation with anisotropy normalization degree = {anisotropy_normalization_degree}...")
-    
-    # Downsample to isotropic spacing
-    downsampled_volume, isotropic_spacing, downsample_temp_dir = downsample_for_isotropic(volume, spacing, anisotropy_normalization_degree)
-    original_shape = volume.shape
-    downsampled_shape = downsampled_volume.shape
-    
-    # Store these values for future use
-    first_pass_params['isotropic_spacing'] = isotropic_spacing
-    first_pass_params['downsampled_shape'] = downsampled_shape
-    
-    # Smooth the volume to reduce noise
-    print("Smoothing volume...")
-    if isinstance(smooth_sigma, (list, tuple)):
-        # Use the smallest sigma to preserve fine details
-        smooth_sigma_value = smooth_sigma[0]
-    else:
-        smooth_sigma_value = smooth_sigma
-    
-    # Smooth in chunks to save memory
-    smoothed_temp_dir = tempfile.mkdtemp()
-    smoothed_path = os.path.join(smoothed_temp_dir, 'smoothed_volume.dat')
-    smoothed = np.memmap(smoothed_path, dtype=downsampled_volume.dtype, mode='w+', shape=downsampled_shape)
-    
-    chunk_size = min(50, downsampled_volume.shape[0])
-    for i in range(0, downsampled_volume.shape[0], chunk_size):
-        end_idx = min(i + chunk_size, downsampled_volume.shape[0])
-        chunk = downsampled_volume[i:end_idx].copy()
-        
-        # Apply smoothing
-        smoothed_chunk = gaussian_filter(chunk, sigma=smooth_sigma_value)
-        smoothed[i:end_idx] = smoothed_chunk
-        
-        # Clean up
-        del chunk, smoothed_chunk
+    if not np.any(hull_boundary_mask):
+        print("  Hull boundary mask is empty. No trimming performed.")
+        return trimmed_voxels_mask
+
+    distance_from_boundary = None # Initialize
+
+    # --- Calculate Distance Transform ---
+    try:
+        print("  Calculating full distance transform from hull boundary...")
+        start_edt = time.time()
+        # Compute distance from non-boundary points to the nearest boundary point
+        distance_from_boundary = distance_transform_edt(
+            ~hull_boundary_mask,
+            sampling=spacing
+        )
+        print(f"  Full EDT calculated in {time.time()-start_edt:.2f}s.")
         gc.collect()
-    
-    smoothed.flush()
-    
-    # Enhance tubular structures (microglia processes)
-    # Adjust scales for the isotropic spacing
-    scaled_tubular_scales = [[scale/s for s in isotropic_spacing] for scale in tubular_scales]
-    enhanced, enhanced_temp_dir = enhance_tubular_structures(smoothed, scaled_tubular_scales, isotropic_spacing)
-    
-    # Free memory by releasing smoothed volume
-    del smoothed
-    gc.collect()
-    os.unlink(smoothed_path)
-    rmtree(smoothed_temp_dir)
-    
-    # Create a temporary directory and a memmap for binary result
-    binary_temp_dir = tempfile.mkdtemp()
-    binary_path = os.path.join(binary_temp_dir, 'binary.dat')
-    binary = np.memmap(binary_path, dtype=np.bool_, mode='w+', shape=enhanced.shape)
 
-    print("Normalizing signal across depth...")
-    normalized_temp_dir = tempfile.mkdtemp()
-    normalized_path = os.path.join(normalized_temp_dir, 'normalized.dat')
-    normalized = np.memmap(normalized_path, dtype=enhanced.dtype, mode='w+', shape=enhanced.shape)
+        # --- Apply Trimming (Full Volume) ---
+        print(f"  Applying trimming threshold ({distance_threshold:.2f})...")
+        # Find all voxels (across all objects) below the threshold
+        voxels_to_trim = (distance_from_boundary < distance_threshold)
 
-    # Calculate intensity statistics for each z-plane
-    z_stats = []
-    for z in tqdm(range(enhanced.shape[0]), desc="Calculating z-plane statistics"):
-        # Sample the slice to save memory
-        indices = np.random.choice(enhanced.shape[1] * enhanced.shape[2], 
-                                min(10000, enhanced.shape[1] * enhanced.shape[2]), 
-                                replace=False)
-        y_indices, x_indices = np.unravel_index(indices, (enhanced.shape[1], enhanced.shape[2]))
-        samples = enhanced[z, y_indices, x_indices]
-        
-        # Get foreground statistics (pixels above noise level)
-        if len(samples) > 0:
-            noise_level = np.percentile(samples, background_level)  # Assume background is roughly lower half
-            foreground = samples[samples > noise_level]
-            if len(foreground) > 0:
-                z_stats.append((z, np.median(foreground), np.std(foreground)))
+        # Apply this mask to the segmentation WHERE objects exist (label > 0)
+        trim_target_mask = voxels_to_trim & (segmentation > 0)
+        num_trimmed = np.sum(trim_target_mask)
+        print(f"  Identified {num_trimmed} object voxels for trimming.")
+
+        if num_trimmed > 0:
+            # Store which voxels were trimmed before modifying segmentation
+            trimmed_voxels_mask[trim_target_mask] = True
+            # Set trimmed voxels to background (0) IN-PLACE
+            segmentation[trim_target_mask] = 0
+            print("  Trimming applied.")
+        else:
+            print("  No voxels met the trimming criteria.")
+
+        del distance_from_boundary, voxels_to_trim, trim_target_mask
+        gc.collect()
+
+    except MemoryError:
+        # --- Fallback to Chunked Processing ---
+        print("\n  MemoryError calculating full distance transform. Falling back to chunked processing...")
+        gc.collect() # Try to free memory before chunking
+
+        num_chunks = math.ceil(original_shape[0] / chunk_size_z)
+        total_trimmed_in_chunks = 0
+
+        for i in tqdm(range(num_chunks), desc="  Processing Chunks"):
+            z_start = i * chunk_size_z
+            z_end = min((i + 1) * chunk_size_z, original_shape[0])
+            if z_start >= z_end: continue
+
+            # Load INVERSE boundary chunk
+            inv_boundary_chunk = ~hull_boundary_mask[z_start:z_end]
+            if not np.any(~inv_boundary_chunk): # If boundary covers whole chunk
+                 edt_chunk = np.zeros(inv_boundary_chunk.shape, dtype=np.float32)
             else:
-                z_stats.append((z, np.median(samples), np.std(samples)))
+                 edt_chunk = distance_transform_edt(inv_boundary_chunk, sampling=spacing)
+
+            # Identify voxels below threshold in this chunk
+            voxels_to_trim_chunk = (edt_chunk < distance_threshold)
+
+            # Apply to the corresponding segmentation slice VIEW
+            seg_chunk_view = segmentation[z_start:z_end]
+            trim_target_mask_chunk = voxels_to_trim_chunk & (seg_chunk_view > 0)
+            num_trimmed_chunk = np.sum(trim_target_mask_chunk)
+
+            if num_trimmed_chunk > 0:
+                 # Update the global tracking mask
+                 trimmed_voxels_mask[z_start:z_end][trim_target_mask_chunk] = True
+                 # Modify the segmentation VIEW in-place
+                 seg_chunk_view[trim_target_mask_chunk] = 0
+                 total_trimmed_in_chunks += num_trimmed_chunk
+
+            del inv_boundary_chunk, edt_chunk, voxels_to_trim_chunk
+            del seg_chunk_view, trim_target_mask_chunk
+            gc.collect()
+
+        print(f"  Chunked trimming applied. Total voxels trimmed: {total_trimmed_in_chunks}")
+
+    # --- Optional: Remove Small Remnants ---
+    if min_remaining_size > 0:
+        print(f"  Removing remnants smaller than {min_remaining_size} voxels...")
+        start_rem = time.time()
+        # remove_small_objects works on boolean or labeled arrays.
+        # Need to apply it efficiently. We can relabel briefly or work on boolean.
+        # Option 1: Relabel (cleaner but uses more memory temporarily)
+        # temp_labels, num_final = label(segmentation > 0)
+        # remove_small_objects(temp_labels, min_size=min_remaining_size, connectivity=1, in_place=True)
+        # segmentation[temp_labels == 0] = 0 # Ensure background is zero
+        # del temp_labels
+
+        # Option 2: Boolean mask and selective removal (more complex code, less memory)
+        # Create boolean mask of current objects
+        bool_seg = segmentation > 0
+        # Remove small objects from boolean mask
+        cleaned_bool_seg = remove_small_objects(bool_seg, min_size=min_remaining_size, connectivity=1)
+        # Identify voxels that were part of small objects
+        small_remnant_mask = bool_seg & (~cleaned_bool_seg)
+        num_remnants_removed = np.sum(segmentation[small_remnant_mask] > 0) # Count actual labeled voxels removed
+        # Set identified remnants to 0 in the original labeled array
+        segmentation[small_remnant_mask] = 0
+        print(f"  Removed {num_remnants_removed} voxels belonging to small remnants "
+              f"in {time.time()-start_rem:.2f}s.")
+        del bool_seg, cleaned_bool_seg, small_remnant_mask
+        gc.collect()
+
+    print("--- Edge trimming finished ---")
+    return trimmed_voxels_mask
+
+def segment_microglia_first_pass(
+    volume, # Use original volume for tissue mask
+    spacing,
+    tubular_scales=[0.5, 1.0, 2.0, 3.0],
+    smooth_sigma=0.5,
+    connect_max_gap_physical=1.0,
+    min_size_voxels=50,
+    sensitivity=0.8,
+    background_level=50,
+    target_level=75,
+    hull_erosion_iterations=1,          # For defining hull boundary
+    edge_trim_distance_threshold=2.0,   # Physical distance for trimming
+    # --- Chunking ---
+    edge_distance_chunk_size_z=32      # Chunk size for distance calc fallback
+    ):
+    """
+    First pass segmentation using slice-wise enhancement and trimming edge artifacts
+    based on distance from the hull boundary.
+    """
+    # --- Initial Setup ---
+    sensitivity = max(0.01, min(1.0, sensitivity))
+    original_shape = volume.shape
+    spacing = tuple(float(s) for s in spacing)
+    first_pass_params = { # ... Store all params ...
+        'spacing': spacing, 'tubular_scales': tubular_scales, 'smooth_sigma': smooth_sigma,
+        'connect_max_gap_physical': connect_max_gap_physical, 'min_size_voxels': min_size_voxels,
+        'sensitivity': sensitivity, 'background_level': background_level, 'target_level': target_level,
+        'hull_erosion_iterations': hull_erosion_iterations,
+        'edge_trim_distance_threshold': edge_trim_distance_threshold, # New
+        'edge_distance_chunk_size_z': edge_distance_chunk_size_z,
+        'original_shape': original_shape }
+    print(f"\n--- Starting First Pass Segmentation (Edge Trimming Method) ---")
+    print(f"Params: ... hull_erosion={hull_erosion_iterations}, "
+          f"trim_dist={edge_trim_distance_threshold:.2f}, ")
+    initial_mem = psutil.Process().memory_info().rss / (1024 * 1024)
+    print(f"Initial memory usage: {initial_mem:.2f} MB")
+
+    # --- Step 1: Enhance Tubular Structures ---
+    print("\nStep 1: Enhancing structures...")
+    # Assuming enhance_tubular_structures_slice_by_slice is defined elsewhere
+    enhanced, enhance_temp_dir = enhance_tubular_structures_slice_by_slice(
+        volume,
+        scales=tubular_scales,
+        spacing=spacing,
+        apply_3d_smoothing=(smooth_sigma > 0),
+        smoothing_sigma_phys=smooth_sigma
+        # Pass other enhance parameters if needed (frangi_alpha, etc.)
+    )
+    print("Enhancement done.")
+    gc.collect()
+
+    # --- Step 2: Normalize Intensity per Z-slice ---
+    print("\nStep 2: Normalizing signal across depth...")
+    normalized_temp_dir = tempfile.mkdtemp(prefix="normalize_")
+    normalized_path = os.path.join(normalized_temp_dir, 'normalized.dat')
+    normalized = np.memmap(normalized_path, dtype=np.float32, mode='w+',
+                           shape=enhanced.shape)
+
+    # Calculate z-stats
+    z_stats = []
+    print("  Calculating z-plane statistics...")
+    for z in tqdm(range(enhanced.shape[0]), desc="  Calculating z-stats"):
+        plane = enhanced[z]
+        if plane is None or plane.size == 0 or not np.any(np.isfinite(plane)):
+             z_stats.append((z, 0, 1)); continue # Fallback for bad slice
+
+        max_samples = 50000
+        finite_plane = plane[np.isfinite(plane)]
+        if finite_plane.size == 0:
+             z_stats.append((z, 0, 1)); continue # Fallback if no finite values
+
+        if finite_plane.size < max_samples:
+             samples = finite_plane
         else:
-            z_stats.append((z, 0, 1))  # Fallback values
+             samples = np.random.choice(finite_plane, max_samples, replace=False)
 
-    # Find target intensity (use statistics from best planes, e.g., top 25%)
-    z_medians = [stat[1] for stat in z_stats]
-    target_intensity = np.percentile(z_medians, target_level)  # Use upper quartile as target
+        if samples.size > 0:
+            try:
+                # USE background_level PARAMETER HERE
+                noise_level = np.percentile(samples, background_level)
+                foreground = samples[samples > noise_level]
 
-    # Normalize each plane
-    for z, median, std in tqdm(z_stats, desc="Normalizing z-planes"):
-        if median > 0:
-            # Scale factor to match target intensity
-            scale_factor = target_intensity / max(median, 1e-6)
-            # Apply scaling
-            normalized[z] = enhanced[z] * scale_factor
+                median_val = np.median(foreground) if len(foreground) > 0 else np.median(samples)
+                std_val = np.std(foreground) if len(foreground) > 0 else np.std(samples)
+
+                if not np.isfinite(median_val): median_val = 0.0
+                if not np.isfinite(std_val) or std_val <= 0: std_val = 1.0
+
+                z_stats.append((z, float(median_val), float(std_val)))
+            except Exception as e:
+                 print(f"  Warn: Error calculating stats for slice {z}: {e}. Using defaults.")
+                 z_stats.append((z, 0, 1))
         else:
-            normalized[z] = enhanced[z]
-    
-    # Thresholding based on chosen method - process in chunks
-    print(f"Applying Otsu thresholding with sensitivity {sensitivity}...")
-    
+             z_stats.append((z, 0, 1)) # Should not happen if finite_plane check passed
 
-    # For Otsu, we need to compute the global threshold first
-    # Sample a subset of the data to calculate threshold (to save memory)
-    sample_size = min(1000000, normalized.size)
-    indices = np.random.choice(normalized.size, sample_size, replace=False)
-    flat_indices = np.unravel_index(indices, normalized.shape)
-    samples = normalized[flat_indices]
-    threshold = threshold_otsu(samples)
-    adjusted_threshold = threshold * (1 - sensitivity * 0.5)
-    
+    # Apply normalization
+    z_medians = [item[1] for item in z_stats
+                 if isinstance(item, (tuple, list)) and len(item)==3 and item[1] > 0]
+    if not z_medians:
+        print("  Warning: No valid foreground medians found. Skipping normalization scaling.")
+        target_intensity = 1.0
+        print("  Copying enhanced data directly to normalized memmap...")
+        chunk_size = min(100, enhanced.shape[0]) if enhanced.shape[0] > 0 else 1
+        for i in range(0, enhanced.shape[0], chunk_size):
+             end = min(i + chunk_size, enhanced.shape[0])
+             normalized[i:end] = enhanced[i:end]
+    else:
+        # USE target_level PARAMETER HERE
+        target_intensity = np.percentile(z_medians, target_level)
+        print(f"  Target intensity for normalization: {target_intensity:.4f}")
+        print("  Applying normalization scaling...")
+        for item in tqdm(z_stats, desc="  Normalizing z-planes"):
+            if isinstance(item, (tuple, list)) and len(item) == 3:
+                z, median, std = item
+                current_slice = enhanced[z]
+                if current_slice is None or not np.any(np.isfinite(current_slice)):
+                     normalized[z] = 0.0; continue
+                if median > 0:
+                    scale_factor = target_intensity / median
+                    normalized[z] = (current_slice * scale_factor).astype(np.float32)
+                else:
+                    normalized[z] = current_slice.astype(np.float32)
+            else: # Fallback for malformed item
+                 print(f"  Warn: Skipping bad item in normalization: {item}")
+                 try:
+                     z_index = int(item[0]) if isinstance(item, (tuple, list)) else item
+                     if 0 <= z_index < enhanced.shape[0]:
+                          normalized[z_index] = enhanced[z_index].astype(np.float32)
+                 except: pass # Ignore if index determination fails
+
+    normalized.flush()
+    print("Normalization step finished.")
+    del enhanced; gc.collect()
+    try: rmtree(enhance_temp_dir)
+    except Exception as e: print(f"Warn: Could not clean enhance temp dir: {e}")
+    gc.collect()
+
+    # --- Step 3: Thresholding ---
+    print("\nStep 3: Thresholding...")
+    binary_temp_dir = tempfile.mkdtemp(prefix="binary_")
+    binary_path = os.path.join(binary_temp_dir, 'b.dat')
+    binary = np.memmap(binary_path, dtype=bool, mode='w+', shape=original_shape)
+
+    # Calculate threshold (Otsu on sample)
+    sample_size = min(2_000_000, normalized.size)
+    print(f"  Sampling {sample_size} points for Otsu...")
+    if sample_size == normalized.size:
+         samples = normalized[:].ravel()
+    else:
+        # Ensure memmap is still valid before sampling
+        if normalized._mmap is None: raise RuntimeError("Normalized memmap closed unexpectedly before Otsu sampling.")
+        indices = np.random.choice(normalized.size, sample_size, replace=False)
+        coords = np.unravel_index(indices, normalized.shape); samples = normalized[coords]
+
+    adjusted_threshold = 0 # Default
+    if samples.size > 0 and np.any(samples > np.min(samples)): # Check variance
+        try:
+            # Basic foreground guess (e.g., above 10th percentile) for robustness
+            foreground_samples = samples[samples > np.percentile(samples, 10)]
+            if foreground_samples.size == 0: foreground_samples = samples # Fallback
+            threshold = threshold_otsu(foreground_samples)
+            # USE sensitivity PARAMETER HERE
+            adjusted_threshold = threshold * (1 - (sensitivity * 0.5))
+            print(f"  Global Otsu threshold: {threshold:.4f}, Adjusted threshold: {adjusted_threshold:.4f}")
+        except ValueError:
+            print("  Warn: Otsu failed. Using median threshold.")
+            median_val = np.median(samples)
+            adjusted_threshold = median_val * (1 - (sensitivity * 0.5)) # Apply sensitivity to median
+            print(f"  Using median-based adjusted threshold: {adjusted_threshold:.4f}")
+    else:
+         print("  Warn: No valid samples/variance for Otsu. Using median.")
+         median_val = np.median(samples) if samples.size > 0 else 0
+         adjusted_threshold = median_val * (1 - (sensitivity * 0.5)) # Apply sensitivity to median
+         print(f"  Using median-based adjusted threshold: {adjusted_threshold:.4f}")
+
     # Apply threshold in chunks
-    chunk_size = min(50, normalized.shape[0])
-    for i in tqdm(range(0, normalized.shape[0], chunk_size)):
-        end_idx = min(i + chunk_size, normalized.shape[0])
-        binary[i:end_idx] = normalized[i:end_idx] > adjusted_threshold
-    
-    # Free memory by releasing enhanced volume
-    del enhanced
-    gc.collect()
-    rmtree(enhanced_temp_dir)
+    chunk_size_z = min(100, original_shape[0])
+    print(f"  Applying threshold {adjusted_threshold:.4f}...")
+    for i in tqdm(range(0, original_shape[0], chunk_size_z), desc="  Applying Threshold"):
+         end_idx = min(i + chunk_size_z, original_shape[0])
+         if normalized._mmap is not None:
+              norm_chunk = normalized[i:end_idx]
+              binary[i:end_idx] = norm_chunk > adjusted_threshold
+              del norm_chunk
+         else:
+              print(f"Error: 'normalized' memmap closed before thresholding chunk {i}")
+              binary[i:end_idx] = False # Fill failed chunk with False
 
-    # Free memory by releasing normalized volume
-    del normalized
+    binary.flush()
+    print("Thresholding done.")
+    # Cleanup normalized memmap
+    if 'normalized' in locals() and normalized._mmap is not None: del normalized
     gc.collect()
-    rmtree(normalized_temp_dir)
-    
-    # Connect fragmented processes
-    print("Connecting fragmented processes...")
-    max_gap = max(1, int(3 / min(isotropic_spacing)))  # Scale gap by spacing
-    connected_binary, connected_temp_dir = connect_fragmented_processes(binary, max_gap=max_gap)
-    
-    # Free memory
-    del binary
+    try: os.unlink(normalized_path); rmtree(normalized_temp_dir)
+    except Exception as e: print(f"Warn: Could not clean norm temp files: {e}")
     gc.collect()
-    os.unlink(binary_path)
-    rmtree(binary_temp_dir)
-    
-    # Remove small objects - process in chunks
-    print(f"Removing objects smaller than {min_size} voxels...")
-    cleaned_binary_dir = tempfile.mkdtemp()
-    cleaned_binary_path = os.path.join(cleaned_binary_dir, 'cleaned_binary.dat')
-    cleaned_binary = np.memmap(cleaned_binary_path, dtype=np.bool_, mode='w+', shape=connected_binary.shape)
-    
-    # This is tricky to do in chunks because object size can cross chunk boundaries
-    # We'll process the entire volume but use a memory-mapped output
-    cleaned_binary_temp = remove_small_objects(connected_binary, min_size=min_size)
-    cleaned_binary[:] = cleaned_binary_temp[:]
+
+    # --- Step 4: Connect Fragmented Processes ---
+    print("\nStep 4: Connecting fragments...")
+    # Assuming connect_fragmented_processes is defined elsewhere
+    connected_binary, connected_temp_dir = connect_fragmented_processes(
+        binary,
+        spacing=spacing,
+        max_gap_physical=connect_max_gap_physical # Use parameter
+    )
+    print("Connection done.")
+    del binary; gc.collect()
+    try: os.unlink(binary_path); rmtree(binary_temp_dir)
+    except Exception as e: print(f"Warn: Could not clean binary temp files: {e}")
+    gc.collect()
+
+    # --- Step 5: Remove Small Objects ---
+    print(f"\nStep 5: Cleaning objects smaller than {min_size_voxels} voxels...")
+    cleaned_binary_dir=tempfile.mkdtemp(prefix="cleaned_")
+    cleaned_binary_path=os.path.join(cleaned_binary_dir, 'c.dat')
+    cleaned_binary=np.memmap(cleaned_binary_path, dtype=bool, mode='w+',
+                              shape=original_shape)
+    # Assuming remove_small_objects is available
+    remove_small_objects(connected_binary,
+                         min_size=min_size_voxels, # Use parameter
+                         connectivity=1, # Use face connectivity
+                         out=cleaned_binary)
     cleaned_binary.flush()
-    
-    # Free memory
-    del connected_binary, cleaned_binary_temp
+    print("Cleaning done.")
+    conn_bin_fn = connected_binary.filename
+    del connected_binary; gc.collect()
+    try: os.unlink(conn_bin_fn); rmtree(connected_temp_dir)
+    except Exception as e: print(f"Warn: Could not clean connected temp files: {e}")
     gc.collect()
-    rmtree(connected_temp_dir)
-    
-    # Define a helper function to find the root label in the equivalence tree
-    def find_root(equivalences, label):
-        root = label
-        # Follow chain of equivalences to find the root
-        while root in equivalences:
-            root = equivalences[root]
-        
-        # Path compression - update all nodes in the path to point to the root
-        current = label
-        while current in equivalences and equivalences[current] != root:
-            next_node = equivalences[current]
-            equivalences[current] = root
-            current = next_node
-            
-        return root
-    
-    # Label connected components - this is memory intensive so we'll chunk it
-    first_pass_dir = tempfile.mkdtemp()
-    first_pass_path = os.path.join(first_pass_dir, 'first_pass.dat')
-    first_pass = np.memmap(first_pass_path, dtype=np.int32, mode='w+', shape=cleaned_binary.shape)
-    
-    # Process in chunks with overlap
-    overlap = 15  # Larger overlap to better handle crossing objects
-    chunk_size = min(50, cleaned_binary.shape[0])
-    max_label = 0
-    
-    # Dictionary to track label equivalences
-    label_equivalences = {}
-    
-    print("Labeling connected components with improved stitching algorithm...")
-    
-    # First pass - label each chunk and build equivalence table
-    for i in tqdm(range(0, cleaned_binary.shape[0], chunk_size - overlap), desc="First-pass labeling"):
-        start_idx = max(0, i)
-        end_idx = min(i + chunk_size, cleaned_binary.shape[0])
-        
-        # Skip if chunk is too small
-        if end_idx - start_idx < overlap + 1:
-            continue
-            
-        # Get chunk
-        chunk = cleaned_binary[start_idx:end_idx].copy()
-        
-        # Label the chunk
-        chunk_labels, num_labels = label(chunk)
-        
-        # Shift labels to avoid conflicts
-        if num_labels > 0 and max_label > 0:
-            chunk_labels[chunk_labels > 0] += max_label
-        
-        # Update max label
-        if num_labels > 0:
-            max_label += num_labels
-        
-        # Store in output
-        first_pass[start_idx:end_idx] = chunk_labels
-        
-        # If not the first chunk, find equivalences in the overlap region
-        if i > 0:
-            overlap_start = start_idx
-            overlap_end = min(start_idx + overlap, end_idx)
-            
-            # We need to check connectivity between current chunk and previous chunk
-            # For each slice in the overlap region
-            for z_offset in range(min(overlap, overlap_end - overlap_start)):
-                curr_z = overlap_start + z_offset
-                
-                # Skip if we're at the boundary
-                if curr_z <= 0 or curr_z >= cleaned_binary.shape[0]:
-                    continue
-                
-                # Get current and previous slices
-                curr_slice = cleaned_binary[curr_z]
-                prev_slice = cleaned_binary[curr_z - 1]
-                
-                # Find where objects touch between slices
-                touching_mask = np.logical_and(curr_slice, prev_slice)
-                
-                if np.any(touching_mask):
-                    # Get labels for touching objects
-                    prev_labels = first_pass[curr_z - 1][touching_mask]
-                    curr_labels = first_pass[curr_z][touching_mask]
-                    
-                    # Create equivalence pairs
-                    for j in range(len(prev_labels)):
-                        prev_label = prev_labels[j]
-                        curr_label = curr_labels[j]
-                        
-                        if prev_label == 0 or curr_label == 0:
-                            continue  # Skip background
-                            
-                        # Find roots for both labels
-                        root_prev = find_root(label_equivalences, prev_label)
-                        root_curr = find_root(label_equivalences, curr_label)
-                        
-                        # Create equivalence if different
-                        if root_prev != root_curr:
-                            # Always use the smaller label as the root
-                            if root_prev < root_curr:
-                                label_equivalences[root_curr] = root_prev
-                            else:
-                                label_equivalences[root_prev] = root_curr
-        
-        # Clean up
-        del chunk, chunk_labels
-        gc.collect()
-    
-    # Flatten the equivalence tree
-    print("Resolving label equivalences...")
-    flattened_equivalences = {}
-    for label in tqdm(np.unique(first_pass[first_pass > 0]), desc="Flattening equivalence tree"):
-        flattened_equivalences[label] = find_root(label_equivalences, label)
-    
-    # Apply equivalences - process in chunks to save memory
-    print("Applying equivalences to create consistent labeling...")
-    for i in tqdm(range(0, first_pass.shape[0], chunk_size), desc="Second-pass relabeling"):
-        end_idx = min(i + chunk_size, first_pass.shape[0])
-        chunk = first_pass[i:end_idx].copy()
-        
-        # Apply mapping to all non-zero labels
-        mask = chunk > 0
-        if np.any(mask):
-            # Vectorized mapping using masked array
-            unique_labels = np.unique(chunk[mask])
-            for label in unique_labels:
-                if label in flattened_equivalences:
-                    chunk[chunk == label] = flattened_equivalences[label]
-        
-        # Update first_pass
-        first_pass[i:end_idx] = chunk
-        first_pass.flush()
-        
-        # Clean up
-        del chunk
-        gc.collect()
-    
-    # Relabel to get consecutive labels
-    print("Relabeling for consecutive indices...")
-    # Process in chunks to minimize memory use
-    max_label = 0
-    label_map = {}
-    
-    # First find all unique labels
-    for i in tqdm(range(0, first_pass.shape[0], chunk_size), desc="Finding unique labels"):
-        end_idx = min(i + chunk_size, first_pass.shape[0])
-        chunk = first_pass[i:end_idx]
-        for label in np.unique(chunk):
-            if label > 0 and label not in label_map:
-                max_label += 1
-                label_map[label] = max_label
-    
-    # Then apply the mapping
-    for i in tqdm(range(0, first_pass.shape[0], chunk_size), desc="Applying new labels"):
-        end_idx = min(i + chunk_size, first_pass.shape[0])
-        chunk = first_pass[i:end_idx].copy()
-        
-        # Apply new consecutive labels
-        for old_label, new_label in label_map.items():
-            chunk[chunk == old_label] = new_label
-        
-        # Update memory-mapped array
-        first_pass[i:end_idx] = chunk
-        first_pass.flush()
-        
-        # Clean up
-        del chunk
-        gc.collect()
-    
-    print(f"Found {max_label} connected components after stitching")
-    
-    # Free memory
-    del cleaned_binary
-    gc.collect()
-    os.unlink(cleaned_binary_path)
-    rmtree(cleaned_binary_dir)
-    
-    # Upsample to original size
-    print("Upsampling segmentation to original size...")
-    upsampled_first_pass = upsample_segmentation(first_pass, original_shape, downsampled_shape)
-    
-    # Clean up memmaps
-    del first_pass, downsampled_volume
-    gc.collect()
-    os.unlink(first_pass_path)
-    rmtree(first_pass_dir)
-    rmtree(downsample_temp_dir)
-    
-    # Report final memory usage
-    print(f"Final memory usage: {psutil.Process().memory_info().rss / (1024 * 1024):.2f} MB")
-    
-    return upsampled_first_pass, first_pass_params
 
+    # --- Step 6: Label Connected Components ---
+    print("\nStep 6: Labeling components...")
+    labels_temp_dir=tempfile.mkdtemp(prefix="labels_")
+    labels_path=os.path.join(labels_temp_dir, 'l.dat')
+    first_pass_segmentation_memmap=np.memmap(labels_path, dtype=np.int32,
+                                             mode='w+', shape=original_shape)
+    num_features = ndimage.label(
+        cleaned_binary,
+        structure=generate_binary_structure(3, 1), # Face connectivity
+        output=first_pass_segmentation_memmap
+    )
+    first_pass_segmentation_memmap.flush()
+    print(f"Labeling done ({num_features} features found).")
+    cleaned_bin_fn = cleaned_binary.filename
+    del cleaned_binary; gc.collect()
+    try: os.unlink(cleaned_bin_fn); rmtree(cleaned_binary_dir)
+    except Exception as e: print(f"Warn: Could not clean cleaned binary temp files: {e}")
+    gc.collect()
+
+    # --- Step 7: Load Labeled Segmentation into Memory ---
+    print("\nStep 7: Loading labels into memory...")
+    first_pass_segmentation = np.array(first_pass_segmentation_memmap)
+    labels_memmap_filename = first_pass_segmentation_memmap.filename
+    del first_pass_segmentation_memmap; gc.collect()
+    try: os.unlink(labels_memmap_filename); rmtree(labels_temp_dir)
+    except Exception as e: print(f"Warn: Could not clean label temp files: {e}")
+    gc.collect()
+    print("Labels loaded into memory.")
+
+    # --- Step 8: Trim Edge Artifacts ---
+    print("\n--- Trimming Edge Artifacts by Distance ---")
+    hull_boundary_mask = np.zeros(original_shape, dtype=bool) # Initialize
+    trimmed_voxels_mask = np.zeros(original_shape, dtype=bool) # Initialize
+    hull_stack = None # Ensure cleanup
+
+    try:
+        # --- 8a. Generate Hull Boundary ---
+        hull_boundary_mask, hull_stack = generate_hull_boundary_and_stack(
+            volume, hull_erosion_iterations=hull_erosion_iterations
+        )
+        if hull_stack is not None: del hull_stack; gc.collect() # Don't need stack
+
+        if hull_boundary_mask is None or not np.any(hull_boundary_mask):
+            print("  Hull boundary mask empty/not generated. Skipping edge trimming.")
+            hull_boundary_mask = np.zeros(original_shape, dtype=bool) # Ensure return is valid shape
+        else:
+            # --- 8b. Call Trimming Helper Function ---
+            # Pass segmentation array (will be modified in-place)
+            trimmed_voxels_mask = trim_object_edges_by_distance(
+                segmentation=first_pass_segmentation, # Pass the array to modify
+                hull_boundary_mask=hull_boundary_mask,
+                spacing=spacing,
+                distance_threshold=edge_trim_distance_threshold,
+                min_remaining_size=min_size_voxels,
+                chunk_size_z=edge_distance_chunk_size_z
+            )
+
+    except Exception as e:
+         print(f"\nERROR during edge artifact trimming: {e}")
+         import traceback; traceback.print_exc()
+         # Ensure masks are valid empty defaults on error
+         hull_boundary_mask = np.zeros(original_shape, dtype=bool)
+         trimmed_voxels_mask = np.zeros(original_shape, dtype=bool)
+         gc.collect()
+    finally:
+         # Cleanup hull_stack if it somehow still exists
+         if 'hull_stack' in locals() and hull_stack is not None:
+             del hull_stack; gc.collect()
+
+
+    # --- Finalization ---
+    print(f"\n--- First Pass Segmentation Finished ---")
+    # Recalculate final count after trimming and remnant removal
+    final_unique_labels = np.unique(first_pass_segmentation)
+    final_object_count = len(final_unique_labels[final_unique_labels != 0])
+    print(f"Final labeled mask shape: {first_pass_segmentation.shape}")
+    print(f"Number of labeled objects remaining: {final_object_count}")
+    final_mem = psutil.Process().memory_info().rss / (1024 * 1024)
+    print(f"Final memory usage: {final_mem:.2f} MB")
+
+    return first_pass_segmentation, first_pass_params, hull_boundary_mask
 
 def extract_soma_masks(segmentation_mask, 
                       small_object_percentile=50,  # Changed to percentile
@@ -856,4 +908,3 @@ def separate_multi_soma_cells(segmentation_mask, intensity_volume, soma_mask, mi
         separated_mask[z_min:z_max, y_min:y_max, x_min:x_max] = full_subvol
     
     return separated_mask
-
