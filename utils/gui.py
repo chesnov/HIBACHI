@@ -385,9 +385,8 @@ class DynamicGUIManager:
                                                             smooth_sigma=current_values.get("smooth_sigma", 1.0),
                                                             connect_max_gap_physical=1,
                                                             min_size_voxels=current_values.get("min_size", 100),
-                                                            sensitivity=current_values.get("sensitivity", 0.2),
-                                                            background_level=current_values.get("background_level", 50),
-                                                            target_level=current_values.get("target_level", 75),
+                                                            low_threshold_percentile=current_values.get("background_level", 50),
+                                                            high_threshold_percentile=current_values.get("target_level", 75),
                                                             edge_trim_distance_threshold=current_values.get("edge_trim_distance_threshold", 2.0),
                                                         )
                 
