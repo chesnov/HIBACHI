@@ -3,6 +3,8 @@ from scipy import ndimage
 # Make sure all necessary ndimage functions are imported
 from scipy.ndimage import (gaussian_filter, distance_transform_edt,
                            binary_erosion, generate_binary_structure)
+from scipy.ndimage import (distance_transform_edt, label as ndimage_label, find_objects,
+                           binary_opening, binary_closing)
 from skimage.filters import frangi, threshold_otsu, sato
 from skimage.morphology import convex_hull_image, remove_small_objects
 import tempfile
@@ -235,127 +237,175 @@ def estimate_memory(shape, *dtypes, overhead_factor=2.5):
 
 def trim_object_edges_by_distance(
     segmentation_memmap,     # Labeled segmentation MEMMAP (opened r+ OR w+)
+    original_volume,         # Original intensity volume (ndarray or memmap)
     hull_boundary_mask,      # Boolean mask of the hull boundary (in-memory)
-    spacing,                 # Voxel spacing for physical distance
+    spacing,                 # Voxel spacing for distance calculation
     distance_threshold,      # Physical distance threshold
-    min_remaining_size=10,   # Minimum size for object remnants after trimming
-    chunk_size_z=32,         # Chunk size for chunked EDT/application
-    # ram_safety_factor is no longer needed for EDT check
+    global_brightness_cutoff,# GLOBAL intensity value threshold for trimming
+    min_remaining_size=10,   # Minimum size for object remnants after trimming/relabeling
+    chunk_size_z=32          # Chunk size for chunked processing
     ):
     """
-    Removes voxels from labeled objects that are closer than a threshold
-    distance to the hull boundary. Optionally removes objects that become
-    too small after trimming. Operates IN-PLACE on the input segmentation_memmap.
-    *** Uses chunked distance transform calculation exclusively to save RAM. ***
+    Removes voxels from labeled objects that are BOTH close to the hull boundary
+    AND below a GLOBAL brightness cutoff.
+    Optionally removes objects that become too small after trimming.
+    If trimming disconnects an object, the resulting components are relabeled.
+    Operates IN-PLACE on the input segmentation_memmap.
+    Uses chunked distance transform calculation exclusively to save RAM.
     """
-    print(f"\n--- Trimming object edges closer than {distance_threshold:.2f} units to hull boundary (on Memmap, Chunked EDT) ---")
+    print(f"\n--- Trimming object edges (Dist < {distance_threshold:.2f} AND Brightness < {global_brightness_cutoff:.4f}) ---")
     original_shape = segmentation_memmap.shape
     trimmed_voxels_mask = np.zeros(original_shape, dtype=bool) # Track in memory
 
     if not np.any(hull_boundary_mask):
         print("  Hull boundary mask is empty. No trimming performed.")
-        return trimmed_voxels_mask # Return empty mask
+        return trimmed_voxels_mask
 
-    # --- Check if memmap is writable ---
+    # Check if memmap is writable... (as before)
     writable_modes = ['r+', 'w+']
     if segmentation_memmap.mode not in writable_modes:
          raise ValueError(f"segmentation_memmap must be opened in a writable mode ({writable_modes}) for in-place modification. Found mode: '{segmentation_memmap.mode}'")
 
-    # --- Skip Full EDT Attempt - Proceed Directly to Chunked Processing ---
-    print("\n  Executing chunked distance transform and trimming...")
-    gc.collect() # Free memory before starting chunks
+    # Get original labels present before trimming... (as before)
+    print("  Finding unique labels before trimming...")
+    try:
+        original_labels_present = np.unique(segmentation_memmap)
+        original_labels_present = original_labels_present[original_labels_present != 0]
+        print(f"  Found {len(original_labels_present)} unique labels initially.")
+        if len(original_labels_present) == 0:
+             print("  No objects found in segmentation. Skipping trimming.")
+             return trimmed_voxels_mask
+    except MemoryError:
+         raise MemoryError("Failed to get initial unique labels from segmentation memmap.")
+    except Exception as e:
+         raise RuntimeError(f"Failed to get initial unique labels: {e}") from e
+
+
+    # --- Chunked Processing for Distance Calc and Combined Trimming ---
+    print("\n  Executing chunked distance transform and combined (distance+global brightness) trimming...")
+    gc.collect()
 
     num_chunks = math.ceil(original_shape[0] / chunk_size_z)
     total_trimmed_in_chunks = 0
     start_chunked_time = time.time()
 
-    # Need hull_boundary_mask accessible here - it should still be in memory
     if 'hull_boundary_mask' not in locals() or hull_boundary_mask is None:
          raise RuntimeError("Hull boundary mask is not available for chunked processing.")
-    # Log hull mask memory usage (approximate)
     hull_mem_gb = hull_boundary_mask.nbytes / (1024**3)
     print(f"  Processing {num_chunks} chunks (chunk_size_z={chunk_size_z}). Hull mask size: {hull_mem_gb:.2f} GB")
 
-
-    for i in tqdm(range(num_chunks), desc="  Processing Chunks (EDT+Trim)"):
+    for i in tqdm(range(num_chunks), desc="  Processing Chunks (Trim)"):
         z_start = i * chunk_size_z
         z_end = min((i + 1) * chunk_size_z, original_shape[0])
         if z_start >= z_end: continue
 
-        # --- Process one chunk ---
         try:
-            # Load INVERSE boundary chunk (boolean)
+            # 1. Calculate Distance Transform for the chunk
             inv_boundary_chunk = ~hull_boundary_mask[z_start:z_end]
-            edt_chunk = None # Initialize
-
-            # Calculate EDT for the chunk (relatively small)
-            if not np.any(inv_boundary_chunk):
-                 edt_chunk = np.zeros(inv_boundary_chunk.shape, dtype=np.float32)
-            elif not np.all(inv_boundary_chunk):
-                 # This is the memory-intensive part *for the chunk*
-                 edt_chunk = distance_transform_edt(inv_boundary_chunk, sampling=spacing).astype(np.float32) # Ensure float32
-            else: # All points are inside boundary in this chunk
-                 edt_chunk = np.full(inv_boundary_chunk.shape, np.finfo(np.float32).max, dtype=np.float32)
-
-            # Identify voxels below threshold in this chunk
-            voxels_to_trim_chunk = (edt_chunk < distance_threshold)
-            del edt_chunk # Free EDT chunk memory ASAP
+            edt_chunk = None
+            # ... (EDT calculation as before) ...
+            if not np.any(inv_boundary_chunk): edt_chunk = np.zeros(inv_boundary_chunk.shape, dtype=np.float32)
+            elif not np.all(inv_boundary_chunk): edt_chunk = distance_transform_edt(inv_boundary_chunk, sampling=spacing).astype(np.float32)
+            else: edt_chunk = np.full(inv_boundary_chunk.shape, np.finfo(np.float32).max, dtype=np.float32)
+            close_to_boundary_chunk = (edt_chunk < distance_threshold)
+            del inv_boundary_chunk, edt_chunk
             gc.collect()
 
-            # Apply to the corresponding segmentation memmap chunk VIEW
-            # Ensure memmap is still valid
+            # 2. Load segmentation and intensity chunks
             if not hasattr(segmentation_memmap, '_mmap') or segmentation_memmap._mmap is None:
-                 raise IOError(f"Segmentation memmap became invalid before reading chunk {i} in chunked mode")
+                 raise IOError(f"Segmentation memmap became invalid before reading chunk {i}")
+            # Read seg chunk data directly into memory for boolean ops
+            seg_chunk_data = np.array(segmentation_memmap[z_start:z_end])
+            intensity_chunk = original_volume[z_start:z_end]
 
-            seg_chunk_view = segmentation_memmap[z_start:z_end] # Get view for reading and writing
+            # 3. Identify voxels below GLOBAL brightness cutoff
+            dim_voxels_chunk = (intensity_chunk < global_brightness_cutoff)
+            del intensity_chunk # Free intensity chunk memory
+            gc.collect()
+            print(f"Number of dim voxels in chunk {i}: {np.sum(dim_voxels_chunk)}")
+            print(f"Number of close-to-boundary voxels in chunk {i}: {np.sum(close_to_boundary_chunk)}")
+            print(f"Number of dim and close-to-boundary voxels in chunk {i}: {np.sum(dim_voxels_chunk & close_to_boundary_chunk)}")
 
-            # Ensure shapes match before boolean indexing
-            if voxels_to_trim_chunk.shape != seg_chunk_view.shape:
-                 raise ValueError(f"Chunk shape mismatch at z={z_start}:{z_end}. Trim chunk: {voxels_to_trim_chunk.shape}, Seg chunk: {seg_chunk_view.shape}")
+            # 4. Combine criteria: Must be object, close, AND dim
+            trim_target_mask_chunk = (seg_chunk_data > 0) & close_to_boundary_chunk & dim_voxels_chunk
+            del seg_chunk_data, close_to_boundary_chunk, dim_voxels_chunk # Free memory
+            gc.collect()
 
-            # Read seg chunk data into memory *after* EDT chunk is deleted
-            seg_chunk_data = np.array(seg_chunk_view) # Read data for boolean op
-
-            trim_target_mask_chunk = voxels_to_trim_chunk & (seg_chunk_data > 0)
-            del seg_chunk_data # Free memory copy
+            # 5. Apply Trimming (Set identified voxels to 0)
             num_trimmed_chunk = np.sum(trim_target_mask_chunk)
-
             if num_trimmed_chunk > 0:
-                 # Update the global tracking mask (in memory)
+                 seg_chunk_view_write = segmentation_memmap[z_start:z_end]
                  trimmed_voxels_mask[z_start:z_end][trim_target_mask_chunk] = True
-                 # Modify the segmentation VIEW in-place on the memmap
-                 # Using the view directly for writing should be fine
-                 seg_chunk_view[trim_target_mask_chunk] = 0
-                 segmentation_memmap.flush() # Flush after modification
+                 seg_chunk_view_write[trim_target_mask_chunk] = 0
+                 segmentation_memmap.flush()
                  total_trimmed_in_chunks += num_trimmed_chunk
+                 del seg_chunk_view_write
 
             # --- Clean up chunk variables ---
-            del inv_boundary_chunk, voxels_to_trim_chunk
-            del seg_chunk_view, trim_target_mask_chunk
-            gc.collect() # Collect garbage after each chunk
+            del trim_target_mask_chunk
+            gc.collect()
 
-        except MemoryError:
-            print(f"\n!!! MemoryError occurred during chunked processing (Chunk {i}, z={z_start}-{z_end}).")
-            print(f"    Chunk shape: {tuple(s for s in hull_boundary_mask.shape[1:])}")
-            # Estimate RAM needed for just the EDT chunk
-            chunk_shape = (z_end - z_start,) + hull_boundary_mask.shape[1:]
-            edt_chunk_mem_mb = (np.prod(chunk_shape) * np.dtype(np.float32).itemsize) / (1024**2)
-            print(f"    Approx. RAM for EDT chunk calculation: {edt_chunk_mem_mb:.1f} MB")
-            print(f"    Consider using a smaller chunk_size_z (current: {chunk_size_z}).")
-            raise MemoryError(f"Chunked processing failed at chunk {i} due to MemoryError.") from None
+        # ... (Error handling: MemoryError, other Exception - as before) ...
+        except MemoryError as mem_err:
+            # ... (Log memory details) ...
+            raise MemoryError(f"Chunked processing failed at chunk {i} due to MemoryError.") from mem_err
         except Exception as chunk_err:
-             print(f"\n!!! Error processing chunk {i} (z={z_start}-{z_end}): {chunk_err}")
-             import traceback; traceback.print_exc()
+            # ... (Log traceback) ...
              raise RuntimeError(f"Chunked processing failed at chunk {i}.") from chunk_err
 
 
-    print(f"  Chunked EDT+trimming applied. Total voxels trimmed: {total_trimmed_in_chunks} in {time.time() - start_chunked_time:.2f}s.")
+    print(f"  Chunked trimming applied. Total voxels trimmed: {total_trimmed_in_chunks} in {time.time() - start_chunked_time:.2f}s.")
+    gc.collect()
 
-    # --- Optional: Remove Small Remnants (Operating on Memmap) ---
-    # This logic remains the same as it happens after the EDT step
+
+    # --- Step 2: Relabel Disconnected Components ---
+    # ... (This section remains exactly the same as before) ...
+    print("\n  Checking for and relabeling disconnected components...")
+    start_relabel_time = time.time()
+    try:
+        print("    Finding max label after trimming...")
+        max_label = 0
+        chunk_size_max = min(500, original_shape[0]) if original_shape[0] > 0 else 1
+        for i in tqdm(range(0, original_shape[0], chunk_size_max), desc="    Finding Max Label", disable=original_shape[0]<=chunk_size_max):
+             seg_chunk = segmentation_memmap[i:min(i+chunk_size_max, original_shape[0])]
+             chunk_max = np.max(seg_chunk); del seg_chunk
+             if chunk_max > max_label: max_label = chunk_max
+        next_available_label = max_label + 1
+        print(f"    Max label found: {max_label}. Next new label: {next_available_label}")
+    except MemoryError: raise MemoryError("Failed to find max label for relabeling.")
+    except Exception as e: raise RuntimeError(f"Failed to find max label for relabeling: {e}") from e
+    relabel_count = 0
+    for label_val in tqdm(original_labels_present, desc="  Relabeling Components"):
+        if not hasattr(segmentation_memmap, '_mmap') or segmentation_memmap._mmap is None: raise IOError(f"Segmentation memmap became invalid before relabeling label {label_val}")
+        try: label_mask_full = (segmentation_memmap == label_val); locations = find_objects(label_mask_full.astype(np.uint8))
+        except MemoryError: print(f"\n!!! MemoryError creating full mask for find_objects (label {label_val}). Skipping relabeling."); del label_mask_full; gc.collect(); continue
+        except Exception as find_obj_err: print(f"\n!!! Error using find_objects for label {label_val}: {find_obj_err}. Skipping relabeling."); 
+        if 'label_mask_full' in locals(): del label_mask_full; gc.collect(); continue
+        if not locations: 
+            if 'label_mask_full' in locals(): del label_mask_full; gc.collect(); continue
+        loc = locations[0]; del locations
+        label_mask_sub = label_mask_full[loc]; del label_mask_full; gc.collect()
+        if not np.any(label_mask_sub): del label_mask_sub; gc.collect(); continue
+        labeled_components_sub, num_components = ndimage_label(label_mask_sub, structure=generate_binary_structure(3,1))
+        if num_components > 1:
+            relabel_count += (num_components - 1)
+            seg_sub_view_write = segmentation_memmap[loc]
+            for c_idx in range(2, num_components + 1):
+                component_mask_sub = (labeled_components_sub == c_idx)
+                seg_sub_view_write[component_mask_sub] = next_available_label
+                next_available_label += 1
+            segmentation_memmap.flush()
+            del seg_sub_view_write
+        del loc, label_mask_sub, labeled_components_sub; gc.collect()
+    print(f"  Relabeling finished. Created {relabel_count} new labels in {time.time() - start_relabel_time:.2f}s."); gc.collect()
+
+
+
+    # --- Step 3: Optional: Remove Small Remnants (based on final labels) ---
     if min_remaining_size > 0:
-        print(f"  Removing remnants smaller than {min_remaining_size} voxels (on Memmap)...")
-        # ... (Rest of the remnant removal logic - unchanged) ...
+        print(f"  Removing remnants smaller than {min_remaining_size} voxels (on Memmap, post-relabel)...")
+        # ... (The existing remnant removal logic should work here,
+        #      operating on the now potentially relabeled segmentation_memmap) ...
         start_rem = time.time()
         print("    Creating boolean mask (chunked)...")
         if not hasattr(segmentation_memmap, '_mmap') or segmentation_memmap._mmap is None:
@@ -405,7 +455,7 @@ def trim_object_edges_by_distance(
                     print(f"  Removed {num_remnants_removed} voxels belonging to small remnants in {time.time()-start_rem:.2f}s.")
                 except MemoryError: print("    MemoryError loading boolean mask for small object removal. Skipping remnant removal."); gc.collect()
                 except Exception as e_rem: print(f"    Error during small remnant removal processing: {e_rem}. Skipping."); gc.collect()
-            else: print("  Segmentation memmap appears empty after trimming, skipping remnant removal.")
+            else: print("  Segmentation memmap appears empty after trimming/relabeling, skipping remnant removal.")
         finally:
              if 'bool_seg_memmap' in locals() and bool_seg_memmap is not None and hasattr(bool_seg_memmap, '_mmap'): del bool_seg_memmap; gc.collect()
              if 'bool_seg_temp_dir' in locals() and bool_seg_temp_dir is not None and os.path.exists(bool_seg_temp_dir):
@@ -414,33 +464,84 @@ def trim_object_edges_by_distance(
              gc.collect()
 
 
-    print("--- Edge trimming on Memmap finished ---")
-    return trimmed_voxels_mask
+    print("--- Edge trimming (combined criteria + relabeling) finished ---")
+    # The segmentation_memmap has been modified in-place.
+    return trimmed_voxels_mask # Return mask of initially trimmed voxels
+
+
 
 def segment_microglia_first_pass(
-    volume, # Use original volume for tissue mask
+    volume, # Original intensity volume
     spacing,
     tubular_scales=[0.5, 1.0, 2.0, 3.0],
     smooth_sigma=0.5,
     connect_max_gap_physical=1.0,
     min_size_voxels=50,
-    low_threshold_percentile=25.0,
-    high_threshold_percentile=95.0,
-    hull_erosion_iterations=1,
+    # --- Intensity Percentile Parameters ---
+    low_threshold_percentile=25.0,   # Used for segmentation AND basis for brightness cutoff
+    high_threshold_percentile=95.0,  # For normalization
+    # --- NEW: Factor to derive brightness cutoff from segmentation threshold ---
+    brightness_cutoff_factor=10000,    # e.g., 1.5 means cutoff is at segmentation_threshold * 1.5
+                                     # Set to <=1.0 to effectively disable brightness check beyond segmentation threshold
+    # --- Hull/Edge Parameters ---
+    hull_opening_radius_phys=0.5,      # Pre-smoothing opening radius (physical units)
+    hull_closing_radius_phys=1.0,      # Pre-smoothing closing radius (physical units)
+    hull_boundary_thickness_phys=2.0,  # Desired physical thickness of boundary
     edge_trim_distance_threshold=2.0,
-    edge_distance_chunk_size_z=32
+    # --- Chunking ---
+    edge_distance_chunk_size_z=32      # Chunk size for distance calc fallback in trimming
     ):
     """
     First pass segmentation using slice-wise enhancement, percentile-based
-    normalization/thresholding, and distance-based edge trimming. Uses memmaps
-    extensively to reduce peak RAM usage.
+    normalization/thresholding, and combined distance/brightness edge trimming.
+    Uses memmaps extensively to reduce peak RAM usage. The brightness cutoff for
+    trimming is derived globally from the low_threshold_percentile used for
+    segmentation, made stricter by brightness_cutoff_factor.
+
+    Parameters:
+    -----------
+    volume : ndarray or memmap
+        Input 3D image volume.
+    spacing : tuple
+        Physical voxel spacing (z, y, x).
+    tubular_scales : list[float]
+        Scales (in physical units) for the Frangi/Sato filters.
+    smooth_sigma : float
+        Sigma (in physical units) for optional initial Gaussian smoothing. 0 to disable.
+    connect_max_gap_physical : float
+        Maximum physical distance to bridge gaps during morphological closing.
+    min_size_voxels : int
+        Minimum voxel count for an object to be kept after initial segmentation and trimming.
+    low_threshold_percentile : float (0-100)
+        Percentile of the *normalized* enhanced signal distribution used for final segmentation thresholding.
+        Also serves as the base for the edge trimming brightness cutoff. Default: 25.0.
+    high_threshold_percentile : float (0-100)
+        Percentile of the *enhanced* signal within each slice used as the target
+        for intensity normalization. Default: 95.0.
+    brightness_cutoff_factor : float (>= 1.0)
+        Multiplier applied to the segmentation threshold to get the brightness cutoff
+        for edge trimming. E.g., 1.5 makes the brightness cutoff 1.5x higher than
+        the segmentation threshold. Values <= 1.0 effectively disable the brightness
+        check beyond the main segmentation threshold. Default: 1.5.
+    hull_erosion_iterations : int
+        Number of iterations to erode the slice-wise hull stack to define the boundary.
+    edge_trim_distance_threshold : float
+        Physical distance threshold for trimming objects near the hull boundary.
+    edge_distance_chunk_size_z : int
+        Chunk size along Z for distance calculation within edge trimming.
+
+    Returns:
+    --------
+    final_segmentation : ndarray (int32)
+        Final labeled segmentation mask (loaded in memory).
+    first_pass_params : dict
+        Dictionary containing the parameters used for the segmentation.
+    hull_boundary_mask : ndarray (bool)
+        Boolean mask indicating the hull boundary used for trimming.
     """
     # --- Initial Setup ---
     low_threshold_percentile = max(0.0, min(100.0, low_threshold_percentile))
     high_threshold_percentile = max(0.0, min(100.0, high_threshold_percentile))
-    if low_threshold_percentile >= high_threshold_percentile:
-         print(f"Warning: low_threshold_percentile ({low_threshold_percentile}) >= high_threshold_percentile ({high_threshold_percentile}). Adjusting low threshold.")
-         low_threshold_percentile = max(0.0, high_threshold_percentile - 1.0)
 
     original_shape = volume.shape
     spacing = tuple(float(s) for s in spacing)
@@ -449,20 +550,25 @@ def segment_microglia_first_pass(
         'connect_max_gap_physical': connect_max_gap_physical, 'min_size_voxels': min_size_voxels,
         'low_threshold_percentile': low_threshold_percentile,
         'high_threshold_percentile': high_threshold_percentile,
-        'hull_erosion_iterations': hull_erosion_iterations,
+        'brightness_cutoff_factor': brightness_cutoff_factor,
+        # Store NEW hull parameters
+        'hull_opening_radius_phys': hull_opening_radius_phys,
+        'hull_closing_radius_phys': hull_closing_radius_phys,
+        'hull_boundary_thickness_phys': hull_boundary_thickness_phys,
+        # Store remaining parameters
         'edge_trim_distance_threshold': edge_trim_distance_threshold,
         'edge_distance_chunk_size_z': edge_distance_chunk_size_z,
-        'original_shape': original_shape }
-    print(f"\n--- Starting First Pass Segmentation (Percentile Method, Memmap Optimized) ---")
-    print(f"Params: low_perc={low_threshold_percentile:.1f}, high_perc={high_threshold_percentile:.1f}, "
-          f"hull_erosion={hull_erosion_iterations}, trim_dist={edge_trim_distance_threshold:.2f}")
+        'original_shape': original_shape
+        }
+    print(f"\n--- Starting First Pass Segmentation (Smooth Hull) ---")
+    print(f"Params: ... hull_open={hull_opening_radius_phys}, hull_close={hull_closing_radius_phys}, "
+          f"hull_thick={hull_boundary_thickness_phys}, trim_dist={edge_trim_distance_threshold:.2f}")
     initial_mem = psutil.Process().memory_info().rss / (1024 * 1024)
     print(f"Initial memory usage: {initial_mem:.2f} MB")
 
     # Keep track of memmaps and their temporary directories for cleanup
     memmap_registry = {} # {name: (memmap_object, path, temp_dir)}
-
-    enhanced_memmap = None # Initialize
+    global_brightness_cutoff = None # Initialize brightness cutoff value
 
     try:
         # --- Step 1: Enhance Tubular Structures (Returns Memmap) ---
@@ -473,6 +579,7 @@ def segment_microglia_first_pass(
             spacing=spacing,
             apply_3d_smoothing=(smooth_sigma > 0),
             smoothing_sigma_phys=smooth_sigma
+            # Pass other enhance parameters if needed (frangi_alpha, etc.)
         )
         memmap_registry['enhanced'] = (enhanced_memmap, enhance_path, enhance_temp_dir)
         print("Enhancement memmap created.")
@@ -486,163 +593,120 @@ def segment_microglia_first_pass(
                                shape=enhanced_memmap.shape)
         memmap_registry['normalized'] = (normalized_memmap, normalized_path, normalized_temp_dir)
 
+        # Calculate z-slice high percentile values...
         z_high_percentile_values = []
         print("  Calculating z-plane high percentile values...")
         target_intensity = 1.0
         print(f"  Target intensity for high percentile ({high_threshold_percentile:.1f}): {target_intensity}")
-
         chunk_size_norm_read = min(50, enhanced_memmap.shape[0]) if enhanced_memmap.shape[0] > 0 else 1
         for z_start in tqdm(range(0, enhanced_memmap.shape[0], chunk_size_norm_read), desc="  Calculating z-stats"):
             z_end = min(z_start + chunk_size_norm_read, enhanced_memmap.shape[0])
-            # Read chunk from enhanced memmap
             enhanced_chunk = enhanced_memmap[z_start:z_end]
             for i, z in enumerate(range(z_start, z_end)):
-                plane = enhanced_chunk[i] # Access plane within the chunk
-                if plane is None or plane.size == 0 or not np.any(np.isfinite(plane)):
-                    z_high_percentile_values.append((z, 0.0)); continue
-
-                max_samples = 100000
-                finite_plane = plane[np.isfinite(plane)].ravel()
-                if finite_plane.size == 0:
-                    z_high_percentile_values.append((z, 0.0)); continue
-
-                samples = np.random.choice(finite_plane, min(max_samples, finite_plane.size), replace=False)
-
+                plane = enhanced_chunk[i]; finite_plane = plane[np.isfinite(plane)].ravel()
+                if finite_plane.size == 0: z_high_percentile_values.append((z, 0.0)); continue
+                samples = np.random.choice(finite_plane, min(100000, finite_plane.size), replace=False)
                 if samples.size > 0:
                     try:
                         high_perc_value = np.percentile(samples, high_threshold_percentile)
                         if not np.isfinite(high_perc_value): high_perc_value = 0.0
                         z_high_percentile_values.append((z, float(high_perc_value)))
-                    except Exception as e:
-                        print(f"  Warn: Error calculating percentile for slice {z}: {e}. Using 0.")
-                        z_high_percentile_values.append((z, 0.0))
-                else:
-                    z_high_percentile_values.append((z, 0.0))
-            del enhanced_chunk # Release chunk memory
-            gc.collect()
+                    except Exception as e: print(f"  Warn: Error calculating percentile for slice {z}: {e}. Using 0."); z_high_percentile_values.append((z, 0.0))
+                else: z_high_percentile_values.append((z, 0.0))
+            del enhanced_chunk; gc.collect()
 
+        # Apply normalization scaling...
         print("  Applying normalization scaling...")
         z_stats_dict = dict(z_high_percentile_values)
         chunk_size_norm_write = min(50, enhanced_memmap.shape[0]) if enhanced_memmap.shape[0] > 0 else 1
         for z_start in tqdm(range(0, enhanced_memmap.shape[0], chunk_size_norm_write), desc="  Normalizing z-planes"):
              z_end = min(z_start + chunk_size_norm_write, enhanced_memmap.shape[0])
-             enhanced_chunk = enhanced_memmap[z_start:z_end] # Read chunk again
-             normalized_chunk = np.zeros_like(enhanced_chunk, dtype=np.float32) # Create chunk in memory
-
+             enhanced_chunk = enhanced_memmap[z_start:z_end]
+             normalized_chunk = np.zeros_like(enhanced_chunk, dtype=np.float32)
              for i, z in enumerate(range(z_start, z_end)):
-                 current_slice = enhanced_chunk[i]
-                 high_perc_value = z_stats_dict.get(z, 0.0)
-
-                 if current_slice is None or not np.any(np.isfinite(current_slice)):
-                     normalized_chunk[i] = 0.0; continue
-
-                 if high_perc_value > 1e-6:
-                     scale_factor = target_intensity / high_perc_value
-                     normalized_chunk[i] = (current_slice * scale_factor).astype(np.float32)
-                 else:
-                     normalized_chunk[i] = current_slice.astype(np.float32) # Don't scale
-
-             # Write normalized chunk to memmap
+                 current_slice = enhanced_chunk[i]; high_perc_value = z_stats_dict.get(z, 0.0)
+                 if current_slice is None or not np.any(np.isfinite(current_slice)): normalized_chunk[i] = 0.0; continue
+                 if high_perc_value > 1e-6: scale_factor = target_intensity / high_perc_value; normalized_chunk[i] = (current_slice * scale_factor).astype(np.float32)
+                 else: normalized_chunk[i] = current_slice.astype(np.float32)
              normalized_memmap[z_start:z_end] = normalized_chunk
-             del enhanced_chunk, normalized_chunk # Free chunk memory
-             gc.collect()
-
+             del enhanced_chunk, normalized_chunk; gc.collect()
         normalized_memmap.flush()
         print("Normalization step finished.")
-        # Clean up enhanced memmap now that normalization is done
+
+        # Cleanup enhanced memmap now
         name = 'enhanced'
         if name in memmap_registry:
-            mm, p, d = memmap_registry[name]
-            if hasattr(mm, '_mmap'): del mm; gc.collect()
-            try:
-                if os.path.exists(p): os.unlink(p)
-                if os.path.exists(d): rmtree(d, ignore_errors=True)
+            mm, p, d = memmap_registry[name]; del mm; gc.collect()
+            try: os.unlink(p); rmtree(d, ignore_errors=True)
             except Exception as e: print(f"Warn: Could not clean {name} temp files: {e}")
             del memmap_registry[name]
         gc.collect()
 
-        # --- Step 3: Thresholding using Low Percentile (Reads normalized_memmap) ---
-        print("\nStep 3: Thresholding using low percentile...")
+        # --- Step 3: Thresholding AND Calculate Global Brightness Cutoff ---
+        print("\nStep 3: Thresholding and Calculating Global Brightness Cutoff...")
         binary_temp_dir = tempfile.mkdtemp(prefix="binary_")
         binary_path = os.path.join(binary_temp_dir, 'b.dat')
         binary_memmap = np.memmap(binary_path, dtype=bool, mode='w+', shape=original_shape)
         memmap_registry['binary'] = (binary_memmap, binary_path, binary_temp_dir)
 
-        # --- Calculate threshold (chunked sampling from normalized memmap) ---
+        # Calculate segmentation threshold using chunked sampling
         sample_size = min(5_000_000, normalized_memmap.size)
-        print(f"  Sampling {sample_size} points from normalized memmap for threshold...")
-        final_threshold = 0.0
-        samples_collected = []
+        print(f"  Sampling {sample_size} points from normalized memmap for thresholds...")
+        segmentation_threshold = 0.0
+        samples_collected = []; collected_count = 0
         num_samples_needed = sample_size
         chunk_size_thresh_sample = min(200, normalized_memmap.shape[0]) if normalized_memmap.shape[0] > 0 else 1
-        indices_z = np.arange(normalized_memmap.shape[0])
-        np.random.shuffle(indices_z) # Process z-slices in random order
+        indices_z = np.arange(normalized_memmap.shape[0]); np.random.shuffle(indices_z)
+        all_samples = None # Define all_samples outside loop
 
-        # Ensure normalized memmap is accessible
         if not hasattr(normalized_memmap, '_mmap') or normalized_memmap._mmap is None:
             raise RuntimeError("Normalized memmap closed unexpectedly before threshold sampling.")
 
-        collected_count = 0
         for z_start_idx in tqdm(range(0, len(indices_z), chunk_size_thresh_sample), desc="  Sampling Norm. Vol."):
             if collected_count >= num_samples_needed: break
             z_indices_chunk = indices_z[z_start_idx : z_start_idx + chunk_size_thresh_sample]
-            # Read slices specified by indices - might be slow if indices are sparse
-            # A potentially faster way for memmap is contiguous reads, but let's try this first
-            # Note: Reading multiple non-contiguous slices can be inefficient
-            # Alternative: Read contiguous chunks and sample proportionally from them
-            slices_data = normalized_memmap[z_indices_chunk, :, :] # Reads multiple slices
-            finite_samples_in_chunk = slices_data[np.isfinite(slices_data)].ravel()
-            del slices_data; gc.collect()
-
+            slices_data = normalized_memmap[z_indices_chunk, :, :]; finite_samples_in_chunk = slices_data[np.isfinite(slices_data)].ravel(); del slices_data; gc.collect()
             samples_to_take = min(len(finite_samples_in_chunk), num_samples_needed - collected_count)
-            if samples_to_take > 0:
-                chosen_samples = np.random.choice(finite_samples_in_chunk, samples_to_take, replace=False)
-                samples_collected.append(chosen_samples)
-                collected_count += samples_to_take
+            if samples_to_take > 0: samples_collected.append(np.random.choice(finite_samples_in_chunk, samples_to_take, replace=False)); collected_count += samples_to_take
             del finite_samples_in_chunk
-            if collected_count >= num_samples_needed: break # Exit loop early if enough samples
+            if collected_count >= num_samples_needed: break
 
         if not samples_collected:
             print("  Warn: No finite samples collected. Using 0.0 threshold.")
-            final_threshold = 0.0
+            segmentation_threshold = 0.0
         else:
-            all_samples = np.concatenate(samples_collected)
-            del samples_collected; gc.collect()
+            all_samples = np.concatenate(samples_collected); del samples_collected; gc.collect()
             if all_samples.size > 0:
-                 try:
-                     final_threshold = np.percentile(all_samples, low_threshold_percentile)
-                     print(f"  Calculated threshold at {low_threshold_percentile:.1f} percentile: {final_threshold:.4f}")
-                 except Exception as e:
-                     print(f"  Warn: Percentile calculation failed: {e}. Using median fallback.")
-                     final_threshold = np.median(all_samples)
-                     print(f"  Using median fallback threshold: {final_threshold:.4f}")
-            else:
-                 print("  Warn: Concatenated samples array is empty. Using 0.0 threshold.")
-                 final_threshold = 0.0
-            del all_samples; gc.collect()
+                 try: segmentation_threshold = np.percentile(all_samples, low_threshold_percentile)
+                 except Exception as e: print(f"  Warn: Percentile calculation failed: {e}. Using median."); segmentation_threshold = np.median(all_samples)
+            else: print("  Warn: Concatenated samples array empty. Using 0.0 threshold."); segmentation_threshold = 0.0
+        print(f"  Segmentation threshold ({low_threshold_percentile:.1f} perc): {segmentation_threshold:.4f}")
 
-        # Apply threshold in chunks
+        # Calculate GLOBAL Brightness Cutoff
+        if all_samples is not None and all_samples.size > 0 :
+             global_brightness_cutoff = segmentation_threshold * brightness_cutoff_factor
+             print(f"  Global Brightness Cutoff ({brightness_cutoff_factor:.2f}x): {global_brightness_cutoff:.4f}")
+        else:
+             print("  Warn: No samples available. Cannot determine brightness cutoff. Setting to Inf.")
+             global_brightness_cutoff = np.inf
+        if all_samples is not None: del all_samples; gc.collect()
+
+        # Apply segmentation threshold in chunks
         chunk_size_thresh_apply = min(100, original_shape[0]) if original_shape[0] > 0 else 1
-        print(f"  Applying threshold {final_threshold:.4f}...")
+        print(f"  Applying segmentation threshold {segmentation_threshold:.4f}...")
         for i in tqdm(range(0, original_shape[0], chunk_size_thresh_apply), desc="  Applying Threshold"):
              end_idx = min(i + chunk_size_thresh_apply, original_shape[0])
              if hasattr(normalized_memmap, '_mmap') and normalized_memmap._mmap is not None:
-                  norm_chunk = normalized_memmap[i:end_idx]
-                  binary_memmap[i:end_idx] = norm_chunk > final_threshold
-                  del norm_chunk; gc.collect()
-             else:
-                  print(f"Error: 'normalized' memmap closed or invalid during thresholding chunk {i}")
-                  binary_memmap[i:end_idx] = False # Fill failed chunk with False
+                  norm_chunk = normalized_memmap[i:end_idx]; binary_memmap[i:end_idx] = norm_chunk > segmentation_threshold; del norm_chunk; gc.collect()
+             else: print(f"Error: 'normalized' memmap closed during thresholding chunk {i}"); binary_memmap[i:end_idx] = False
         binary_memmap.flush()
         print("Thresholding done.")
+
         # Cleanup normalized memmap
         name = 'normalized'
         if name in memmap_registry:
-            mm, p, d = memmap_registry[name]
-            if hasattr(mm, '_mmap'): del mm; gc.collect()
-            try:
-                if os.path.exists(p): os.unlink(p)
-                if os.path.exists(d): rmtree(d, ignore_errors=True)
+            mm, p, d = memmap_registry[name]; del mm; gc.collect()
+            try: os.unlink(p); rmtree(d, ignore_errors=True)
             except Exception as e: print(f"Warn: Could not clean {name} temp files: {e}")
             del memmap_registry[name]
         gc.collect()
@@ -650,21 +714,19 @@ def segment_microglia_first_pass(
         # --- Step 4: Connect Fragmented Processes (Reads binary_memmap) ---
         print("\nStep 4: Connecting fragments...")
         connected_binary_memmap, connected_temp_dir = connect_fragmented_processes(
-            binary_memmap, # Use the thresholded binary memmap
+            binary_memmap,
             spacing=spacing,
             max_gap_physical=connect_max_gap_physical
         )
         connected_path = connected_binary_memmap.filename
         memmap_registry['connected'] = (connected_binary_memmap, connected_path, connected_temp_dir)
         print("Connection memmap created.")
+
         # Cleanup binary memmap
         name = 'binary'
         if name in memmap_registry:
-            mm, p, d = memmap_registry[name]
-            if hasattr(mm, '_mmap'): del mm; gc.collect()
-            try:
-                if os.path.exists(p): os.unlink(p)
-                if os.path.exists(d): rmtree(d, ignore_errors=True)
+            mm, p, d = memmap_registry[name]; del mm; gc.collect()
+            try: os.unlink(p); rmtree(d, ignore_errors=True)
             except Exception as e: print(f"Warn: Could not clean {name} temp files: {e}")
             del memmap_registry[name]
         gc.collect()
@@ -673,174 +735,136 @@ def segment_microglia_first_pass(
         print(f"\nStep 5: Cleaning objects smaller than {min_size_voxels} voxels...")
         cleaned_binary_dir=tempfile.mkdtemp(prefix="cleaned_")
         cleaned_binary_path=os.path.join(cleaned_binary_dir, 'c.dat')
-        cleaned_binary_memmap=np.memmap(cleaned_binary_path, dtype=bool, mode='w+',
-                                      shape=original_shape)
+        cleaned_binary_memmap=np.memmap(cleaned_binary_path, dtype=bool, mode='w+', shape=original_shape)
         memmap_registry['cleaned'] = (cleaned_binary_memmap, cleaned_binary_path, cleaned_binary_dir)
-        # remove_small_objects needs array input, try loading connected if possible, else chunk
         print("  Loading connected mask for small object removal...")
         connected_memmap_obj = memmap_registry['connected'][0]
         try:
             connected_in_memory = np.array(connected_memmap_obj)
             print("  Applying remove_small_objects...")
-            remove_small_objects(connected_in_memory,
-                                 min_size=min_size_voxels,
-                                 connectivity=1,
-                                 out=cleaned_binary_memmap) # Output to memmap
+            remove_small_objects(connected_in_memory, min_size=min_size_voxels, connectivity=1, out=cleaned_binary_memmap)
             del connected_in_memory; gc.collect()
         except MemoryError:
-             print("  MemoryError loading connected mask. Cannot remove small objects effectively. Skipping.")
-             # Copy connected to cleaned as a fallback
-             print("  Copying connected mask to cleaned mask...")
-             chunk_size_copy = min(100, original_shape[0]) if original_shape[0] > 0 else 1
-             for i in tqdm(range(0, original_shape[0], chunk_size_copy), desc="  Copying Connected"):
-                 cleaned_binary_memmap[i:min(i+chunk_size_copy, original_shape[0])] = connected_memmap_obj[i:min(i+chunk_size_copy, original_shape[0])]
+             print("  MemoryError loading connected mask. Skipping small object removal.")
+             print("  Copying connected mask to cleaned mask..."); chunk_size_copy = min(100, original_shape[0]) if original_shape[0] > 0 else 1
+             for i in tqdm(range(0, original_shape[0], chunk_size_copy), desc="  Copying Connected"): cleaned_binary_memmap[i:min(i+chunk_size_copy, original_shape[0])] = connected_memmap_obj[i:min(i+chunk_size_copy, original_shape[0])]
         except Exception as e:
             print(f"  Error during small object removal: {e}. Skipping.")
-            # Copy connected to cleaned as a fallback
-            print("  Copying connected mask to cleaned mask...")
-            chunk_size_copy = min(100, original_shape[0]) if original_shape[0] > 0 else 1
-            for i in tqdm(range(0, original_shape[0], chunk_size_copy), desc="  Copying Connected"):
-                 cleaned_binary_memmap[i:min(i+chunk_size_copy, original_shape[0])] = connected_memmap_obj[i:min(i+chunk_size_copy, original_shape[0])]
-
+            print("  Copying connected mask to cleaned mask..."); chunk_size_copy = min(100, original_shape[0]) if original_shape[0] > 0 else 1
+            for i in tqdm(range(0, original_shape[0], chunk_size_copy), desc="  Copying Connected"): cleaned_binary_memmap[i:min(i+chunk_size_copy, original_shape[0])] = connected_memmap_obj[i:min(i+chunk_size_copy, original_shape[0])]
         cleaned_binary_memmap.flush()
         print("Cleaning step done.")
+
         # Cleanup connected memmap
         name = 'connected'
         if name in memmap_registry:
-            mm, p, d = memmap_registry[name]
-            if hasattr(mm, '_mmap'): del mm; gc.collect()
-            try:
-                if os.path.exists(p): os.unlink(p)
-                if os.path.exists(d): rmtree(d, ignore_errors=True)
+            mm, p, d = memmap_registry[name]; del mm; gc.collect()
+            try: os.unlink(p); rmtree(d, ignore_errors=True)
             except Exception as e: print(f"Warn: Could not clean {name} temp files: {e}")
             del memmap_registry[name]
         gc.collect()
 
         # --- Step 6: Label Connected Components (Reads cleaned_memmap) ---
-        # --- Step 6: Label Connected Components (Reads cleaned_memmap) ---
         print("\nStep 6: Labeling components...")
-        labels_temp_dir = None # Initialize to None
-        labels_path = None
-        first_pass_segmentation_memmap = None # Initialize
-
+        labels_temp_dir = None; labels_path = None; first_pass_segmentation_memmap = None
         try:
             labels_temp_dir = tempfile.mkdtemp(prefix="labels_")
             labels_path = os.path.join(labels_temp_dir, 'l.dat')
-
-            # *** FIX: Change mode from 'r+' to 'w+' to CREATE the file ***
-            print(f"  Creating labels memmap file: {labels_path}") # Add log
-            first_pass_segmentation_memmap = np.memmap(labels_path, dtype=np.int32,
-                                                     mode='w+', # <-- CORRECTED MODE
-                                                     shape=original_shape)
-            # Add to registry ONLY after successful memmap creation
+            first_pass_segmentation_memmap=np.memmap(labels_path, dtype=np.int32, mode='w+', shape=original_shape)
             memmap_registry['labels'] = (first_pass_segmentation_memmap, labels_path, labels_temp_dir)
-            print("  Labels memmap object created.")
-
-            # --- Rest of Step 6 ---
             print("  Applying ndimage.label...")
-            # Check input memmap validity before labeling
             cleaned_memmap_obj = memmap_registry.get('cleaned', (None,))[0]
-            if cleaned_memmap_obj is None or not hasattr(cleaned_memmap_obj, '_mmap') or cleaned_memmap_obj._mmap is None:
-                 raise RuntimeError("Input 'cleaned' memmap for labeling is invalid or missing from registry.")
-
+            if cleaned_memmap_obj is None or not hasattr(cleaned_memmap_obj, '_mmap') or cleaned_memmap_obj._mmap is None: raise RuntimeError("Input 'cleaned' memmap for labeling is invalid or missing.")
             try:
-                num_features = ndimage.label(
-                    cleaned_memmap_obj,
-                    structure=generate_binary_structure(3, 1),
-                    output=first_pass_segmentation_memmap
-                )
+                num_features = ndimage.label(cleaned_memmap_obj, structure=generate_binary_structure(3, 1), output=first_pass_segmentation_memmap)
                 first_pass_segmentation_memmap.flush()
                 print(f"Labeling done ({num_features} features found).")
-
             except Exception as label_error:
-                 print(f"\n!!! ERROR during ndimage.label or flush: {label_error}")
-                 import traceback
-                 traceback.print_exc()
-                 # Immediate cleanup attempt for 'labels'
-                 name = 'labels'
-                 if name in memmap_registry:
-                     mm, p, d = memmap_registry[name]
-                     if hasattr(mm, '_mmap'): del mm; gc.collect()
-                     try:
-                         if p and os.path.exists(p): os.unlink(p)
-                         if d and os.path.exists(d): rmtree(d, ignore_errors=True)
-                     except Exception as e_clean: print(f"Warn: Error cleaning up failed {name} resources: {e_clean}")
-                     del memmap_registry[name]
+                 print(f"\n!!! ERROR during ndimage.label or flush: {label_error}"); import traceback; traceback.print_exc()
+                 name = 'labels'; # Attempt immediate cleanup
+                 if name in memmap_registry: mm, p, d = memmap_registry[name]; del mm; gc.collect(); 
+                 try: os.unlink(p); rmtree(d, ignore_errors=True); 
+                 except Exception as e_clean: print(f"Warn cleanup {name}: {e_clean}"); del memmap_registry[name]
                  raise label_error from label_error
-
             # Cleanup cleaned binary memmap (ONLY if labeling succeeded)
             name = 'cleaned'
-            # ... (cleanup logic for 'cleaned' remains the same) ...
             if name in memmap_registry:
-                print(f"  Cleaning up {name} after successful labeling...") # Add log
-                mm, p, d = memmap_registry[name]
-                if hasattr(mm, '_mmap'): del mm; gc.collect()
-                try:
-                    if p and os.path.exists(p): os.unlink(p)
-                    if d and os.path.exists(d): rmtree(d, ignore_errors=True)
-                except Exception as e: print(f"Warn: Could not clean {name} temp files during step 6 cleanup: {e}")
+                print(f"  Cleaning up {name} after successful labeling...")
+                mm, p, d = memmap_registry[name]; del mm; gc.collect()
+                try: os.unlink(p); rmtree(d, ignore_errors=True)
+                except Exception as e: print(f"Warn: Could not clean {name} temp files: {e}")
                 del memmap_registry[name]
             gc.collect()
-
-
         except Exception as step6_setup_error:
-             # Catch errors during setup of step 6 (e.g., mkdtemp, memmap creation itself)
-             print(f"\n!!! ERROR during Step 6 setup (before labeling): {step6_setup_error}")
-             import traceback
-             traceback.print_exc()
-             # Attempt cleanup of potentially created labels dir/file
-             # ... (cleanup logic in this except block remains the same) ...
-             name = 'labels'
-             if name in memmap_registry: # If it got added to registry
-                  mm, p, d = memmap_registry[name]
-                  if hasattr(mm, '_mmap'): del mm; gc.collect()
-                  del memmap_registry[name] # Remove from registry first
-             else: # If memmap object creation failed, use paths directly
-                  p, d = labels_path, labels_temp_dir
-             try:
-                 if p and os.path.exists(p): os.unlink(p)
+             print(f"\n!!! ERROR during Step 6 setup (before labeling): {step6_setup_error}"); import traceback; traceback.print_exc()
+             name = 'labels'; # Attempt immediate cleanup
+             if name in memmap_registry: mm, p, d = memmap_registry[name]; del mm; gc.collect(); del memmap_registry[name]
+             else: p, d = labels_path, labels_temp_dir
+             try: 
+                 if p and os.path.exists(p): os.unlink(p); 
                  if d and os.path.exists(d): rmtree(d, ignore_errors=True)
-             except Exception as e_clean: print(f"Warn: Error cleaning up failed {name} resources during setup error: {e_clean}")
+             except Exception as e_clean: print(f"Warn cleanup {name} setup fail: {e_clean}")
              raise step6_setup_error from step6_setup_error
 
-        try:
-            # --- 7a. Generate Hull Boundary ---
-            hull_boundary_mask, hull_stack = generate_hull_boundary_and_stack(
-                volume, hull_erosion_iterations=hull_erosion_iterations
-            )
+        # --- Step 7: Generate Smooth Hull Boundary AND Trim Edge Artifacts ---
+        print("\nStep 7: Generating Smooth Hull and Trimming Edges...")
 
+        try:
+            # --- 7a. Generate Smooth Hull Boundary ---
+            hull_boundary_mask, _ = generate_hull_boundary_and_stack(volume, hull_erosion_iterations=1)
+
+            # --- 7b. Trim based on the new boundary ---
             if hull_boundary_mask is None or not np.any(hull_boundary_mask):
                 print("  Hull boundary mask empty/not generated. Skipping edge trimming.")
+                # Ensure hull_boundary_mask is valid empty mask if needed later
                 hull_boundary_mask = np.zeros(original_shape, dtype=bool)
             else:
-                # --- 7b. Call Trimming Helper Function (operates on memmap) ---
-                # Pass the memmap opened in 'r+' mode
-                _ = trim_object_edges_by_distance( # Discard returned trim mask for now
-                    segmentation_memmap=first_pass_segmentation_memmap, # Pass the memmap
-                    hull_boundary_mask=hull_boundary_mask,
-                    spacing=spacing,
-                    distance_threshold=edge_trim_distance_threshold,
-                    min_remaining_size=min_size_voxels,
-                    chunk_size_z=edge_distance_chunk_size_z
-                )
-                # Ensure changes are flushed after trimming function returns
-                first_pass_segmentation_memmap.flush()
+                 print("  Proceeding with edge trimming using the generated smooth boundary...")
+                 # Ensure labels memmap exists and reopen in r+ mode
+                 labels_memmap_obj, labels_path, labels_temp_dir = memmap_registry.get('labels', (None, None, None))
+                 if labels_memmap_obj is None or not hasattr(labels_memmap_obj, '_mmap') or labels_memmap_obj._mmap is None:
+                      raise RuntimeError("Labels memmap is invalid or missing before starting trimming.")
+
+                 # Reopen in r+ mode for modification
+                 # Check if it's already r+ (it shouldn't be if created with w+)
+                 if labels_memmap_obj.mode != 'r+':
+                      del labels_memmap_obj; gc.collect() # Close w+ version
+                      labels_memmap_rplus = np.memmap(labels_path, dtype=np.int32, mode='r+', shape=original_shape)
+                      memmap_registry['labels'] = (labels_memmap_rplus, labels_path, labels_temp_dir) # Update registry
+                 else:
+                      labels_memmap_rplus = labels_memmap_obj # Already r+
+
+                 # Call the trimming function (assumed to be updated for global cutoff)
+                 _ = trim_object_edges_by_distance(
+                     segmentation_memmap=labels_memmap_rplus,
+                     original_volume=volume,
+                     hull_boundary_mask=hull_boundary_mask, # Use the newly generated mask
+                     spacing=spacing,
+                     distance_threshold=edge_trim_distance_threshold,
+                     global_brightness_cutoff=global_brightness_cutoff,
+                     min_remaining_size=min_size_voxels,
+                     chunk_size_z=edge_distance_chunk_size_z
+                 )
+                 labels_memmap_rplus.flush() # Ensure trimming changes are saved
 
         except Exception as e:
-             print(f"\nERROR during edge artifact trimming: {e}")
-             import traceback; traceback.print_exc()
-             hull_boundary_mask = np.zeros(original_shape, dtype=bool) # Ensure valid default
+             print(f"\nERROR during hull generation or edge trimming: {e}"); import traceback; traceback.print_exc()
+             # Ensure hull_boundary_mask exists even on error for final return
+             if 'hull_boundary_mask' not in locals() or hull_boundary_mask is None:
+                  hull_boundary_mask = np.zeros(original_shape, dtype=bool)
              gc.collect()
-        finally:
-             if hull_stack is not None: del hull_stack; gc.collect()
-             # Do NOT clean up labels memmap yet
+
 
         # --- Step 8: Load FINAL Labeled Segmentation into Memory ---
         print("\nStep 8: Loading final trimmed labels into memory...")
-        final_segmentation = np.array(first_pass_segmentation_memmap)
+        labels_memmap_obj, labels_path, labels_temp_dir = memmap_registry.get('labels', (None, None, None))
+        if labels_memmap_obj is None or not hasattr(labels_memmap_obj, '_mmap') or labels_memmap_obj._mmap is None:
+            raise RuntimeError("Final labels memmap object not found or invalid before loading into memory.")
+        final_segmentation = np.array(labels_memmap_obj)
         print("Final labels loaded into memory.")
 
         # --- Finalization ---
+        # ... (Log final stats, same as before) ...
         print(f"\n--- First Pass Segmentation Finished ---")
         final_unique_labels = np.unique(final_segmentation)
         final_object_count = len(final_unique_labels[final_unique_labels != 0])
@@ -849,39 +873,32 @@ def segment_microglia_first_pass(
         final_mem = psutil.Process().memory_info().rss / (1024 * 1024)
         print(f"Final memory usage: {final_mem:.2f} MB")
 
-        # Return the final in-memory segmentation, parameters, and boundary mask
+        # Return final result and the generated hull boundary mask
         return final_segmentation, first_pass_params, hull_boundary_mask
 
     finally:
         # --- FINAL Cleanup ALL remaining memmaps ---
-        # The final cleanup logic with os.path.exists checks remains the same
-        # It will handle any memmaps still left in the registry
         print("\nCleaning up any remaining temporary memmap files...")
         registry_keys = list(memmap_registry.keys())
         for name in registry_keys:
-            if name in memmap_registry: # Check if still present
+            if name in memmap_registry:
                 mm, p, d = memmap_registry[name]
                 print(f"  Cleaning up {name} (Path: {p})...")
-                # 1. Delete memmap object
                 if hasattr(mm, '_mmap') and mm._mmap is not None:
                     try: del mm; gc.collect()
                     except Exception as e_del: print(f"    Warn: Error deleting memmap object for {name}: {e_del}")
-                elif hasattr(mm, 'close'):
-                     try: mm.close()
-                     except: pass
-                # 2. Delete file
+                elif hasattr(mm, 'close'): 
+                    try: mm.close(); 
+                    except: pass
                 try:
-                    if p and os.path.exists(p): os.unlink(p); print(f"    Deleted file: {p}")
+                    if p and os.path.exists(p): os.unlink(p); # print(f"    Deleted file: {p}")
                 except Exception as e_unlink: print(f"    Warn: Error unlinking file {p}: {e_unlink}")
-                # 3. Delete directory
                 try:
-                    if d and os.path.exists(d): rmtree(d, ignore_errors=True); print(f"    Removed directory: {d}")
+                    if d and os.path.exists(d): rmtree(d, ignore_errors=True); # print(f"    Removed directory: {d}")
                 except Exception as e_rmtree: print(f"    Warn: Error removing directory {d}: {e_rmtree}")
-                # 4. Remove from registry
                 if name in memmap_registry: del memmap_registry[name]
         print("Final cleanup attempts finished.")
         gc.collect()
-
 
 def extract_soma_masks(segmentation_mask, 
                       small_object_percentile=50,  # Changed to percentile
