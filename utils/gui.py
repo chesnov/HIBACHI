@@ -1,12 +1,7 @@
 
 import numpy as np
 import os
-import plotly.graph_objs as go
-import napari
-from skimage import morphology
-from magicgui import magicgui
-from skimage.measure import label
-from PyQt5.QtWidgets import QApplication, QFileDialog, QInputDialog, QMessageBox
+from PyQt5.QtWidgets import QMessageBox
 
 os.environ["QT_SCALE_FACTOR"] = "1.5"
 
@@ -16,7 +11,8 @@ np.random.seed(seed)         # For NumPy
 from ramified_segmenter import *
 from nuclear_segmenter import *
 from calculate_features import *
-from helper_funcs import create_parameter_widget, check_processing_state, organize_processing_dir
+from helper_funcs import create_parameter_widget, check_processing_state
+from initial_3d_segmentation import segment_microglia_first_pass
 
 
 import yaml
