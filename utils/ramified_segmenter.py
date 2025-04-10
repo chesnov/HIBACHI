@@ -198,33 +198,198 @@ def connect_fragmented_processes(binary_mask, spacing, max_gap_physical=1.0):
     return connected_mask, temp_dir
 
 
-def generate_hull_boundary_and_stack(volume, hull_erosion_iterations=1):
-    """ Generates boundary and hull stack from slice-wise 2D hulls. """
-    # ... (Implementation as provided before) ...
-    print("Generating hull boundary mask AND stack using slice-wise hulls...")
-    original_shape = volume.shape; hull_boundary = None; hull_stack = None
-    print("  Creating tissue mask..."); # ... Otsu logic ...
-    otsu_sample_size = min(2_000_000, volume.size)
-    if otsu_sample_size == volume.size: otsu_samples = volume.ravel()
-    else: otsu_indices = np.random.choice(volume.size, otsu_sample_size, replace=False); otsu_coords = np.unravel_index(otsu_indices, volume.shape); otsu_samples = volume[otsu_coords]
-    if np.all(otsu_samples == otsu_samples[0]): tissue_thresh = otsu_samples[0]; print(f"  Warn: All samples identical ({tissue_thresh}).")
-    else: tissue_thresh = threshold_otsu(otsu_samples)
-    print(f"  Tissue threshold: {tissue_thresh:.2f}"); tissue_mask = volume > tissue_thresh; del otsu_samples; gc.collect()
-    if not np.any(tissue_mask): print("  Warn: Tissue mask empty."); return None, None
-    print("  Calculating 2D convex hull slice-by-slice..."); hull_stack = np.zeros_like(tissue_mask, dtype=bool)
+def generate_hull_boundary_and_stack(
+    volume,                     # Original intensity volume (for Otsu threshold)
+    cell_mask,                  # Labeled or boolean mask of segmented cells
+    hull_erosion_iterations=1,  # Iterations for final boundary erosion
+    smoothing_iterations=1      # Iterations for 3D closing/opening to smooth Z-axis
+    ):
+    """
+    Generates a 3D hull stack and its boundary based on tissue intensity
+    and an existing cell segmentation, ensuring cells are included and
+    smoothing the hull across the Z-axis.
+
+    Steps:
+    1. Creates a tissue mask using Otsu thresholding on the input volume.
+    2. For each Z-slice:
+        a. Combines the tissue mask slice with the cell mask slice (logical OR).
+        b. Computes the 2D convex hull of this combined mask.
+    3. Stacks the 2D hulls into an initial 3D `hull_stack`.
+    4. (Optional) Applies 3D morphological closing then opening to smooth
+       the `hull_stack` along the Z-axis, reducing slice-to-slice jumps.
+    5. Erodes the smoothed `hull_stack` using a 3D structure.
+    6. Calculates the `hull_boundary` as the difference between the smoothed
+       hull and the eroded hull.
+
+    Parameters:
+    -----------
+    volume : ndarray
+        Input 3D intensity image volume. Used for Otsu thresholding.
+    cell_mask : ndarray (bool or int)
+        A mask (boolean or labeled integers) where non-zero values indicate
+        segmented cells that *must* be contained within the hull.
+        Must have the same shape as `volume`.
+    hull_erosion_iterations : int, optional
+        Number of iterations for the final 3D binary erosion to define the
+        thickness of the boundary. Defaults to 1.
+    smoothing_iterations : int, optional
+        Number of iterations for 3D binary closing and opening applied to the
+        initial hull stack to smooth it along the Z-axis. Set to 0 to disable.
+        Defaults to 1.
+
+    Returns:
+    --------
+    hull_boundary : ndarray (bool)
+        Boolean mask indicating the boundary region of the final smoothed hull.
+        Shape matches the input volume. Returns None if hull generation fails.
+    smoothed_hull_stack : ndarray (bool)
+        The final, smoothed 3D hull stack (after potential closing/opening).
+        Shape matches the input volume. Returns None if hull generation fails.
+    """
+    print("\n--- Generating Smoothed Hull Boundary and Stack ---")
+    original_shape = volume.shape
+    if cell_mask.shape != original_shape:
+        raise ValueError(f"Shape mismatch: volume {original_shape} vs cell_mask {cell_mask.shape}")
+
+    print(f"Input shape: {original_shape}")
+    print(f"Smoothing iterations: {smoothing_iterations}")
+    print(f"Boundary erosion iterations: {hull_erosion_iterations}")
+    initial_mem = psutil.Process().memory_info().rss / (1024 * 1024)
+    print(f"Memory usage at start: {initial_mem:.2f} MB")
+
+    # --- Step 1: Create Tissue Mask using Otsu ---
+    print("Step 1: Creating base tissue mask using Otsu threshold...")
+    tissue_mask = np.zeros(original_shape, dtype=bool)
+    try:
+        # Sample for Otsu to avoid memory issues on huge arrays
+        otsu_sample_size = min(2_000_000, volume.size)
+        if otsu_sample_size == volume.size:
+            otsu_samples = volume.ravel()
+        else:
+            # Ensure we sample non-zero voxels if possible, otherwise random
+            non_zero_indices = np.flatnonzero(volume)
+            if len(non_zero_indices) > otsu_sample_size:
+                 sample_indices = np.random.choice(non_zero_indices, otsu_sample_size, replace=False)
+            elif len(non_zero_indices) > 0:
+                 sample_indices = non_zero_indices # Use all non-zeros
+            else: # If all zero, just sample randomly
+                 sample_indices = np.random.choice(volume.size, otsu_sample_size, replace=False)
+
+            otsu_coords = np.unravel_index(sample_indices, volume.shape)
+            otsu_samples = volume[otsu_coords]
+
+        if np.all(otsu_samples == otsu_samples[0]):
+            # Handle constant intensity case
+            tissue_thresh = otsu_samples[0]
+            print(f"  Warning: Sampled intensity values are constant ({tissue_thresh}). Threshold set.")
+        elif otsu_samples.size > 0:
+            tissue_thresh = threshold_otsu(otsu_samples)
+            print(f"  Otsu tissue threshold determined: {tissue_thresh:.2f}")
+        else:
+             print("  Warning: No valid samples for Otsu. Using threshold 0.")
+             tissue_thresh = 0
+
+        # Apply threshold chunk-wise if needed, but direct comparison is often fine
+        tissue_mask = volume > tissue_thresh
+        del otsu_samples # Free memory
+        gc.collect()
+
+        if not np.any(tissue_mask):
+            print("  Warning: Otsu tissue mask is empty based on threshold.")
+            # Continue, as the cell_mask might still define the hull
+
+    except Exception as e:
+        print(f"  Error during Otsu thresholding: {e}. Proceeding without tissue mask.")
+        tissue_mask = np.zeros(original_shape, dtype=bool) # Ensure it exists
+
+    # --- Step 2: Combine Masks and Generate Slice-wise 2D Hulls ---
+    print("\nStep 2: Generating initial hull stack from slice-wise combined masks...")
+    # Ensure cell_mask is boolean
+    cell_mask_bool = cell_mask > 0
+    initial_hull_stack = np.zeros(original_shape, dtype=bool)
+
     for z in tqdm(range(original_shape[0]), desc="  Processing Slices for Hull"):
-        tissue_slice = tissue_mask[z, :, :];
-        if np.any(tissue_slice):
-             if not tissue_slice.flags['C_CONTIGUOUS']: tissue_slice = np.ascontiguousarray(tissue_slice)
-             hull_stack[z, :, :] = convex_hull_image(tissue_slice)
-    del tissue_mask; gc.collect(); print("  Slice-wise hull complete.")
-    if hull_erosion_iterations <= 0: print("  Warn: No hull erosion."); hull_boundary = np.zeros(original_shape, dtype=bool); return hull_boundary, hull_stack
-    print(f"  Eroding 3D hull stack (iter={hull_erosion_iterations})..."); struct_3d = generate_binary_structure(3, 1)
-    eroded_hull_stack = binary_erosion(hull_stack, structure=struct_3d, iterations=hull_erosion_iterations); print("  Erosion complete.")
-    print("  Calculating hull boundary..."); hull_boundary = hull_stack & (~eroded_hull_stack); # Keep hull_stack for return
-    print(f"  Hull boundary mask created ({np.sum(hull_boundary)} voxels).")
-    # Return boundary AND original hull stack (in case caller needs it, though trimming doesn't)
-    return hull_boundary, hull_stack
+        tissue_slice = tissue_mask[z, :, :]
+        cell_slice = cell_mask_bool[z, :, :]
+
+        # Combine tissue and cell masks for this slice
+        combined_mask_slice = tissue_slice | cell_slice
+
+        if np.any(combined_mask_slice):
+            try:
+                # convex_hull_image needs contiguous array
+                if not combined_mask_slice.flags['C_CONTIGUOUS']:
+                    combined_mask_slice = np.ascontiguousarray(combined_mask_slice)
+                initial_hull_stack[z, :, :] = convex_hull_image(combined_mask_slice)
+            except Exception as e:
+                print(f"\nWarning: Failed to compute convex hull for slice {z}: {e}")
+                # Leave slice as zeros in the stack
+        # else: Slice remains False (empty)
+
+    del tissue_mask, cell_mask_bool, combined_mask_slice, tissue_slice, cell_slice # Free memory
+    gc.collect()
+    print("  Initial slice-wise hull stack generated.")
+
+    if not np.any(initial_hull_stack):
+         print("  Warning: Initial hull stack is empty after processing all slices. Cannot proceed.")
+         return None, None # Return None if hull is empty
+
+    # --- Step 3: Smooth Hull Stack in 3D (Optional) ---
+    smoothed_hull_stack = initial_hull_stack # Start with the initial stack
+    if smoothing_iterations > 0:
+        print(f"\nStep 3: Smoothing hull stack with {smoothing_iterations} iteration(s) of 3D closing/opening...")
+        struct_3d = generate_binary_structure(3, 1) # Connectivity=1 for 3x3x3 cube
+        try:
+            # Closing fills holes and gaps
+            print("  Applying binary closing...")
+            smoothed_hull_stack = binary_closing(smoothed_hull_stack, structure=struct_3d, iterations=smoothing_iterations, border_value=0)
+            # Opening removes small protrusions/thin connections
+            print("  Applying binary opening...")
+            smoothed_hull_stack = binary_opening(smoothed_hull_stack, structure=struct_3d, iterations=smoothing_iterations, border_value=0)
+            print("  3D smoothing complete.")
+        except MemoryError:
+            print("  Warning: MemoryError during 3D smoothing. Using unsmoothed hull stack.")
+            smoothed_hull_stack = initial_hull_stack # Fallback to original
+        except Exception as e:
+            print(f"  Warning: Error during 3D smoothing ({e}). Using unsmoothed hull stack.")
+            smoothed_hull_stack = initial_hull_stack # Fallback to original
+        gc.collect()
+    else:
+        print("\nStep 3: Skipping 3D hull stack smoothing (smoothing_iterations=0).")
+
+    # --- Step 4: Erode Smoothed Hull Stack ---
+    hull_boundary = np.zeros(original_shape, dtype=bool) # Initialize boundary mask
+    if hull_erosion_iterations > 0:
+        print(f"\nStep 4: Eroding smoothed hull stack ({hull_erosion_iterations} iterations)...")
+        struct_3d = generate_binary_structure(3, 1) # Use same structure for consistency
+        try:
+            eroded_hull_stack = binary_erosion(smoothed_hull_stack, structure=struct_3d, iterations=hull_erosion_iterations, border_value=0)
+            print("  Erosion complete.")
+
+            # --- Step 5: Calculate Hull Boundary ---
+            print("\nStep 5: Calculating final hull boundary...")
+            hull_boundary = smoothed_hull_stack & (~eroded_hull_stack)
+            boundary_voxel_count = np.sum(hull_boundary)
+            print(f"  Hull boundary mask created ({boundary_voxel_count} voxels).")
+            del eroded_hull_stack # Free memory
+
+        except MemoryError:
+            print("  Warning: MemoryError during hull erosion or boundary calculation. Boundary will be empty.")
+            # hull_boundary remains all False
+        except Exception as e:
+            print(f"  Warning: Error during hull erosion or boundary calculation ({e}). Boundary will be empty.")
+            # hull_boundary remains all False
+        gc.collect()
+    else:
+        print("\nSteps 4 & 5: Skipping hull erosion and boundary calculation (hull_erosion_iterations=0).")
+        # hull_boundary remains all False
+
+    final_mem = psutil.Process().memory_info().rss / (1024 * 1024)
+    print(f"Memory usage at end: {final_mem:.2f} MB")
+    print("--- Hull generation finished ---")
+
+    # Return the boundary AND the (potentially smoothed) hull stack
+    return hull_boundary, smoothed_hull_stack
 
 
 # Helper function for memory estimation
@@ -808,37 +973,83 @@ def segment_microglia_first_pass(
 
         # --- Step 7: Generate Smooth Hull Boundary AND Trim Edge Artifacts ---
         print("\nStep 7: Generating Smooth Hull and Trimming Edges...")
+        hull_boundary_mask = None # Initialize
+        smoothed_hull_stack = None # Initialize
+        labels_memmap_obj = None # Initialize labels object variable
 
         try:
-            # --- 7a. Generate Smooth Hull Boundary ---
-            hull_boundary_mask, _ = generate_hull_boundary_and_stack(volume, hull_erosion_iterations=1)
+            # --- Retrieve the Labeled Segmentation Memmap ---
+            # This memmap was created in Step 6 and should still exist.
+            print("  Locating labeled segmentation mask for hull generation and trimming...")
+            labels_memmap_obj, labels_path, labels_temp_dir = memmap_registry.get('labels', (None, None, None))
+
+            # **** CRITICAL CHECK ****
+            if labels_memmap_obj is None or not hasattr(labels_memmap_obj, '_mmap') or labels_memmap_obj._mmap is None:
+                # This check ensures the memmap object itself is valid and hasn't been closed/deleted unexpectedly.
+                # It checks the internal _mmap attribute which is essential for operation.
+                raise RuntimeError("Labeled segmentation memmap ('labels') is invalid or missing before Step 7.")
+            # Check if file path exists too, as an extra safety measure
+            if not os.path.exists(labels_path):
+                 raise RuntimeError(f"Labeled segmentation memmap file ('{labels_path}') not found before Step 7.")
+            print(f"  Found labels memmap: {labels_path}, Mode: {labels_memmap_obj.mode}")
+            # Note: labels_memmap_obj was created with 'w+', so it's readable.
+
+            # --- 7a. Generate Smooth Hull Boundary using the Labeled Mask ---
+            print("  Generating smoothed hull boundary using the labeled segmentation...")
+            # **** MODIFIED CALL using LABELS memmap ****
+            hull_boundary_mask, smoothed_hull_stack = generate_hull_boundary_and_stack(
+                volume=volume,                          # Original intensity volume
+                cell_mask=labels_memmap_obj,            # Use the LABELED mask from Step 6
+                hull_erosion_iterations=math.ceil(hull_boundary_thickness_phys / min(spacing)) if min(spacing)>0 else 1, # Calc based on physical thickness
+                smoothing_iterations=1                  # Default or use a new parameter if added
+            )
+            # **** END MODIFIED CALL ****
 
             # --- 7b. Trim based on the new boundary ---
             if hull_boundary_mask is None or not np.any(hull_boundary_mask):
                 print("  Hull boundary mask empty/not generated. Skipping edge trimming.")
-                # Ensure hull_boundary_mask is valid empty mask if needed later
-                hull_boundary_mask = np.zeros(original_shape, dtype=bool)
+                if hull_boundary_mask is None: # Ensure it's a valid empty mask if needed later
+                     hull_boundary_mask = np.zeros(original_shape, dtype=bool)
             else:
                  print("  Proceeding with edge trimming using the generated smooth boundary...")
-                 # Ensure labels memmap exists and reopen in r+ mode
-                 labels_memmap_obj, labels_path, labels_temp_dir = memmap_registry.get('labels', (None, None, None))
-                 if labels_memmap_obj is None or not hasattr(labels_memmap_obj, '_mmap') or labels_memmap_obj._mmap is None:
-                      raise RuntimeError("Labels memmap is invalid or missing before starting trimming.")
 
-                 # Reopen in r+ mode for modification
-                 # Check if it's already r+ (it shouldn't be if created with w+)
-                 if labels_memmap_obj.mode != 'r+':
-                      del labels_memmap_obj; gc.collect() # Close w+ version
-                      labels_memmap_rplus = np.memmap(labels_path, dtype=np.int32, mode='r+', shape=original_shape)
-                      memmap_registry['labels'] = (labels_memmap_rplus, labels_path, labels_temp_dir) # Update registry
+                 # --- Reopen labels memmap in r+ mode IF NEEDED ---
+                 # We need to modify the labels memmap in-place during trimming.
+                 # It was created with 'w+', which allows writing, but 'r+' is explicitly
+                 # for reading and writing to an existing file. Depending on the numpy
+                 # version and OS, directly writing after reading might work with 'w+',
+                 # but reopening with 'r+' is safer and more explicit for modification.
+
+                 labels_memmap_rplus = None # Initialize variable for the r+ handle
+                 current_mode = labels_memmap_obj.mode
+                 print(f"    Labels memmap current mode for trimming: {current_mode}")
+
+                 if current_mode != 'r+':
+                     print(f"    Reopening labels memmap ({labels_path}) in 'r+' mode for trimming.")
+                     # Ensure the previous handle is closed before reopening
+                     if hasattr(labels_memmap_obj, '_mmap') and labels_memmap_obj._mmap is not None:
+                         labels_memmap_obj.flush() # Flush writes if any were made (shouldn't be yet)
+                         del labels_memmap_obj
+                         gc.collect()
+                     # Reopen
+                     labels_memmap_rplus = np.memmap(labels_path, dtype=np.int32, mode='r+', shape=original_shape)
+                     # Update the registry TO POINT TO THE NEW HANDLE
+                     memmap_registry['labels'] = (labels_memmap_rplus, labels_path, labels_temp_dir)
+                     print("    Labels memmap reopened in 'r+' mode.")
                  else:
-                      labels_memmap_rplus = labels_memmap_obj # Already r+
+                     # It's already in a writable mode ('r+' or potentially 'w+' still works)
+                     print("    Labels memmap already in a writable mode.")
+                     labels_memmap_rplus = labels_memmap_obj # Use the existing handle
 
-                 # Call the trimming function (assumed to be updated for global cutoff)
+                 # --- Perform Trimming ---
+                 # Ensure the handle we pass is valid
+                 if labels_memmap_rplus is None or not hasattr(labels_memmap_rplus, '_mmap') or labels_memmap_rplus._mmap is None:
+                      raise RuntimeError("Labels memmap became invalid before trimming could start.")
+
                  _ = trim_object_edges_by_distance(
-                     segmentation_memmap=labels_memmap_rplus,
+                     segmentation_memmap=labels_memmap_rplus, # Use the handle assured to be writable
                      original_volume=volume,
-                     hull_boundary_mask=hull_boundary_mask, # Use the newly generated mask
+                     hull_boundary_mask=hull_boundary_mask, # Use the mask from 7a
                      spacing=spacing,
                      distance_threshold=edge_trim_distance_threshold,
                      global_brightness_cutoff=global_brightness_cutoff,
@@ -846,22 +1057,38 @@ def segment_microglia_first_pass(
                      chunk_size_z=edge_distance_chunk_size_z
                  )
                  labels_memmap_rplus.flush() # Ensure trimming changes are saved
+                 print("    Trimming applied to labels memmap.")
 
         except Exception as e:
-             print(f"\nERROR during hull generation or edge trimming: {e}"); import traceback; traceback.print_exc()
+             print(f"\nERROR during hull generation or edge trimming: {e}")
+             import traceback
+             traceback.print_exc()
              # Ensure hull_boundary_mask exists even on error for final return
              if 'hull_boundary_mask' not in locals() or hull_boundary_mask is None:
                   hull_boundary_mask = np.zeros(original_shape, dtype=bool)
+             # Attempt cleanup of labels memmap if it was opened and caused the error
+             if 'labels_memmap_obj' in locals() and labels_memmap_obj is not None and hasattr(labels_memmap_obj, '_mmap'):
+                 del labels_memmap_obj
+             if 'labels_memmap_rplus' in locals() and labels_memmap_rplus is not None and hasattr(labels_memmap_rplus, '_mmap'):
+                 del labels_memmap_rplus
              gc.collect()
-
+             # We might want to re-raise the error here depending on desired behavior
+             # raise e
 
         # --- Step 8: Load FINAL Labeled Segmentation into Memory ---
+        # This part should now correctly use the potentially modified 'labels' handle from the registry
         print("\nStep 8: Loading final trimmed labels into memory...")
-        labels_memmap_obj, labels_path, labels_temp_dir = memmap_registry.get('labels', (None, None, None))
-        if labels_memmap_obj is None or not hasattr(labels_memmap_obj, '_mmap') or labels_memmap_obj._mmap is None:
+        # Retrieve the potentially updated handle from the registry again
+        final_labels_memmap_obj, _, _ = memmap_registry.get('labels', (None, None, None))
+
+        if final_labels_memmap_obj is None or not hasattr(final_labels_memmap_obj, '_mmap') or final_labels_memmap_obj._mmap is None:
             raise RuntimeError("Final labels memmap object not found or invalid before loading into memory.")
-        final_segmentation = np.array(labels_memmap_obj)
+
+        # Ensure data is flushed before reading into memory
+        final_labels_memmap_obj.flush()
+        final_segmentation = np.array(final_labels_memmap_obj)
         print("Final labels loaded into memory.")
+
 
         # --- Finalization ---
         # ... (Log final stats, same as before) ...
