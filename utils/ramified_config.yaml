@@ -1,95 +1,81 @@
-# Enhanced configuration for image processing pipeline with GUI definitions
-mode: "ramified"
-
+mode: ramified
 initial_segmentation:
-  name: "Initial Segmentation"
+  name: Initial Segmentation
   parameters:
     tubular_scales:
-      label: "Tubular Scales"
-      type: "float"
-      value: 0.8
-      min: 0.1
-      max: 20
-      step: 0.1
+      label: Tubular Scales (comma-sep floats)
+      type: list
+      value: [0.8, 1.0, 1.5, 2.0]
+      element_type: float
     min_size:
-      label: "Minimum Size"
-      type: "float"
-      value: 300
+      label: Minimum Size
+      type: float
+      value: 2000
       min: 0.5
       max: 10000
       step: 0.1
-    anisotropy_normalization_degree:
-      label: "Anisotropy Normalization Degree"
-      type: "float"
-      value: 1
-      min: 0
-      max: 1
-      step: 1
     smooth_sigma:
-      label: "Smooth Sigma"
-      type: "float"
+      label: Smooth Sigma
+      type: float
       value: 1.3
       min: 0.1
       max: 10
       step: 0.1
-    min_cell_body_size:
-      label: "Minimum Cell Body Size"
-      type: "float"
-      value: 300
-      min: 0.5
-      max: 10000
+    low_threshold_percentile:
+      label: Low Threshold Percentile
+      type: float
+      value: 98
+      min: 0
+      max: 100
       step: 0.1
-    sensitivity:
-      label: "Sensitivity"
-      type: "float"
-      value: 1.0
+    high_threshold_percentile:
+      label: High Threshold Percentile
+      type: float
+      value: 100
+      min: 0
+      max: 100
+      step: 0.1
+    brightness_cutoff_factor:
+      label: Brightness Cutoff Factor
+      type: float
+      value: 100000
       min: 0.0
-      max: 1.0
+      max: 10000000
       step: 0.1
-    background_level:
-      label: "Background Level"
-      type: "int"
-      value: 50
-      min: 0
-      max: 100
-      step: 1
-    target_level:
-      label: "Target Level"
-      type: "int"
-      value: 75
-      min: 0
-      max: 100
-      step: 1
-
+    edge_trim_distance_threshold:
+      label: Edge Trim Distance Threshold
+      type: float
+      value: 4.5
+      min: 0.0
+      max: 10
+      step: 0.1
 refine_rois:
-  name: "Refine ROIs"
+  name: Refine ROIs
   parameters:
     small_object_percentile:
-      label: "Small Object Percentile"
-      type: "int"
+      label: Small Object Percentile
+      type: int
       value: 93
       min: 0
       max: 100
       step: 1
     thickness_percentile:
-      label: "Thickness Percentile"
-      type: "int"
+      label: Thickness Percentile
+      type: int
       value: 92
       min: 0
       max: 100
       step: 1
     min_size_threshold:
-      label: "Minimum Size Threshold"
-      type: "float"
+      label: Minimum Size Threshold
+      type: float
       value: 900
       min: 0.5
       max: 10000
       step: 0.1
-
 calculate_features:
-  name: "Calculate Features"
-
+  name: Calculate Features
 voxel_dimensions:
-  x: 471.4
-  y: 471.4
-  z: 1
+  x: 424.27
+  y: 424.27
+  z: 191.0

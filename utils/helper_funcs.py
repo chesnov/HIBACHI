@@ -1,5 +1,5 @@
 from magicgui import magicgui
-from typing import Dict, Any
+from typing import Dict, Any, List
 import os
 import pandas as pd
 import napari
@@ -9,7 +9,7 @@ import traceback
 import tifffile as tiff
 import shutil
 from PyQt5.QtGui import QCloseEvent
-from PyQt5.QtCore import Qt, QObject, pyqtSignal
+from PyQt5.QtCore import Qt, QObject, pyqtSignal, QTimer
 from PyQt5.QtWidgets import (
     QApplication, QFileDialog, QMessageBox,
     QMainWindow, QVBoxLayout, QHBoxLayout,
@@ -18,63 +18,220 @@ from PyQt5.QtWidgets import (
 
 
 def create_parameter_widget(param_name: str, param_config: Dict[str, Any], callback):
-    """Create a widget for a single parameter"""
-    
-    # Define the function with the appropriate type annotation
-    if param_config["type"] == "float":
-        def parameter_widget(value: float = param_config["value"]):
-            callback(value)  # Modified to only pass the value
-            return value
-    elif param_config["type"] == "int":
-        def parameter_widget(value: int = param_config["value"]):
-            callback(value)  # Modified to only pass the value
-            return value
-    else:
-        def parameter_widget(value: float = param_config["value"]):
-            callback(value)  # Modified to only pass the value
-            return value
-    
-    # Create the widget with magicgui
-    widget = magicgui(
-        parameter_widget,
-        auto_call=True,
-        value={
-            "label": param_config["label"],
-            "min": param_config["min"],
-            "max": param_config["max"],
-            "step": param_config["step"]
-        }
-    )
-    
-    # Store the original parameter name as an attribute
-    widget.param_name = param_name
-    
+    """
+    Create a widget for a single parameter, supporting int, float, bool, and list (via LineEdit).
+    """
+    param_type = param_config.get("type", "float") # Default type if missing
+    label = param_config.get("label", param_name) # Default label
+
+    widget = None # Initialize widget variable
+
+    try:
+        if param_type == "list":
+            # Handle list type using a LineEdit for comma-separated floats
+            initial_list = param_config.get("value", [])
+            # Ensure initial value is a list
+            if not isinstance(initial_list, list):
+                print(f"Warning: Initial value for list parameter '{param_name}' is not a list ({type(initial_list)}). Using empty list.")
+                initial_list = []
+
+            # Convert list to initial string representation
+            initial_str = ", ".join(map(str, initial_list))
+            last_valid_list = list(initial_list) # Store a mutable copy
+
+            # Define the inner widget function accepting a string
+            def list_widget(value_str: str = initial_str):
+                nonlocal last_valid_list # Allow modification of the outer scope variable
+                new_list = None
+                try:
+                    # Attempt to parse the string into a list of floats
+                    cleaned_str = value_str.strip()
+                    if not cleaned_str: # Handle empty string -> empty list
+                        new_list = []
+                    else:
+                        # Split by comma, strip whitespace from each item, filter out empty strings, convert to float
+                        new_list = [float(x.strip()) for x in cleaned_str.split(',') if x.strip()]
+
+                    # --- Optional: Add validation for list elements ---
+                    # e.g., check element count, type, range based on other config keys
+                    # element_min = param_config.get("element_min")
+                    # if element_min is not None and any(x < element_min for x in new_list):
+                    #    raise ValueError(f"All scale values must be >= {element_min}")
+                    # --- End Optional Validation ---
+
+                    # If parsing and validation succeeded:
+                    print(f"Parsed list for {param_name}: {new_list}") # Debugging
+                    if new_list != last_valid_list: # Only call back if value changed
+                         callback(new_list) # Call the original callback with the list
+                         last_valid_list[:] = new_list # Update last valid list state correctly
+                    # Reset background color on success if error was shown previously
+                    if hasattr(list_widget, 'native') and list_widget.native:
+                         list_widget.native.setStyleSheet("")
+                    return value_str # Return the input string to keep it in the widget
+
+                except ValueError as e:
+                    # Handle parsing errors (e.g., non-float input)
+                    print(f"Warning: Invalid list format for {param_name}: '{value_str}'. Error: {e}.")
+                    print(f"         Keeping last valid value: {last_valid_list}")
+                    # Indicate error visually (optional)
+                    if hasattr(list_widget, 'native') and list_widget.native:
+                        list_widget.native.setStyleSheet("background-color: #FFDDDD;") # Light red background
+                    # Do NOT call the main callback
+                    # Return the *string representation of the last valid list* to revert the widget
+                    return ", ".join(map(str, last_valid_list))
+
+            # Create the magicgui widget as a LineEdit
+            widget = magicgui(
+                list_widget,
+                auto_call=True, # Call on change
+                value_str={ # Parameter name in inner function must match key here
+                    "widget_type": "LineEdit",
+                    "label": label, # Use label from config
+                }
+            )
+
+        elif param_type == "float":
+            # Handle float type (Slider or SpinBox)
+            default_value = float(param_config.get("value", 0.0)) # Ensure float
+            min_val = float(param_config.get("min", 0.0))
+            max_val = float(param_config.get("max", 100.0))
+            step_val = float(param_config.get("step", 0.1))
+            # Ensure min <= default <= max
+            default_value = max(min_val, min(default_value, max_val))
+
+            def float_widget(value: float = default_value):
+                 callback(value)
+                 return value
+            widget = magicgui(
+                 float_widget, auto_call=True,
+                 value={"widget_type": "FloatSpinBox", # SpinBox might be better for floats
+                        "label": label,
+                        "min": min_val,
+                        "max": max_val,
+                        "step": step_val}
+            )
+
+        elif param_type == "int":
+            # Handle int type (Slider or SpinBox)
+            default_value = int(param_config.get("value", 0)) # Ensure int
+            min_val = int(param_config.get("min", 0))
+            max_val = int(param_config.get("max", 100))
+            step_val = int(param_config.get("step", 1))
+            # Ensure min <= default <= max
+            default_value = max(min_val, min(default_value, max_val))
+
+            def int_widget(value: int = default_value):
+                 callback(value)
+                 return value
+            widget = magicgui(
+                 int_widget, auto_call=True,
+                 value={"widget_type": "SpinBox", # Use SpinBox for better precision control
+                        "label": label,
+                        "min": min_val,
+                        "max": max_val,
+                        "step": step_val}
+            )
+
+        elif param_type == "bool":
+             # Handle boolean type
+             default_value = bool(param_config.get("value", False)) # Ensure bool
+             def bool_widget(value: bool = default_value):
+                  callback(value)
+                  return value
+             widget = magicgui(
+                 bool_widget, auto_call=True,
+                 value={"widget_type": "CheckBox",
+                        "label": label}
+             )
+        else:
+            # Fallback for unsupported types - create a simple LineEdit displaying str(value)
+            print(f"Warning: Unsupported parameter type '{param_type}' for '{param_name}'. Creating basic LineEdit.")
+            default_value_str = str(param_config.get("value", "")) # Convert value to string
+            last_valid_str = default_value_str
+
+            def fallback_widget(value: str = default_value_str):
+                nonlocal last_valid_str
+                # Here, we don't know the target type, so we pass the string directly.
+                # The receiving function might need to handle conversion.
+                if value != last_valid_str:
+                     callback(value) # Pass the raw string value
+                     last_valid_str = value
+                return value # Keep the string in the widget
+
+            widget = magicgui(
+                fallback_widget, auto_call=True,
+                value={"widget_type": "LineEdit",
+                       "label": label}
+            )
+
+        # Store the original parameter name as an attribute on the magicgui instance
+        if widget:
+            widget.param_name = param_name
+
+    except Exception as e:
+         print(f"ERROR creating widget for parameter '{param_name}': {e}")
+         print(f"Config: {param_config}")
+         print(traceback.format_exc())
+         # Optionally create a disabled label indicating the error
+         # error_label = magicgui(lambda: None, labels=False, auto_call=False)
+         # error_label.native.setText(f"Error loading '{label}'")
+         # error_label.native.setEnabled(False)
+         # return error_label # Or return None, or raise error
+         return None # Return None if widget creation failed
+
     return widget
 
-def check_processing_state(processed_dir, processing_mode):
+
+
+# --- check_processing_state (MODIFIED) ---
+def check_processing_state(processed_dir: str, processing_mode: str, mode_files: Dict[str, str]) -> int:
     """
-    Check the processing state by looking for checkpoint files
-    Returns the current step number (0, 1, 2, or 3) based on found files
+    Check the processing state based on the existence of key output files for the mode.
+    Now uses the mode_files dictionary provided by the strategy.
+
+    Args:
+        processed_dir: The directory containing processed files. (Potentially redundant if paths in mode_files are absolute)
+        processing_mode: The current mode ('nuclei' or 'ramified'). Used for warnings.
+        mode_files: A dictionary mapping step keys (e.g., "metrics_df", "final_segmentation")
+                    to their expected FULL file paths, provided by the strategy.
+
+    Returns:
+        The highest completed step number (0=none, 1=initial, 2=refine, 3=features).
     """
+    # Define keys used for checking steps
+    feature_key = "metrics_df"
+    refine_key = "final_segmentation"
+    initial_key = "initial_segmentation"
+    cell_bodies_key = "cell_bodies" # Specific to ramified, used for warning
+
     # Check for step 3 completion (feature calculation)
-    metrics_df_loc = os.path.join(processed_dir, f"metrics_df_{processing_mode}.csv")
-    if os.path.exists(metrics_df_loc):
-        return 3  # All steps completed
-    
-    # Check for step 2 completion (refined ROIs)
-    merged_roi_array_loc = os.path.join(processed_dir, f"final_segmentation_{processing_mode}.dat")
-    if os.path.exists(merged_roi_array_loc):
-        return 2  # Ready for feature calculation
-    
-    # Check for step 1 completion (initial segmentation)
-    segmented_cells_path = os.path.join(processed_dir, f"initial_segmentation_{processing_mode}.npy")
-    if os.path.exists(segmented_cells_path):
-        return 1  # Ready for ROI refinement
-    
-    # No checkpoints found
-    return 0  # Ready for initial segmentation
+    # Using metrics_df as the primary indicator for step 3 completion
+    metrics_df_loc = mode_files.get(feature_key)
+    if metrics_df_loc and os.path.exists(metrics_df_loc):
+        # Optional: Check for depth_df - its absence doesn't mean step 3 failed,
+        # but calculation might be needed later. Handled within strategy now.
+        return 3  # Feature calculation completed
+
+    # Check for step 2 completion (ROI refinement)
+    # Requires final segmentation file
+    final_seg_loc = mode_files.get(refine_key)
+    if final_seg_loc and os.path.exists(final_seg_loc):
+         # Check for cell bodies file in ramified mode, though its absence might not block step 3
+         cell_bodies_loc = mode_files.get(cell_bodies_key)
+         if processing_mode == 'ramified' and (not cell_bodies_loc or not os.path.exists(cell_bodies_loc)):
+             print(f"Warning (check_processing_state): Final segmentation found for '{processing_mode}', but cell bodies file missing or not specified in mode_files.")
+         return 2 # ROI refinement completed
+
+    # Check for step 1 completion (Initial segmentation)
+    # Requires initial segmentation file
+    initial_seg_loc = mode_files.get(initial_key)
+    if initial_seg_loc and os.path.exists(initial_seg_loc):
+        return 1 # Initial segmentation completed
+
+    return 0 # No steps completed
 
 
+# --- organize_processing_dir (Largely Unchanged) ---
 def organize_processing_dir(drctry, mode):
     """
     A function to organize the directory with multiple samples for processing with 3D segmentation
@@ -88,17 +245,19 @@ def organize_processing_dir(drctry, mode):
     # Make a list of all the tif files in the directory
     try:
         all_files = os.listdir(drctry)
-        tif_files = [f for f in all_files if f.lower().endswith('.tif') and os.path.isfile(os.path.join(drctry, f))]
+        # Robustly filter TIF/TIFF extensions, case-insensitive
+        tif_files = [f for f in all_files if f.lower().endswith(('.tif', '.tiff')) and os.path.isfile(os.path.join(drctry, f))]
         csv_files = [f for f in all_files if f.lower().endswith('.csv') and os.path.isfile(os.path.join(drctry, f))]
     except OSError as e:
         raise OSError(f"Error listing files in directory {drctry}: {e}") from e
 
     if not tif_files:
-        raise ValueError('No .tif files found directly in the selected directory.')
+        # Check subdirectories too? No, instruction says 'directly in the selected directory'.
+        raise ValueError('No .tif or .tiff files found directly in the selected directory.')
 
     # Check that there is only one csv file in the directory
     if len(csv_files) != 1:
-        raise ValueError(f'Expected exactly one .csv file in the directory, found {len(csv_files)}.')
+        raise ValueError(f'Expected exactly one .csv file in the directory, found {len(csv_files)}: {", ".join(csv_files)}')
 
     # Load the csv file
     csv_file = csv_files[0]
@@ -111,23 +270,24 @@ def organize_processing_dir(drctry, mode):
     # Check that the csv file has the correct columns
     required_cols = ['Filename', 'Width (um)', 'Height (um)', 'Slices', 'Depth (um)']
     if not all([col in df.columns for col in required_cols]):
-        raise ValueError(f'The CSV file must have columns: {", ".join(required_cols)}')
+        raise ValueError(f'The CSV file must have columns: {", ".join(required_cols)}. Found: {", ".join(df.columns)}')
 
     # Check that the CSV file lists all the found TIF files (matching base names)
+    # Ensure comparison is robust (e.g., string type)
     csv_filenames = set(df['Filename'].astype(str))
     tif_basenames = set(os.path.splitext(f)[0] for f in tif_files)
 
     if csv_filenames != tif_basenames:
         missing_in_csv = tif_basenames - csv_filenames
         missing_in_folder = csv_filenames - tif_basenames
-        error_msg = "Mismatch between CSV filenames and TIF files found:"
+        error_msg = "Mismatch between CSV 'Filename' column (without extension) and TIF/TIFF files found:"
         if missing_in_csv:
             error_msg += f"\n - TIF files not listed in CSV: {', '.join(missing_in_csv)}"
         if missing_in_folder:
             error_msg += f"\n - CSV filenames without matching TIF: {', '.join(missing_in_folder)}"
         raise ValueError(error_msg)
 
-    # Determine paths for template config files (assuming they are alongside this script)
+    # Determine paths for template config files (assuming they are alongside this script or CWD)
     script_dir = os.path.dirname(os.path.abspath(__file__))
     if mode == 'nuclear':
         config_template_name = 'nuclear_config.yaml'
@@ -139,13 +299,14 @@ def organize_processing_dir(drctry, mode):
     config_template_path = os.path.join(script_dir, config_template_name)
     if not os.path.exists(config_template_path):
         # Fallback: Check current working directory if not found alongside script
+        print(f"Template not found in {script_dir}, checking CWD: {os.getcwd()}")
         config_template_path = os.path.join(os.getcwd(), config_template_name)
         if not os.path.exists(config_template_path):
-           raise FileNotFoundError(f"Config template '{config_template_name}' not found in {script_dir} or {os.getcwd()}. Please ensure it exists.")
-
+           raise FileNotFoundError(f"Config template '{config_template_name}' not found in script directory ({script_dir}) or current working directory ({os.getcwd()}). Please ensure it exists.")
+    print(f"Using config template: {config_template_path}")
 
     # Create a new directory for each tif file and process
-    root_names = [os.path.splitext(f)[0] for f in tif_files]
+    root_names = list(tif_basenames) # Use the set derived from actual files
     print(f"Found TIF roots: {root_names}")
 
     for root_name in root_names:
@@ -156,146 +317,236 @@ def organize_processing_dir(drctry, mode):
         except OSError as e:
              raise OSError(f"Error creating directory {new_dir}: {e}") from e
 
-        # Move the tif file to the new directory
-        tif_file = root_name + '.tif' # Reconstruct filename assuming .tif extension
-        # Find the actual tif filename case-insensitively if needed, but stick to root_name.tif for now
-        original_tif_path = os.path.join(drctry, tif_file)
-        # Find the actual TIF file matching the root name (case-insensitive check might be better)
+        # Find the actual TIF/TIFF file matching the root name (case-insensitive check might be better if needed)
         actual_tif_file = next((f for f in tif_files if os.path.splitext(f)[0] == root_name), None)
         if not actual_tif_file:
-             print(f"Warning: Could not find exact TIF file for root '{root_name}'. Skipping move/config.")
+             print(f"Critical Warning: Could not find exact TIF file for root '{root_name}' during processing loop. Skipping.")
              continue # Should not happen due to earlier check, but safety first
+
         original_tif_path = os.path.join(drctry, actual_tif_file)
         new_tif_path = os.path.join(new_dir, actual_tif_file) # Use original filename in new dir
 
-        try:
-             print(f"Moving {original_tif_path} to {new_tif_path}")
-             shutil.move(original_tif_path, new_tif_path)
-        except Exception as e:
-             raise OSError(f"Error moving file {original_tif_path} to {new_tif_path}: {e}") from e
+        # Avoid moving if source and destination are the same (e.g., if rerun)
+        if os.path.abspath(original_tif_path) == os.path.abspath(new_tif_path):
+            print(f"File {actual_tif_file} is already in the target directory {new_dir}. Skipping move.")
+        elif not os.path.exists(original_tif_path):
+             print(f"Warning: Source file {original_tif_path} does not exist (might have been moved already?). Skipping move.")
+             # Check if it exists in the new location already
+             if not os.path.exists(new_tif_path):
+                  raise FileNotFoundError(f"Critical: TIF file {actual_tif_file} missing from both source and destination.")
+        else:
+             try:
+                 print(f"Moving {original_tif_path} to {new_tif_path}")
+                 shutil.move(original_tif_path, new_tif_path)
+             except Exception as e:
+                 # Check if destination already exists (e.g., if interrupted and rerun)
+                 if os.path.exists(new_tif_path):
+                      print(f"Warning: Destination {new_tif_path} already exists. Assuming move was completed earlier. Skipping move.")
+                 else:
+                      raise OSError(f"Error moving file {original_tif_path} to {new_tif_path}: {e}") from e
 
 
         # Copy the correct yaml config file to the new directory and populate it
-        new_config_path = os.path.join(new_dir, config_template_name) # Use template name for consistency
+        # Always use the template name for the copied file for consistency
+        new_config_path = os.path.join(new_dir, config_template_name)
         try:
-            print(f"Copying template {config_template_path} to {new_config_path}")
-            shutil.copy2(config_template_path, new_config_path) # copy2 preserves metadata
+            # Copy template only if config doesn't exist or explicitly overwrite
+            if not os.path.exists(new_config_path):
+                 print(f"Copying template {config_template_path} to {new_config_path}")
+                 shutil.copy2(config_template_path, new_config_path) # copy2 preserves metadata
+            else:
+                 print(f"Config file {new_config_path} already exists. Skipping copy, will update existing.")
 
             # Populate the yaml file with the correct dimensions and mode
-            row = df[df['Filename'] == root_name]
+            # Match filename case-insensitively in DataFrame if necessary, but CSV should match root_name
+            row = df[df['Filename'].astype(str) == root_name]
             if row.empty:
                 print(f"Warning: No data found in CSV for Filename '{root_name}'. Skipping config update.")
                 continue
 
-            x = row['Width (um)'].values[0]
-            y = row['Height (um)'].values[0]
-            z = row['Depth (um)'].values[0]
+            # Safely get values, handle potential multiple matches (take first)
+            x = row['Width (um)'].iloc[0]
+            y = row['Height (um)'].iloc[0]
+            z = row['Depth (um)'].iloc[0]
 
             # Read, update, and write the YAML safely
-            with open(new_config_path, 'r') as f:
-                config_data = yaml.safe_load(f) # Load existing structure
+            config_data = {}
+            if os.path.exists(new_config_path):
+                try:
+                    with open(new_config_path, 'r') as f:
+                        config_data = yaml.safe_load(f) # Load existing structure
+                        if config_data is None: # Handle empty YAML file
+                             config_data = {}
+                except yaml.YAMLError as ye:
+                    print(f"Warning: Could not parse existing YAML {new_config_path}: {ye}. Will create from scratch.")
+                    config_data = {} # Reset if unparseable
+                except Exception as e:
+                    print(f"Warning: Error reading existing YAML {new_config_path}: {e}. Will create from scratch.")
+                    config_data = {}
 
-            # Ensure keys exist before assigning
-            if 'voxel_dimensions' not in config_data or not isinstance(config_data['voxel_dimensions'], dict):
+
+            # Ensure keys exist before assigning, create if necessary
+            if 'voxel_dimensions' not in config_data or not isinstance(config_data.get('voxel_dimensions'), dict):
                 config_data['voxel_dimensions'] = {}
             config_data['voxel_dimensions']['x'] = float(x) # Ensure float
             config_data['voxel_dimensions']['y'] = float(y) # Ensure float
             config_data['voxel_dimensions']['z'] = float(z) # Ensure float
 
-            # Add the mode
+            # Add/Update the mode
             config_data['mode'] = mode
 
             with open(new_config_path, 'w') as f:
                 yaml.dump(config_data, f, default_flow_style=False, sort_keys=False)
-            print(f"Updated config {new_config_path} with dimensions and mode.")
+            print(f"Updated config {new_config_path} with dimensions (X:{x}, Y:{y}, Z:{z}) and mode '{mode}'.")
 
         except Exception as e:
-            raise RuntimeError(f"Error processing config file for {root_name}: {e}") from e
+            raise RuntimeError(f"Error processing config file for {root_name}: {e}\n{traceback.format_exc()}") from e
 
     print(f"Directory organization complete for {drctry}")
 
 
-
-
+# --- ApplicationState (Unchanged) ---
 class ApplicationState(QObject):
     """Singleton to manage application state, including the main project window."""
     show_project_view_signal = pyqtSignal()
 
     _instance = None
-    project_view_window = None  # Add attribute to hold the window instance
+    project_view_window = None  # Holds the single ProjectViewWindow instance
 
     def __new__(cls):
         if cls._instance is None:
+            print("Creating ApplicationState instance")
             cls._instance = super(ApplicationState, cls).__new__(cls)
             cls._instance.__initialized = False
         return cls._instance
 
     def __init__(self):
-        if not self.__initialized:
+        if not getattr(self, '_ApplicationState__initialized', False): # Name mangling check
             super().__init__()
             self.__initialized = True
+            print("Initializing ApplicationState")
 
 # Create global instance
 app_state = ApplicationState()
 
+# --- ProjectManager (Unchanged) ---
 class ProjectManager:
     """
     Manages project-level operations for image segmentation
     """
     def __init__(self):
         self.project_path = None
-        self.image_folders = []
-    
+        self.image_folders = [] # List of full paths to valid image subdirectories
+
     def select_project_folder(self):
         """
         Open file dialog to select project folder
         """
-        self.project_path = QFileDialog.getExistingDirectory(
-            None, 
-            "Select Project Folder", 
-            ""
+        # Use parent=None if no specific parent window is needed
+        selected_path = QFileDialog.getExistingDirectory(
+            None,
+            "Select Project Root Folder (containing organized image subfolders or files to be organized)",
+            "" # Start directory (optional)
         )
-        
-        if not self.project_path:
+
+        if not selected_path:
+            print("Project folder selection cancelled.")
             return None
-        
-        # Validate and collect image folders
+
+        self.project_path = selected_path
+        print(f"Project folder selected: {self.project_path}")
+
+        # Re-scan for valid folders after selection (important if organizing happened)
         self._find_valid_image_folders()
         return self.project_path
-    
+
     def _find_valid_image_folders(self):
         """
-        Find all subfolders that contain a valid TIFF image and YAML configuration
+        Find all direct subfolders of self.project_path that contain exactly
+        one valid TIFF image and exactly one YAML configuration file.
         """
         self.image_folders = []
-        for root, dirs, files in os.walk(self.project_path):
-            # Check for TIFF and YAML files
-            tif_files = [f for f in files if f.endswith('.tif')]
-            yaml_files = [f for f in files if f.endswith(('.yaml', '.yml'))]
-            
-            if tif_files and yaml_files:
-                # Ensure only one TIFF and YAML file
-                if len(tif_files) == 1 and len(yaml_files) == 1:
-                    self.image_folders.append(root)
-    
+        if not self.project_path or not os.path.isdir(self.project_path):
+            print("Project path not set or invalid, cannot find image folders.")
+            return
+
+        print(f"Scanning for valid image folders in: {self.project_path}")
+        try:
+            for item in os.listdir(self.project_path):
+                potential_folder_path = os.path.join(self.project_path, item)
+                if os.path.isdir(potential_folder_path):
+                    # Check contents of this subdirectory
+                    try:
+                        folder_contents = os.listdir(potential_folder_path)
+                        tif_files = [f for f in folder_contents if f.lower().endswith(('.tif', '.tiff')) and os.path.isfile(os.path.join(potential_folder_path, f))]
+                        yaml_files = [f for f in folder_contents if f.lower().endswith(('.yaml', '.yml')) and os.path.isfile(os.path.join(potential_folder_path, f))]
+
+                        # Check for exactly one of each required file type
+                        if len(tif_files) == 1 and len(yaml_files) == 1:
+                            print(f"  Found valid image folder: {item}")
+                            self.image_folders.append(potential_folder_path)
+                        # else:
+                        #     if len(tif_files) > 1 or len(yaml_files) > 1:
+                        #          print(f"  Skipping folder {item}: Found {len(tif_files)} TIFs, {len(yaml_files)} YAMLs (expected 1 each).")
+                        #     elif not tif_files or not yaml_files:
+                        #          print(f"  Skipping folder {item}: Missing TIF or YAML file.")
+
+                    except OSError as e:
+                        print(f"Warning: Could not read subdirectory {potential_folder_path}: {e}")
+                        continue # Skip this subdirectory
+
+        except OSError as e:
+            print(f"Error listing contents of project path {self.project_path}: {e}")
+            self.image_folders = [] # Reset on error
+
+        print(f"Found {len(self.image_folders)} valid image folders.")
+
+
     def get_image_details(self, folder_path):
         """
-        Get details of images in a specific folder
+        Get details (tif, yaml, mode) of image in a specific folder.
+        Assumes folder_path is a valid image folder found by _find_valid_image_folders.
         """
-        tif_file = [f for f in os.listdir(folder_path) if f.endswith('.tif')][0]
-        yaml_file = [f for f in os.listdir(folder_path) if f.endswith(('.yaml', '.yml'))][0]
-        
-        # Load YAML to get processing mode
-        with open(os.path.join(folder_path, yaml_file), 'r') as file:
-            config = yaml.safe_load(file)
-        
-        return {
-            'path': folder_path,
-            'tif_file': tif_file,
-            'yaml_file': yaml_file,
-            'mode': config.get('mode', 'unknown')
-        }
+        try:
+            contents = os.listdir(folder_path)
+            tif_file = next((f for f in contents if f.lower().endswith(('.tif', '.tiff'))), None)
+            yaml_file = next((f for f in contents if f.lower().endswith(('.yaml', '.yml'))), None)
 
+            if not tif_file or not yaml_file:
+                raise FileNotFoundError(f"Required TIF/YAML file not found in {folder_path}")
+
+            # Load YAML to get processing mode
+            config = {}
+            yaml_path = os.path.join(folder_path, yaml_file)
+            try:
+                with open(yaml_path, 'r') as file:
+                    config = yaml.safe_load(file)
+                    if config is None: config = {} # Handle empty file
+            except yaml.YAMLError as ye:
+                 print(f"Warning: Could not parse YAML {yaml_path}: {ye}")
+                 config = {} # Treat as empty
+            except Exception as e:
+                print(f"Warning: Error reading YAML {yaml_path}: {e}")
+                config = {} # Treat as empty
+
+
+            return {
+                'path': folder_path,
+                'tif_file': tif_file,   # Just the filename
+                'yaml_file': yaml_file, # Just the filename
+                'mode': config.get('mode', 'unknown') # Default if mode key is missing
+            }
+        except Exception as e:
+             print(f"Error getting image details for {folder_path}: {e}")
+             # Return partial or error state
+             return {
+                 'path': folder_path,
+                 'tif_file': 'Error',
+                 'yaml_file': 'Error',
+                 'mode': 'error'
+             }
+
+# --- ProjectViewWindow (Unchanged UI, logic for organization integrated) ---
 class ProjectViewWindow(QMainWindow):
     """
     Main window for project view with list of images.
@@ -304,9 +555,11 @@ class ProjectViewWindow(QMainWindow):
     def __init__(self, project_manager):
         super().__init__()
         self.project_manager = project_manager
+        # Store the napari viewer instance if needed, maybe passed or created here
+        # self.viewer = viewer # If managing a single viewer instance
         self.initUI()
-        # No need to explicitly set WA_DeleteOnClose unless you have specific reasons.
-        # Overriding closeEvent is the cleaner way to handle shutdown logic.
+        # Ensure this window closing quits the app if it's the main control window
+        self.setAttribute(Qt.WA_QuitOnClose) # More direct than overriding closeEvent for simple quit
 
     def initUI(self):
         self.setWindowTitle("Image Segmentation Project")
@@ -328,9 +581,11 @@ class ProjectViewWindow(QMainWindow):
         # Buttons
         button_layout = QHBoxLayout()
 
-        select_project_btn = QPushButton("Select Project Folder")
+        select_project_btn = QPushButton("Select/Load Project Folder") # Changed label slightly
         select_project_btn.clicked.connect(self.load_project)
         button_layout.addWidget(select_project_btn)
+
+        # Add other buttons if needed (e.g., "Organize Current Folder")
 
         layout.addLayout(button_layout)
 
@@ -339,311 +594,475 @@ class ProjectViewWindow(QMainWindow):
 
     def load_project(self):
         """
-        Load project: select folder, check if needs organizing, organize if needed,
-        then populate image list.
+        Selects a project folder, checks if it needs organizing, organizes if necessary,
+        and populates the image list with valid subfolders.
         """
-        selected_path = self.project_manager.select_project_folder() # Use PM just to get path
+        selected_path = self.project_manager.select_project_folder() # Uses PM to get/set path
 
         if not selected_path:
-            # User cancelled selection
-            # Optionally clear list or keep previous state
-            # self.image_list.clear()
-            # self.project_path_label.setText("Project Path: Not Selected")
-            return
+            return # User cancelled
 
         self.project_path_label.setText(f"Project Path: {selected_path}")
         self.image_list.clear() # Clear previous list
 
         try:
             # --- Check if the selected folder needs organizing ---
+            # This logic checks for loose TIFs and a single CSV at the root
             needs_organizing = False
+            root_tifs = []
+            root_csvs = []
+            root_dirs = []
             try:
-                # List contents safely
                 root_contents = os.listdir(selected_path)
-                root_files = [f for f in root_contents if os.path.isfile(os.path.join(selected_path, f))]
-                root_dirs = [d for d in root_contents if os.path.isdir(os.path.join(selected_path, d))]
-
-                root_tifs = [f for f in root_files if f.lower().endswith('.tif')]
-                root_csvs = [f for f in root_files if f.lower().endswith('.csv')]
+                for item in root_contents:
+                    item_path = os.path.join(selected_path, item)
+                    if os.path.isfile(item_path):
+                         if item.lower().endswith(('.tif', '.tiff')):
+                             root_tifs.append(item)
+                         elif item.lower().endswith('.csv'):
+                             root_csvs.append(item)
+                    elif os.path.isdir(item_path):
+                         root_dirs.append(item)
 
                 if root_tifs and len(root_csvs) == 1:
                     # Potential candidate. Check if subdirs matching TIF names already exist.
                     tif_basenames = set(os.path.splitext(f)[0] for f in root_tifs)
                     existing_matching_dirs = tif_basenames.intersection(set(root_dirs))
-                    if not existing_matching_dirs: # If no subdirs matching TIFs exist, it needs organizing
+                    # If TIFs exist, CSV exists, AND no subdirs matching the TIFs exist, then organize.
+                    if not existing_matching_dirs:
                          needs_organizing = True
                          print(f"Detected unorganized project structure in: {selected_path}")
+                    # else:
+                    #      print("Structure looks organized or partially organized. Will load existing subfolders.")
 
             except OSError as e:
-                 QMessageBox.critical(self, "Error Listing Directory", f"Could not read directory contents:\n{selected_path}\n{e}")
+                 QMessageBox.critical(self, "Error Listing Directory", f"Could not read directory contents to check organization:\n{selected_path}\n{e}")
                  return # Stop loading
 
             # --- Organize if needed ---
             if needs_organizing:
-                modes = ["nuclei", "ramified"]
-                selected_mode, ok = QInputDialog.getItem(
-                    self,
-                    "Select Processing Mode",
-                    "Choose the processing mode for this dataset:",
-                    modes,
-                    0,  # Default index
-                    False # Not editable
-                )
+                reply = QMessageBox.question(self, "Organize Project?",
+                                             f"Unorganized structure detected (TIFs and one CSV found at root level: {selected_path}).\n\n"
+                                             "Do you want to organize this folder now?\n"
+                                             "(This will move TIFs into subfolders and create config files).",
+                                             QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes)
 
-                if ok and selected_mode:
-                    try:
-                        organize_processing_dir(selected_path, selected_mode)
-                        QMessageBox.information(self, "Organization Complete",
-                                                f"Project folder organized successfully for '{selected_mode}' mode.")
-                    except (ValueError, OSError, FileNotFoundError, RuntimeError) as e:
-                        QMessageBox.critical(self, "Organization Failed",
-                                             f"Failed to organize the project folder:\n{e}\n\nPlease check the folder contents, CSV file, and config templates.")
-                        return # Stop loading if organization fails
-                    except Exception as e:
-                         QMessageBox.critical(self, "Unexpected Error During Organization",
-                                             f"An unexpected error occurred:\n{e}\n\n{traceback.format_exc()}")
-                         return
+                if reply == QMessageBox.Yes:
+                    modes = ["nuclei", "ramified"]
+                    selected_mode, ok = QInputDialog.getItem(
+                        self, "Select Processing Mode", "Choose the mode for organizing this dataset:",
+                        modes, 0, False)
+
+                    if ok and selected_mode:
+                        try:
+                            organize_processing_dir(selected_path, selected_mode)
+                            QMessageBox.information(self, "Organization Complete",
+                                                    f"Project folder organized successfully for '{selected_mode}' mode.")
+                            # Re-scan project after organizing
+                            self.project_manager._find_valid_image_folders()
+
+                        except Exception as e:
+                            QMessageBox.critical(self, "Organization Failed",
+                                                 f"Failed to organize the project folder:\n{e}\n\n{traceback.format_exc()}")
+                            # Decide whether to proceed or stop
+                            # Allowing to proceed might show an empty list if organization failed partially
+                            # Let's attempt to load whatever might be valid anyway.
+                            self.project_manager._find_valid_image_folders() # Scan again
+                    else:
+                        # User cancelled mode selection
+                        QMessageBox.warning(self, "Organization Cancelled",
+                                            "Project organization cancelled by user.")
+                        # Proceed to load whatever might be valid, even if unorganized
+                        self.project_manager._find_valid_image_folders() # Scan again
                 else:
-                    # User cancelled mode selection
-                    QMessageBox.warning(self, "Organization Cancelled",
-                                        "Project organization cancelled. Cannot load unorganized project.")
-                    self.project_path_label.setText("Project Path: Not Selected") # Reset label
-                    return # Stop loading
+                     # User chose not to organize
+                     QMessageBox.information(self, "Organization Skipped",
+                                         "Organization skipped. Loading existing valid subfolders only.")
+                     # Scan for existing valid folders
+                     self.project_manager._find_valid_image_folders() # Scan again
 
-            # --- Load project (either pre-existing or just organized) ---
-            # Now, update the project manager's path and find valid folders
-            self.project_manager.project_path = selected_path # Set the path in the manager
-            self.project_manager._find_valid_image_folders() # This looks for the organized structure
-
+            # --- Populate list (using folders found by ProjectManager) ---
             if not self.project_manager.image_folders:
-                 QMessageBox.warning(self, "No Valid Images", f"No valid image subfolders (containing one .tif and one .yaml) found in:\n{selected_path}")
+                 if not needs_organizing: # Only show warning if it wasn't expected to be empty
+                     QMessageBox.warning(self, "No Valid Images Found",
+                                         f"No valid image subfolders (containing one .tif/.tiff and one .yaml/.yml) found in:\n{selected_path}")
+                 # List remains empty
 
             # Populate image list
-            for folder in self.project_manager.image_folders:
+            for folder_path in self.project_manager.image_folders:
                 try:
-                    image_details = self.project_manager.get_image_details(folder)
-                    display_text = (
-                        f"{os.path.basename(folder)} - "
-                        f"Mode: {image_details.get('mode', 'unknown')}" # Use .get for safety
-                    )
-                    # Use QListWidgetItem for potential future features
+                    details = self.project_manager.get_image_details(folder_path)
+                    if details.get('mode') == 'error':
+                         display_text = f"{os.path.basename(folder_path)} - Error loading details"
+                    else:
+                         display_text = (
+                             f"{os.path.basename(folder_path)} - "
+                             f"Mode: {details.get('mode', 'unknown')}"
+                         )
                     item_widget = QListWidgetItem(display_text)
+                    # Store the full path in the item's data for retrieval
+                    item_widget.setData(Qt.UserRole, folder_path)
                     self.image_list.addItem(item_widget)
                 except Exception as e:
-                    print(f"Error processing folder {folder} for display: {e}")
-                    item_widget = QListWidgetItem(f"{os.path.basename(folder)} - Error loading details")
-                    self.image_list.addItem(item_widget)
+                    print(f"Error processing folder {folder_path} for display list: {e}")
+                    # Add an error item to the list
+                    error_item = QListWidgetItem(f"{os.path.basename(folder_path)} - Error processing")
+                    error_item.setData(Qt.UserRole, folder_path) # Still store path if possible
+                    self.image_list.addItem(error_item)
 
         except Exception as e:
-            # Catch-all for unexpected errors during loading/checking
             QMessageBox.critical(self, "Error Loading Project",
-                                 f"An unexpected error occurred while loading the project:\n{e}\n\n{traceback.format_exc()}")
+                                 f"An unexpected error occurred:\n{e}\n\n{traceback.format_exc()}")
             self.image_list.clear()
             self.project_path_label.setText("Project Path: Error")
+
 
     def open_image_view(self, item):
         """
         Open the image view for the selected item, hiding the project view.
+        Retrieves folder path from item data.
         """
         try:
-            index = self.image_list.row(item)
-            if index < 0 or index >= len(self.project_manager.image_folders):
-                QMessageBox.warning(self, "Warning", "Invalid item selected.")
+            selected_folder = item.data(Qt.UserRole) # Retrieve the stored path
+            if not selected_folder or not os.path.isdir(selected_folder):
+                QMessageBox.warning(self, "Error", f"Invalid folder path associated with selected item:\n{selected_folder}")
                 return
 
-            selected_folder = self.project_manager.image_folders[index]
-
+            print(f"Opening image view for: {selected_folder}")
             self.hide() # Hide the project view
 
             # Launch image-specific segmentation view
+            # This function will create its own Napari instance and run it.
             interactive_segmentation_with_config(selected_folder)
 
+            # Note: After interactive_segmentation_with_config finishes (Napari closes),
+            # control returns here. The ProjectView might need to be reshown if the
+            # back button wasn't used, or handled by the ApplicationState signal.
+            # The 'Back to Project' button is the cleaner way to return.
+
         except Exception as e:
-            # Detailed error logging
-            error_msg = f"Error opening image view:\n{str(e)}\n\nFull Traceback:\n{traceback.format_exc()}"
+            error_msg = f"Error opening image view from Project View:\n{str(e)}\n\nFull Traceback:\n{traceback.format_exc()}"
             QMessageBox.critical(self, "Error", error_msg)
             print(error_msg)
-            self.show() # Reshow project view on error
+            # Attempt to reshow project view on error, though state might be uncertain
+            if not self.isVisible():
+                self.show()
 
-    # --- Override closeEvent ---
+
+    # --- Override closeEvent (Optional but recommended for clean exit) ---
     def closeEvent(self, event: QCloseEvent):
         """
         Overrides the default close event handler.
-        Called when the user clicks the 'X' button or Alt+F4 etc.
-        Ensures the entire Qt application terminates.
+        Ensures the entire Qt application terminates cleanly.
         """
         print("ProjectViewWindow closeEvent received. Quitting application.")
-        # Get the QApplication instance and call quit() to stop the event loop
-        app = QApplication.instance()
-        if app:
-            app.quit()
-        # Accept the event to allow the window to be closed and destroyed.
-        event.accept()
-        # If you wanted to prevent closing (e.g., ask "Are you sure?"),
-        # you would call event.ignore() instead of event.accept() based on user response.
+        reply = QMessageBox.question(self, 'Confirm Exit',
+                                     "Are you sure you want to exit the application?",
+                                     QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
 
+        if reply == QMessageBox.Yes:
+            # Clean up resources if necessary
+            # e.g., close open files, stop threads
+
+            # Get the QApplication instance and call quit()
+            app = QApplication.instance()
+            if app:
+                app.quit() # Stops the event loop
+            event.accept() # Allow the window to close
+        else:
+            event.ignore() # Prevent the window from closing
+
+
+def _check_if_last_window():
+    """Checks if the application should quit after a window closed."""
+    app = QApplication.instance()
+    if not app:
+        print("CheckIfLastWindow: No App instance.")
+        return # No application anymore
+
+    project_window = app_state.project_view_window
+    project_view_exists = project_window is not None
+    # We need to check if the C++ object still exists too
+    project_view_valid = False
+    if project_view_exists:
+        try:
+            # Check if underlying Qt widget is still valid
+            project_view_valid = project_window.isVisible() or not project_window.isHidden()
+        except RuntimeError: # C++ object deleted
+            print("CheckIfLastWindow: Project window C++ object deleted.")
+            project_view_exists = False # Treat as non-existent
+            project_view_valid = False
+
+
+    # Get all potentially relevant top-level windows
+    active_windows = app.topLevelWidgets()
+
+    # Filter out the project window itself if it exists and any non-visible widgets
+    other_visible_task_windows = [
+        w for w in active_windows
+        if w is not project_window and w.isVisible()
+    ]
+
+    # If the project view doesn't exist OR it's not valid/visible,
+    # AND there are no other VISIBLE top-level windows, then quit.
+    if (not project_view_exists or not project_view_valid) and not other_visible_task_windows:
+         print("CheckIfLastWindow: Project View gone/hidden and no other visible windows found. Quitting.")
+         app.quit()
+    # If the project view IS visible, we never quit here (closing Napari goes back to project view)
+    elif project_view_exists and project_view_valid and project_window.isVisible():
+         print("CheckIfLastWindow: Project View is visible. Not quitting.")
+    # If project view is hidden, but other windows ARE visible, don't quit
+    elif project_view_exists and project_view_valid and not project_window.isVisible() and other_visible_task_windows:
+         print(f"CheckIfLastWindow: Project View hidden, but {len(other_visible_task_windows)} other window(s) visible. Not quitting.")
+    else:
+         # Catch-all, includes case where project view is hidden and no other windows visible
+         if not project_view_exists or not project_view_valid: # Double check the condition for quit
+              if not other_visible_task_windows:
+                   print("CheckIfLastWindow: Fallback check - Project View gone/hidden, no other visible windows. Quitting.")
+                   app.quit()
+              else:
+                   print("CheckIfLastWindow: Fallback check - Project View gone/hidden, but other windows visible. Not quitting.")
+         else: # Project view exists and is hidden
+              if not other_visible_task_windows:
+                   print("CheckIfLastWindow: Project view hidden, no other visible windows. Quitting.")
+                   app.quit()
+              # This else case should be covered above
+              # else:
+              #      print("CheckIfLastWindow: Project view hidden, but other windows visible. Not quitting.")
+
+
+def _handle_napari_close():
+    """Called when a Napari window's destroyed signal is emitted."""
+    print("Napari window destroyed signal received.")
+    # Use QTimer.singleShot to delay the check slightly.
+    # This allows Qt's event loop to process the window closure fully
+    # before we check the list of topLevelWidgets. 100ms is usually safe.
+    QTimer.singleShot(100, _check_if_last_window)
+
+
+
+# --- interactive_segmentation_with_config (MODIFIED - Removed ModifiedGUIManager) ---
 def interactive_segmentation_with_config(selected_folder=None):
-    from gui import DynamicGUIManager
     """
-    Launch interactive segmentation with dynamic GUI
-    
+    Launch interactive segmentation with dynamic GUI for a specific image folder.
+
     Args:
-        selected_folder (str, optional): Path to the specific image folder. 
-                                         If None, prompt for file selection.
+        selected_folder (str): Path to the specific image folder containing TIF and YAML.
+                               Must be provided.
     """
-    # Create PyQt5 app instance if it doesn't exist
+    # --- Import DynamicGUIManager inside the function to avoid circular imports ---
+    try:
+        from gui.gui_manager import DynamicGUIManager
+    except ImportError as e:
+        print(f"Error importing DynamicGUIManager inside function: {e}")
+        QMessageBox.critical(None, "Import Error", "Could not load core GUI component. Check installation/paths.")
+        if QApplication.instance() and app_state:
+             app_state.show_project_view_signal.emit() # Try to show project view on error
+        return # Cannot proceed
+
+    # Get existing app or create if necessary
     app = QApplication.instance()
     if app is None:
+        print("Warning: No QApplication instance found, creating one.")
         app = QApplication(sys.argv)
-    
+        app.setQuitOnLastWindowClosed(False) # Important for multi-window apps
+
+    viewer = None # Initialize viewer to None for cleanup/error handling
     try:
-        # If no folder selected, prompt for input file
-        if selected_folder is None:
-            file_loc, _ = QFileDialog.getOpenFileName(
-                None,
-                "Select a .tif file",
-                "",
-                "TIFF files (*.tif);;All files (*.*)"
-            )
-            
-            if not file_loc or not os.path.exists(file_loc):
-                QMessageBox.warning(None, "Warning", "No file selected. Exiting.")
-                return
-            input_dir = os.path.dirname(file_loc)
-        else:
-            # Use the selected folder from project view
-            input_dir = selected_folder
-            file_loc = [
-                os.path.join(input_dir, f) 
-                for f in os.listdir(input_dir) 
-                if f.endswith('.tif')
-            ][0]
-        
-        # Find YAML file in the same directory as the TIF file
-        yaml_files = [f for f in os.listdir(input_dir) if f.endswith(('.yaml', '.yml'))]
-        
-        if not yaml_files:
-            QMessageBox.critical(None, "Error", "No YAML configuration file found in the directory.")
+        # --- Input Validation ---
+        if selected_folder is None or not os.path.isdir(selected_folder):
+             raise ValueError("No valid image folder provided.")
+        input_dir = selected_folder
+        print(f"Starting interactive segmentation for folder: {input_dir}")
+
+        # --- Find TIF and YAML files ---
+        try:
+             contents = os.listdir(input_dir)
+             tif_files = [f for f in contents if f.lower().endswith(('.tif', '.tiff'))]
+             yaml_files = [f for f in contents if f.lower().endswith(('.yaml', '.yml'))]
+
+             if len(tif_files) != 1:
+                 raise FileNotFoundError(f"Expected 1 TIF/TIFF file, found {len(tif_files)} in {input_dir}")
+             if len(yaml_files) != 1:
+                 raise FileNotFoundError(f"Expected 1 YAML/YML file, found {len(yaml_files)} in {input_dir}")
+
+             file_loc = os.path.join(input_dir, tif_files[0])
+             config_path = os.path.join(input_dir, yaml_files[0])
+        except (FileNotFoundError, OSError) as e:
+            # Show error and attempt to return to project view
+            QMessageBox.critical(None, "File Error", f"Error finding required files in {input_dir}:\n{e}")
+            if QApplication.instance() and app_state: app_state.show_project_view_signal.emit()
             return
-        
-        if len(yaml_files) > 1:
-            QMessageBox.critical(None, "Error", f"Multiple YAML files found in the directory. Please keep only one YAML file.")
-            return
-        
-        config_path = os.path.join(input_dir, yaml_files[0])
-        
-        # Load config
+
+        # --- Load Config ---
         try:
             with open(config_path, 'r') as file:
                 config = yaml.safe_load(file)
+            if config is None:
+                 raise ValueError("YAML file is empty or invalid.")
         except Exception as e:
-            QMessageBox.critical(None, "Error", f"Failed to load YAML file: {str(e)}")
-            return
-        
-        # Extract processing mode from config
-        if 'mode' not in config:
-            QMessageBox.critical(None, "Error", "The YAML file does not contain a 'mode' field. Please add 'mode: nuclei' or 'mode: ramified' to the YAML file.")
-            return
-        
-        processing_mode = config['mode']
-        if processing_mode not in ["nuclei", "ramified"]:
-            QMessageBox.critical(None, "Error", f"Invalid processing mode '{processing_mode}' in YAML file. Mode must be 'nuclei' or 'ramified'.")
-            return
-        
-        # Load the .tif file
-        try:
-            image_stack = tiff.imread(file_loc)
-            print(f"Loaded stack with shape {image_stack.shape}")
-        except Exception as e:
-            QMessageBox.critical(None, "Error", f"Failed to load TIFF file: {str(e)}")
+            QMessageBox.critical(None, "Config Error", f"Failed to load or parse YAML file: {config_path}\n{e}")
+            if QApplication.instance() and app_state: app_state.show_project_view_signal.emit()
             return
 
-        # Initialize viewer and GUI manager with processing mode
-        viewer = napari.Viewer(title=f"Microscopy Analysis - {processing_mode.capitalize()} Mode")
-        
-        # Add back to project button
-        back_to_project_button = create_back_to_project_button(viewer)
-        viewer.window.add_dock_widget(back_to_project_button, area="right")
-        
-        # Create a modified DynamicGUIManager that updates the config file after each step
-        class ModifiedGUIManager(DynamicGUIManager):
-            def __init__(self, viewer, config, image_stack, file_loc, processing_mode, original_config_path):
-                super().__init__(viewer, config, image_stack, file_loc, processing_mode)
-                self.original_config_path = original_config_path
-                
-            def execute_processing_step(self):
-                """Override to save config after each step"""
-                result = super().execute_processing_step()
-                # Save updated config after each step
-                self.save_updated_config()
-                return result
-                
-            def save_updated_config(self):
-                """Save the current configuration to a YAML file in the output directory"""
-                config_save_path = os.path.join(self.processed_dir, f"processing_config_{self.processing_mode}.yaml")
-                # Create a new config with updated values but preserve the original structure
-                updated_config = self.config.copy()
-                # Keep the mode in the saved config
-                if 'mode' not in updated_config and hasattr(self, 'original_config_path'):
-                    try:
-                        with open(self.original_config_path, 'r') as file:
-                            orig_config = yaml.safe_load(file)
-                            if 'mode' in orig_config:
-                                updated_config['mode'] = orig_config['mode']
-                    except Exception:
-                        pass
-                
-                with open(config_save_path, 'w') as file:
-                    yaml.dump(updated_config, file, default_flow_style=False)
-                print(f"Saved updated configuration to {config_save_path}")
-        
-        # Use the modified GUI manager
-        gui_manager = ModifiedGUIManager(viewer, config, image_stack, file_loc, processing_mode, config_path)
-        
-        @magicgui(call_button="Continue Processing")
-        def continue_processing():
-            """Execute the next step in the processing pipeline"""
+        # --- Extract and Validate Processing Mode ---
+        processing_mode = config.get('mode')
+        if not processing_mode:
+            QMessageBox.critical(None, "Config Error", f"The YAML file ({config_path}) must contain a 'mode' field ('nuclei' or 'ramified').")
+            if QApplication.instance() and app_state: app_state.show_project_view_signal.emit()
+            return
+        if processing_mode not in ["nuclei", "ramified"]:
+            QMessageBox.critical(None, "Config Error", f"Invalid processing mode '{processing_mode}' in YAML file. Must be 'nuclei' or 'ramified'.")
+            if QApplication.instance() and app_state: app_state.show_project_view_signal.emit()
+            return
+
+        # --- Load Image Stack ---
+        try:
+            print(f"Loading image stack: {file_loc}")
+            image_stack = tiff.imread(file_loc)
+            print(f"Loaded stack with shape {image_stack.shape}, dtype {image_stack.dtype}")
+            if image_stack.ndim != 3:
+                 print(f"Warning: Expected 3D image stack, but got {image_stack.ndim} dimensions.")
+            if image_stack.size == 0:
+                 raise ValueError("Image stack is empty.")
+        except Exception as e:
+            QMessageBox.critical(None, "Image Load Error", f"Failed to load TIFF file: {file_loc}\n{e}\n\n{traceback.format_exc()}")
+            if QApplication.instance() and app_state: app_state.show_project_view_signal.emit()
+            return
+
+        # --- Initialize Napari Viewer ---
+        print("Initializing Napari viewer...")
+        viewer = napari.Viewer(title=f"Segmentation: {os.path.basename(input_dir)} ({processing_mode.capitalize()} Mode)")
+
+        # --- Connect Destroyed Signal for App Exit Logic ---
+        qt_window_to_connect = None
+        if viewer and viewer.window:
+             if hasattr(viewer.window, '_qt_window') and viewer.window._qt_window:
+                 qt_window_to_connect = viewer.window._qt_window
+                 print("Connecting destroyed signal using viewer.window._qt_window")
+        if qt_window_to_connect:
             try:
+                 # Ensure _handle_napari_close is defined elsewhere in helper_funcs.py
+                 qt_window_to_connect.destroyed.connect(_handle_napari_close)
+                 print(f"Connected destroyed signal for viewer window: {qt_window_to_connect}")
+            except NameError:
+                 print("Warning: _handle_napari_close function not defined. Cannot connect destroyed signal.")
+            except Exception as connect_error:
+                 print(f"Warning: Failed to connect destroyed signal: {connect_error}")
+        else:
+            print("Warning: Could not find underlying Qt window to connect destroyed signal.")
+
+        # --- Initialize GUI Manager ---
+        print("Initializing DynamicGUIManager...")
+        # This uses the DynamicGUIManager imported at the start of the function
+        gui_manager = DynamicGUIManager(viewer, config, image_stack, file_loc, processing_mode)
+
+        # --- Add Navigation and Control Widgets ---
+
+        # 1. Back to Project Button (using standard QPushButton)
+        # Ensure create_back_to_project_button is defined elsewhere in helper_funcs.py
+        try:
+            back_button_widget = create_back_to_project_button(viewer)
+            viewer.window.add_dock_widget(back_button_widget, area="left", name="Navigation")
+        except NameError:
+             print("Warning: create_back_to_project_button function not defined. Cannot add back button.")
+        except Exception as e:
+             print(f"Error adding back button: {e}")
+
+
+        # 2. Processing Step Buttons (using magicgui)
+        @magicgui(call_button="▶ Next Step / Run Current")
+        def continue_processing():
+            """Execute the next step or rerun current step if parameters changed."""
+            print("Continue Processing button clicked.")
+            try:
+                # Parent message box to the viewer window if possible
+                parent_widget = viewer.window._qt_window if viewer and viewer.window and hasattr(viewer.window, '_qt_window') else None
                 gui_manager.execute_processing_step()
                 update_navigation_buttons()
             except Exception as e:
-                QMessageBox.critical(None, "Processing Error", f"Error during processing: {str(e)}")
+                error_msg = f"Error during processing step:\n{str(e)}\n\n{traceback.format_exc()}"
+                QMessageBox.critical(parent_widget, "Processing Error", error_msg)
+                print(error_msg)
 
-        @magicgui(call_button="Previous Step")
+        @magicgui(call_button="◀ Previous Step")
         def go_to_previous_step():
-            """Go back one step in the processing pipeline"""
-            if gui_manager.current_step["value"] > 0:
-                gui_manager.current_step["value"] -= 1
-                step_name = gui_manager.processing_steps[gui_manager.current_step["value"]]
-                gui_manager.create_step_widgets(step_name)
-                gui_manager.cleanup_step(gui_manager.current_step["value"] + 1)
-                update_navigation_buttons()
+            """Go back one step, clearing results of the undone step."""
+            print("Previous Step button clicked.")
+            # Parent message box to the viewer window if possible
+            parent_widget = viewer.window._qt_window if viewer and viewer.window and hasattr(viewer.window, '_qt_window') else None
+            current_step_index = gui_manager.current_step["value"]
+            if current_step_index > 0:
+                try:
+                    print(f"Cleaning up artifacts of step {current_step_index}")
+                    gui_manager.cleanup_step(current_step_index)
+                    gui_manager.current_step["value"] -= 1
+                    prev_step_index = gui_manager.current_step["value"]
+                    prev_step_name = gui_manager.processing_steps[prev_step_index]
+                    print(f"Recreating widgets for step {prev_step_index+1}: {prev_step_name}")
+                    gui_manager.create_step_widgets(prev_step_name)
+                    update_navigation_buttons()
+                except Exception as e:
+                    error_msg = f"Error going to previous step:\n{str(e)}\n\n{traceback.format_exc()}"
+                    QMessageBox.critical(parent_widget, "Navigation Error", error_msg)
+                    print(error_msg)
+            else:
+                print("Already at the first step.")
 
         def update_navigation_buttons():
-            """Update the state of navigation buttons"""
-            previous_step_button.enabled = gui_manager.current_step["value"] > 0
-            continue_processing_button.enabled = gui_manager.current_step["value"] < len(gui_manager.processing_steps)
+            """Update the enabled state and label of navigation buttons."""
+            try:
+                current_step_index = gui_manager.current_step["value"]
+                total_steps = len(gui_manager.processing_steps)
 
-        # Add navigation buttons
-        continue_processing_button = continue_processing
-        previous_step_button = go_to_previous_step
-        viewer.window.add_dock_widget(continue_processing_button, area="right")
-        viewer.window.add_dock_widget(previous_step_button, area="right")
-        
-        # Initialize button states
+                # Check if magicgui widgets exist before accessing them
+                if hasattr(go_to_previous_step, 'enabled'):
+                    go_to_previous_step.enabled = current_step_index > 0
+                if hasattr(continue_processing, 'enabled'):
+                    continue_processing.enabled = current_step_index < total_steps
+                if hasattr(continue_processing, 'label'):
+                    if current_step_index < total_steps:
+                         next_step_name = gui_manager.processing_steps[current_step_index]
+                         continue_processing.label = f"Run Step {current_step_index + 1}: {next_step_name}"
+                    else:
+                         continue_processing.label = "Processing Complete"
+            except Exception as e:
+                print(f"Error updating navigation buttons: {e}") # Prevent crash if widgets deleted
+
+        # --- Add step buttons to a container dock widget ---
+        step_widget_container = QWidget()
+        step_layout = QVBoxLayout()
+        step_widget_container.setLayout(step_layout)
+        step_layout.addWidget(continue_processing.native) # Add magicgui widget's native Qt widget
+        step_layout.addWidget(go_to_previous_step.native) # Add magicgui widget's native Qt widget
+        step_layout.setContentsMargins(5,5,5,5) # Optional margins
+        viewer.window.add_dock_widget(step_widget_container, area="left", name="Processing Control")
+
+        # --- Initialize Button States ---
         update_navigation_buttons()
 
+        # --- Start the Napari Event Loop ---
+        print("Starting Napari event loop...")
+        # This blocks until the Napari window associated with 'viewer' is closed.
         napari.run()
-        print(f"Processing image: {file_loc}")
-        print(f"Processing mode: {processing_mode}")
-        # Add your existing implementation here
-            
-    except Exception as e:
-        # Detailed error logging
-        error_msg = f"Error in interactive segmentation:\n{str(e)}\n\nFull Traceback:\n{traceback.format_exc()}"
-        QMessageBox.critical(None, "Error", error_msg)
-        print(error_msg)
 
+    except Exception as e:
+        # Catch-all for errors during setup BEFORE napari.run()
+        error_msg = f"Critical error setting up interactive segmentation:\n{str(e)}\n\nFull Traceback:\n{traceback.format_exc()}"
+        QMessageBox.critical(None, "Setup Error", error_msg)
+        print(error_msg)
+        # Clean up viewer if it was created but napari.run() wasn't reached
+        if viewer is not None:
+             try:
+                 viewer.close()
+             except Exception as close_err:
+                 print(f"Error trying to close viewer after setup error: {close_err}")
+        # Try to return to project view if possible
+        if QApplication.instance() and app_state:
+             app_state.show_project_view_signal.emit()
+
+
+# --- launch_image_segmentation_tool (Unchanged, but check imports/paths) ---
 def launch_image_segmentation_tool():
     """
     Main entry point for the application. Manages the ProjectViewWindow instance.
@@ -652,116 +1071,190 @@ def launch_image_segmentation_tool():
         # Get existing app or create new one
         app = QApplication.instance()
         if app is None:
+            print("Creating QApplication instance...")
             app = QApplication(sys.argv)
-            # Ensure the application doesn't quit when the last window (potentially Napari) is closed.
-            # We will handle quitting explicitly when the ProjectViewWindow is closed.
-            app.setQuitOnLastWindowClosed(False) 
+            # Quit only when the ProjectViewWindow (main controller) is closed
+            app.setQuitOnLastWindowClosed(False) # IMPORTANT
+        else:
+             print("Using existing QApplication instance.")
+
 
         def show_or_create_project_view():
-            if app_state.project_view_window is None:
-                print("Creating new ProjectViewWindow")
+            # Check if window exists and is valid
+            window_exists = False
+            if app_state.project_view_window is not None:
+                 # Check if the underlying Qt object still exists
+                 try:
+                     if app_state.project_view_window.isVisible():
+                         window_exists = True
+                     else:
+                         # It might exist but be hidden, or it might have been deleted
+                         # Try showing it; if it errors, it was deleted.
+                         try:
+                              app_state.project_view_window.show()
+                              window_exists = True
+                         except RuntimeError: # Underlying C++ object deleted
+                              print("ProjectViewWindow object existed but underlying Qt widget was deleted. Recreating.")
+                              app_state.project_view_window = None # Clear the reference
+                              window_exists = False
+                 except Exception as e:
+                     print(f"Error checking existing project window state: {e}. Recreating.")
+                     app_state.project_view_window = None # Clear the reference
+                     window_exists = False
+
+
+            if not window_exists: # Either None or deleted
+                print("Creating new ProjectViewWindow instance.")
                 project_manager = ProjectManager()
                 app_state.project_view_window = ProjectViewWindow(project_manager)
-                # Optional: Connect the window's closed signal to app.quit
-                app_state.project_view_window.setAttribute(Qt.WA_DeleteOnClose, False) # Prevent accidental deletion
-                # If you want closing the project window to exit the app:
-                # app_state.project_view_window.destroyed.connect(app.quit) 
-                # Or handle via closeEvent if more complex logic needed.
-                
-                # Load project automatically if path exists or prompt
-                # For simplicity, we'll rely on the button inside the window
-                
-            print("Showing ProjectViewWindow")
+                # Ensure closing this window quits the app
+                app_state.project_view_window.setAttribute(Qt.WA_QuitOnClose)
+                print("ProjectViewWindow created.")
+
+            # Show and activate
+            print("Showing ProjectViewWindow...")
             app_state.project_view_window.show()
             app_state.project_view_window.activateWindow() # Bring to front
             app_state.project_view_window.raise_()         # Bring to front
 
 
         # Connect signal to handler *before* first show
-        # Use a direct connection type if issues arise, but default should work
+        try:
+             # Disconnect first to avoid multiple connections if run again in interactive env
+             app_state.show_project_view_signal.disconnect(show_or_create_project_view)
+        except TypeError: # Signal has no connection
+             pass
         app_state.show_project_view_signal.connect(show_or_create_project_view)
+        print("Connected show_project_view_signal.")
+
 
         # Show initial project view
         show_or_create_project_view()
 
         # Start the application event loop ONLY if this is the main script execution
-        if __name__ == "__main__" and not hasattr(sys, 'ps1'): # Check if not in interactive shell
-             print("Starting Qt Application event loop...")
+        # Check ensures loop isn't started if imported or in some interactive environments
+        is_interactive = hasattr(sys, 'ps1') or sys.flags.interactive
+        am_main = __name__ == "__main__"
+
+        if am_main and not is_interactive:
+             print("Starting Qt Application event loop (sys.exit(app.exec_()))...")
+             # Use sys.exit(app.exec_()) for proper exit code propagation
              exit_code = app.exec_()
              print(f"Qt Application event loop finished with exit code: {exit_code}")
              sys.exit(exit_code)
-        # else: # If imported, let the caller manage the event loop
-        #    pass
+        elif am_main and is_interactive:
+             print("Running in interactive mode. Qt event loop not started automatically by launch_image_segmentation_tool.")
+             print("You may need to manually run '%gui qt' in IPython or handle the event loop.")
+        # else: # Imported as module
+        #      print("Imported as a module. Qt event loop managed by caller.")
+
 
     except Exception as e:
-        # Detailed error logging
-        error_msg = f"Unhandled error in launch:\n{str(e)}\n\nFull Traceback:\n{traceback.format_exc()}"
+        error_msg = f"Unhandled error in launch_image_segmentation_tool:\n{str(e)}\n\nFull Traceback:\n{traceback.format_exc()}"
         print(error_msg)
-        # Ensure sys.exit is called even on error if we started the app
-        if app and __name__ == "__main__" and not hasattr(sys, 'ps1'):
+        # Try to show error in a message box if possible
+        try:
+            QMessageBox.critical(None, "Fatal Launch Error", error_msg)
+        except Exception:
+             pass # Ignore if GUI cannot be shown
+        # Ensure sys.exit is called even on error if we intended to start the app
+        if app and am_main and not is_interactive:
             sys.exit(1)
-        elif not app: # If app creation failed
+        elif not app and am_main: # If app creation failed
              sys.exit(1)
 
+
+# --- create_back_to_project_button (Unchanged logic, added checks) ---
 def create_back_to_project_button(viewer):
     """
-    Create a button to return to the project view.
+    Create a standard QPushButton in a QWidget container to act as the
+    'Back to Project List' button.
 
     Args:
-        viewer (napari.Viewer): Current napari viewer
+        viewer (napari.Viewer): The Napari viewer instance this button belongs to.
+
+    Returns:
+        QWidget: A container widget holding the button, suitable for add_dock_widget.
     """
-    @magicgui(call_button="Back to Project")
-    def back_to_project():
+    # Define the action function separately
+    def _do_back_to_project():
         """
-        Close the current image view and emit signal to reopen the project view.
+        Closes the current Napari viewer and emits signal to show project view.
         """
-        print("Back to Project button clicked.")
+        print("Back to Project button clicked (standard button).")
         try:
-            # Close the viewer window. This should trigger Napari's cleanup.
-            # Using viewer.window.qt_window.close() might be slightly more direct
-            # for the Qt part, but viewer.close() is the documented way.
-            viewer.close()
-            print("Napari viewer closed.")
+            # Initiate viewer closing
+            if viewer is not None:
+                print(f"Attempting to close viewer: {viewer}")
+                # viewer.close() triggers the destruction and 'destroyed' signal
+                viewer.close()
+                print("viewer.close() called.")
+            else:
+                 print("Viewer instance is None. Cannot call close().")
 
-            # Short delay might help ensure viewer is fully closed before signal processing
-            # but ideally not needed if event loops are handled correctly.
-            # QTimer.singleShot(50, app_state.show_project_view_signal.emit) 
-
-            # Emit signal to show project view - the connected slot will handle showing the window
+            # Emit signal immediately to bring back project view
             print("Emitting show_project_view_signal.")
-            app_state.show_project_view_signal.emit()
+            if app_state:
+                 app_state.show_project_view_signal.emit()
+            else:
+                 print("Error: ApplicationState instance is not available.")
 
         except Exception as e:
              error_msg = f"Error during 'Back to Project':\n{str(e)}\n\nFull Traceback:\n{traceback.format_exc()}"
-             QMessageBox.critical(None, "Error", error_msg)
+             QMessageBox.critical(None, "Navigation Error", error_msg)
              print(error_msg)
-             # Fallback: Try to emit signal anyway if viewer closing failed but app still runs
-             if QApplication.instance(): 
+             # Fallback signal emission
+             if QApplication.instance() and app_state:
+                 print("Attempting to emit signal despite error during close.")
                  app_state.show_project_view_signal.emit()
 
+    # Create the standard Qt button
+    button = QPushButton("Back to Project List")
+    button.clicked.connect(_do_back_to_project)
 
-    return back_to_project
+    # Create a container widget to hold the button
+    # This container is what gets added as the dock widget
+    container_widget = QWidget()
+    layout = QVBoxLayout()
+    layout.addWidget(button)
+    layout.setContentsMargins(5, 5, 5, 5) # Optional margins
+    container_widget.setLayout(layout)
 
+    return container_widget
+
+
+# --- Main execution block (Unchanged, but crucial) ---
 if __name__ == "__main__":
+    print("Running helper_funcs.py as main script...")
     # Ensure required config templates exist before launching GUI
     script_dir = os.path.dirname(os.path.abspath(__file__))
     missing_templates = []
+    print(f"Checking for config templates in {script_dir} and {os.getcwd()}...")
     for template in ['nuclear_config.yaml', 'ramified_config.yaml']:
         path1 = os.path.join(script_dir, template)
         path2 = os.path.join(os.getcwd(), template)
         if not os.path.exists(path1) and not os.path.exists(path2):
             missing_templates.append(template)
+            print(f"  MISSING: {template}")
+        else:
+             print(f"  Found: {template} (at {path1 if os.path.exists(path1) else path2})")
+
 
     if missing_templates:
-        print(f"ERROR: Missing required configuration template(s): {', '.join(missing_templates)}")
-        print(f"Please ensure these files are present in the script directory ({script_dir}) or the current working directory ({os.getcwd()}).")
-        # Optionally show a GUI message box here if QApplication is already running,
-        # but printing to console is safer before the app starts.
+        error_msg = (f"ERROR: Missing required configuration template(s): {', '.join(missing_templates)}\n\n"
+                     f"Please ensure these files are present either in the script directory:\n{script_dir}\n"
+                     f"or the current working directory:\n{os.getcwd()}")
+        print(error_msg)
+        # Try to show a message box if possible, otherwise just print and exit
+        try:
+            app = QApplication.instance() or QApplication(sys.argv)
+            QMessageBox.critical(None, "Missing Files", error_msg)
+        except Exception:
+             pass
         sys.exit(1) # Exit if templates are missing
 
+    print("Config templates found. Launching segmentation tool...")
     launch_image_segmentation_tool()
 
 
-
-    
-    
+# --- END OF FILE helper_funcs.py ---

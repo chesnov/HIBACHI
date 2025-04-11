@@ -95,7 +95,8 @@ def enhance_tubular_structures_slice_by_slice(volume, scales, spacing, black_rid
             smoothed_chunk = gaussian_filter(chunk, sigma=sigma_voxel_3d, mode='reflect')
             if local_write_end > local_write_start: input_volume_memmap[start_write:end_write, :, :] = smoothed_chunk[local_write_start:local_write_end, :, :]
             del chunk, smoothed_chunk; gc.collect()
-        input_volume_memmap.flush(); print(f"  3D pre-smoothing done.")
+        input_volume_memmap.flush(); 
+        print(f"  3D pre-smoothing done.")
     else:
         print("  Skipping initial 3D smoothing.");
         if isinstance(volume, np.memmap): input_volume_memmap = volume; input_memmap_path = volume.filename
@@ -104,6 +105,7 @@ def enhance_tubular_structures_slice_by_slice(volume, scales, spacing, black_rid
             input_volume_memmap, input_memmap_path, _ = create_memmap(data=volume, directory=input_memmap_dir)
             source_volume_cleaned = True # Mark this temp dir for cleaning later
 
+    print(f"xy spacing is: {xy_spacing}, scales: {scales}")
     avg_xy_spacing = np.mean(xy_spacing); sigmas_voxel_2d = sorted([s / avg_xy_spacing for s in scales])
     print(f"  Using 2D voxel sigmas: {sigmas_voxel_2d}")
     output_temp_dir = tempfile.mkdtemp(prefix='tubular_enhance_parallel_'); temp_dirs_to_clean.append(output_temp_dir) # Track this dir
