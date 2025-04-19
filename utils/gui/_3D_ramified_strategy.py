@@ -17,7 +17,7 @@ if parent_dir not in sys.path:
 # Import necessary functions from sibling modules
 try:
     from initial_3d_segmentation import segment_microglia_first_pass
-    from ramified_segmenter import extract_soma_masks, separate_multi_soma_cells
+    from ramified_segmenter import extract_soma_masks, refine_seeds_pca, separate_multi_soma_cells
     from calculate_features import shortest_distance, analyze_segmentation, calculate_depth_df
 except ImportError as e:
     print(f"Error importing segmentation functions in _3D_ramified_strategy.py: {e}")
@@ -109,17 +109,29 @@ class RamifiedStrategy(ProcessingStrategy):
         try:
             cell_bodies = extract_soma_masks(
                 labeled_cells,
-                params.get("small_object_percentile"),
-                params.get("thickness_percentile")
+                self.spacing,
+                params.get("smallest_quantile"),
+                params.get("min_samples_for_median"),
+                params.get("relative_core_definition_ratio"),
+                params.get("min_fragment_size"),
             )
+
+            refined_mask = refine_seeds_pca(cell_bodies,
+                     self.spacing,
+                     target_aspect_ratio=1.1,
+                     projection_percentile_crop=10,
+                     min_fragment_size=params.get("min_fragment_size"))
+            
             merged_roi_array = separate_multi_soma_cells(
                 labeled_cells,
                 image_stack,
-                cell_bodies,
-                params.get('min_size_threshold')
+                refined_mask,
+                self.spacing,
+                params.get('min_fragment_size'),
+                intensity_weight=params.get("intensity_weight")
             )
         except Exception as e:
-             print(f"Error during ROI refinement (extract_soma/separate_multi_soma): {e}")
+             print(f"Error ducell_bodiesring ROI refinement (extract_soma/separate_multi_soma): {e}")
              return False
 
         # Save cell bodies and final segmentation
@@ -134,8 +146,10 @@ class RamifiedStrategy(ProcessingStrategy):
 
              # Add visualization
              self._add_layer_safely(viewer, cell_bodies, "Cell bodies")
+             self._add_layer_safely(viewer, refined_mask, "Refined ROIs")
              # Add final segmentation layer (memmap for viewing?)
              self._add_layer_safely(viewer, merged_roi_array, "Final segmentation")
+
              print(f"Saved cell bodies to {cell_bodies_path} and final segmentation to {final_seg_path}")
              return True
         except Exception as e:
