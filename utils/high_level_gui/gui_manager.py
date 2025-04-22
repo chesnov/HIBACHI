@@ -13,8 +13,8 @@ np.random.seed(seed)
 
 # --- UPDATED IMPORTS ---
 # Import strategies using relative paths within the 'gui' package
-from ._3D_nuclear_strategy import NuclearStrategy
-from ._3D_ramified_strategy import RamifiedStrategy
+from ..nuclear_module_3d._3D_nuclear_strategy import NuclearStrategy
+from ..ramified_module_3d._3D_ramified_strategy import RamifiedStrategy
 
 # Add parent directory (project root) to path to find helper_funcs
 parent_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -23,7 +23,7 @@ if parent_dir not in sys.path:
 
 try:
     # Import helpers from the parent directory
-    from helper_funcs import create_parameter_widget, check_processing_state
+    from utils.high_level_gui.helper_funcs import create_parameter_widget, check_processing_state
 except ImportError as e:
     print(f"Error importing helper_funcs in gui_manager.py: {e}")
     print(f"Ensure helper_funcs.py is in the directory: {parent_dir}")

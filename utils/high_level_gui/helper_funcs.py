@@ -290,13 +290,13 @@ def organize_processing_dir(drctry, mode):
     # Determine paths for template config files (assuming they are alongside this script or CWD)
     script_dir = os.path.dirname(os.path.abspath(__file__))
     if mode == 'nuclear':
-        config_template_name = 'nuclear_config.yaml'
+        config_template_name = os.path.join('3d_nuclear_module','nuclear_config.yaml')
     elif mode == 'ramified':
-        config_template_name = 'ramified_config.yaml'
+        config_template_name = os.path.join('3d_ramified_module', 'ramified_config.yaml')
     else:
         raise ValueError(f"Invalid mode '{mode}' specified.")
 
-    config_template_path = os.path.join(script_dir, config_template_name)
+    config_template_path = os.path.join(script_dir, os.path.join('..', config_template_name))
     if not os.path.exists(config_template_path):
         # Fallback: Check current working directory if not found alongside script
         print(f"Template not found in {script_dir}, checking CWD: {os.getcwd()}")
@@ -852,7 +852,7 @@ def interactive_segmentation_with_config(selected_folder=None):
     """
     # --- Import DynamicGUIManager inside the function to avoid circular imports ---
     try:
-        from gui.gui_manager import DynamicGUIManager
+        from .gui_manager import DynamicGUIManager
     except ImportError as e:
         print(f"Error importing DynamicGUIManager inside function: {e}")
         QMessageBox.critical(None, "Import Error", "Could not load core GUI component. Check installation/paths.")
@@ -1065,104 +1065,162 @@ def interactive_segmentation_with_config(selected_folder=None):
 # --- launch_image_segmentation_tool (Unchanged, but check imports/paths) ---
 def launch_image_segmentation_tool():
     """
-    Main entry point for the application. Manages the ProjectViewWindow instance.
+    Main entry point for the application setup.
+    Manages the ProjectViewWindow instance and returns the QApplication instance.
+    The actual event loop (app.exec_()) should be called by the script
+    that calls this function (e.g., segment.py).
     """
+    app = None # Initialize app to None for error handling
     try:
         # Get existing app or create new one
         app = QApplication.instance()
         if app is None:
             print("Creating QApplication instance...")
-            app = QApplication(sys.argv)
-            # Quit only when the ProjectViewWindow (main controller) is closed
-            app.setQuitOnLastWindowClosed(False) # IMPORTANT
+            # Use sys.argv if available, otherwise provide an empty list.
+            # This is standard practice for QApplication.
+            app = QApplication(sys.argv if hasattr(sys, 'argv') else [])
+            # Quit only when the designated main window (ProjectViewWindow) is closed.
+            # Setting this False prevents unexpected quits if other top-level
+            # windows (like transient dialogs or potentially detached viewers
+            # if not handled carefully) are closed first. The ProjectViewWindow's
+            # WA_QuitOnClose attribute and its closeEvent handle the actual quit.
+            app.setQuitOnLastWindowClosed(False)
+            print("QApplication created. QuitOnLastWindowClosed set to False.")
         else:
              print("Using existing QApplication instance.")
 
 
         def show_or_create_project_view():
-            # Check if window exists and is valid
-            window_exists = False
-            if app_state.project_view_window is not None:
-                 # Check if the underlying Qt object still exists
+            """
+            Ensures the ProjectViewWindow exists and is visible.
+            Creates it if it doesn't exist or its underlying Qt object was deleted.
+            Connects to the ApplicationState.
+            """
+            # Check if a Python reference to the window exists in our state manager
+            window_exists_py = app_state.project_view_window is not None
+            window_valid_qt = False # Assume Qt object might be invalid initially
+
+            if window_exists_py:
                  try:
-                     if app_state.project_view_window.isVisible():
-                         window_exists = True
-                     else:
-                         # It might exist but be hidden, or it might have been deleted
-                         # Try showing it; if it errors, it was deleted.
-                         try:
-                              app_state.project_view_window.show()
-                              window_exists = True
-                         except RuntimeError: # Underlying C++ object deleted
-                              print("ProjectViewWindow object existed but underlying Qt widget was deleted. Recreating.")
-                              app_state.project_view_window = None # Clear the reference
-                              window_exists = False
+                     # Attempt to interact with the Qt object to check its validity.
+                     # Accessing a property like isVisible() is a common way.
+                     # If the underlying C++ object has been deleted, this will
+                     # raise a RuntimeError.
+                     _ = app_state.project_view_window.isVisible() # Access property
+                     window_valid_qt = True # If no error, Qt object is still alive
+                     print("Existing ProjectViewWindow Qt object appears valid.")
+                 except RuntimeError:
+                     # This specific exception means the C++ part of the widget is gone
+                     print("ProjectViewWindow Python reference exists, but underlying Qt widget was deleted. Recreating.")
+                     app_state.project_view_window = None # Clear the stale Python reference
+                     window_exists_py = False # Mark that Python reference is now None
+                     window_valid_qt = False # It's definitely not valid
                  except Exception as e:
-                     print(f"Error checking existing project window state: {e}. Recreating.")
+                     # Catch other potential errors during the check
+                     print(f"Error checking existing project window state: {e}. Assuming invalid and recreating.")
                      app_state.project_view_window = None # Clear the reference
-                     window_exists = False
+                     window_exists_py = False
+                     window_valid_qt = False
 
+            # Determine if a new window instance needs to be created
+            create_new_window = not window_exists_py or not window_valid_qt
 
-            if not window_exists: # Either None or deleted
+            if create_new_window:
                 print("Creating new ProjectViewWindow instance.")
-                project_manager = ProjectManager()
+                # Ensure ProjectManager and ProjectViewWindow classes are defined above
+                project_manager = ProjectManager() # Create a new manager for the new window
                 app_state.project_view_window = ProjectViewWindow(project_manager)
-                # Ensure closing this window quits the app
-                app_state.project_view_window.setAttribute(Qt.WA_QuitOnClose)
-                print("ProjectViewWindow created.")
+                # Crucial: Set the attribute to make this window control app exit.
+                # When this window with WA_QuitOnClose=True is closed, Qt *may*
+                # quit the application IF QuitOnLastWindowClosed is also True (which
+                # we set to False). However, setting this attribute is often used
+                # in conjunction with custom closeEvent handlers or simply as a flag.
+                # The ProjectViewWindow's closeEvent is the primary mechanism here.
+                app_state.project_view_window.setAttribute(Qt.WA_QuitOnClose, True)
+                print("ProjectViewWindow created and WA_QuitOnClose attribute set to True.")
+            # else: # Window exists and is valid
+            #      print("Using existing valid ProjectViewWindow instance.")
 
-            # Show and activate
-            print("Showing ProjectViewWindow...")
-            app_state.project_view_window.show()
-            app_state.project_view_window.activateWindow() # Bring to front
-            app_state.project_view_window.raise_()         # Bring to front
+
+            # Now, show and activate the window (either existing or newly created)
+            if app_state.project_view_window:
+                 print("Showing and activating ProjectViewWindow...")
+                 app_state.project_view_window.show()
+                 app_state.project_view_window.activateWindow() # Bring to front if possible
+                 app_state.project_view_window.raise_()         # Ensure it's raised above other windows
+            else:
+                 # This path indicates a failure in the creation logic above.
+                 critical_error_msg = "Error: ProjectViewWindow is unexpectedly None after creation/check."
+                 print(critical_error_msg)
+                 # Show a message box about this internal error
+                 try:
+                     QMessageBox.critical(None, "Internal Error", critical_error_msg)
+                 except Exception as msg_err:
+                     print(f"Could not display critical error message: {msg_err}")
+                 # We should probably not continue if the main window failed creation.
+                 # Returning None from the outer function will handle this.
+                 raise RuntimeError(critical_error_msg) # Raise error to be caught by outer try/except
 
 
-        # Connect signal to handler *before* first show
+        # --- Signal Connection ---
+        # Connect the global state signal to the function that shows/creates the window.
+        # This allows other parts of the app (like the 'Back' button) to bring back the project view.
+        print("Setting up show_project_view_signal connection...")
         try:
-             # Disconnect first to avoid multiple connections if run again in interactive env
+             # Disconnect first to prevent multiple connections if this function
+             # is somehow called again within the same application instance.
              app_state.show_project_view_signal.disconnect(show_or_create_project_view)
-        except TypeError: # Signal has no connection
+             print("Disconnected existing show_project_view_signal connection (if any).")
+        except TypeError:
+             # This is expected if the signal had no connections yet.
+             print("No existing show_project_view_signal connection found to disconnect (normal).")
              pass
+        except Exception as e:
+             # Log unexpected errors during disconnect attempt
+             print(f"Warning: Non-TypeError during signal disconnect attempt: {e}")
+
+        # Connect the signal
         app_state.show_project_view_signal.connect(show_or_create_project_view)
-        print("Connected show_project_view_signal.")
+        print("Connected show_project_view_signal to show_or_create_project_view.")
 
 
-        # Show initial project view
+        # --- Initial Show ---
+        # Explicitly call the function here to ensure the project view is created
+        # and shown when the application starts for the first time.
+        print("Performing initial call to show_or_create_project_view...")
         show_or_create_project_view()
 
-        # Start the application event loop ONLY if this is the main script execution
-        # Check ensures loop isn't started if imported or in some interactive environments
-        is_interactive = hasattr(sys, 'ps1') or sys.flags.interactive
-        am_main = __name__ == "__main__"
-
-        if am_main and not is_interactive:
-             print("Starting Qt Application event loop (sys.exit(app.exec_()))...")
-             # Use sys.exit(app.exec_()) for proper exit code propagation
-             exit_code = app.exec_()
-             print(f"Qt Application event loop finished with exit code: {exit_code}")
-             sys.exit(exit_code)
-        elif am_main and is_interactive:
-             print("Running in interactive mode. Qt event loop not started automatically by launch_image_segmentation_tool.")
-             print("You may need to manually run '%gui qt' in IPython or handle the event loop.")
-        # else: # Imported as module
-        #      print("Imported as a module. Qt event loop managed by caller.")
-
+        # --- Return Application Instance ---
+        # The setup is complete. Return the QApplication instance to the caller.
+        # The caller (segment.py) is responsible for starting the event loop (app.exec_()).
+        print("launch_image_segmentation_tool finished setup successfully, returning app instance.")
+        return app
 
     except Exception as e:
-        error_msg = f"Unhandled error in launch_image_segmentation_tool:\n{str(e)}\n\nFull Traceback:\n{traceback.format_exc()}"
+        # Catch any unexpected errors during the entire setup process
+        error_msg = (f"Unhandled critical error in launch_image_segmentation_tool setup:\n{str(e)}\n\n"
+                     f"Full Traceback:\n{traceback.format_exc()}")
         print(error_msg)
-        # Try to show error in a message box if possible
+        # Attempt to display the error in a message box for the user
         try:
-            QMessageBox.critical(None, "Fatal Launch Error", error_msg)
-        except Exception:
-             pass # Ignore if GUI cannot be shown
-        # Ensure sys.exit is called even on error if we intended to start the app
-        if app and am_main and not is_interactive:
-            sys.exit(1)
-        elif not app and am_main: # If app creation failed
-             sys.exit(1)
+            # Need a QApplication instance to show a message box.
+            # If 'app' is None here, it means QApplication creation failed very early.
+            if app is None:
+                 # Try creating a temporary, minimal app just for the error dialog.
+                 print("Creating temporary QApplication instance for error message.")
+                 error_app = QApplication(sys.argv if hasattr(sys, 'argv') else [])
+                 QMessageBox.critical(None, "Fatal Launch Error", error_msg)
+                 # We don't run error_app.exec_()
+            else:
+                 # Use the 'app' instance if it was created successfully before the error.
+                 QMessageBox.critical(None, "Fatal Launch Error", error_msg)
+        except Exception as msg_err:
+             # Fallback if even the error message fails
+             print(f"Failed to display the graphical error message: {msg_err}")
 
+        # Indicate failure to the caller by returning None
+        print("launch_image_segmentation_tool failed due to an error, returning None.")
+        return None
 
 # --- create_back_to_project_button (Unchanged logic, added checks) ---
 def create_back_to_project_button(viewer):
@@ -1222,39 +1280,6 @@ def create_back_to_project_button(viewer):
 
     return container_widget
 
-
-# --- Main execution block (Unchanged, but crucial) ---
-if __name__ == "__main__":
-    print("Running helper_funcs.py as main script...")
-    # Ensure required config templates exist before launching GUI
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    missing_templates = []
-    print(f"Checking for config templates in {script_dir} and {os.getcwd()}...")
-    for template in ['nuclear_config.yaml', 'ramified_config.yaml']:
-        path1 = os.path.join(script_dir, template)
-        path2 = os.path.join(os.getcwd(), template)
-        if not os.path.exists(path1) and not os.path.exists(path2):
-            missing_templates.append(template)
-            print(f"  MISSING: {template}")
-        else:
-             print(f"  Found: {template} (at {path1 if os.path.exists(path1) else path2})")
-
-
-    if missing_templates:
-        error_msg = (f"ERROR: Missing required configuration template(s): {', '.join(missing_templates)}\n\n"
-                     f"Please ensure these files are present either in the script directory:\n{script_dir}\n"
-                     f"or the current working directory:\n{os.getcwd()}")
-        print(error_msg)
-        # Try to show a message box if possible, otherwise just print and exit
-        try:
-            app = QApplication.instance() or QApplication(sys.argv)
-            QMessageBox.critical(None, "Missing Files", error_msg)
-        except Exception:
-             pass
-        sys.exit(1) # Exit if templates are missing
-
-    print("Config templates found. Launching segmentation tool...")
-    launch_image_segmentation_tool()
 
 
 # --- END OF FILE helper_funcs.py ---

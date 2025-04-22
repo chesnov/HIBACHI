@@ -22,7 +22,7 @@ import math
 seed = 42
 np.random.seed(seed)         # For NumPy
 
-from remove_artifacts import *
+from .remove_artifacts import *
 
 # Helper function for memory mapping (remains the same)
 def create_memmap(data=None, dtype=None, shape=None, prefix='temp', directory=None):

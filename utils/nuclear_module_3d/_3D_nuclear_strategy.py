@@ -7,7 +7,7 @@ import sys
 from typing import Dict
 
 # Import base class using relative import
-from .processing_strategies import ProcessingStrategy
+from ..high_level_gui.processing_strategies import ProcessingStrategy
 
 # Add parent directory (project root) to path to find segmentation modules
 parent_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -16,8 +16,8 @@ if parent_dir not in sys.path:
 
 # Import necessary functions from sibling modules
 try:
-    from nuclear_segmenter import segment_nuclei
-    from calculate_features import shortest_distance, analyze_segmentation, calculate_depth_df
+    from .nuclear_segmenter import segment_nuclei
+    from ..calculate_features import shortest_distance, analyze_segmentation, calculate_depth_df
 except ImportError as e:
     print(f"Error importing segmentation functions in _3D_nuclear_strategy.py: {e}")
     print(f"Ensure nuclear_segmenter.py and calculate_features.py are in the directory: {parent_dir}")
