@@ -4,8 +4,8 @@ from scipy.ndimage import (distance_transform_edt,
                            binary_erosion, generate_binary_structure)
 from scipy.ndimage import (distance_transform_edt, label as ndimage_label, find_objects,
                            binary_opening, binary_closing)
-from skimage.filters import threshold_otsu
-from skimage.morphology import convex_hull_image, remove_small_objects
+from skimage.filters import threshold_otsu # type: ignore
+from skimage.morphology import convex_hull_image, remove_small_objects # type: ignore
 import tempfile
 import os
 from tqdm import tqdm

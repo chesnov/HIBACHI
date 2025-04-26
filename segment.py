@@ -3,7 +3,7 @@
 import sys
 import os
 import traceback
-from PyQt5.QtWidgets import QApplication, QMessageBox
+from PyQt5.QtWidgets import QApplication, QMessageBox # type: ignore
 
 # Import the main launcher function from the utils subpackage
 try:

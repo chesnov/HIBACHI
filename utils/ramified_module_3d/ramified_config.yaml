@@ -1,39 +1,67 @@
 mode: ramified
-initial_segmentation:
-  name: Initial Segmentation
+execute_raw_segmentation_ramified:
+  name: Execute Raw Segmentation
   parameters:
     tubular_scales:
       label: Tubular Scales (comma-sep floats)
       type: list
-      value: [0.8, 1.0, 1.5, 2.0]
+      value:
+      - 0.8
+      - 1.0
+      - 1.5
+      - 2.0
       element_type: float
     min_size:
-      label: Minimum Size
-      type: float
+      label: Minimum Size (Voxels, Raw Seg)
+      type: int
       value: 2000
-      min: 0.5
-      max: 10000
-      step: 0.1
+      min: 10
+      max: 50000
+      step: 10
     smooth_sigma:
-      label: Smooth Sigma
+      label: Smooth Sigma (Initial)
       type: float
       value: 1.3
       min: 0.1
-      max: 10
+      max: 10.0
       step: 0.1
     low_threshold_percentile:
-      label: Low Threshold Percentile
+      label: Low Threshold Percentile (Raw Seg)
       type: float
-      value: 98
-      min: 0
-      max: 100
+      value: 98.0
+      min: 0.0
+      max: 100.0
       step: 0.1
     high_threshold_percentile:
-      label: High Threshold Percentile
+      label: High Threshold Percentile (Raw Seg)
       type: float
-      value: 100
-      min: 0
-      max: 100
+      value: 100.0
+      min: 0.0
+      max: 100.0
+      step: 0.1
+    connect_max_gap_physical:
+      label: Max Connect Gap (um)
+      type: float
+      value: 1.0
+      min: 0.0
+      max: 10.0
+      step: 0.1
+execute_trim_edges_ramified:
+  name: Execute Edge Trimming
+  parameters:
+    edge_trim_distance_threshold:
+      label: Edge Trim Distance (um)
+      type: float
+      value: 4.5
+      min: 0.0
+      max: 20.0
+      step: 0.1
+    hull_boundary_thickness_phys:
+      label: Hull Boundary Thickness (um)
+      type: float
+      value: 2.0
+      min: 0.1
+      max: 10.0
       step: 0.1
     brightness_cutoff_factor:
       label: Brightness Cutoff Factor
@@ -42,40 +70,79 @@ initial_segmentation:
       min: 0.0
       max: 10000000
       step: 0.1
-    edge_trim_distance_threshold:
-      label: Edge Trim Distance Threshold
-      type: float
-      value: 4.5
-      min: 0.0
-      max: 10
-      step: 0.1
-refine_rois:
-  name: Refine ROIs
-  parameters:
-    small_object_percentile:
-      label: Small Object Percentile
+    min_size_voxels:
+      label: Min Size (Voxels, Post-Trim)
       type: int
-      value: 93
+      value: 2000
       min: 0
-      max: 100
-      step: 1
-    thickness_percentile:
-      label: Thickness Percentile
-      type: int
-      value: 92
-      min: 0
-      max: 100
-      step: 1
-    min_size_threshold:
-      label: Minimum Size Threshold
-      type: float
-      value: 900
-      min: 0.5
       max: 10000
+      step: 10
+execute_refine_rois_ramified:
+  name: Execute Refine ROIs
+  parameters:
+    smallest_quantile:
+      label: Smallest Quantile (Soma)
+      type: float
+      value: 0.05
+      min: 0.0
+      max: 1.0
+      step: 0.01
+    min_samples_for_median:
+      label: Min Samples for Median (Soma)
+      type: int
+      value: 5
+      min: 1
+      max: 1000
+      step: 1
+    soma_extraction_thresholds:
+      label: Soma Extraction Ratios (List)
+      type: list
+      value:
+      - 0.3
+      - 0.4
+      - 0.5
+      - 0.6
+      element_type: float
+    min_fragment_size:
+      label: Min Fragment Size (Refine/Separate)
+      type: int
+      value: 1000
+      min: 1
+      max: 1000000
+      step: 10
+    target_aspect_ratio:
+      label: Target Aspect Ratio (PCA Refine)
+      type: float
+      value: 1.1
+      min: 0.1
+      max: 5.0
       step: 0.1
-calculate_features:
-  name: Calculate Features
+    projection_percentile_crop:
+      label: Projection Crop % (PCA Refine)
+      type: int
+      value: 10
+      min: 0
+      max: 49
+      step: 1
+    intensity_weight:
+      label: Intensity Weight (Separate)
+      type: float
+      value: 0.5
+      min: 0.0
+      max: 1.0
+      step: 0.01
+execute_calculate_features_ramified:
+  name: Execute Calculate Features
+  parameters:
+    n_jobs:
+      label: Parallel Jobs (Features)
+      type: int
+      value: 24
+      min: 1
+      max: 64
 voxel_dimensions:
   x: 424.27
   y: 424.27
   z: 191.0
+saved_state:
+  segmentation_threshold: 0.08478374034166336

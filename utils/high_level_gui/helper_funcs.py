@@ -1,16 +1,16 @@
-from magicgui import magicgui
+from magicgui import magicgui # type: ignore
 from typing import Dict, Any, List
 import os
 import pandas as pd
-import napari
+import napari # type: ignore
 import sys
-import yaml
+import yaml # type: ignore
 import traceback
-import tifffile as tiff
+import tifffile as tiff # type: ignore
 import shutil
-from PyQt5.QtGui import QCloseEvent
-from PyQt5.QtCore import Qt, QObject, pyqtSignal, QTimer
-from PyQt5.QtWidgets import (
+from PyQt5.QtGui import QCloseEvent # type: ignore
+from PyQt5.QtCore import Qt, QObject, pyqtSignal, QTimer # type: ignore
+from PyQt5.QtWidgets import ( # type: ignore
     QApplication, QFileDialog, QMessageBox,
     QMainWindow, QVBoxLayout, QHBoxLayout,
     QListWidget, QListWidgetItem, QPushButton, QWidget, QLabel, QInputDialog
@@ -183,52 +183,69 @@ def create_parameter_widget(param_name: str, param_config: Dict[str, Any], callb
 
 
 
-# --- check_processing_state (MODIFIED) ---
-def check_processing_state(processed_dir: str, processing_mode: str, mode_files: Dict[str, str]) -> int:
+def check_processing_state(processed_dir: str, mode: str, checkpoint_files: dict, num_steps: int) -> int:
     """
-    Check the processing state based on the existence of key output files for the mode.
-    Now uses the mode_files dictionary provided by the strategy.
+    Checks the processing state by looking for expected output files.
 
     Args:
-        processed_dir: The directory containing processed files. (Potentially redundant if paths in mode_files are absolute)
-        processing_mode: The current mode ('nuclei' or 'ramified'). Used for warnings.
-        mode_files: A dictionary mapping step keys (e.g., "metrics_df", "final_segmentation")
-                    to their expected FULL file paths, provided by the strategy.
+        processed_dir: The directory where processed files are stored.
+        mode: The current processing mode ('nuclei' or 'ramified').
+        checkpoint_files: Dictionary mapping logical file keys to output file paths
+                         (obtained from strategy.get_checkpoint_files()).
+        num_steps: The total number of steps expected for this mode.
 
     Returns:
-        The highest completed step number (0=none, 1=initial, 2=refine, 3=features).
+        int: The number of the last successfully completed step (0 if none).
+             Returns num_steps if the final step's output exists.
     """
-    # Define keys used for checking steps
-    feature_key = "metrics_df"
-    refine_key = "final_segmentation"
-    initial_key = "initial_segmentation"
-    cell_bodies_key = "cell_bodies" # Specific to ramified, used for warning
+    if not os.path.isdir(processed_dir):
+        print(f"Processed directory not found: {processed_dir}. Starting from step 0.")
+        return 0
 
-    # Check for step 3 completion (feature calculation)
-    # Using metrics_df as the primary indicator for step 3 completion
-    metrics_df_loc = mode_files.get(feature_key)
-    if metrics_df_loc and os.path.exists(metrics_df_loc):
-        # Optional: Check for depth_df - its absence doesn't mean step 3 failed,
-        # but calculation might be needed later. Handled within strategy now.
-        return 3  # Feature calculation completed
+    print(f"Checking processing state in: {processed_dir} (Mode: {mode}, Steps: {num_steps})")
+    print(f"  Available checkpoint keys: {list(checkpoint_files.keys())}") # Debug
 
-    # Check for step 2 completion (ROI refinement)
-    # Requires final segmentation file
-    final_seg_loc = mode_files.get(refine_key)
-    if final_seg_loc and os.path.exists(final_seg_loc):
-         # Check for cell bodies file in ramified mode, though its absence might not block step 3
-         cell_bodies_loc = mode_files.get(cell_bodies_key)
-         if processing_mode == 'ramified' and (not cell_bodies_loc or not os.path.exists(cell_bodies_loc)):
-             print(f"Warning (check_processing_state): Final segmentation found for '{processing_mode}', but cell bodies file missing or not specified in mode_files.")
-         return 2 # ROI refinement completed
+    # --- Define key output files that signify step completion ---
+    # These should map step number (1-based) to the KEY in checkpoint_files dict
+    completion_file_keys = {}
+    if mode == 'ramified':
+        # --- THIS IS THE CRITICAL CHANGE ---
+        completion_file_keys = {
+            1: "raw_segmentation",       # Step 1 output KEY
+            2: "trimmed_segmentation",   # Step 2 output KEY
+            3: "final_segmentation",     # Step 3 output KEY (Main labeled result)
+            4: "metrics_df"              # Step 4 output KEY (or skeleton_array etc.)
+        }
+        # --- END CRITICAL CHANGE ---
+    elif mode == 'nuclei':
+         completion_file_keys = {
+            1: "initial_segmentation",   # Step 1 output KEY
+            2: "final_segmentation",     # Step 2 output KEY
+            3: "metrics_df"              # Step 3 output KEY
+        }
+    else:
+        print(f"Warning: Unknown mode '{mode}' in check_processing_state.")
+        return 0
 
-    # Check for step 1 completion (Initial segmentation)
-    # Requires initial segmentation file
-    initial_seg_loc = mode_files.get(initial_key)
-    if initial_seg_loc and os.path.exists(initial_seg_loc):
-        return 1 # Initial segmentation completed
+    last_completed_step = 0
+    for step in range(1, num_steps + 1):
+        file_key = completion_file_keys.get(step) # Get the KEY for this step
+        if not file_key:
+            print(f"Warning: No completion file key defined for step {step} in mode '{mode}'. Cannot check.")
+            break # Cannot check further
 
-    return 0 # No steps completed
+        file_to_check = checkpoint_files.get(file_key) # Get the PATH using the key
+
+        if file_to_check and os.path.exists(file_to_check):
+            last_completed_step = step
+            print(f"  Found output for step {step} (Key: '{file_key}'): {os.path.basename(file_to_check)}")
+        else:
+            # If a step's output is missing, stop checking further steps
+            print(f"  Output for step {step} (Key: '{file_key}', Path: {file_to_check}) not found.")
+            break # Exit the loop early
+
+    print(f"Determined last completed step: {last_completed_step}")
+    return last_completed_step
 
 
 # --- organize_processing_dir (Largely Unchanged) ---

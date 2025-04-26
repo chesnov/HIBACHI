@@ -6,14 +6,15 @@ from tqdm import tqdm
 from shutil import rmtree
 import gc
 from functools import partial
-from skimage.measure import regionprops, label as skimage_label # Added skimage_label
-from skimage.segmentation import watershed
-from skimage.graph import route_through_array # Added for pathfinding
-from skimage.morphology import binary_dilation # Added for interface finding
+from skimage.measure import regionprops, label as skimage_label # type: ignore # Added skimage_label
+from skimage.segmentation import watershed # type: ignore
+from skimage.graph import route_through_array # type: ignore # Added for pathfinding
+from skimage.morphology import binary_dilation # type: ignore # Added for interface finding
 import math
-from sklearn.decomposition import PCA # Keep PCA import
-from skimage.feature import peak_local_max
+from sklearn.decomposition import PCA # type: ignore # Keep PCA import
+from skimage.feature import peak_local_max # type: ignore
 from typing import List, Dict, Optional, Tuple, Union, Any, Set
+from skimage.segmentation import relabel_sequential # type: ignore
 
 seed = 42
 np.random.seed(seed)         # For NumPy
@@ -443,7 +444,6 @@ def extract_soma_masks(
     print("--- Finished Intermediate Seed Extraction ---")
 
     return final_seed_mask
-
 
 # --- refine_seeds_pca function remains the same ---
 def refine_seeds_pca(intermediate_seed_mask,
