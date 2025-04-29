@@ -547,8 +547,8 @@ class RamifiedStrategy(ProcessingStrategy):
             ].copy()
             if not connections_df.empty:
                 # --- Ensure you are using the Z,Y,X order here if you applied that fix ---
-                coord_cols_self = ['point_on_self_z', 'point_on_self_y', 'point_on_self_x']
-                coord_cols_neigh = ['point_on_neighbor_z', 'point_on_neighbor_y', 'point_on_neighbor_x']
+                coord_cols_self = ['point_on_self_z', 'point_on_self_x', 'point_on_self_y']
+                coord_cols_neigh = ['point_on_neighbor_z', 'point_on_neighbor_x', 'point_on_neighbor_y']
                 # --- End coordinate order check ---
 
                 if all(c in connections_df for c in coord_cols_self) and all(c in connections_df for c in coord_cols_neigh):
@@ -660,8 +660,8 @@ class RamifiedStrategy(ProcessingStrategy):
                 if not connections_df.empty:
                     # --- !!! DOUBLE-CHECK THIS BLOCK !!! ---
                     # Use Z, Y, X order for Napari shapes layer
-                    coord_cols_self = ['point_on_self_z', 'point_on_self_y', 'point_on_self_x'] # Swapped Y and X
-                    coord_cols_neigh = ['point_on_neighbor_z', 'point_on_neighbor_y', 'point_on_neighbor_x'] # Swapped Y and X
+                    coord_cols_self = ['point_on_self_z', 'point_on_self_x', 'point_on_self_y'] # Swapped Y and X
+                    coord_cols_neigh = ['point_on_neighbor_z', 'point_on_neighbor_x', 'point_on_neighbor_y'] # Swapped Y and X
                     print(f"DEBUG: Using coordinate columns for shapes: Self={coord_cols_self}, Neigh={coord_cols_neigh}") # Add this print
                     # --- !!! END DOUBLE-CHECK !!! ---
 
