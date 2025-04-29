@@ -530,9 +530,7 @@ def apply_hull_trimming(
                 distance_threshold=edge_trim_distance_threshold,
                 global_brightness_cutoff=global_brightness_cutoff,
                 min_remaining_size=min_size_voxels,
-                chunk_size_z=edge_distance_chunk_size_z,
-                heal_iterations=heal_iterations
-            )
+                chunk_size_z=edge_distance_chunk_size_z)
             trimmed_labels_memmap.flush() # Ensure modifications are written
             print(f"  Trimming applied. Mask of initially trimmed voxels captured (Sum: {np.sum(trimmed_voxels_mask)}).")
 

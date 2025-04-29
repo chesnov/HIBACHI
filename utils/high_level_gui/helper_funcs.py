@@ -1,6 +1,7 @@
 from magicgui import magicgui # type: ignore
 from typing import Dict, Any, List
 import os
+import re
 import pandas as pd
 import napari # type: ignore
 import sys
@@ -15,6 +16,18 @@ from PyQt5.QtWidgets import ( # type: ignore
     QMainWindow, QVBoxLayout, QHBoxLayout,
     QListWidget, QListWidgetItem, QPushButton, QWidget, QLabel, QInputDialog
 )
+
+def natural_sort_key(s):
+    """
+    Create a sort key for natural alphanumeric sorting (e.g., image1, image2, image10).
+    Operates on the basename of the input path string.
+    """
+    # Extract the directory/file name from the full path
+    basename = os.path.basename(s)
+    # Split the basename into alternating non-digit and digit parts
+    # Convert digit parts to integers for correct numerical comparison
+    return [int(text) if text.isdigit() else text.lower()
+            for text in re.split('([0-9]+)', basename)]
 
 
 def create_parameter_widget(param_name: str, param_config: Dict[str, Any], callback):
@@ -307,16 +320,16 @@ def organize_processing_dir(drctry, mode):
     # Determine paths for template config files (assuming they are alongside this script or CWD)
     script_dir = os.path.dirname(os.path.abspath(__file__))
     if mode == 'nuclear':
-        config_template_name = os.path.join('3d_nuclear_module','nuclear_config.yaml')
+        config_template_name = os.path.join('nuclear_module_3d','nuclear_config.yaml')
     elif mode == 'ramified':
-        config_template_name = os.path.join('3d_ramified_module', 'ramified_config.yaml')
+        config_template_name = os.path.join('ramified_module_3d', 'ramified_config.yaml')
     else:
         raise ValueError(f"Invalid mode '{mode}' specified.")
 
     config_template_path = os.path.join(script_dir, os.path.join('..', config_template_name))
     if not os.path.exists(config_template_path):
         # Fallback: Check current working directory if not found alongside script
-        print(f"Template not found in {script_dir}, checking CWD: {os.getcwd()}")
+        print(f"Template not found in {config_template_path}, checking CWD: {os.getcwd()}")
         config_template_path = os.path.join(os.getcwd(), config_template_name)
         if not os.path.exists(config_template_path):
            raise FileNotFoundError(f"Config template '{config_template_name}' not found in script directory ({script_dir}) or current working directory ({os.getcwd()}). Please ensure it exists.")
@@ -365,7 +378,8 @@ def organize_processing_dir(drctry, mode):
 
         # Copy the correct yaml config file to the new directory and populate it
         # Always use the template name for the copied file for consistency
-        new_config_path = os.path.join(new_dir, config_template_name)
+        config_filename = os.path.basename(config_template_name) # Get just the filename e.g., 'ramified_config.yaml'
+        new_config_path = os.path.join(new_dir, config_filename) # Construct path like '.../N/ramified_config.yaml'
         try:
             # Copy template only if config doesn't exist or explicitly overwrite
             if not os.path.exists(new_config_path):
@@ -515,6 +529,8 @@ class ProjectManager:
         except OSError as e:
             print(f"Error listing contents of project path {self.project_path}: {e}")
             self.image_folders = [] # Reset on error
+
+        self.image_folders.sort(key=natural_sort_key)
 
         print(f"Found {len(self.image_folders)} valid image folders.")
 

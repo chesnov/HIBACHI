@@ -3,7 +3,7 @@ from scipy import ndimage
 from scipy.ndimage import (distance_transform_edt,
                            binary_erosion, generate_binary_structure)
 from scipy.ndimage import (distance_transform_edt, label as ndimage_label, find_objects,
-                           binary_opening, binary_closing)
+                           binary_opening, binary_closing, binary_dilation)
 from skimage.filters import threshold_otsu # type: ignore
 from skimage.morphology import convex_hull_image, remove_small_objects # type: ignore
 import tempfile
@@ -19,6 +19,7 @@ import tempfile
 import gc
 import numpy as np
 from tqdm import tqdm
+from collections import defaultdict
 import math
 seed = 42
 np.random.seed(seed)         # For NumPy
@@ -217,6 +218,38 @@ def generate_hull_boundary_and_stack(
     return hull_boundary, smoothed_hull_stack
 
 
+def find_set(i):
+    """Finds the representative (root) of the set containing i, with path compression."""
+    global union_find_parent
+    root = i
+    # Find the root
+    while union_find_parent.get(root, root) != root:
+        root = union_find_parent.get(root, root)
+    # Path compression
+    curr = i
+    while union_find_parent.get(curr, curr) != root:
+        next_node = union_find_parent.get(curr, curr)
+        union_find_parent[curr] = root # Point directly to root
+        curr = next_node
+    # Ensure the node itself is in the parent dict if it wasn't processed before
+    if i not in union_find_parent:
+        union_find_parent[i] = i
+    return union_find_parent.get(i, i) # Return the direct parent after compression (which is the root)
+
+def unite_sets(i, j):
+    """Merges the sets containing i and j, merging into the smaller root ID."""
+    global union_find_parent
+    root_i = find_set(i)
+    root_j = find_set(j)
+    if root_i != root_j:
+        # Merge the set with the larger root ID into the one with the smaller root ID
+        if root_i < root_j:
+            union_find_parent[root_j] = root_i
+        else:
+            union_find_parent[root_i] = root_j
+# --- End Union-Find ---
+
+
 def trim_object_edges_by_distance(
     segmentation_memmap,     # Labeled segmentation MEMMAP (opened r+ OR w+)
     original_volume,         # Original intensity volume (ndarray or memmap)
@@ -225,25 +258,25 @@ def trim_object_edges_by_distance(
     distance_threshold,      # Physical distance threshold
     global_brightness_cutoff,# GLOBAL intensity value threshold for trimming
     min_remaining_size=10,   # Minimum size for object remnants after trimming/relabeling
-    chunk_size_z=32,         # Chunk size for chunked processing
-    heal_iterations=1        # <-- NEW: Iterations for grey_closing to heal edges
+    chunk_size_z=32          # Chunk size for chunked processing
     ):
     """
-    Removes voxels from labeled objects near the hull boundary AND below a
-    GLOBAL brightness cutoff. Then attempts to heal small gaps created by
-    trimming using grey closing, constrained by the object shapes before trimming.
-    Optionally removes objects that become too small after trimming/healing.
-    If trimming/healing disconnects an object, components are relabeled.
-    Operates IN-PLACE on the input segmentation_memmap.
-    Uses chunked processing for distance calculation and trimming.
+    Applies operations in the order: Trim -> Remove Small -> Relabel -> Heal -> Merge Touching.
+    1. Trims voxels from labeled objects near hull boundary AND below global brightness cutoff.
+    2. Removes objects/fragments smaller than min_remaining_size.
+    3. Relabels disconnected components.
+    4. Heals porosity using the convex hull method (requires copy of original state).
+    5. Merges any distinct labels that are directly touching after healing.
+    Assumes scikit-image is installed. Operates IN-PLACE on the input segmentation_memmap.
     """
-    print(f"\n--- Trimming object edges (Dist < {distance_threshold:.2f} AND Brightness < {global_brightness_cutoff:.4f}) ---")
-    print(f"--- Healing porous edges ({heal_iterations} iter) ---") # Announce healing
+    print("\n--- Processing Order: Trim -> Remove Small -> Relabel -> Heal -> Merge Touching ---")
+    print("--- (Assuming scikit-image is installed for required steps) ---")
+
     original_shape = segmentation_memmap.shape
     trimmed_voxels_mask = np.zeros(original_shape, dtype=bool) # Track initial trims
 
     if not np.any(hull_boundary_mask):
-        print("  Hull boundary mask is empty. No trimming or healing performed.")
+        print("  Hull boundary mask is empty. No processing performed.")
         return trimmed_voxels_mask
 
     # Check if memmap is writable
@@ -251,69 +284,69 @@ def trim_object_edges_by_distance(
     if segmentation_memmap.mode not in writable_modes:
          raise ValueError(f"segmentation_memmap must be opened in a writable mode ({writable_modes}) for in-place modification. Found mode: '{segmentation_memmap.mode}'")
 
-    # Get original labels present before trimming
-    print("  Finding unique labels before trimming...")
+    # Get original labels present before any modifications
+    print("  Finding unique labels before processing...")
     original_labels_present = np.unique(segmentation_memmap)
     original_labels_present = original_labels_present[original_labels_present != 0]
     print(f"  Found {len(original_labels_present)} unique labels initially.")
     if len(original_labels_present) == 0:
-         print("  No objects found in segmentation. Skipping trimming and healing.")
+         print("  No objects found in segmentation. Skipping all steps.")
          return trimmed_voxels_mask
 
-    # --- Step 0: Create Pre-Trimming Mask ---
-    # This mask defines the maximum extent allowed after healing.
-    print("  Creating pre-trimming boolean mask (chunked)...")
-    pre_trim_mask_memmap = None
-    pre_trim_temp_dir = None
+    # --- Step 0: Create Copy of Original Segmentation (Needed for Healing Reference) ---
+    original_segmentation_memmap = None
+    original_seg_temp_dir = None
+    copy_success = False
+    print("  Creating copy of original segmentation for healing reference...")
+    start_copy_time = time.time()
     try:
-        pre_trim_temp_dir = tempfile.mkdtemp(prefix="pre_trim_mask_")
-        pre_trim_mask_path = os.path.join(pre_trim_temp_dir, 'pre_trim_mask.dat')
-        pre_trim_mask_memmap = np.memmap(pre_trim_mask_path, dtype=bool, mode='w+', shape=original_shape)
+        original_seg_temp_dir = tempfile.mkdtemp(prefix="orig_seg_copy_")
+        original_seg_path = os.path.join(original_seg_temp_dir, 'original_seg.dat')
+        original_segmentation_memmap = np.memmap(original_seg_path, dtype=segmentation_memmap.dtype, mode='w+', shape=original_shape)
 
-        chunk_size_mask_gen = min(100, original_shape[0]) if original_shape[0] > 0 else 1
-        for i in tqdm(range(0, original_shape[0], chunk_size_mask_gen), desc="    Pre-Trim Mask Gen"):
-            z_start = i; z_end = min(i + chunk_size_mask_gen, original_shape[0])
+        chunk_size_copy = min(100, original_shape[0]) if original_shape[0] > 0 else 1
+        for i in tqdm(range(0, original_shape[0], chunk_size_copy), desc="    Copying Seg"):
+            z_start = i; z_end = min(i + chunk_size_copy, original_shape[0])
             if z_start >= z_end: continue
-            # Ensure memmap is valid before reading
             if not hasattr(segmentation_memmap, '_mmap') or segmentation_memmap._mmap is None:
-                raise IOError("Segmentation memmap became invalid during pre-trim mask generation")
+                raise IOError("Source segmentation memmap became invalid during copy")
             seg_chunk = segmentation_memmap[z_start:z_end]
-            pre_trim_mask_memmap[z_start:z_end] = seg_chunk > 0
+            original_segmentation_memmap[z_start:z_end] = seg_chunk
             del seg_chunk
-        pre_trim_mask_memmap.flush()
-        print("  Pre-trimming mask created.")
+        original_segmentation_memmap.flush()
+        copy_success = True # Mark copy as successful
+        print(f"  Original segmentation copied in {time.time() - start_copy_time:.2f}s.")
         gc.collect()
-    except Exception as e_mask:
-        print(f"\n!!! ERROR creating pre-trim mask: {e_mask}. Cannot perform healing.")
-        # Cleanup if creation failed partially
-        if pre_trim_mask_memmap is not None and hasattr(pre_trim_mask_memmap, '_mmap'):
-            del pre_trim_mask_memmap
-            gc.collect()
-        if pre_trim_temp_dir and os.path.exists(pre_trim_temp_dir):
-            rmtree(pre_trim_temp_dir, ignore_errors=True)
-        # Set heal_iterations to 0 so the healing step is skipped
-        heal_iterations = 0
-        pre_trim_mask_memmap = None # Ensure it's None if failed
+    except Exception as e_copy:
+        print(f"\n!!! ERROR creating copy of original segmentation: {e_copy}. Cannot perform convex hull healing.")
+        copy_success = False
+        # Cleanup partially created resources immediately
+        if original_segmentation_memmap is not None and hasattr(original_segmentation_memmap, '_mmap'):
+            del original_segmentation_memmap; gc.collect()
+            original_segmentation_memmap = None
+        if original_seg_temp_dir and os.path.exists(original_seg_temp_dir):
+            rmtree(original_seg_temp_dir, ignore_errors=True)
+            original_seg_temp_dir = None
+        # Continue processing, but Healing step will be skipped automatically later
+        print("    Healing step will be skipped due to copy failure.")
 
 
-    # --- Step 1: Chunked Processing for Distance Calc and Combined Trimming ---
-    print("\n  Executing chunked distance transform and combined (distance+global brightness) trimming...")
+    # --- Step 1: Trimming ---
+    print(f"\n--- 1. Trimming object edges (Dist < {distance_threshold:.2f} AND Brightness < {global_brightness_cutoff:.4f}) ---")
+    # ... (Trimming logic remains identical) ...
     gc.collect()
     num_chunks = math.ceil(original_shape[0] / chunk_size_z)
     total_trimmed_in_chunks = 0
-    start_chunked_time = time.time()
+    start_trim_time = time.time()
+    modified_labels_during_trim = set() # Track *original* labels affected by trimming
 
-    # ... (hull boundary check remains same) ...
     print(f"  Processing {num_chunks} chunks (chunk_size_z={chunk_size_z}).")
-
     for i in tqdm(range(num_chunks), desc="  Processing Chunks (Trim)"):
         z_start = i * chunk_size_z
         z_end = min((i + 1) * chunk_size_z, original_shape[0])
         if z_start >= z_end: continue
-
         try:
-            # 1. Calculate Distance Transform for the chunk
-            # ... (Distance calculation logic remains the same) ...
+            # Distance calculation
             inv_boundary_chunk = ~hull_boundary_mask[z_start:z_end]
             edt_chunk = None
             if not np.any(inv_boundary_chunk): edt_chunk = np.zeros(inv_boundary_chunk.shape, dtype=np.float32)
@@ -322,299 +355,405 @@ def trim_object_edges_by_distance(
             close_to_boundary_chunk = (edt_chunk < distance_threshold)
             del inv_boundary_chunk, edt_chunk; gc.collect()
 
-
-            # 2. Load segmentation and intensity chunks
+            # Load data chunks
             if not hasattr(segmentation_memmap, '_mmap') or segmentation_memmap._mmap is None:
-                 raise IOError(f"Segmentation memmap became invalid before reading chunk {i}")
-            seg_chunk_data = np.array(segmentation_memmap[z_start:z_end]) # Read into memory for check
+                 raise IOError(f"Segmentation memmap invalid reading chunk {i}")
+            seg_chunk_data = np.array(segmentation_memmap[z_start:z_end])
             intensity_chunk = original_volume[z_start:z_end]
 
-            # 3. Identify voxels below GLOBAL brightness cutoff
+            # Brightness check
             dim_voxels_chunk = (intensity_chunk < global_brightness_cutoff)
             del intensity_chunk; gc.collect()
 
-            # 4. Combine criteria: Must be object, close, AND dim
+            # Combine criteria & Apply Trim
             trim_target_mask_chunk = (seg_chunk_data > 0) & close_to_boundary_chunk & dim_voxels_chunk
-            del seg_chunk_data, close_to_boundary_chunk, dim_voxels_chunk; gc.collect()
-
-            # 5. Apply Trimming (Set identified voxels to 0)
             num_trimmed_chunk = np.sum(trim_target_mask_chunk)
+
             if num_trimmed_chunk > 0:
-                 seg_chunk_view_write = segmentation_memmap[z_start:z_end] # Get view for writing
-                 # Record which voxels were initially trimmed FOR DEBUGGING/INFO
+                 unique_trimmed_in_chunk = np.unique(seg_chunk_data[trim_target_mask_chunk])
+                 modified_labels_during_trim.update(unique_trimmed_in_chunk[unique_trimmed_in_chunk != 0])
+
+                 seg_chunk_view_write = segmentation_memmap[z_start:z_end]
                  trimmed_voxels_mask[z_start:z_end][trim_target_mask_chunk] = True
-                 # Apply trimming
                  seg_chunk_view_write[trim_target_mask_chunk] = 0
-                 segmentation_memmap.flush() # Flush changes for this chunk
+                 segmentation_memmap.flush()
                  total_trimmed_in_chunks += num_trimmed_chunk
-                 del seg_chunk_view_write # Release view
+                 del seg_chunk_view_write
 
-            del trim_target_mask_chunk
+            del seg_chunk_data, close_to_boundary_chunk, dim_voxels_chunk, trim_target_mask_chunk
             gc.collect()
-
-        except MemoryError as mem_err:
-            # ... (Error handling) ...
-            raise MemoryError(f"Chunked trimming failed at chunk {i} due to MemoryError.") from mem_err
-        except Exception as chunk_err:
-            # ... (Error handling) ...
-             raise RuntimeError(f"Chunked trimming failed at chunk {i}.") from chunk_err
-
-    print(f"  Chunked trimming applied. Total voxels initially trimmed: {total_trimmed_in_chunks} in {time.time() - start_chunked_time:.2f}s.")
+        except MemoryError as mem_err: raise MemoryError(f"Trimming failed chunk {i}: MemoryError.") from mem_err
+        except Exception as chunk_err: raise RuntimeError(f"Trimming failed chunk {i}.") from chunk_err
+    print(f"  Trimming finished. Voxels trimmed: {total_trimmed_in_chunks}. Labels affected: {len(modified_labels_during_trim)}.")
+    print(f"  Time taken: {time.time() - start_trim_time:.2f}s.")
     gc.collect()
 
-    # --- Step 1.5: Heal Porous Edges (Optional) ---
-    if heal_iterations > 0 and pre_trim_mask_memmap is not None:
-        print(f"\n  Applying grey closing ({heal_iterations} iter) to heal edges...")
-        start_heal_time = time.time()
-        healed_labels_memmap = None
-        healed_temp_dir = None
-        try:
-            # Create temporary memmap for the healed result
-            healed_temp_dir = tempfile.mkdtemp(prefix="healed_labels_")
-            healed_labels_path = os.path.join(healed_temp_dir, 'healed_labels.dat')
-            healed_labels_memmap = np.memmap(healed_labels_path, dtype=segmentation_memmap.dtype, mode='w+', shape=original_shape)
 
-            # Define structure for closing
-            closing_structure = generate_binary_structure(3, 1) # Connectivity 1 (3x3x3 neighborhood)
-
-            # Apply grey closing (chunked if necessary, but often feasible directly on memmap)
-            # Note: grey_closing reads the input memmap and writes to the output memmap.
-            # It's generally memory-efficient for moderate structures/iterations.
-            print("    Executing grey closing...")
-            ndimage.grey_closing(
-                input=segmentation_memmap,
-                size=None, # Size is ignored if structure is provided
-                footprint=closing_structure,
-                output=healed_labels_memmap,
-                mode='reflect', # Or choose appropriate mode
-                # iterations parameter doesn't exist for grey_closing, apply multiple times if needed
-                # For multiple iterations: loop apply grey_closing swapping input/output or use intermediate storage
-            )
-            if heal_iterations > 1: # Handle multiple iterations if specified
-                 print(f"    Applying grey closing for {heal_iterations} total iterations...")
-                 temp_swap_memmap = np.memmap(os.path.join(healed_temp_dir, 'swap.dat'), dtype=segmentation_memmap.dtype, mode='w+', shape=original_shape)
-                 current_input = healed_labels_memmap # Start with result of first iteration
-                 current_output = temp_swap_memmap
-                 for it in range(heal_iterations - 1):
-                     print(f"      Iteration {it+2}/{heal_iterations}")
-                     ndimage.grey_closing(current_input, footprint=closing_structure, output=current_output, mode='reflect')
-                     current_input, current_output = current_output, current_input # Swap for next iteration
-                 # Ensure the final result is in healed_labels_memmap
-                 if (heal_iterations-1) % 2 == 0: # Odd number of extra iterations, result is in temp_swap
-                     healed_labels_memmap[:,:,:] = temp_swap_memmap[:,:,:]
-                 del temp_swap_memmap
-                 gc.collect()
-
-
-            healed_labels_memmap.flush()
-            print("    Grey closing finished.")
-
-            # Apply the pre-trim mask to constrain the result
-            print("    Applying pre-trim mask to constrain healed result (chunked)...")
-            chunk_size_mask_apply = min(100, original_shape[0]) if original_shape[0] > 0 else 1
-            voxels_restored_count = 0
-            original_zeros_mask_chunk = None # To calculate restored count accurately
-            healed_chunk = None
-
-            for i in tqdm(range(0, original_shape[0], chunk_size_mask_apply), desc="    Applying Heal Mask"):
-                z_start = i; z_end = min(i + chunk_size_mask_apply, original_shape[0])
-                if z_start >= z_end: continue
-
-                # Read chunks needed
-                if not hasattr(segmentation_memmap, '_mmap') or segmentation_memmap._mmap is None: raise IOError("Seg memmap invalid during heal masking")
-                if not hasattr(healed_labels_memmap, '_mmap') or healed_labels_memmap._mmap is None: raise IOError("Healed memmap invalid during heal masking")
-                if not hasattr(pre_trim_mask_memmap, '_mmap') or pre_trim_mask_memmap._mmap is None: raise IOError("Pre-trim mask invalid during heal masking")
-
-                original_zeros_mask_chunk = (segmentation_memmap[z_start:z_end] == 0)
-                healed_chunk = healed_labels_memmap[z_start:z_end]
-                pre_trim_mask_chunk = pre_trim_mask_memmap[z_start:z_end]
-
-                # Apply the mask: Set voxels outside pre-trim mask back to 0
-                healed_chunk[~pre_trim_mask_chunk] = 0
-
-                # Calculate how many zero voxels were filled *within* the pre-trim mask
-                restored_in_chunk = np.sum(original_zeros_mask_chunk & (healed_chunk != 0))
-                voxels_restored_count += restored_in_chunk
-
-                # Write the masked healed chunk back to the ORIGINAL segmentation memmap
-                segmentation_memmap[z_start:z_end] = healed_chunk
-                segmentation_memmap.flush() # Flush changes for the chunk
-
-                # Clean up chunk memory
-                del original_zeros_mask_chunk, healed_chunk, pre_trim_mask_chunk
-                gc.collect()
-
-            print(f"  Edge healing finished. Filled approx. {voxels_restored_count} voxels in {time.time() - start_heal_time:.2f}s.")
-
-        except MemoryError as mem_err:
-            print(f"  !!! MemoryError during healing step: {mem_err}. Skipping healing.")
-        except Exception as e_heal:
-            print(f"  !!! ERROR during healing step: {e_heal}. Skipping healing.")
-        finally:
-            # Clean up temporary healed memmap and pre-trim mask
-            if healed_labels_memmap is not None and hasattr(healed_labels_memmap, '_mmap'):
-                del healed_labels_memmap; gc.collect()
-            if healed_temp_dir and os.path.exists(healed_temp_dir):
-                rmtree(healed_temp_dir, ignore_errors=True)
-            if pre_trim_mask_memmap is not None and hasattr(pre_trim_mask_memmap, '_mmap'):
-                del pre_trim_mask_memmap; gc.collect()
-            if pre_trim_temp_dir and os.path.exists(pre_trim_temp_dir):
-                rmtree(pre_trim_temp_dir, ignore_errors=True)
-            gc.collect()
-    elif heal_iterations > 0:
-        print("\n  Skipping healing step because pre-trim mask generation failed.")
-    else:
-        # Cleanup pre-trim mask if it was created but healing was skipped
-        if pre_trim_mask_memmap is not None and hasattr(pre_trim_mask_memmap, '_mmap'):
-            del pre_trim_mask_memmap; gc.collect()
-        if pre_trim_temp_dir and os.path.exists(pre_trim_temp_dir):
-            rmtree(pre_trim_temp_dir, ignore_errors=True)
-
-
-    # --- Step 2: Relabel Disconnected Components ---
-    # This step now runs on the potentially healed segmentation
-    print("\n  Checking for and relabeling disconnected components (post-trim/heal)...")
-    # ... (Relabeling logic remains exactly the same) ...
-    start_relabel_time = time.time()
-    try:
-        print("    Finding max label after trimming/healing...")
-        max_label = 0
-        chunk_size_max = min(500, original_shape[0]) if original_shape[0] > 0 else 1
-        for i in tqdm(range(0, original_shape[0], chunk_size_max), desc="    Finding Max Label", disable=original_shape[0]<=chunk_size_max):
-             # Check memmap validity before reading chunk
-             if not hasattr(segmentation_memmap, '_mmap') or segmentation_memmap._mmap is None:
-                 raise IOError(f"Segmentation memmap became invalid while finding max label (chunk {i})")
-             seg_chunk = segmentation_memmap[i:min(i+chunk_size_max, original_shape[0])]
-             chunk_max = np.max(seg_chunk); del seg_chunk
-             if chunk_max > max_label: max_label = chunk_max
-        next_available_label = max_label + 1
-        print(f"    Max label found: {max_label}. Next new label: {next_available_label}")
-    except MemoryError: raise MemoryError("Failed to find max label for relabeling.")
-    except Exception as e: raise RuntimeError(f"Failed to find max label for relabeling: {e}") from e
-    relabel_count = 0
-    structure_relabel = generate_binary_structure(3,1) # Define structure once
-    for label_val in tqdm(original_labels_present, desc="  Relabeling Components"):
-        # Check if label still exists after trimming/healing before processing
-        # (Could add a check here, but find_objects handles empty results)
-
-        # Ensure memmap is valid for each label
-        if not hasattr(segmentation_memmap, '_mmap') or segmentation_memmap._mmap is None:
-            raise IOError(f"Segmentation memmap became invalid before relabeling label {label_val}")
-
-        try:
-            # Find bounding box slice for the label
-            locations = find_objects(segmentation_memmap == label_val) # Still operates on boolean check per label
-            if not locations: continue # Label might have been fully removed
-            loc = locations[0]
-            del locations # Free memory
-
-            # Extract sub-volume view for labeling
-            seg_sub_view = segmentation_memmap[loc]
-            label_mask_sub = (seg_sub_view == label_val) # Create mask within sub-volume
-
-            if not np.any(label_mask_sub):
-                del loc, seg_sub_view, label_mask_sub; gc.collect(); continue # Should not happen if find_objects worked, but safety check
-
-            # Label components within the sub-volume mask
-            labeled_components_sub, num_components = ndimage_label(label_mask_sub, structure=structure_relabel)
-
-            # If disconnected, relabel the smaller components
-            if num_components > 1:
-                relabel_count += (num_components - 1)
-                # Modify the sub-volume view directly
-                for c_idx in range(2, num_components + 1): # Start from component 2
-                    component_mask_sub = (labeled_components_sub == c_idx)
-                    # Assign the next available global label
-                    seg_sub_view[component_mask_sub] = next_available_label
-                    next_available_label += 1
-                segmentation_memmap.flush() # Flush changes made through the view
-
-            # Clean up sub-volume variables
-            del loc, seg_sub_view, label_mask_sub, labeled_components_sub; gc.collect()
-
-        except MemoryError: print(f"\n!!! MemoryError during find_objects or labeling for label {label_val}. Skipping relabeling."); gc.collect(); continue
-        except Exception as find_obj_err: print(f"\n!!! Error during relabeling process for label {label_val}: {find_obj_err}. Skipping."); gc.collect(); continue
-
-    print(f"  Relabeling finished. Created {relabel_count} new labels in {time.time() - start_relabel_time:.2f}s."); gc.collect()
-
-
-    # --- Step 3: Optional: Remove Small Remnants (based on final labels) ---
-    # This now operates on the trimmed, healed, and relabeled segmentation
+    # --- Step 2: Remove Small Remnants ---
+    num_remnants_removed = 0
     if min_remaining_size > 0:
-        print(f"\n  Removing remnants smaller than {min_remaining_size} voxels (on Memmap, post-relabel)...")
-        # ... (Small remnant removal logic remains the same) ...
-        start_rem = time.time()
+        print(f"\n--- 2. Removing remnants smaller than {min_remaining_size} voxels ---")
+        start_rem_time = time.time()
+        # ... (Small object removal logic remains identical) ...
         print("    Creating boolean mask (chunked)...")
         if not hasattr(segmentation_memmap, '_mmap') or segmentation_memmap._mmap is None:
-            raise IOError("Segmentation memmap became invalid before remnant removal step")
-        bool_seg_temp_dir = tempfile.mkdtemp(prefix="bool_remnant_")
-        bool_seg_path = os.path.join(bool_seg_temp_dir, 'temp_bool_seg.dat')
+            raise IOError("Segmentation memmap invalid before remnant removal.")
+        bool_seg_temp_dir = None
         bool_seg_memmap = None
         try:
+            bool_seg_temp_dir = tempfile.mkdtemp(prefix="bool_remnant_")
+            bool_seg_path = os.path.join(bool_seg_temp_dir, 'temp_bool_seg.dat')
             bool_seg_memmap = np.memmap(bool_seg_path, dtype=bool, mode='w+', shape=original_shape)
             chunk_size_rem = min(100, original_shape[0]) if original_shape[0] > 0 else 1
             any_objects_found = False
             for i in tqdm(range(0, original_shape[0], chunk_size_rem), desc="    Bool Mask Gen"):
                 z_start = i; z_end = min(i + chunk_size_rem, original_shape[0])
                 if z_start >= z_end: continue
-                if not hasattr(segmentation_memmap, '_mmap') or segmentation_memmap._mmap is None: raise IOError("Seg memmap invalid during bool mask gen")
+                if not hasattr(segmentation_memmap, '_mmap') or segmentation_memmap._mmap is None: raise IOError("Seg memmap invalid bool mask gen")
                 seg_chunk = segmentation_memmap[z_start:z_end]
                 bool_chunk = seg_chunk > 0
                 bool_seg_memmap[z_start:z_end] = bool_chunk
                 if not any_objects_found and np.any(bool_chunk): any_objects_found = True
                 del seg_chunk, bool_chunk
             bool_seg_memmap.flush(); gc.collect()
-            num_remnants_removed = 0
+
             if any_objects_found:
-                print("    Loading boolean mask for small object removal...")
+                print("    Loading boolean mask into memory...")
                 try:
-                    # Load boolean mask into memory for remove_small_objects
                     bool_seg_in_memory = np.array(bool_seg_memmap)
-                    # Close and delete the temporary boolean memmap file NOW to save disk space/handles
                     del bool_seg_memmap; bool_seg_memmap = None; gc.collect()
                     os.unlink(bool_seg_path); rmtree(bool_seg_temp_dir); bool_seg_temp_dir = None
 
-                    print("    Applying remove_small_objects...")
-                    # remove_small_objects requires boolean input
+                    print("    Applying remove_small_objects (skimage)...")
                     cleaned_bool_seg = remove_small_objects(bool_seg_in_memory, min_size=min_remaining_size, connectivity=1)
-                    # Calculate the difference mask (objects TO BE removed)
                     small_remnant_mask_overall = bool_seg_in_memory & (~cleaned_bool_seg)
-                    del bool_seg_in_memory, cleaned_bool_seg; gc.collect() # Free memory
+                    del bool_seg_in_memory, cleaned_bool_seg; gc.collect()
 
                     print("    Applying removal mask to segmentation memmap (chunked)...")
                     chunk_size_apply_rem = min(100, original_shape[0]) if original_shape[0] > 0 else 1
                     for i in tqdm(range(0, original_shape[0], chunk_size_apply_rem), desc="    Applying Removal"):
                         z_start = i; z_end = min(i + chunk_size_apply_rem, original_shape[0])
                         if z_start >= z_end: continue
-                        if not hasattr(segmentation_memmap, '_mmap') or segmentation_memmap._mmap is None: raise IOError("Segmentation memmap became invalid during remnant removal application")
+                        if not hasattr(segmentation_memmap, '_mmap') or segmentation_memmap._mmap is None: raise IOError("Seg memmap invalid removal application")
 
-                        # Get view of segmentation chunk and mask chunk
                         seg_chunk_view = segmentation_memmap[z_start:z_end]
                         small_remnant_mask_chunk = small_remnant_mask_overall[z_start:z_end]
 
-                        # Find where small remnants exist in the chunk
-                        chunk_remnants_count = np.sum(seg_chunk_view[small_remnant_mask_chunk] > 0) # Count only labeled pixels being removed
+                        chunk_remnants_count = np.sum(seg_chunk_view[small_remnant_mask_chunk] > 0)
                         if chunk_remnants_count > 0:
-                            # Set labels in the segmentation memmap to 0 where the mask is True
                             seg_chunk_view[small_remnant_mask_chunk] = 0
-                            segmentation_memmap.flush() # Flush changes
+                            segmentation_memmap.flush()
                             num_remnants_removed += chunk_remnants_count
 
-                    del small_remnant_mask_overall # Free memory of the full mask
+                    del small_remnant_mask_overall
                     gc.collect()
-                    print(f"  Removed {num_remnants_removed} voxels belonging to small remnants in {time.time()-start_rem:.2f}s.")
-                except MemoryError: print("    MemoryError during small object removal processing (loading bool mask or applying). Skipping remnant removal."); gc.collect()
+                    print(f"  Small object removal finished. Removed {num_remnants_removed} voxels.")
+                except MemoryError: print("    MemoryError during small object removal. Skipping remaining removal steps."); gc.collect()
                 except Exception as e_rem: print(f"    Error during small remnant removal processing: {e_rem}. Skipping."); gc.collect()
-            else: print("  Segmentation memmap appears empty after trimming/healing/relabeling, skipping remnant removal.")
+            else: print("  Segmentation memmap appears empty after trimming. Skipping remnant removal.")
         finally:
-             # Ensure temp dir/files are cleaned up even if loading bool mask failed
-             if 'bool_seg_memmap' in locals() and bool_seg_memmap is not None and hasattr(bool_seg_memmap, '_mmap'): del bool_seg_memmap; gc.collect()
-             if 'bool_seg_temp_dir' in locals() and bool_seg_temp_dir is not None and os.path.exists(bool_seg_temp_dir):
+             if bool_seg_memmap is not None and hasattr(bool_seg_memmap, '_mmap'): del bool_seg_memmap; gc.collect()
+             if bool_seg_temp_dir is not None and os.path.exists(bool_seg_temp_dir):
                  try: rmtree(bool_seg_temp_dir, ignore_errors=True)
-                 except Exception as e_final_clean: print(f"    Warn: Error cleaning up remnant temp dir {bool_seg_temp_dir}: {e_final_clean}")
+                 except Exception: pass # Ignore cleanup error
              gc.collect()
+        print(f"  Time taken: {time.time() - start_rem_time:.2f}s.")
+    else:
+        print(f"\n--- 2. Skipping small object removal (min_remaining_size={min_remaining_size}) ---")
 
 
-    print("--- Edge trimming, healing, and cleanup finished ---")
+    # --- Step 3: Relabel Disconnected Components ---
+    print("\n--- 3. Checking for and relabeling disconnected components ---")
+    start_relabel_time = time.time()
+    relabel_map = {} # Stores {new_label: original_root_label}
+    next_available_label = 0
+    relabel_count = 0
+    # ... (Relabeling logic remains identical, building relabel_map) ...
+    try:
+        print("    Finding current max label...")
+        max_label = 0
+        chunk_size_max = min(500, original_shape[0]) if original_shape[0] > 0 else 1
+        for i in tqdm(range(0, original_shape[0], chunk_size_max), desc="    Finding Max Label", disable=original_shape[0]<=chunk_size_max):
+             if not hasattr(segmentation_memmap, '_mmap') or segmentation_memmap._mmap is None:
+                 raise IOError(f"Seg memmap invalid finding max label (chunk {i})")
+             seg_chunk = segmentation_memmap[i:min(i+chunk_size_max, original_shape[0])]
+             try: chunk_max = np.max(seg_chunk) if seg_chunk.size > 0 else 0
+             except ValueError: chunk_max = 0
+             del seg_chunk
+             if chunk_max > max_label: max_label = chunk_max
+        next_available_label = max_label + 1
+        print(f"    Max label found: {max_label}. Next new label: {next_available_label}")
+
+        print("    Finding unique labels present *before* relabeling...")
+        current_labels_present = np.unique(segmentation_memmap)
+        current_labels_present = current_labels_present[current_labels_present != 0]
+        print(f"    Found {len(current_labels_present)} unique labels to check.")
+
+        for lbl in current_labels_present:
+            relabel_map[lbl] = lbl
+
+        structure_relabel = generate_binary_structure(3,1)
+
+        for label_val in tqdm(current_labels_present, desc="  Relabeling Components"):
+            # ... (inner loop logic identical to previous version) ...
+            if not hasattr(segmentation_memmap, '_mmap') or segmentation_memmap._mmap is None:
+                raise IOError(f"Seg memmap invalid relabeling label {label_val}")
+            try:
+                locations = find_objects(segmentation_memmap == label_val)
+                if not locations: continue
+
+                if len(locations) == 1:
+                    loc = locations[0]
+                    seg_sub_view = segmentation_memmap[loc]
+                    label_mask_sub = (seg_sub_view == label_val)
+                    if not np.any(label_mask_sub): continue
+                    labeled_components_sub, num_components = ndimage_label(label_mask_sub, structure=structure_relabel)
+                    if num_components > 1:
+                        component_sizes = np.bincount(labeled_components_sub.ravel())
+                        component_sizes[0] = 0 # Ignore background
+                        largest_component_idx = np.argmax(component_sizes)
+                        original_root_label = relabel_map[label_val]
+                        for c_idx in range(1, num_components + 1):
+                            if c_idx == largest_component_idx: continue
+                            component_mask_sub = (labeled_components_sub == c_idx)
+                            new_label = next_available_label
+                            seg_sub_view[component_mask_sub] = new_label
+                            relabel_map[new_label] = original_root_label
+                            next_available_label += 1
+                            relabel_count += 1
+                        segmentation_memmap.flush()
+                    del seg_sub_view, label_mask_sub, labeled_components_sub
+                elif len(locations) > 1:
+                    original_root_label = relabel_map[label_val]
+                    for i in range(1, len(locations)):
+                        loc = locations[i]
+                        seg_sub_view = segmentation_memmap[loc]
+                        component_mask_sub = (seg_sub_view == label_val)
+                        if np.any(component_mask_sub):
+                            new_label = next_available_label
+                            seg_sub_view[component_mask_sub] = new_label
+                            relabel_map[new_label] = original_root_label
+                            next_available_label += 1
+                            relabel_count += 1
+                    segmentation_memmap.flush()
+                    del seg_sub_view, component_mask_sub
+                del locations
+            except MemoryError: print(f"\n!!! MemoryError during relabeling {label_val}. Skipping."); gc.collect(); continue
+            except Exception as rel_err: print(f"\n!!! Error during relabeling {label_val}: {rel_err}. Skipping."); gc.collect(); continue
+
+        print(f"  Relabeling finished. Created {relabel_count} new labels.")
+
+    except MemoryError: print("MemoryError during relabeling setup. Skipping relabeling."); gc.collect()
+    except Exception as e: print(f"Error during relabeling setup: {e}. Skipping relabeling."); gc.collect()
+    print(f"  Time taken: {time.time() - start_relabel_time:.2f}s.")
+    gc.collect()
+
+
+    # --- Step 4: Heal Porous Edges using Convex Hull ---
+    voxels_restored_count = 0
+    # Check if healing is possible (original seg copy succeeded)
+    if copy_success and original_segmentation_memmap is not None:
+        print(f"\n--- 4. Applying Convex Hull Healing ---")
+        print(f"  (Healing based on {len(modified_labels_during_trim)} labels initially modified by trimming)")
+        start_heal_time = time.time()
+        failed_labels_heal = 0
+        processed_labels_heal = 0
+        # ... (Healing logic remains identical, using relabel_map) ...
+        original_to_current_map = defaultdict(list)
+        print("    Building mapping from original labels to current labels...")
+        all_current_mapped_labels = list(relabel_map.keys())
+        for current_label in tqdm(all_current_mapped_labels, desc="    Building Inverse Map"):
+             original_root_label = relabel_map.get(current_label, 0)
+             if original_root_label != 0:
+                 original_to_current_map[original_root_label].append(current_label)
+        print(f"    Inverse map built for {len(original_to_current_map)} original roots.")
+
+        labels_to_heal = list(modified_labels_during_trim)
+
+        for original_label in tqdm(labels_to_heal, desc="  Healing Labels"):
+            processed_labels_heal += 1
+            try:
+                current_labels_for_this_object = original_to_current_map.get(original_label)
+                if not current_labels_for_this_object: continue
+
+                if not hasattr(segmentation_memmap, '_mmap') or segmentation_memmap._mmap is None: raise IOError(f"Current seg memmap invalid healing {original_label}")
+                if not hasattr(original_segmentation_memmap, '_mmap') or original_segmentation_memmap._mmap is None: raise IOError(f"Original seg memmap invalid healing {original_label}")
+
+                combined_mask_for_findobj = None
+                try:
+                    combined_mask_for_findobj = np.isin(segmentation_memmap, current_labels_for_this_object)
+                except MemoryError: print(f"\n!!! MemoryError creating boolean mask for find_objects (label {original_label}). Skipping."); gc.collect(); failed_labels_heal += 1; continue
+
+                locations = find_objects(combined_mask_for_findobj)
+                del combined_mask_for_findobj; gc.collect()
+                if not locations: continue
+
+                min_coords = [min(s[d].start for s in locations) for d in range(3)]; max_coords = [max(s[d].stop for s in locations) for d in range(3)]
+                global_loc = tuple(slice(min_coords[d], max_coords[d]) for d in range(3)); del locations; gc.collect()
+
+                seg_sub_current_view = segmentation_memmap[global_loc]
+                seg_sub_current_data = np.array(seg_sub_current_view); orig_sub_data = original_segmentation_memmap[global_loc]
+                object_mask_current_sub = np.isin(seg_sub_current_data, current_labels_for_this_object)
+
+                if np.sum(object_mask_current_sub) < 4: del seg_sub_current_view, seg_sub_current_data, orig_sub_data, object_mask_current_sub; gc.collect(); continue
+
+                hull_mask_sub = convex_hull_image(object_mask_current_sub)
+                restore_mask_sub = hull_mask_sub & (orig_sub_data == original_label)
+                currently_zero_mask_sub = (seg_sub_current_data == 0)
+                actual_restore_mask_sub = restore_mask_sub & currently_zero_mask_sub
+                num_restored_for_label = np.sum(actual_restore_mask_sub)
+                voxels_restored_count += num_restored_for_label
+
+                if num_restored_for_label > 0: seg_sub_current_view[actual_restore_mask_sub] = original_label; segmentation_memmap.flush()
+
+                del global_loc, seg_sub_current_view, seg_sub_current_data, orig_sub_data, object_mask_current_sub, hull_mask_sub, restore_mask_sub, currently_zero_mask_sub, actual_restore_mask_sub; gc.collect()
+            except MemoryError as mem_err: failed_labels_heal += 1; print(f"\n!!! MemoryError healing {original_label}: {mem_err}. Skip."); gc.collect(); continue
+            except ValueError as ve: failed_labels_heal += 1; print(f"\n!!! ValueError healing {original_label}: {ve}. Skip."); gc.collect(); continue
+            except Exception as e_heal_label: failed_labels_heal += 1; print(f"\n!!! ERROR healing {original_label}: {e_heal_label}. Skip."); gc.collect(); continue
+
+        print(f"  Convex hull healing finished. Restored approx. {voxels_restored_count} voxels.")
+        print(f"  Processed {processed_labels_heal}/{len(labels_to_heal)} labels ({failed_labels_heal} failed).")
+        print(f"  Time taken: {time.time() - start_heal_time:.2f}s.")
+    else:
+        print("\n--- 4. Skipping convex hull healing step (original segmentation copy failed or unavailable) ---")
+
+
+    # --- Step 5: Merge Touching Labels ---
+    print("\n--- 5. Merging touching labels ---")
+    start_merge_time = time.time()
+    global union_find_parent # Use the global union-find structure
+    union_find_parent = {} # Reset for this step
+    touching_pairs = set()
+    merged_labels_count = 0
+    try:
+        print("    Finding unique labels present before merging...")
+        # Find labels present *after* healing
+        labels_after_healing = np.unique(segmentation_memmap)
+        labels_after_healing = labels_after_healing[labels_after_healing != 0]
+        print(f"    Found {len(labels_after_healing)} unique labels to check for merging.")
+
+        if len(labels_after_healing) > 1: # Only need to check if there's more than one label
+            # Initialize union-find structure for all current labels
+            for lbl in labels_after_healing:
+                union_find_parent[lbl] = lbl
+
+            # Structure for finding neighbors (connectivity 1)
+            neighbor_structure = generate_binary_structure(3, 1)
+
+            print("    Identifying touching label pairs...")
+            for label_val in tqdm(labels_after_healing, desc="  Checking Neighbors"):
+                try:
+                    # Ensure memmap is valid before find_objects
+                    if not hasattr(segmentation_memmap, '_mmap') or segmentation_memmap._mmap is None:
+                        raise IOError(f"Segmentation memmap became invalid checking label {label_val}")
+
+                    locations = find_objects(segmentation_memmap == label_val)
+                    if not locations: continue
+
+                    # Process each disconnected component found by find_objects separately
+                    for loc in locations:
+                        # Extract sub-volume view (read data later if needed)
+                        seg_sub_view = segmentation_memmap[loc]
+                        # Create boolean mask *within the sub-volume*
+                        is_current_label_sub = (seg_sub_view == label_val)
+
+                        # Dilate the mask within the sub-volume
+                        # Ensure dilation doesn't go out of bounds implicitly (mode='constant', cval=0 is default)
+                        dilated_mask_sub = binary_dilation(is_current_label_sub, structure=neighbor_structure)
+
+                        # Identify neighbor voxels within the sub-volume
+                        neighbor_mask_sub = dilated_mask_sub & ~is_current_label_sub
+
+                        # Get the labels of these neighbors from the sub-volume view
+                        # Only read neighbor labels if neighbor_mask_sub has True values
+                        if np.any(neighbor_mask_sub):
+                            neighbor_labels = seg_sub_view[neighbor_mask_sub]
+                            unique_neighbor_labels = np.unique(neighbor_labels[neighbor_labels != 0])
+
+                            # Add touching pairs to the set and perform union
+                            for neighbor_label in unique_neighbor_labels:
+                                # Ensure neighbor_label is valid (might have been removed?)
+                                if neighbor_label in union_find_parent:
+                                    # Add pair (smaller_id, larger_id)
+                                    pair = tuple(sorted((label_val, neighbor_label)))
+                                    if pair not in touching_pairs:
+                                        touching_pairs.add(pair)
+                                        unite_sets(label_val, neighbor_label) # Perform union immediately
+
+                        del seg_sub_view, is_current_label_sub, dilated_mask_sub, neighbor_mask_sub
+                        if 'neighbor_labels' in locals(): del neighbor_labels
+                        if 'unique_neighbor_labels' in locals(): del unique_neighbor_labels
+                        gc.collect()
+
+                except MemoryError: print(f"\n!!! MemoryError checking neighbors for label {label_val}. Skipping."); gc.collect(); continue
+                except Exception as err_touch: print(f"\n!!! Error checking neighbors for label {label_val}: {err_touch}. Skipping."); gc.collect(); continue
+
+            print(f"    Found {len(touching_pairs)} touching pairs.")
+
+            # --- Apply the merge mapping ---
+            print("    Applying merge map to segmentation (chunked)...")
+            # Create the final map: {old_label: representative_label}
+            # Ensure all original labels are mapped, even if they didn't touch anything
+            merge_map_final = {lbl: find_set(lbl) for lbl in labels_after_healing}
+            num_labels_to_change = sum(1 for old, new in merge_map_final.items() if old != new)
+            merged_labels_count = num_labels_to_change # Count how many labels are merged into another
+
+            if num_labels_to_change > 0:
+                chunk_size_merge = min(100, original_shape[0]) if original_shape[0] > 0 else 1
+                for i in tqdm(range(0, original_shape[0], chunk_size_merge), desc="    Applying Merge"):
+                    z_start = i; z_end = min(i + chunk_size_merge, original_shape[0])
+                    if z_start >= z_end: continue
+                    if not hasattr(segmentation_memmap, '_mmap') or segmentation_memmap._mmap is None:
+                        raise IOError("Segmentation memmap became invalid applying merge map")
+
+                    # Read chunk into memory
+                    seg_chunk = np.array(segmentation_memmap[z_start:z_end])
+                    seg_chunk_modified = np.copy(seg_chunk) # Work on a copy
+
+                    unique_labels_in_chunk = np.unique(seg_chunk)
+
+                    labels_changed_in_chunk = False
+                    for old_label in unique_labels_in_chunk:
+                        if old_label == 0: continue
+                        # Use .get(old_label, old_label) in case a label somehow exists
+                        # that wasn't in labels_after_healing (shouldn't happen).
+                        final_label = merge_map_final.get(old_label, old_label)
+                        if final_label != old_label:
+                            seg_chunk_modified[seg_chunk == old_label] = final_label
+                            labels_changed_in_chunk = True
+
+                    # Write back modified chunk ONLY if changes were made
+                    if labels_changed_in_chunk:
+                        segmentation_memmap[z_start:z_end] = seg_chunk_modified
+                        segmentation_memmap.flush()
+
+                    del seg_chunk, seg_chunk_modified, unique_labels_in_chunk
+                    gc.collect()
+                print(f"    Merge applied. {merged_labels_count} labels were merged into others.")
+            else:
+                print("    No labels needed merging.")
+
+        else:
+            print("    Skipping merge check: Only one label present.")
+
+    except MemoryError: print("!!! MemoryError during merge setup or application. Merge step incomplete."); gc.collect()
+    except Exception as e_merge: print(f"!!! Error during merge step: {e_merge}. Merge step incomplete."); gc.collect()
+
+    print(f"  Time taken for merging: {time.time() - start_merge_time:.2f}s.")
+    gc.collect()
+
+
+    # --- Final Cleanup ---
+    print("\n--- Cleaning up temporary files ---")
+    # Cleanup original segmentation copy if it exists
+    if original_segmentation_memmap is not None and hasattr(original_segmentation_memmap, '_mmap'):
+        del original_segmentation_memmap; gc.collect()
+    if original_seg_temp_dir and os.path.exists(original_seg_temp_dir):
+        try: rmtree(original_seg_temp_dir, ignore_errors=True)
+        except Exception as e_clean: print(f"  Warn: Error cleaning up original seg temp dir: {e_clean}")
+    gc.collect()
+
+
+    print("\n--- Processing sequence finished ---")
     # The segmentation_memmap has been modified in-place.
-    return trimmed_voxels_mask # Return mask of voxels *initially* trimmed (before healing)
+    return trimmed_voxels_mask # Return mask of voxels *initially* trimmed
