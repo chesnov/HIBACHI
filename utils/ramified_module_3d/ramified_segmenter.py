@@ -33,8 +33,6 @@ def extract_soma_masks(
     segmentation_mask: np.ndarray,
     spacing: Optional[Tuple[float, float, float]],
     smallest_quantile: int = 25,
-    min_samples_for_median: int = 5,
-    relative_core_definition_ratios: Union[List[float], float] = 0.3,
     min_fragment_size: int = 30,
     core_volume_target_factor_lower: float = 0.4,
     core_volume_target_factor_upper: float = 10
@@ -49,14 +47,7 @@ def extract_soma_masks(
     print("--- Starting Soma Extraction (Smallest Persistent + Splits Aggregation, V7) ---")
 
     # --- Handle input ratios (same as V5/V6) ---
-    if isinstance(relative_core_definition_ratios, (float, int)): ratios_to_process = [float(relative_core_definition_ratios)]
-    elif isinstance(relative_core_definition_ratios, list):
-        if not relative_core_definition_ratios: ratios_to_process = [0.3]
-        else:
-             try: ratios_to_process = sorted(list(set(float(r) for r in relative_core_definition_ratios if r > 0 and r < 1)));
-             except (ValueError, TypeError): ratios_to_process = [0.3]
-             if not ratios_to_process: ratios_to_process = [0.3] # Handle empty list after filtering
-    else: ratios_to_process = [0.3]
+    ratios_to_process = [0.3, 0.4, 0.5, 0.6]
     print(f"Processing large cells with ratios: {ratios_to_process} (aggregating splits + smallest persistent)")
 
     # --- Internal Parameters & Setup (Identical to V6) ---
@@ -103,6 +94,7 @@ def extract_soma_masks(
     volumes = {label: initial_volumes[label] for label in unique_labels}; all_volumes_list = list(volumes.values())
     if not all_volumes_list: print("Error: No valid volumes."); return np.zeros_like(segmentation_mask, dtype=np.int32)
 
+    min_samples_for_median = 5
     # Heuristic Target Volume & Filter Ranges
     smallest_thresh_volume = np.percentile(all_volumes_list, smallest_quantile) if len(all_volumes_list) > 1 else (all_volumes_list[0] + 1 if all_volumes_list else 1)
     smallest_object_labels_set = {label for label, vol in volumes.items() if vol <= smallest_thresh_volume}
@@ -446,11 +438,123 @@ def extract_soma_masks(
     return final_seed_mask
 
 # --- refine_seeds_pca function remains the same ---
-def refine_seeds_pca(intermediate_seed_mask,
-                     spacing,
-                     target_aspect_ratio=1.1,
-                     projection_percentile_crop=10,
-                     min_fragment_size=30):
+def refine_seeds_pca(
+    intermediate_seed_mask: np.ndarray,
+    spacing: Optional[Tuple[float, float, float]],
+    target_aspect_ratio: float = 1.1,
+    projection_percentile_crop: int = 10,
+    min_fragment_size: int = 30
+) -> np.ndarray:
+    """
+    Refines the shape of preliminary seeds using PCA to make them more compact.
+
+    Identifies the principal axes of each seed based on its physical voxel
+    coordinates. If a seed's aspect ratio (longest axis / shortest axis)
+    exceeds a target threshold, it crops the seed along its longest axis
+    by removing voxels falling in the outer percentiles of the projection
+    onto that axis. Filters out seeds that are too small initially or
+    become too small after refinement.
+
+    Args:
+        intermediate_seed_mask (np.ndarray):
+            Input integer mask where each unique positive integer represents a
+            preliminary seed region identified by the previous step
+            (e.g., `extract_soma_masks`). This is the mask that will be refined.
+
+        spacing (Optional[Tuple[float, float, float]]):
+            The physical size of a voxel along each dimension (Z, Y, X),
+            typically in micrometers (µm). Example: (2.0, 0.5, 0.5).
+            *   **Role:** Crucial for accurate shape analysis. PCA is performed on
+                *physical* coordinates (voxel coordinates multiplied by spacing).
+                This ensures that the shape analysis reflects the true physical
+                dimensions and is not skewed by anisotropic voxel resolutions
+                (e.g., thick Z-slices).
+            *   **Influence of Changing:**
+                *   **Correct Spacing:** Provides the most accurate assessment of
+                    physical elongation.
+                *   **Incorrect Spacing (or None/Default (1,1,1) for anisotropic data):**
+                    Leads to inaccurate PCA results. If Z-spacing is large but
+                    treated as 1, objects might appear artificially compact along Z
+                    in the analysis, potentially preventing necessary refinement.
+                    Conversely, if XY spacing is large but treated as 1, objects
+                    might appear artificially elongated in the XY plane. Using (1,1,1)
+                    is only accurate if the voxels are truly isotropic.
+
+        target_aspect_ratio (float, optional):
+            The threshold for determining if a seed is "too elongated" and needs
+            refinement. The aspect ratio is calculated from the PCA eigenvalues
+            (representing variance along principal axes) as:
+            sqrt(largest_eigenvalue) / sqrt(smallest_eigenvalue).
+            Defaults to 1.1.
+            *   **Role:** Acts as a trigger condition for refinement. Only seeds
+                whose calculated aspect ratio is *greater than or equal to* this
+                value will be considered for cropping.
+            *   **Influence of Changing:**
+                *   **Increasing Value (e.g., 1.5, 2.0):** Makes the criterion
+                    stricter. Only *more* significantly elongated seeds will be
+                    refined. Fewer seeds will be cropped, and the final seeds might
+                    retain more of their original (potentially elongated) shape.
+                *   **Decreasing Value (e.g., 1.05, closer to 1.0):** Makes the
+                    criterion looser. Seeds with even slight elongation will meet
+                    the threshold and be cropped. More seeds are likely to undergo
+                    refinement, resulting in final seeds that are generally more
+                    compact/spherical. A value of 1.0 would theoretically trigger
+                    cropping for almost any non-perfectly spherical seed (though
+                    numeric precision might play a role).
+
+        projection_percentile_crop (int, optional):
+            Determines *how much* to crop from the ends of an elongated seed
+            along its longest principal axis (the axis corresponding to the
+            largest eigenvalue). Voxels are kept only if their projection onto
+            this axis falls between the `projection_percentile_crop`-th and
+            `(100 - projection_percentile_crop)`-th percentile.
+            Defaults to 10 (meaning the outer 10% from *each* end are removed).
+            *   **Role:** Controls the *aggressiveness* of the cropping applied to
+                seeds that meet the `target_aspect_ratio` threshold.
+            *   **Influence of Changing:**
+                *   **Increasing Value (e.g., 20, 25):** Results in *more*
+                    aggressive cropping. A larger percentage of the seed's extent
+                    along its longest axis is removed from both ends. This leads
+                    to significantly shorter, more compact refined seeds. Risk:
+                    May crop too much, potentially making the seed too small (see
+                    `min_fragment_size`) or even disconnecting it if the original
+                    seed was dumbbell-shaped.
+                *   **Decreasing Value (e.g., 5, 2):** Results in *less*
+                    aggressive cropping. A smaller percentage is removed from the
+                    ends. The refined seed retains more of its original length
+                    along the primary axis. This is a gentler refinement. Risk:
+                    May not sufficiently compact a very elongated seed.
+                *   **Value of 0:** No cropping occurs, even if the aspect ratio
+                    threshold is met. The refinement step for that seed becomes
+                    a no-op (it keeps its original shape).
+
+        min_fragment_size (int, optional):
+            The minimum number of voxels a seed must have to be considered valid,
+            both *before* attempting PCA and *after* potential cropping.
+            Defaults to 30.
+            *   **Role:** Acts as a size filter to discard insignificant fragments.
+                It prevents processing extremely small initial seeds (which might
+                give unreliable PCA results) and removes seeds that become too small
+                as a result of the cropping process.
+            *   **Influence of Changing:**
+                *   **Increasing Value (e.g., 50, 100):** Makes the filter
+                    stricter. Fewer small initial seeds will be processed, and more
+                    seeds might be discarded *after* cropping if the refinement
+                    reduces their volume below this higher threshold. Results in
+                    fewer final seeds, biased towards larger ones.
+                *   **Decreasing Value (e.g., 10, 5):** Makes the filter more
+                    permissive. Smaller initial seeds might be processed, and
+                    refined seeds are less likely to be discarded due to size
+                    reduction. Results in potentially more final seeds, including
+                    smaller ones.
+
+    Returns:
+        np.ndarray:
+            A new integer mask of the same shape as the input, containing the
+            *refined* seeds. Labels are relabeled sequentially starting from 1.
+            Seeds that were too small initially, or became too small after
+            refinement, are removed.
+    """
     # ... (Code identical to previous version - no changes needed here based on request) ...
     print("--- Starting PCA Seed Refinement ---")
     if spacing is None: spacing = (1.0, 1.0, 1.0); print("Warn: No spacing, assume isotropic.")
@@ -652,9 +756,20 @@ def separate_multi_soma_cells(segmentation_mask,
                     median_intensity_on_path = 0
                     try:
                         indices, weight = route_through_array(cost_array, coords1_bounded, coords2_bounded, fully_connected=True)
-                        if indices.shape[1] > 0: # Check if path found (shape is (ndim, npoints))
-                            path_intensities = intensity_sub[tuple(indices)] # Direct indexing works for (ndim, npoints)
-                            if path_intensities.size > 0: median_intensity_on_path = np.median(path_intensities)
+                        # Validate the format and shape of indices before using
+                        if not isinstance(indices, np.ndarray) or indices.ndim != 2 or indices.shape[0] != 3:
+                            # If indices are not a 2D numpy array with 3 rows (dimensions), something is wrong.
+                            print(f"Warning: Unexpected format for path indices from route_through_array for cell {cell_label}, pair ({label1},{label2}). Shape: {getattr(indices, 'shape', 'N/A')}. Skipping path intensity check for this pair.")
+                            median_intensity_on_path = 0 # Treat as failed path
+                        elif indices.shape[1] == 0:
+                            # Path found but has zero points (shouldn't usually happen if start != end, but check)
+                            median_intensity_on_path = 0
+                        else:
+                            # Shape is confirmed as (3, N) with N > 0. Proceed with indexing.
+                            # The original indexing method is correct *if* shape is (3, N)
+                            path_intensities = intensity_sub[tuple(indices)]
+                            if path_intensities.size > 0:
+                                median_intensity_on_path = np.median(path_intensities)
                     except ValueError: median_intensity_on_path = 0 # Path not found
 
                     max_intensity_in_seeds = max(prop1.max_intensity, prop2.max_intensity) if prop1.max_intensity > 0 and prop2.max_intensity > 0 else 1.0

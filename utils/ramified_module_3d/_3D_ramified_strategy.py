@@ -373,8 +373,6 @@ class RamifiedStrategy(ProcessingStrategy):
         try:
             # --- Parameter Handling ---
             smallest_quantile = float(params.get("smallest_quantile", 0.05))
-            min_samples_for_median = int(params.get("min_samples_for_median", 5))
-            soma_thresholds = params.get("soma_extraction_thresholds", [0.3, 0.4, 0.5, 0.6])
             min_fragment_size = int(params.get("min_fragment_size", 50))
             target_aspect_ratio = float(params.get("target_aspect_ratio", 1.1))
             projection_percentile_crop = int(params.get("projection_percentile_crop", 10))
@@ -384,8 +382,6 @@ class RamifiedStrategy(ProcessingStrategy):
                 labeled_cells,
                 self.spacing, # Assumes self.spacing is set
                 smallest_quantile=smallest_quantile,
-                min_samples_for_median=min_samples_for_median,
-                relative_core_definition_ratios=soma_thresholds,
                 min_fragment_size=min_fragment_size,
             )
 

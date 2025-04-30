@@ -21,7 +21,7 @@ execute_raw_segmentation_ramified:
     smooth_sigma:
       label: Smooth Sigma (Initial)
       type: float
-      value: 1.3
+      value: 1.1
       min: 0.1
       max: 10.0
       step: 0.1
@@ -66,7 +66,7 @@ execute_trim_edges_ramified:
     brightness_cutoff_factor:
       label: Brightness Cutoff Factor
       type: float
-      value: 100000
+      value: 120000.0
       min: 0.0
       max: 10000000
       step: 0.1
@@ -87,33 +87,17 @@ execute_refine_rois_ramified:
       min: 0.0
       max: 1.0
       step: 0.01
-    min_samples_for_median:
-      label: Min Samples for Median (Soma)
-      type: int
-      value: 5
-      min: 1
-      max: 1000
-      step: 1
-    soma_extraction_thresholds:
-      label: Soma Extraction Ratios (List)
-      type: list
-      value:
-      - 0.3
-      - 0.4
-      - 0.5
-      - 0.6
-      element_type: float
     min_fragment_size:
       label: Min Fragment Size (Refine/Separate)
       type: int
-      value: 1000
+      value: 2000
       min: 1
       max: 1000000
       step: 10
     target_aspect_ratio:
       label: Target Aspect Ratio (PCA Refine)
       type: float
-      value: 1.1
+      value: 1.05
       min: 0.1
       max: 5.0
       step: 0.1
@@ -127,19 +111,10 @@ execute_refine_rois_ramified:
     intensity_weight:
       label: Intensity Weight (Separate)
       type: float
-      value: 0.5
+      value: 5.0
       min: 0.0
-      max: 1.0
+      max: 10
       step: 0.01
-execute_calculate_features_ramified:
-  name: Execute Calculate Features
-  parameters:
-    n_jobs:
-      label: Parallel Jobs (Features)
-      type: int
-      value: 24
-      min: 1
-      max: 64
 voxel_dimensions:
   x: 424.27
   y: 424.27
