@@ -229,7 +229,14 @@ def check_processing_state(processed_dir: str, mode: str, checkpoint_files: dict
             3: "final_segmentation",     # Step 3 output KEY (Main labeled result)
             4: "metrics_df"              # Step 4 output KEY (or skeleton_array etc.)
         }
-        # --- END CRITICAL CHANGE ---
+    elif mode == 'ramified_2d':
+        # Use the same logical keys, the strategy maps them to 2D paths
+        completion_file_keys = {
+            1: "raw_segmentation",       # Step 1 output KEY
+            2: "trimmed_segmentation",   # Step 2 output KEY
+            3: "final_segmentation",     # Step 3 output KEY (Main labeled result)
+            4: "metrics_df"              # Step 4 output KEY (or skeleton_array etc.)
+        }
     elif mode == 'nuclei':
          completion_file_keys = {
             1: "initial_segmentation",   # Step 1 output KEY
@@ -264,32 +271,32 @@ def check_processing_state(processed_dir: str, mode: str, checkpoint_files: dict
 # --- organize_processing_dir (Largely Unchanged) ---
 def organize_processing_dir(drctry, mode):
     """
-    A function to organize the directory with multiple samples for processing with 3D segmentation
+    Organizes a directory containing TIF files and a dimension mapping CSV
+    for processing with 2D or 3D segmentation workflows.
+
     Inputs:
-    - drctry: the directory containing tif files and a single csv file with the mapping of x,y,z dimensions
-              to the corresponding tif files; csv file should have columns:
-              Filename, Width (um), Height (um), Slices, Depth (um)
-    - mode: 'nuclear' or 'ramified', determines which config template to use
+    - drctry: Directory containing TIF files and a single CSV file.
+        - For 3D modes ('nuclear', 'ramified'): CSV needs columns
+          'Filename', 'Width (um)', 'Height (um)', 'Slices', 'Depth (um)'.
+        - For 2D modes ('ramified_2d'): CSV needs columns
+          'Filename', 'Width (um)', 'Height (um)'.
+    - mode: 'nuclear', 'ramified', or 'ramified_2d'. Determines required
+            CSV columns and config template.
     """
     print(f"Organizing directory: {drctry} for mode: {mode}")
     # Make a list of all the tif files in the directory
     try:
         all_files = os.listdir(drctry)
-        # Robustly filter TIF/TIFF extensions, case-insensitive
         tif_files = [f for f in all_files if f.lower().endswith(('.tif', '.tiff')) and os.path.isfile(os.path.join(drctry, f))]
         csv_files = [f for f in all_files if f.lower().endswith('.csv') and os.path.isfile(os.path.join(drctry, f))]
     except OSError as e:
         raise OSError(f"Error listing files in directory {drctry}: {e}") from e
 
     if not tif_files:
-        # Check subdirectories too? No, instruction says 'directly in the selected directory'.
         raise ValueError('No .tif or .tiff files found directly in the selected directory.')
-
-    # Check that there is only one csv file in the directory
     if len(csv_files) != 1:
         raise ValueError(f'Expected exactly one .csv file in the directory, found {len(csv_files)}: {", ".join(csv_files)}')
 
-    # Load the csv file
     csv_file = csv_files[0]
     csv_path = os.path.join(drctry, csv_file)
     try:
@@ -297,138 +304,147 @@ def organize_processing_dir(drctry, mode):
     except Exception as e:
         raise ValueError(f"Error reading CSV file {csv_path}: {e}") from e
 
-    # Check that the csv file has the correct columns
-    required_cols = ['Filename', 'Width (um)', 'Height (um)', 'Slices', 'Depth (um)']
-    if not all([col in df.columns for col in required_cols]):
-        raise ValueError(f'The CSV file must have columns: {", ".join(required_cols)}. Found: {", ".join(df.columns)}')
+    # --- MODIFICATION START: Define required columns based on mode ---
+    is_2d_mode = mode == 'ramified_2d' # Add other 2D modes here if created later
 
-    # Check that the CSV file lists all the found TIF files (matching base names)
-    # Ensure comparison is robust (e.g., string type)
+    if is_2d_mode:
+        required_cols = ['Filename', 'Width (um)', 'Height (um)']
+        dimension_section_key = 'pixel_dimensions' # Key used in 2D config YAML
+        print("Mode is 2D. Requiring columns:", required_cols)
+    else: # 3D modes
+        required_cols = ['Filename', 'Width (um)', 'Height (um)', 'Slices', 'Depth (um)']
+        dimension_section_key = 'voxel_dimensions' # Key used in 3D config YAML
+        print("Mode is 3D. Requiring columns:", required_cols)
+    # --- MODIFICATION END ---
+
+    # Check that the csv file has the correct columns for the mode
+    if not all([col in df.columns for col in required_cols]):
+        raise ValueError(f'For mode "{mode}", the CSV file must have columns: {", ".join(required_cols)}. Found: {", ".join(df.columns)}')
+
+    # Check CSV vs TIF files (no change needed here)
     csv_filenames = set(df['Filename'].astype(str))
     tif_basenames = set(os.path.splitext(f)[0] for f in tif_files)
-
     if csv_filenames != tif_basenames:
         missing_in_csv = tif_basenames - csv_filenames
         missing_in_folder = csv_filenames - tif_basenames
         error_msg = "Mismatch between CSV 'Filename' column (without extension) and TIF/TIFF files found:"
-        if missing_in_csv:
-            error_msg += f"\n - TIF files not listed in CSV: {', '.join(missing_in_csv)}"
-        if missing_in_folder:
-            error_msg += f"\n - CSV filenames without matching TIF: {', '.join(missing_in_folder)}"
+        if missing_in_csv: error_msg += f"\n - TIF files not listed in CSV: {', '.join(missing_in_csv)}"
+        if missing_in_folder: error_msg += f"\n - CSV filenames without matching TIF: {', '.join(missing_in_folder)}"
         raise ValueError(error_msg)
 
-    # Determine paths for template config files (assuming they are alongside this script or CWD)
+    # Determine config template path (already updated in previous step)
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    if mode == 'nuclear':
-        config_template_name = os.path.join('nuclear_module_3d','nuclear_config.yaml')
-    elif mode == 'ramified':
-        config_template_name = os.path.join('ramified_module_3d', 'ramified_config.yaml')
-    else:
-        raise ValueError(f"Invalid mode '{mode}' specified.")
+    if mode == 'nuclear': config_template_name = os.path.join('nuclear_module_3d','nuclear_config.yaml')
+    elif mode == 'ramified': config_template_name = os.path.join('ramified_module_3d', 'ramified_config.yaml')
+    elif mode == 'ramified_2d': config_template_name = os.path.join('ramified_module_2d', 'ramified_config_2d.yaml')
+    else: raise ValueError(f"Invalid mode '{mode}' specified.")
 
+    # --- Path finding logic (no changes) ---
     config_template_path = os.path.join(script_dir, os.path.join('..', config_template_name))
     if not os.path.exists(config_template_path):
-        # Fallback: Check current working directory if not found alongside script
-        print(f"Template not found in {config_template_path}, checking CWD: {os.getcwd()}")
-        config_template_path = os.path.join(os.getcwd(), config_template_name)
-        if not os.path.exists(config_template_path):
-           raise FileNotFoundError(f"Config template '{config_template_name}' not found in script directory ({script_dir}) or current working directory ({os.getcwd()}). Please ensure it exists.")
+        print(f"Template not found relative to script ({script_dir}), checking CWD: {os.getcwd()}")
+        config_template_path_cwd = os.path.join(os.getcwd(), config_template_name)
+        # Prioritize path relative to script if found there or parent dirs structure exists
+        # Fallback to CWD only if absolutely not found relative to script structure
+        if os.path.exists(config_template_path_cwd) and not os.path.exists(os.path.dirname(config_template_path)):
+             config_template_path = config_template_path_cwd
+             print(f"Using config template found in CWD: {config_template_path}")
+        elif not os.path.exists(config_template_path):
+             raise FileNotFoundError(f"Config template '{config_template_name}' not found relative to script directory ({script_dir}) or in CWD ({os.getcwd()}). Ensure module structure exists.")
     print(f"Using config template: {config_template_path}")
+    # --- End Path finding logic ---
 
-    # Create a new directory for each tif file and process
-    root_names = list(tif_basenames) # Use the set derived from actual files
+    root_names = list(tif_basenames)
     print(f"Found TIF roots: {root_names}")
 
     for root_name in root_names:
         print(f"Processing: {root_name}")
         new_dir = os.path.join(drctry, root_name)
-        try:
-            os.makedirs(new_dir, exist_ok=True)
-        except OSError as e:
-             raise OSError(f"Error creating directory {new_dir}: {e}") from e
+        try: os.makedirs(new_dir, exist_ok=True)
+        except OSError as e: raise OSError(f"Error creating directory {new_dir}: {e}") from e
 
-        # Find the actual TIF/TIFF file matching the root name (case-insensitive check might be better if needed)
         actual_tif_file = next((f for f in tif_files if os.path.splitext(f)[0] == root_name), None)
-        if not actual_tif_file:
-             print(f"Critical Warning: Could not find exact TIF file for root '{root_name}' during processing loop. Skipping.")
-             continue # Should not happen due to earlier check, but safety first
+        if not actual_tif_file: continue # Should not happen
 
         original_tif_path = os.path.join(drctry, actual_tif_file)
-        new_tif_path = os.path.join(new_dir, actual_tif_file) # Use original filename in new dir
+        new_tif_path = os.path.join(new_dir, actual_tif_file)
 
-        # Avoid moving if source and destination are the same (e.g., if rerun)
+        # File moving logic (no changes needed)
         if os.path.abspath(original_tif_path) == os.path.abspath(new_tif_path):
-            print(f"File {actual_tif_file} is already in the target directory {new_dir}. Skipping move.")
+            print(f"File {actual_tif_file} already in target directory. Skipping move.")
         elif not os.path.exists(original_tif_path):
-             print(f"Warning: Source file {original_tif_path} does not exist (might have been moved already?). Skipping move.")
-             # Check if it exists in the new location already
-             if not os.path.exists(new_tif_path):
-                  raise FileNotFoundError(f"Critical: TIF file {actual_tif_file} missing from both source and destination.")
+            print(f"Warning: Source {original_tif_path} does not exist. Assuming moved.")
+            if not os.path.exists(new_tif_path): raise FileNotFoundError(f"Critical: TIF file {actual_tif_file} missing.")
         else:
-             try:
-                 print(f"Moving {original_tif_path} to {new_tif_path}")
-                 shutil.move(original_tif_path, new_tif_path)
-             except Exception as e:
-                 # Check if destination already exists (e.g., if interrupted and rerun)
-                 if os.path.exists(new_tif_path):
-                      print(f"Warning: Destination {new_tif_path} already exists. Assuming move was completed earlier. Skipping move.")
-                 else:
-                      raise OSError(f"Error moving file {original_tif_path} to {new_tif_path}: {e}") from e
+            try:
+                print(f"Moving {original_tif_path} to {new_tif_path}")
+                shutil.move(original_tif_path, new_tif_path)
+            except Exception as e:
+                 if os.path.exists(new_tif_path): print(f"Warning: Destination {new_tif_path} exists. Assuming moved earlier.")
+                 else: raise OSError(f"Error moving file {original_tif_path}: {e}") from e
 
-
-        # Copy the correct yaml config file to the new directory and populate it
-        # Always use the template name for the copied file for consistency
-        config_filename = os.path.basename(config_template_name) # Get just the filename e.g., 'ramified_config.yaml'
-        new_config_path = os.path.join(new_dir, config_filename) # Construct path like '.../N/ramified_config.yaml'
+        # Copy and populate the config file
+        config_filename = os.path.basename(config_template_name)
+        new_config_path = os.path.join(new_dir, config_filename)
         try:
-            # Copy template only if config doesn't exist or explicitly overwrite
             if not os.path.exists(new_config_path):
                  print(f"Copying template {config_template_path} to {new_config_path}")
-                 shutil.copy2(config_template_path, new_config_path) # copy2 preserves metadata
+                 shutil.copy2(config_template_path, new_config_path)
             else:
-                 print(f"Config file {new_config_path} already exists. Skipping copy, will update existing.")
+                 print(f"Config file {new_config_path} exists. Skipping copy, will update existing.")
 
-            # Populate the yaml file with the correct dimensions and mode
-            # Match filename case-insensitively in DataFrame if necessary, but CSV should match root_name
             row = df[df['Filename'].astype(str) == root_name]
             if row.empty:
                 print(f"Warning: No data found in CSV for Filename '{root_name}'. Skipping config update.")
                 continue
 
-            # Safely get values, handle potential multiple matches (take first)
-            x = row['Width (um)'].iloc[0]
-            y = row['Height (um)'].iloc[0]
-            z = row['Depth (um)'].iloc[0]
+            # --- MODIFICATION START: Extract dimensions based on mode ---
+            x_um = row['Width (um)'].iloc[0]
+            y_um = row['Height (um)'].iloc[0]
+            z_um = 0.0 # Default for 2D or if 3D read fails
 
-            # Read, update, and write the YAML safely
+            if not is_2d_mode:
+                # Read Z only for 3D modes
+                # Using .get avoids KeyError if columns exist but maybe aren't used later
+                z_um = row['Depth (um)'].iloc[0]
+                # We don't actually need 'Slices' for the config, just for validation
+            # --- MODIFICATION END ---
+
+            # Read, update, and write YAML
             config_data = {}
             if os.path.exists(new_config_path):
                 try:
-                    with open(new_config_path, 'r') as f:
-                        config_data = yaml.safe_load(f) # Load existing structure
-                        if config_data is None: # Handle empty YAML file
-                             config_data = {}
-                except yaml.YAMLError as ye:
-                    print(f"Warning: Could not parse existing YAML {new_config_path}: {ye}. Will create from scratch.")
-                    config_data = {} # Reset if unparseable
-                except Exception as e:
-                    print(f"Warning: Error reading existing YAML {new_config_path}: {e}. Will create from scratch.")
-                    config_data = {}
+                    with open(new_config_path, 'r') as f: config_data = yaml.safe_load(f) or {}
+                except Exception as e: print(f"Warning: Error reading YAML {new_config_path}: {e}. Will create from scratch."); config_data = {}
 
+            # --- MODIFICATION START: Use correct dimension key and dimensions ---
+            # Ensure the correct section key exists
+            if dimension_section_key not in config_data or not isinstance(config_data.get(dimension_section_key), dict):
+                config_data[dimension_section_key] = {}
 
-            # Ensure keys exist before assigning, create if necessary
-            if 'voxel_dimensions' not in config_data or not isinstance(config_data.get('voxel_dimensions'), dict):
-                config_data['voxel_dimensions'] = {}
-            config_data['voxel_dimensions']['x'] = float(x) # Ensure float
-            config_data['voxel_dimensions']['y'] = float(y) # Ensure float
-            config_data['voxel_dimensions']['z'] = float(z) # Ensure float
+            # Populate dimensions based on mode
+            config_data[dimension_section_key]['x'] = float(x_um)
+            config_data[dimension_section_key]['y'] = float(y_um)
+            if not is_2d_mode:
+                config_data[dimension_section_key]['z'] = float(z_um)
+            elif 'z' in config_data[dimension_section_key]:
+                 # Clean up Z key if it exists in a 2D config
+                 del config_data[dimension_section_key]['z']
+                 print(f"  Removed legacy 'z' key from {dimension_section_key} for 2D mode.")
+            # --- MODIFICATION END ---
 
             # Add/Update the mode
             config_data['mode'] = mode
 
             with open(new_config_path, 'w') as f:
                 yaml.dump(config_data, f, default_flow_style=False, sort_keys=False)
-            print(f"Updated config {new_config_path} with dimensions (X:{x}, Y:{y}, Z:{z}) and mode '{mode}'.")
+
+            # --- MODIFICATION START: Update print message ---
+            if is_2d_mode:
+                print(f"Updated config {new_config_path} with 2D dimensions (X:{x_um}, Y:{y_um}) and mode '{mode}'.")
+            else:
+                print(f"Updated config {new_config_path} with 3D dimensions (X:{x_um}, Y:{y_um}, Z:{z_um}) and mode '{mode}'.")
+            # --- MODIFICATION END ---
 
         except Exception as e:
             raise RuntimeError(f"Error processing config file for {root_name}: {e}\n{traceback.format_exc()}") from e
@@ -681,7 +697,7 @@ class ProjectViewWindow(QMainWindow):
                                              QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes)
 
                 if reply == QMessageBox.Yes:
-                    modes = ["nuclei", "ramified"]
+                    modes = ["nuclei", "ramified", "ramified_2d"]
                     selected_mode, ok = QInputDialog.getItem(
                         self, "Select Processing Mode", "Choose the mode for organizing this dataset:",
                         modes, 0, False)
@@ -944,8 +960,8 @@ def interactive_segmentation_with_config(selected_folder=None):
             QMessageBox.critical(None, "Config Error", f"The YAML file ({config_path}) must contain a 'mode' field ('nuclei' or 'ramified').")
             if QApplication.instance() and app_state: app_state.show_project_view_signal.emit()
             return
-        if processing_mode not in ["nuclei", "ramified"]:
-            QMessageBox.critical(None, "Config Error", f"Invalid processing mode '{processing_mode}' in YAML file. Must be 'nuclei' or 'ramified'.")
+        if processing_mode not in ["nuclei", "ramified", "ramified_2d"]:
+            QMessageBox.critical(None, "Config Error", f"Invalid processing mode '{processing_mode}' in YAML file. Must be 'nuclei', 'ramified', or 'ramified_2d'.")
             if QApplication.instance() and app_state: app_state.show_project_view_signal.emit()
             return
 
@@ -953,9 +969,13 @@ def interactive_segmentation_with_config(selected_folder=None):
         try:
             print(f"Loading image stack: {file_loc}")
             image_stack = tiff.imread(file_loc)
-            print(f"Loaded stack with shape {image_stack.shape}, dtype {image_stack.dtype}")
-            if image_stack.ndim != 3:
-                 print(f"Warning: Expected 3D image stack, but got {image_stack.ndim} dimensions.")
+            print(f"Loaded data with shape {image_stack.shape}, dtype {image_stack.dtype}")
+
+            # --- ADD DIMENSIONALITY CHECK BASED ON MODE ---
+            expected_ndim = 2 if processing_mode == "ramified_2d" else 3
+            if image_stack.ndim != expected_ndim:
+                raise ValueError(f"Expected {expected_ndim}D image for mode '{processing_mode}', but got {image_stack.ndim} dimensions.")
+            # --- END DIMENSIONALITY CHECK ---
             if image_stack.size == 0:
                  raise ValueError("Image stack is empty.")
         except Exception as e:
@@ -1077,7 +1097,7 @@ def interactive_segmentation_with_config(selected_folder=None):
         # --- Start the Napari Event Loop ---
         print("Starting Napari event loop...")
         # This blocks until the Napari window associated with 'viewer' is closed.
-        napari.run()
+        # napari.run()
 
     except Exception as e:
         # Catch-all for errors during setup BEFORE napari.run()

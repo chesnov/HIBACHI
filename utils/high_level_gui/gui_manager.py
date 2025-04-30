@@ -13,6 +13,7 @@ import gc
 # --- Assumed relative imports based on structure ---
 from ..nuclear_module_3d._3D_nuclear_strategy import NuclearStrategy
 from ..ramified_module_3d._3D_ramified_strategy import RamifiedStrategy
+from ..ramified_module_2d._2D_ramified_strategy import Ramified2DStrategy
 from ..high_level_gui.processing_strategies import ProcessingStrategy # Import base class for type hint
 
 try:
@@ -64,7 +65,11 @@ class DynamicGUIManager:
         # --- Instantiate Strategy ---
         self.strategy: ProcessingStrategy # Type hint for clarity
         try:
-            strategy_class = {'nuclei': NuclearStrategy, 'ramified': RamifiedStrategy}.get(self.processing_mode)
+            strategy_class = {
+                'nuclei': NuclearStrategy,
+                'ramified': RamifiedStrategy,
+                'ramified_2d': Ramified2DStrategy # <-- ADD THIS MAPPING
+            }.get(self.processing_mode)
             if not strategy_class:
                 raise ValueError(f"Unsupported processing mode: {self.processing_mode}")
 
@@ -99,25 +104,59 @@ class DynamicGUIManager:
 
 
     def _calculate_spacing(self):
-        """Calculates voxel spacing and Z-scale factor from self.config."""
-        voxel_dims = self.config.get('voxel_dimensions', {})
+        """
+        Calculates voxel/pixel spacing and Z-scale factor from self.config.
+        Assumes config dimensions are TOTAL physical size of each axis.
+        Stores spacing as [Z, Y, X] for Napari consistency.
+        """
+        # Determine config keys based on mode
+        is_2d_mode = self.processing_mode.endswith("_2d")
+        dim_section_key = 'pixel_dimensions' if is_2d_mode else 'voxel_dimensions'
+        dimensions = self.config.get(dim_section_key, {})
+
         try:
-            vx = float(voxel_dims.get('x', 1.0))
-            vy = float(voxel_dims.get('y', 1.0))
-            vz = float(voxel_dims.get('z', 1.0))
+            # Get total dimensions from config
+            total_x_um = float(dimensions.get('x', 1.0))
+            total_y_um = float(dimensions.get('y', 1.0))
+            total_z_um = 1.0 # Default for 2D
+            if not is_2d_mode:
+                total_z_um = float(dimensions.get('z', 1.0))
+
         except (ValueError, TypeError):
-            print("Warning: Invalid voxel dimensions in config. Using defaults (1.0, 1.0, 1.0).")
-            vx, vy, vz = 1.0, 1.0, 1.0
+            print(f"Warning: Invalid total dimensions in config section '{dim_section_key}'. Using defaults (1.0).")
+            total_x_um, total_y_um, total_z_um = 1.0, 1.0, 1.0
 
         shape = self.image_stack.shape
-        # Prevent division by zero if shape dimension is 0 or 1
-        self.x_spacing = vx / shape[2] if shape and len(shape)>2 and shape[2] > 0 else vx
-        self.y_spacing = vy / shape[1] if shape and len(shape)>1 and shape[1] > 0 else vy
-        self.z_spacing = vz / shape[0] if shape and len(shape)>0 and shape[0] > 0 else vz
-        self.spacing = [self.z_spacing, self.x_spacing, self.y_spacing] # ZXY order
-        # Prevent division by zero for scale factor
-        self.z_scale_factor = self.z_spacing / self.x_spacing if self.x_spacing > 1e-9 else 1.0
-        print(f"Calculated Spacing (Z, X, Y): {self.spacing}")
+        num_dims = len(shape)
+
+        # Initialize pixel sizes
+        x_pixel_size = total_x_um
+        y_pixel_size = total_y_um
+        z_pixel_size = total_z_um
+
+        # Calculate pixel size based on image shape (Y, X for 2D; Z, Y, X for 3D)
+        if num_dims == 2: # 2D: shape is (Y, X)
+            if shape[0] > 0: y_pixel_size = total_y_um / shape[0]
+            if shape[1] > 0: x_pixel_size = total_x_um / shape[1]
+            z_pixel_size = 1.0 # Define Z pixel size as 1.0 for 2D case consistency
+            self.spacing = [z_pixel_size, y_pixel_size, x_pixel_size] # Store as Z, Y, X
+            self.z_scale_factor = 1.0 # No Z scaling needed for 2D display relative to XY
+
+        elif num_dims == 3: # 3D: shape is (Z, Y, X)
+            if shape[0] > 0: z_pixel_size = total_z_um / shape[0]
+            if shape[1] > 0: y_pixel_size = total_y_um / shape[1]
+            if shape[2] > 0: x_pixel_size = total_x_um / shape[2]
+            self.spacing = [z_pixel_size, y_pixel_size, x_pixel_size] # Store as Z, Y, X
+            # Calculate Z scale factor relative to X for visualization
+            self.z_scale_factor = z_pixel_size / x_pixel_size if x_pixel_size > 1e-9 else 1.0
+
+        else: # Handle unexpected dimensions
+            print(f"Warning: Image stack has unexpected dimensions: {num_dims}. Using default spacing [1,1,1].")
+            self.spacing = [1.0, 1.0, 1.0]
+            self.z_scale_factor = 1.0
+
+        # Use the CORRECT labels in the print statement
+        print(f"Calculated {num_dims}D Pixel/Voxel Size (Z, Y, X): {self.spacing}")
         print(f"Calculated Z Scale Factor for display: {self.z_scale_factor:.4f}")
 
 
@@ -130,10 +169,35 @@ class DynamicGUIManager:
             except Exception as e: print(f"Note: Error removing existing original layer: {e}")
         # Add the image
         try:
+            # --- MODIFICATION START ---
+            image_ndim = self.image_stack.ndim
+            if image_ndim == 2:
+                # For 2D, Napari expects scale (y, x).
+                # Use the y and x components from self.spacing if it's [Z, Y, X]
+                # Or use (1,1) if spacing isn't critical for initial display
+                # Assuming self.spacing was set to [1.0, y_spacing, x_spacing] for 2D
+                # If self.spacing is [y_spacing, x_spacing] for 2D, adjust indices.
+                # Let's assume [Z,Y,X] format for consistency from calculation step:
+                if hasattr(self, 'spacing') and len(self.spacing) >= 3:
+                     # Use Y and X spacing components
+                     scale = (self.spacing[1], self.spacing[2])
+                     print(f"Applying 2D scale: {scale}")
+                else:
+                     scale = (1, 1) # Default scale if spacing is unavailable/wrong format
+                     print("Applying default 2D scale (1, 1)")
+            elif image_ndim == 3:
+                # Existing 3D logic
+                scale = (self.z_scale_factor, 1, 1) # Apply Z scaling for display
+                print(f"Applying 3D scale: {scale}")
+            else:
+                print(f"Warning: Unexpected image dimensionality ({image_ndim}). Using default scale.")
+                scale = tuple([1.0] * image_ndim)
+            # --- MODIFICATION END ---
+
             self.viewer.add_image(
                 self.image_stack,
                 name=layer_name,
-                scale=(self.z_scale_factor, 1, 1) # Apply Z scaling for display
+                scale=scale # Use the calculated scale
             )
         except Exception as e:
              print(f"ERROR adding original image layer: {e}")
@@ -287,70 +351,85 @@ class DynamicGUIManager:
     def execute_processing_step(self):
         """Executes the next processing step defined by the strategy."""
         start_time = time.time()
-        step_index = self.current_step["value"] # 0-based index of step to run
+        step_index = self.current_step["value"]
 
         if step_index >= self.num_steps:
             print("All processing steps already completed."); msg = QMessageBox(); msg.setIcon(QMessageBox.Information); msg.setText("Processing complete."); msg.exec_(); return
 
-        step_method_name = self.processing_steps[step_index]
-        step_display_name = self.step_display_names.get(step_method_name, f"Step {step_index + 1}")
+        # Get the LOGICAL step name (e.g., "execute_raw_segmentation")
+        logical_step_method_name = self.processing_steps[step_index]
+        step_display_name = self.step_display_names.get(logical_step_method_name, f"Step {step_index + 1}")
         success = False
 
+        # --- MODIFICATION START: Determine the ACTUAL method name to call ---
+        actual_method_name_to_call = logical_step_method_name
+        # If the strategy is 2D (check mode name), append _2d to the method name
+        if self.strategy.mode_name.endswith("_2d"): # Check if mode indicates 2D
+            actual_method_name_to_call = f"{logical_step_method_name}_2d"
+            print(f"  Mapping logical step '{logical_step_method_name}' to actual 2D method '{actual_method_name_to_call}'")
+        # --- MODIFICATION END ---
+
         try:
-            # 1. Get current parameters from GUI/state
+            # --- MOVED: Get current parameters (no change here) ---
             current_values = self.get_current_values()
 
-            # --- MOVED: Save config *before* cleanup & execution (still might be needed) ---
-            # Although the key state is set *during* the step, saving params *before*
-            # running is still useful if the run fails midway. Let's keep this save.
+            # --- MOVED: Save config before cleanup (no change here) ---
             print(f"Saving parameters before executing {step_display_name}...")
             self.strategy.save_config(self.config)
-            # --- END MOVE ---
 
-            # 2. Clean up artifacts from this step and any subsequent steps
+            # --- Clean up artifacts (no change here) ---
             print(f"Cleaning up potential old artifacts for {step_display_name} (Step {step_index+1}) onwards...")
             for i in range(step_index + 1, self.num_steps + 1):
-                 self.cleanup_step(i) # Pass 1-based step number
+                 self.cleanup_step(i)
 
-            # 3. Execute the step using the strategy's generic method
-            success = self.strategy.execute_step(
-                step_index=step_index,
-                viewer=self.viewer,
-                image_stack_or_none=self.image_stack,
-                params=current_values
-            )
+            # --- Execute the step using the strategy's execute_step method,
+            #     BUT execute_step itself needs to know the ACTUAL method name.
+            #     Let's modify execute_step in the base class slightly OR
+            #     call the actual method directly here. Calling directly is simpler:
 
-            # 4. Handle results
+            print(f"\n--- Attempting Step {step_index + 1}/{self.num_steps}: '{step_display_name}' (Method: '{actual_method_name_to_call}') ---")
+
+            try:
+                # Get the actual method object from the strategy instance
+                step_method = getattr(self.strategy, actual_method_name_to_call)
+            except AttributeError:
+                print(f"FATAL ERROR: Method '{actual_method_name_to_call}' not found in strategy class '{self.strategy.__class__.__name__}'.")
+                return # Cannot proceed
+
+            # Call the specific step method directly
+            # Assumes step methods accept these arguments.
+            success = step_method(viewer=self.viewer, image_stack=self.image_stack, params=current_values)
+
+            # Validate return type (already present in base strategy execute_step, keep here too)
+            if not isinstance(success, bool):
+                 print(f"Warning: Step method '{actual_method_name_to_call}' did not return bool. Assuming failure.")
+                 success = False
+
+            print(f"--- Step {step_index + 1} ('{step_display_name}') finished (Success: {success}) ---")
+
+            # --- Handle results (no change here) ---
             if success:
-                # --- ADDED: Save config AGAIN *after* successful step execution ---
-                # This ensures any state calculated *during* the step (like segmentation_threshold)
-                # is included in the saved YAML file.
                 print(f"Step successful. Saving updated configuration and state after {step_display_name}...")
                 self.strategy.save_config(self.config)
-                # --- END ADDED SAVE ---
-
-                self.current_step["value"] += 1 # Advance index for the *next* step
+                self.current_step["value"] += 1
                 if self.current_step["value"] < self.num_steps:
-                    next_step_internal_name = self.processing_steps[self.current_step["value"]]
-                    self.create_step_widgets(next_step_internal_name)
-                else: # Processing finished
+                    next_step_logical_name = self.processing_steps[self.current_step["value"]]
+                    self.create_step_widgets(next_step_logical_name) # Use logical name for widgets
+                else:
                     print("\n*** Processing complete! ***")
-                    # Config already saved after last successful step
                     self.clear_current_widgets()
                     msg = QMessageBox(); msg.setIcon(QMessageBox.Information); msg.setWindowTitle("Complete"); msg.setText(f"All '{self.processing_mode}' steps finished."); msg.exec_()
-            else: # Step explicitly returned False
+            else:
                  print(f"{step_display_name} failed or returned False.")
                  msg = QMessageBox(); msg.setIcon(QMessageBox.Warning); msg.setWindowTitle("Step Not Completed"); msg.setText(f"Step '{step_display_name}' did not complete successfully."); msg.setInformativeText("Check console output. Adjust parameters and click 'Run Current Step' again."); msg.exec_()
 
-        except Exception as e: # Catch unexpected errors during the flow
+        except Exception as e:
             print(f"FATAL ERROR during processing flow for {step_display_name}: {str(e)}")
             traceback.print_exc()
             msg = QMessageBox(); msg.setIcon(QMessageBox.Critical); msg.setWindowTitle("Processing Error"); msg.setText(f"An unexpected error occurred during '{step_display_name}'."); msg.setInformativeText(f"Error: {str(e)}\n\nCheck console output."); msg.exec_()
-            # Do not advance step on general error
 
         finally:
             end_time = time.time(); print(f"'{step_display_name}' execution attempt took {end_time - start_time:.2f} seconds.")
-
 
     def clear_current_widgets(self):
         """Removes all currently displayed parameter widgets."""
