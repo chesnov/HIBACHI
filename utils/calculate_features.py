@@ -841,7 +841,8 @@ def calculate_ramification_with_skan(segmented_array, spacing=(1.0, 1.0, 1.0), l
 # Main Analysis Function
 # =============================================================================
 
-def analyze_segmentation(segmented_array, spacing=(1.0, 1.0, 1.0),
+def analyze_segmentation(segmented_array, 
+                         spacing=(1.0, 1.0, 1.0),
                          calculate_distances=True,
                          calculate_skeletons=True,
                          skeleton_export_path=None,
@@ -975,12 +976,6 @@ def analyze_segmentation(segmented_array, spacing=(1.0, 1.0, 1.0),
     cols = ['label'] + [col for col in metrics_df if col != 'label']
     metrics_df = metrics_df[cols]
     metrics_df = metrics_df.fillna(value=np.nan)
-
-    # --- DEBUG: Print final metrics head ---
-    print("-" * 30)
-    print(f"DEBUG [analyze_segmentation] Final metrics_df head (showing points):")
-    print(metrics_df[['label', 'volume_um3', 'shortest_distance_um', 'point_on_self_z', 'point_on_self_x', 'point_on_self_y', 'point_on_neighbor_z', 'point_on_neighbor_x', 'point_on_neighbor_y', 'skan_total_length_um']].head())
-    print("-" * 30)
 
     print(f"DEBUG [analyze_segmentation] Analysis completed in {time.time() - overall_start_time:.2f} seconds.")
     print("=" * 30 + "\n")

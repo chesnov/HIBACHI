@@ -1,12 +1,12 @@
 import numpy as np
 from scipy import ndimage
 from scipy.ndimage import gaussian_filter, label, distance_transform_edt, zoom
-from skimage.feature import peak_local_max
-from skimage.segmentation import watershed
-from skimage.filters import frangi, threshold_otsu
-from skimage.morphology import binary_dilation, ball
+from skimage.feature import peak_local_max # type: ignore
+from skimage.segmentation import watershed # type: ignore
+from skimage.filters import frangi, threshold_otsu # type: ignore
+from skimage.morphology import binary_dilation, ball # type: ignore
 import tempfile
-from skimage.morphology import skeletonize
+from skimage.morphology import skeletonize # type: ignore
 import os
 from tqdm import tqdm
 import matplotlib.pyplot as plt
@@ -107,13 +107,48 @@ def upsample_segmentation(segmentation, original_shape, downsampled_shape):
     """
     Upsample segmentation labels to match the original volume shape, using memmap if needed.
     """
+    print(f"  upsample_segmentation: Input segmentation shape = {segmentation.shape}") # DEBUG
+    print(f"  upsample_segmentation: Target original_shape = {original_shape}") # DEBUG
+    print(f"  upsample_segmentation: Source downsampled_shape = {downsampled_shape}") # DEBUG
+
+    if segmentation.shape != downsampled_shape:
+        print(f"    WARNING in upsample_segmentation: Input segmentation shape {segmentation.shape} " \
+              f"does not match provided downsampled_shape {downsampled_shape}. This might lead to incorrect zoom factors.")
+        # Potentially, use segmentation.shape as the source shape for zoom_factors if this warning occurs.
+        # However, it's better to ensure downsampled_shape is correctly passed.
+
     zoom_factors = [
         original_shape[0] / downsampled_shape[0],
         original_shape[1] / downsampled_shape[1],
         original_shape[2] / downsampled_shape[2]
     ]
-    upsampled_segmentation = zoom(segmentation, zoom_factors, order=0)  # Nearest neighbor for labels
-    return upsampled_segmentation
+    print(f"  upsample_segmentation: Calculated zoom_factors = {zoom_factors}") # DEBUG
+
+    # Ensure segmentation is a numpy array before zoom, not memmap for this operation if issues arise
+    if isinstance(segmentation, np.memmap):
+        segmentation_array = np.array(segmentation) # Work with an in-memory copy for zoom
+        print(f"  upsample_segmentation: Converted memmap to array for zoom.")
+    else:
+        segmentation_array = segmentation
+    
+    # Error check: if any zoom factor is < 1 (i.e., trying to downsample when expecting upsample)
+    if any(zf < 1 for zf in zoom_factors if original_shape != downsampled_shape) : # check if not already same shape
+        print(f"    WARNING in upsample_segmentation: One or more zoom factors are < 1, which means downsampling. Original: {original_shape}, Downsampled: {downsampled_shape}")
+
+
+    upsampled_segmentation_data = zoom(segmentation_array, zoom_factors, order=0, prefilter=False)  # Nearest neighbor for labels
+    print(f"  upsample_segmentation: Output upsampled_segmentation_data shape = {upsampled_segmentation_data.shape}") # DEBUG
+
+    # Final shape check
+    if upsampled_segmentation_data.shape != original_shape:
+         print(f"    CRITICAL WARNING in upsample_segmentation: Final output shape {upsampled_segmentation_data.shape} != target original_shape {original_shape}")
+         # This could happen due to floating point inaccuracies in zoom factors leading to off-by-one pixel dimensions.
+         # A more robust way might involve resizing to the exact target shape if `zoom` is problematic.
+         # For labels, `scipy.ndimage.map_coordinates` or even a manual nearest-neighbor interpolation loop
+         # could offer more control if `zoom` causes shape mismatches with `order=0`.
+         # However, `zoom` with `order=0` should generally be okay.
+
+    return upsampled_segmentation_data
 
 def detect_nuclei_centers_LoG(volume, scales, spacing=(1.0, 1.0, 1.0)):
     """
@@ -133,7 +168,7 @@ def detect_nuclei_centers_LoG(volume, scales, spacing=(1.0, 1.0, 1.0)):
     centers : ndarray
         Array of detected center coordinates (z, y, x)
     """
-    from skimage.feature import blob_log
+    from skimage.feature import blob_log # type: ignore
     
     # Convert scales from physical units to voxels
     voxel_scales = [scale / min(spacing) for scale in scales]
@@ -164,7 +199,7 @@ def analyze_shape_features(segmentation):
     cluster_candidates : list
         List of label IDs that are likely to be clusters
     """
-    from skimage.measure import regionprops
+    from skimage.measure import regionprops # type: ignore
     from scipy.ndimage import binary_closing, binary_dilation
     
     props = regionprops(segmentation)
@@ -236,8 +271,8 @@ def graph_cut_splitting(volume, segmentation, label, spacing=(1.0, 1.0, 1.0)):
     """
     try:
         # Only import these if actually using graph cuts
-        from skimage.segmentation import random_walker
-        from skimage.filters import gaussian
+        from skimage.segmentation import random_walker # type: ignore
+        from skimage.filters import gaussian # type: ignore
     except ImportError:
         print("Warning: scikit-image's random_walker not available. Using fallback method.")
         return segmentation == label
@@ -270,7 +305,7 @@ def graph_cut_splitting(volume, segmentation, label, spacing=(1.0, 1.0, 1.0)):
     distance = distance_transform_edt(sub_mask, sampling=spacing)
     
     # Find local maxima in the distance transform (potential centers)
-    from skimage.feature import peak_local_max
+    from skimage.feature import peak_local_max # type: ignore
     # Get peak coordinates directly from peak_local_max
     coordinates = peak_local_max(
         distance, 
@@ -392,6 +427,10 @@ def segment_nuclei_first_pass(volume,
     first_pass_memmap.flush()
     
     upsampled_first_pass = upsample_segmentation(first_pass_memmap, original_shape, downsampled_shape)
+
+    print(f"  segment_nuclei_first_pass: upsampled_first_pass shape = {upsampled_first_pass.shape}") # DEBUG
+    if upsampled_first_pass.shape != original_shape:
+        print(f"    CRITICAL WARNING in segment_nuclei_first_pass: upsampled_first_pass shape {upsampled_first_pass.shape} != original_shape {original_shape}")
     
     # Clean up memmaps
     for path in [first_pass_path] + smoothed_paths:

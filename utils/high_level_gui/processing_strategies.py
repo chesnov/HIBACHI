@@ -272,120 +272,170 @@ class ProcessingStrategy(abc.ABC):
              traceback.print_exc()
 
 
+    # In utils/high_level_gui/processing_strategies.py
+
     def _add_layer_safely(self, viewer, data, name, layer_type='labels', **kwargs):
         """
         Helper to add/update a layer in Napari with mode suffix.
-        Ensures consistent scale and translation, matching data spatial dimensionality.
+        Ensures consistent scale and translation for display, aligning with the
+        original image layer's display transformation.
         """
         layer_name = f"{name}_{self.mode_name}"
 
-        # --- REVISED Scale/Translate Calculation Block ---
-        spatial_ndim = -1 # Initialize
+        # Determine the spatial dimensionality of the data
+        spatial_ndim = -1
         if layer_type in ['image', 'labels']:
-            spatial_ndim = data.ndim
+            if hasattr(data, 'ndim'):
+                spatial_ndim = data.ndim
+            else:
+                print(f"Warning: Data for layer '{layer_name}' (type: {layer_type}) has no 'ndim'. Assuming 2D.")
+                spatial_ndim = 2
         elif layer_type == 'shapes':
-            # Data shape is (N_shapes, ..., N_spatial_dims) for points/lines/polygons etc.
-            # Or (N_coords, N_spatial_dims) for paths
-            if data.ndim >= 1: # Basic check
-                spatial_ndim = data.shape[-1]
+            if hasattr(data, 'ndim') and data.ndim >= 1:
+                spatial_ndim = data.shape[-1] # Last dimension is usually spatial for shapes
             else:
-                print(f"Warning: Shapes data has unexpected ndim {data.ndim}. Assuming 2 spatial dims.")
-                spatial_ndim = 2 # Default assumption
-        # Add handling for other layer types (points?) if necessary
+                print(f"Warning: Shapes data for '{layer_name}' has unexpected ndim or no ndim. Assuming 2 spatial dims.")
+                spatial_ndim = 2
+        # Add handling for other layer types (e.g., points) if necessary
+        # elif layer_type == 'points':
+        #     if hasattr(data, 'ndim') and data.ndim == 2: # Points are usually (N, D_spatial)
+        #         spatial_ndim = data.shape[1]
+        #     else:
+        #         print(f"Warning: Points data for '{layer_name}' has unexpected shape. Assuming 2D.")
+        #         spatial_ndim = 2
         else:
-             print(f"Warning: Unknown layer_type '{layer_type}' for spatial dim detection. Using data.ndim.")
-             try:
-                 spatial_ndim = data.ndim
-             except AttributeError:
-                 print("Error: Cannot determine dimensionality. Using default 2D.")
-                 spatial_ndim = 2
+            print(f"Warning: Unknown layer_type '{layer_type}' for '{layer_name}'. Attempting to use data.ndim.")
+            try:
+                spatial_ndim = data.ndim
+            except AttributeError:
+                print(f"Error: Cannot determine dimensionality for '{layer_name}'. Using default 2D.")
+                spatial_ndim = 2
 
+        # --- Determine the scale and translate for display ---
+        # The goal is to use the same display scaling transform that was applied
+        # to the original image when it was first added to the viewer by DynamicGUIManager.
+        
+        # These attributes (z_scale_factor, spacing) are set on the Strategy instance
+        # by the DynamicGUIManager during initialization.
+        # z_scale_factor = (actual_Z_voxel_size / actual_X_voxel_size)
+        # spacing = (actual_Z_voxel_size, actual_Y_voxel_size, actual_X_voxel_size)
 
-        # Now calculate scale and translate based on spatial_ndim
-        if spatial_ndim == 2: # YX data
-            if hasattr(self, 'spacing') and len(self.spacing) >= 3: # Assuming self.spacing is [Z, Y, X]
-                scale = (self.spacing[1], self.spacing[2]) # Y, X scale
+        display_scale_to_use = None
+        display_translate_to_use = (0.0,) * spatial_ndim # Default translation is usually (0,0,...)
+
+        if spatial_ndim == 2:
+            # Original 2D image in DynamicGUIManager is added with scale=(self.spacing[1], self.spacing[2])
+            # which are (Y_voxel_size, X_voxel_size)
+            if hasattr(self, 'spacing') and len(self.spacing) >= 3:
+                display_scale_to_use = (self.spacing[1], self.spacing[2])
             else:
-                scale = (1.0, 1.0)
-            translate = (0.0, 0.0) # 2D Translate tuple
-        elif spatial_ndim == 3: # ZYX data
-            if hasattr(self, 'spacing') and len(self.spacing) == 3:
-                 scale = tuple(self.spacing) # Z, Y, X scale
+                print(f"Warning: Strategy 'spacing' attribute ill-defined for 2D layer '{layer_name}'. Using (1,1) scale.")
+                display_scale_to_use = (1.0, 1.0)
+        
+        elif spatial_ndim == 3:
+            # Original 3D image in DynamicGUIManager is added with scale=(self.z_scale_factor, 1, 1)
+            # This scale is designed for visual aspect ratio correction.
+            # Any subsequent layer (like a segmentation) that is voxel-aligned with the original image
+            # should use this SAME display scale to align correctly in the viewer's world space.
+            if hasattr(self, 'z_scale_factor'):
+                display_scale_to_use = (self.z_scale_factor, 1.0, 1.0)
             else:
-                 scale = (1.0, 1.0, 1.0)
-            translate = (0.0, 0.0, 0.0) # 3D Translate tuple
-        elif spatial_ndim > 0 : # Handle other dimensions generically
-            print(f"Warning: Unsupported spatial dimensionality {spatial_ndim} in _add_layer_safely. Using default scale/translate.")
-            scale = tuple([1.0] * spatial_ndim)
-            translate = tuple([0.0] * spatial_ndim)
-        else: # Fallback if spatial_ndim determination failed
-             print("Error: Could not determine spatial dimensionality. Using default 2D scale/translate.")
-             scale = (1.0, 1.0)
-             translate = (0.0, 0.0)
-             spatial_ndim = 2 # Set for debug print consistency
+                print(f"Warning: Strategy 'z_scale_factor' not found for 3D layer '{layer_name}'. "
+                      "This implies an issue with strategy initialization or mode. "
+                      "Falling back to raw voxel spacing, which might cause visual misalignment or squashing "
+                      "if the original image was aspect-ratio corrected for display.")
+                if hasattr(self, 'spacing') and len(self.spacing) == 3:
+                    display_scale_to_use = tuple(self.spacing) # (abs_Z, abs_Y, abs_X)
+                else:
+                    display_scale_to_use = (1.0, 1.0, 1.0)
+        
+        elif spatial_ndim > 0 : # Generic case for other dimensions (e.g., 4D image)
+            print(f"Warning: Generic spatial dimensionality {spatial_ndim} for layer '{layer_name}'. "
+                  "Using default scale (1.0, ...) . Ensure this is intended.")
+            display_scale_to_use = (1.0,) * spatial_ndim
+        
+        else: # Fallback if spatial_ndim determination failed or is 0/-1
+             print(f"Error: Could not determine valid spatial dimensionality for layer '{layer_name}' (is {spatial_ndim}). "
+                   "Using default 2D scale (1.0, 1.0).")
+             display_scale_to_use = (1.0, 1.0)
+             # Update spatial_ndim for translate if it was invalid
+             if not isinstance(display_translate_to_use, tuple) or len(display_translate_to_use) !=2 :
+                 display_translate_to_use = (0.0, 0.0)
 
-        # --- End REVISED Scale/Translate Calculation Block ---
 
-        kwargs['scale'] = scale
-        kwargs['translate'] = translate
+        # Ensure kwargs for scale and translate are set
+        kwargs['scale'] = display_scale_to_use
+        kwargs['translate'] = display_translate_to_use
 
         # --- Debug prints ---
         print(f"  DEBUG [_add_layer_safely] Preparing layer '{layer_name}' (Type: {layer_type})")
-        print(f"    Input data type: {type(data)}")
-        if isinstance(data, np.ndarray):
-             print(f"    Input data shape: {data.shape}")
-             print(f"    Input data dtype: {data.dtype}")
-        # Make clear which ndim is used for scale/translate
-        print(f"    Determined spatial_ndim: {spatial_ndim}")
-        print(f"    Calculated scale (len={len(scale)}): {kwargs.get('scale')}")
-        print(f"    Calculated translate (len={len(translate)}): {kwargs.get('translate')}")
-
-        if layer_name not in viewer.layers:
-            # --- Add detailed print before adding (no change needed) ---
-            print(f"    Attempting ADD layer '{layer_name}'")
-            if layer_type == 'shapes' and isinstance(data, np.ndarray) and data.size > 0:
-                 print(f"    First 3 shape coords being passed to add_shapes:\n{data[:3]}")
-            # --- End detailed print ---
-
-            try:
-                 if layer_type == 'labels':
-                     viewer.add_labels(data, name=layer_name, **kwargs)
-                 elif layer_type == 'image':
-                     viewer.add_image(data, name=layer_name, **kwargs)
-                 elif layer_type == 'shapes':
-                     if (isinstance(data, np.ndarray) and data.size == 0) or \
-                        (isinstance(data, list) and not data):
-                         print(f"    Skipping empty shapes layer '{layer_name}'"); return
-                     viewer.add_shapes(data, name=layer_name, **kwargs)
-                 else: print(f"    Warn: Unknown layer type '{layer_type}' for '{layer_name}'")
-            except Exception as e: print(f"ERROR adding layer '{layer_name}': {e}"); traceback.print_exc()
+        if hasattr(data, 'shape') and hasattr(data, 'dtype'):
+             print(f"    Input data shape: {data.shape}, dtype: {data.dtype}")
         else:
-            # --- Layer exists: Update (no change needed in this part regarding scale) ---
+             print(f"    Input data type: {type(data)}")
+        print(f"    Determined spatial_ndim: {spatial_ndim}")
+        print(f"    Applied DISPLAY scale: {kwargs['scale']}")
+        print(f"    Applied DISPLAY translate: {kwargs['translate']}")
+
+        # --- Add or Update Layer ---
+        if layer_name not in viewer.layers:
+            print(f"    Attempting ADD layer '{layer_name}'")
+            try:
+                if layer_type == 'labels':
+                    viewer.add_labels(data, name=layer_name, **kwargs)
+                elif layer_type == 'image':
+                    viewer.add_image(data, name=layer_name, **kwargs)
+                elif layer_type == 'shapes':
+                    # Ensure data is not empty for shapes, as Napari might error
+                    if (isinstance(data, np.ndarray) and data.size == 0) or \
+                       (isinstance(data, list) and not data):
+                        print(f"    Skipping addition of empty shapes layer '{layer_name}'.")
+                        return # Or return the layer if add_shapes can handle empty data gracefully
+                    viewer.add_shapes(data, name=layer_name, **kwargs)
+                # Add elif for 'points' if you use it
+                # elif layer_type == 'points':
+                #     viewer.add_points(data, name=layer_name, **kwargs)
+                else:
+                    print(f"    Warning: Unknown layer type '{layer_type}' for '{layer_name}'. Cannot add.")
+            except Exception as e:
+                print(f"ERROR adding layer '{layer_name}': {e}")
+                traceback.print_exc()
+        else:
             print(f"    Layer '{layer_name}' exists. Attempting UPDATE.")
             try:
-               layer = viewer.layers[layer_name]
-               # ... (memmap conversion logic - keep) ...
-               if isinstance(data, np.memmap):
-                    print(f"      Converting memmap data to in-memory array for update.")
-                    data_array = np.array(data)
-                    if hasattr(data, '_mmap') and data._mmap is not None:
-                        try: data._mmap.close()
-                        except: pass
-                    layer.data = data_array
-                    del data_array
-               else:
-                    layer.data = data # Assign regular array
+                layer = viewer.layers[layer_name]
+                
+                # Handle memmap data by converting to in-memory array for update
+                # as direct assignment of memmap can sometimes be problematic for refresh
+                if isinstance(data, np.memmap):
+                    print(f"      Converting memmap data to in-memory array for update of layer '{layer_name}'.")
+                    data_for_update = np.array(data) # Create a copy
+                    # No need to close original memmap here if it's managed elsewhere or read-only for this operation
+                else:
+                    data_for_update = data
 
-               # --- Explicitly set scale and translate on update ---
-               print(f"      Setting layer scale: {scale}")
-               print(f"      Setting layer translate: {translate}")
-               if hasattr(layer, 'scale'): layer.scale = scale
-               if hasattr(layer, 'translate'): layer.translate = translate
-
-               # ... (update other properties) ...
-               layer.refresh()
-               print(f"    Layer '{layer_name}' updated.")
-            except Exception as e: print(f"Error updating layer '{layer_name}': {e}"); traceback.print_exc()
+                layer.data = data_for_update
+                
+                # Explicitly set scale and translate on update as well,
+                # in case they could have changed or need re-assertion.
+                if hasattr(layer, 'scale'):
+                    layer.scale = kwargs['scale']
+                if hasattr(layer, 'translate'):
+                    layer.translate = kwargs['translate']
+                
+                # Update other properties from kwargs if necessary
+                for key, value in kwargs.items():
+                    if key not in ['scale', 'translate', 'name'] and hasattr(layer, key):
+                        try:
+                            setattr(layer, key, value)
+                        except Exception as e_setattr:
+                            print(f"      Note: Could not set attribute '{key}' on layer '{layer_name}': {e_setattr}")
+                
+                layer.refresh() # Ensure the viewer updates
+                print(f"    Layer '{layer_name}' updated.")
+            except Exception as e:
+                print(f"Error updating layer '{layer_name}': {e}")
+                traceback.print_exc()
 
     def _remove_layer_safely(self, viewer, name):
         """Helper to remove a layer by its base name + mode suffix."""
