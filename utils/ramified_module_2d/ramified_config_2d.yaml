@@ -1,176 +1,166 @@
-# --- START OF FILE ramified_config_2d.yaml ---
-
-mode: ramified_2d # Changed mode identifier
-
-# --- Step 1: Raw Segmentation (2D) ---
-execute_raw_segmentation_ramified_2d: # Renamed key
-  name: Execute Raw Segmentation (2D) # Updated display name
+mode: ramified_2d
+execute_raw_segmentation_ramified_2d:
+  name: Execute Raw Segmentation (2D)
   parameters:
     tubular_scales:
       label: Tubular Scales (comma-sep floats)
       type: list
-      value: # Defaults seem fine for 2D too
-      - 0.8
+      value:
       - 1.0
-      - 1.5
       - 2.0
+      - 3.0
       element_type: float
-    min_size: # Parameter used by segment_microglia_first_pass_raw_2d
-      label: Minimum Size (Pixels, Raw Seg) # Changed label
+    min_size:
+      label: Minimum Size (Pixels, Raw Seg)
       type: int
-      value: 100 # Reduced default value for 2D
+      value: 120
       min: 10
-      max: 10000 # Adjusted max?
+      max: 10000
       step: 10
     smooth_sigma:
       label: Smooth Sigma (Initial)
       type: float
-      value: 1.0 # Slightly reduced default?
+      value: 1.1
       min: 0.1
       max: 10.0
       step: 0.1
     low_threshold_percentile:
       label: Low Threshold Percentile (Raw Seg)
       type: float
-      value: 98.0 # Keep default
+      value: 80.0
       min: 0.0
       max: 100.0
       step: 0.1
     high_threshold_percentile:
-      label: High Threshold Percentile (Norm) # Changed target slightly
+      label: High Threshold Percentile (Norm)
       type: float
-      value: 99.9 # Adjusted default? 100% can be sensitive.
+      value: 100.0
       min: 0.0
       max: 100.0
       step: 0.1
     connect_max_gap_physical:
       label: Max Connect Gap (um)
       type: float
-      value: 1.0 # Keep default
+      value: 2.0
       min: 0.0
       max: 10.0
       step: 0.1
-
-# --- Step 2: Edge Trimming (2D) ---
-execute_trim_edges_ramified_2d: # Renamed key
-  name: Execute Edge Trimming (2D) # Updated display name
+execute_trim_edges_ramified_2d:
+  name: Execute Edge Trimming (2D)
   parameters:
     edge_trim_distance_threshold:
       label: Edge Trim Distance (um)
       type: float
-      value: 4.5 # Keep default
+      value: 0.1
       min: 0.0
       max: 20.0
       step: 0.1
     hull_boundary_thickness_phys:
       label: Hull Boundary Thickness (um)
       type: float
-      value: 2.0 # Keep default
+      value: 2.0
       min: 0.1
       max: 10.0
       step: 0.1
     brightness_cutoff_factor:
-      label: Brightness Cutoff Factor # Factor applied to seg_threshold
+      label: Brightness Cutoff Factor
       type: float
-      value: 1.5 # Changed default from likely incorrect 3D value
+      value: 1.5
       min: 0.0
-      max: 10.0 # Adjusted range
+      max: 10.0
       step: 0.1
-    min_size_pixels: # Renamed parameter to match 2D function arg
-      label: Min Size (Pixels, Post-Trim) # Changed label
+    min_size_pixels:
+      label: Min Size (Pixels, Post-Trim)
       type: int
-      value: 50 # Reduced default value for 2D
+      value: 120
       min: 0
-      max: 5000 # Adjusted range?
+      max: 5000
       step: 5
-    # Parameters used by apply_hull_trimming_2d
     smoothing_iterations:
-       label: Hull Smoothing Iterations
-       type: int
-       value: 1
-       min: 0
-       max: 10
-       step: 1
-    heal_iterations: # Parameter IS used by trim_object_edges_by_distance_2d
-       label: Heal Iterations (Post-Trim) # Currently unused by hull heal, but may be needed later
-       type: int
-       value: 1
-       min: 0
-       max: 10
-       step: 1
-
-
-# --- Step 3: Refine ROIs (2D) ---
-execute_refine_rois_ramified_2d: # Renamed key
-  name: Execute Refine ROIs (2D) # Updated display name
+      label: Hull Smoothing Iterations
+      type: int
+      value: 1
+      min: 0
+      max: 10
+      step: 1
+    heal_iterations:
+      label: Heal Iterations (Post-Trim)
+      type: int
+      value: 1
+      min: 0
+      max: 10
+      step: 1
+execute_refine_rois_ramified_2d:
+  name: Execute Refine ROIs (2D)
   parameters:
     smallest_quantile:
       label: Smallest Quantile (Soma)
       type: float
-      value: 0.05 # Keep default
+      value: 0.01
       min: 0.0
       max: 1.0
       step: 0.01
-    min_fragment_size: # Parameter used by extract_soma_masks_2d, refine_seeds_pca_2d, separate_multi_soma_cells_2d
-      label: Min Fragment Size (Pixels) # Changed label
+    min_fragment_size:
+      label: Min Fragment Size (Pixels)
       type: int
-      value: 50 # Reduced default value for 2D
+      value: 20
       min: 1
-      max: 10000 # Adjusted range?
+      max: 10000
       step: 5
+    post_merge_min_interface_pixels:
+      label: Min Interface Pixels (Post-Merge)
+      type: int
+      value: 12
+      min: 1
+      max: 10000
+      step: 1
     target_aspect_ratio:
       label: Target Aspect Ratio (PCA Refine)
       type: float
-      value: 1.05 # Keep default
-      min: 1.0 # Min should be 1.0
+      value: 1.01
+      min: 1.0
       max: 5.0
       step: 0.05
     projection_percentile_crop:
       label: Projection Crop % (PCA Refine)
       type: int
-      value: 10 # Keep default
+      value: 30
       min: 0
-      max: 49 # Max is < 50
+      max: 49
       step: 1
-    intensity_weight: # Used by separate_multi_soma_cells_2d
+    intensity_weight:
       label: Intensity Weight (Separate)
       type: float
-      value: 1.0 # Adjusted default from 5.0
+      value: 10.0
       min: 0.0
       max: 10.0
       step: 0.01
-    # Parameters used by separate_multi_soma_cells_2d
     max_seed_centroid_dist:
       label: Max Seed Merge Dist (um)
       type: float
-      value: 15.0
+      value: 10.0
       min: 0.0
       max: 50.0
       step: 0.5
     min_path_intensity_ratio:
       label: Min Path Intensity Ratio (Merge)
       type: float
-      value: 0.6
+      value: 0.4
       min: 0.0
       max: 1.0
       step: 0.01
-    # Parameter *not currently used* by separate_multi_soma_cells_2d but could be added
-    # post_merge_min_interface_pixels:
-    #   label: Min Interface Pixels (Post-Merge)
-    #   type: int
-    #   value: 10
-    #   min: 0
-    #   max: 100
-    #   step: 1
-
-# --- Dimensions (2D) ---
-pixel_dimensions: # Renamed section
-  x: 0.5 # Example value
-  y: 0.5 # Evoxel_dimensionsxample value
-# Removed z dimension
-
-# --- Saved State ---
+execute_calculate_features_ramified_2d:
+  name: Execute Calculate Features (2D)
+  parameters:
+    n_jobs:
+      label: Parallel Jobs (Features)
+      type: int
+      value: -1
+      min: -1
+      max: 128
+      step: 1
+pixel_dimensions:
+  x: 695.296
+  y: 695.296
 saved_state:
-  segmentation_threshold: 0.0 # Keep structure, value will be overwritten
-
-# --- END OF FILE ramified_config_2d.yaml ---
+  segmentation_threshold: 0.016062716022133827

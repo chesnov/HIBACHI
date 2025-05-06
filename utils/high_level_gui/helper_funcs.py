@@ -334,7 +334,7 @@ def organize_processing_dir(drctry, mode):
 
     # Determine config template path (already updated in previous step)
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    if mode == 'nuclear': config_template_name = os.path.join('nuclear_module_3d','nuclear_config.yaml')
+    if mode == 'nuclei': config_template_name = os.path.join('nuclear_module_3d','nuclear_config.yaml')
     elif mode == 'ramified': config_template_name = os.path.join('ramified_module_3d', 'ramified_config.yaml')
     elif mode == 'ramified_2d': config_template_name = os.path.join('ramified_module_2d', 'ramified_config_2d.yaml')
     else: raise ValueError(f"Invalid mode '{mode}' specified.")

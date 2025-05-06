@@ -343,8 +343,10 @@ class Ramified2DStrategy(ProcessingStrategy):
             # --- Call 2D Functions with CORRECT spacing_yx ---
             print("  Calling extract_soma_masks_2d...")
             cell_bodies = extract_soma_masks_2d(
-                labeled_cells, spacing_yx, # Pass 2D spacing
-                smallest_quantile=smallest_quantile, min_fragment_size=min_fragment_size,
+                    segmentation_mask=labeled_cells,
+                    intensity_image=original_image, # Pass the intensity image
+                    spacing=spacing_yx, # Pass 2D spacing
+                    smallest_quantile=smallest_quantile, min_fragment_size=min_fragment_size,
             )
             print("  Calling refine_seeds_pca_2d...")
             refined_mask = refine_seeds_pca_2d(
