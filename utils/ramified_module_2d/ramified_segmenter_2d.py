@@ -356,8 +356,14 @@ def extract_soma_masks_2d(
                 except Exception as e_int: print(f"Warn: Error in Intensity path L{label}: {e_int}")
 
             # --- Combine Candidates ---
-            if valid_cands_lbl: valid_candidates.extend(valid_cands_lbl)
-            elif fallback_cands_lbl: fallback_candidates.append(max(fallback_cands_lbl, key=lambda x: x['area']))
+            if valid_cands_lbl:
+                valid_candidates.extend(valid_cands_lbl)
+            # Always add all fallback candidates from this label to the global list.
+            # The global sorting and non-overlapping placement logic for fallbacks
+            # will then decide if they get placed.
+            # This allows a parent object to contribute both valid and fallback candidates.
+            if fallback_cands_lbl:
+                fallback_candidates.extend(fallback_cands_lbl)
 
         except MemoryError: print(f"Warn: MemError L{label}."); gc.collect()
         except Exception as e: print(f"Warn: Uncaught Error L{label}: {e}"); traceback.print_exc()

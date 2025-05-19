@@ -380,6 +380,7 @@ class RamifiedStrategy(ProcessingStrategy):
 
             cell_bodies = extract_soma_masks(
                 labeled_cells,
+                image_stack,
                 self.spacing, # Assumes self.spacing is set
                 smallest_quantile=smallest_quantile,
                 min_fragment_size=min_fragment_size,
