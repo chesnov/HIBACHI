@@ -1,10 +1,9 @@
-# --- START OF REVISED FILE ramified_segmenter.py ---
-
 import numpy as np
 from scipy import ndimage
 from tqdm import tqdm
 from shutil import rmtree
 import gc
+import time # For profiling
 from functools import partial
 from skimage.measure import regionprops, label as skimage_label # type: ignore
 from skimage.segmentation import watershed # type: ignore
@@ -33,6 +32,7 @@ def get_min_distance_pixels(spacing, physical_distance):
 # --- Helper function for filtering candidate fragments (3D) ---
 def _filter_candidate_fragment_3d(
     fragment_mask: np.ndarray, # sub-mask (boolean)
+    parent_dt: np.ndarray, # OPTIMIZED: DT of the core this fragment came from
     spacing: Tuple[float, float, float],
     min_seed_fragment_volume: int,
     min_accepted_core_volume: float,
@@ -40,439 +40,268 @@ def _filter_candidate_fragment_3d(
     min_accepted_thickness_um: float, # From fragment's own DT, in um
     max_accepted_thickness_um: float, # From fragment's own DT, in um
     max_allowed_core_aspect_ratio: float
-) -> Tuple[Optional[bool], Optional[float], Optional[np.ndarray]]:
+) -> Tuple[Optional[bool], Optional[float], Optional[np.ndarray], float]:
     """
     Filters a single 3D candidate fragment based on volume, shape, and thickness.
-    Returns: (is_valid, volume, mask_copy)
-    is_valid=True: passes all checks.
-    is_valid=False: passes min_seed_fragment_volume but fails others (fallback).
-    is_valid=None: fails min_seed_fragment_volume (discard).
+    Returns: (is_valid, volume, mask_copy, duration)
     """
-    # Define variables for finally block
-    dt_fragment, labeled_fragment_for_props = None, None
-    fragment_mask_copy_local = None # Use a distinct name
+    t_start = time.time()
+    labeled_fragment_for_props, fragment_mask_copy_local = None, None
 
     try:
         fragment_volume = np.sum(fragment_mask)
         if fragment_volume < min_seed_fragment_volume:
-            return None, None, None # Fails basic size check
+            return None, None, None, time.time() - t_start
 
-        fragment_mask_copy_local = fragment_mask.copy() # Make copy for potential return
+        fragment_mask_copy_local = fragment_mask.copy()
 
-        # --- Calculate fragment's own thickness (max radius of inscribed sphere) ---
-        dt_fragment = ndimage.distance_transform_edt(fragment_mask_copy_local, sampling=spacing)
-        # max_dist_in_fragment_um is already in physical units due to sampling=spacing
-        max_dist_in_fragment_um = np.max(dt_fragment)
-
+        max_dist_in_fragment_um = np.max(parent_dt[fragment_mask])
         passes_thickness = (min_accepted_thickness_um <= max_dist_in_fragment_um <= max_accepted_thickness_um)
         passes_volume_range = (min_accepted_core_volume <= fragment_volume <= max_accepted_core_volume)
 
-        passes_aspect = True # Assume true unless check fails
-        aspect_ratio = -1.0
-        # Aspect ratio calculation for 3D objects from inertia tensor eigenvalues
-        if fragment_volume > 3: # Need a few points for regionprops/inertia tensor
+        passes_aspect = True
+        if fragment_volume > 3:
             try:
-                # regionprops needs a labeled array. Convert bool to int.
                 labeled_fragment_for_props, num_feat_prop = ndimage.label(fragment_mask_copy_local.astype(np.uint8))
                 if num_feat_prop > 0:
-                    props_list = regionprops(labeled_fragment_for_props) # Can be slow for large fragments
+                    props_list = regionprops(labeled_fragment_for_props)
                     if props_list:
                         frag_prop = props_list[0]
-                        eigvals_sq = frag_prop.inertia_tensor_eigvals # principal moments of inertia
+                        eigvals_sq = frag_prop.inertia_tensor_eigvals
                         if eigvals_sq is not None and len(eigvals_sq) == 3 and np.all(np.isfinite(eigvals_sq)):
-                            # Ensure eigenvalues are positive before sqrt
                             eigvals_sq_abs = np.abs(eigvals_sq)
-                            eigvals_sq_sorted = np.sort(eigvals_sq_abs)[::-1] # Largest to smallest
-                            if eigvals_sq_sorted[2] > 1e-12: # Smallest eigenvalue (related to shortest axis)
-                                # lengths are proportional to sqrt of eigenvalues
+                            eigvals_sq_sorted = np.sort(eigvals_sq_abs)[::-1]
+                            if eigvals_sq_sorted[2] > 1e-12:
                                 aspect_ratio = math.sqrt(eigvals_sq_sorted[0]) / math.sqrt(eigvals_sq_sorted[2])
-                                if aspect_ratio > max_allowed_core_aspect_ratio:
-                                    passes_aspect = False
-                            # else: aspect ratio ill-defined (e.g., too flat/thin), assume pass or handle as error
-            except Exception as e_prop:
-                # print(f"Warn: Regionprops for aspect ratio failed: {e_prop}. Assuming pass for aspect.") # Can be too verbose
+                                if aspect_ratio > max_allowed_core_aspect_ratio: passes_aspect = False
+            except Exception:
                 passes_aspect = True
-        # else: too small for robust aspect ratio, assume pass
 
+        duration = time.time() - t_start
         if passes_thickness and passes_volume_range and passes_aspect:
-            return True, fragment_volume, fragment_mask_copy_local # Passed all
+            return True, fragment_volume, fragment_mask_copy_local, duration
         else:
-            # Passed min_seed_fragment_volume but failed one or more specific checks
-            return False, fragment_volume, fragment_mask_copy_local # Fallback candidate
-
+            return False, fragment_volume, fragment_mask_copy_local, duration
     except Exception as e_filt:
         print(f"Warn: Unexpected error during 3D fragment filtering: {e_filt}")
-        traceback.print_exc()
-        if fragment_mask_copy_local is not None: del fragment_mask_copy_local # Clean up if error occurred after copy
-        return None, None, None # Discard on unexpected error
+        # BUG FIX: Use 'is not None' to check for array existence before deleting
+        if fragment_mask_copy_local is not None: del fragment_mask_copy_local
+        return None, None, None, time.time() - t_start
     finally:
-        if dt_fragment is not None: del dt_fragment
+        # BUG FIX: Use 'is not None' to check for array existence before deleting
         if labeled_fragment_for_props is not None: del labeled_fragment_for_props
 
 
 def extract_soma_masks(
     segmentation_mask: np.ndarray, # 3D mask
-    intensity_image: Optional[np.ndarray], # 3D intensity image, NEW
+    intensity_image: np.ndarray, # 3D intensity image
     spacing: Optional[Tuple[float, float, float]],
     smallest_quantile: int = 25,
     min_fragment_size: int = 30, # Voxels
     core_volume_target_factor_lower: float = 0.4,
     core_volume_target_factor_upper: float = 10,
-    erosion_iterations: int = 1, # NEW PARAMETER for uniform erosion
-    intensity_percentiles_to_process: List[int] = [100 - i*5 for i in range(20)] # NEW PARAMETER
+    erosion_iterations: int = 0,
+    intensity_percentiles_to_process: List[int] = [100 - i*5 for i in range(20)]
 ) -> np.ndarray:
     """
-    Generates candidate seed mask using hybrid approach (DT/Intensity) + uniform erosion + mini-watershed (3D).
-    Aggregates results: all valid candidates are prioritized, then fallbacks fill remaining gaps.
+    Generates candidate seed mask using a memory-efficient strategy by storing
+    candidate coordinates and provides detailed performance profiling.
     """
-    print("--- Starting 3D Soma Extraction (DT/Intensity + Erosion + Mini-WS + Aggregation) ---")
+    print("--- Starting 3D Soma Extraction (Coordinate Storage Strategy with Profiling) ---")
 
-    # --- Input Validation & Setup ---
-    run_intensity_path = False
-    if intensity_image is None: print("Info: `intensity_image` None. Intensity path skipped.")
-    elif intensity_image.shape != segmentation_mask.shape: print(f"Error: `intensity_image` shape mismatch ({intensity_image.shape} vs {segmentation_mask.shape}). Intensity path disabled.")
-    elif not np.issubdtype(intensity_image.dtype, np.number): print(f"Error: `intensity_image` not numeric. Intensity path disabled.")
-    else: run_intensity_path = True; print("Info: Valid `intensity_image`. Intensity path enabled."); intensity_image = intensity_image.astype(np.float32, copy=False) # Ensure float32 for percentile calcs
-
-    ratios_to_process = [0.3, 0.4, 0.5, 0.6] # For DT path
-    print(f"DT ratios: {ratios_to_process}")
-    if run_intensity_path:
-        intensity_percentiles_to_process = sorted([p for p in intensity_percentiles_to_process if 0 < p < 100], reverse=True)
-        print(f"Intensity Percentiles: {intensity_percentiles_to_process}")
-    print(f"Uniform Erosion Iterations: {erosion_iterations}")
-
+    ratios_to_process = [0.3, 0.4, 0.5, 0.6]; print(f"DT ratios: {ratios_to_process}")
+    intensity_percentiles_to_process = intensity_percentiles_to_process + [1]
+    intensity_percentiles_to_process = sorted([p for p in intensity_percentiles_to_process if 0 < p < 100], reverse=True)
+    print(f"Intensity Percentiles: {intensity_percentiles_to_process}")
 
     # --- Internal Parameters & Setup ---
-    min_physical_peak_separation = 7.0 # um, for mini-watershed peak detection
-    max_allowed_core_aspect_ratio = 10.0 # For _filter_candidate_fragment_3d
-    min_seed_fragment_volume = max(30, min_fragment_size) # Absolute min voxel count for any fragment
-    ref_vol_percentile_lower, ref_vol_percentile_upper = 30, 70 # For selecting typical objects for ref thickness
-    ref_thickness_percentile_lower = 15 # For deriving min_accepted_thickness_um from reference objects
-    absolute_min_thickness_um, absolute_max_thickness_um = 1.5, 10.0 # Hard bounds for fragment thickness
+    min_physical_peak_separation = 7.0; max_allowed_core_aspect_ratio = 10.0
+    min_seed_fragment_volume = max(30, min_fragment_size)
+    MAX_CORE_VOXELS_FOR_WS = 500_000 # SAFETY VALVE
+    print(f"Watershed safety valve: cores > {MAX_CORE_VOXELS_FOR_WS} voxels will not be split.")
 
-    if spacing is None: spacing = (1.0, 1.0, 1.0); print("Warn: No 3D spacing, assume isotropic.")
+    # --- Setup block remains the same ---
+    ref_vol_percentile_lower, ref_vol_percentile_upper = 30, 70
+    ref_thickness_percentile_lower = 15
+    absolute_min_thickness_um, absolute_max_thickness_um = 1.5, 10.0
+    if spacing is None: spacing = (1.0, 1.0, 1.0)
     else:
         try: spacing = tuple(float(s) for s in spacing); assert len(spacing) == 3
-        except: print(f"Warn: Invalid 3D spacing {spacing}. Using default."); spacing = (1.0, 1.0, 1.0)
+        except: spacing = (1.0, 1.0, 1.0)
     print(f"Using 3D spacing (z,y,x): {spacing}")
-
-    # --- 1. Perform Setup Calculations (Only Once) ---
-    print("Calculating initial object properties (3D)...")
     unique_labels_all, counts = np.unique(segmentation_mask[segmentation_mask > 0], return_counts=True)
     if len(unique_labels_all) == 0: return np.zeros_like(segmentation_mask, dtype=np.int32)
     initial_volumes = dict(zip(unique_labels_all, counts))
-
-    print("Finding object bounding boxes and validating labels (3D)...")
     label_to_slice: Dict[int, Tuple[slice, ...]] = {}
     valid_unique_labels_list: List[int] = []
-    try:
-        object_slices = ndimage.find_objects(segmentation_mask)
-        if object_slices is not None:
-            num_slices_found = len(object_slices)
-            for label in unique_labels_all:
-                idx = label - 1
-                if 0 <= idx < num_slices_found and object_slices[idx] is not None:
-                    s = object_slices[idx]
-                    if len(s) == 3 and all(si.start < si.stop for si in s): # Ensure 3D and valid slice
-                        label_to_slice[label] = s; valid_unique_labels_list.append(label)
-        if not valid_unique_labels_list: print("Error: No valid bounding boxes."); return np.zeros_like(segmentation_mask, dtype=np.int32)
-        unique_labels = np.array(valid_unique_labels_list)
-    except Exception as e: print(f"Error finding boxes: {e}"); return np.zeros_like(segmentation_mask, dtype=np.int32)
-
+    object_slices = ndimage.find_objects(segmentation_mask)
+    if object_slices:
+        for label in unique_labels_all:
+            idx = label - 1
+            if 0 <= idx < len(object_slices) and object_slices[idx]:
+                s = object_slices[idx]
+                if len(s) == 3 and all(si.start < si.stop for si in s):
+                    label_to_slice[label] = s; valid_unique_labels_list.append(label)
+    if not valid_unique_labels_list: return np.zeros_like(segmentation_mask, dtype=np.int32)
+    unique_labels = np.array(valid_unique_labels_list)
     volumes = {label: initial_volumes[label] for label in unique_labels}; all_volumes_list = list(volumes.values())
-    if not all_volumes_list: print("Error: No valid volumes."); return np.zeros_like(segmentation_mask, dtype=np.int32)
-
-    min_samples_for_median = 5
+    if not all_volumes_list: return np.zeros_like(segmentation_mask, dtype=np.int32)
     smallest_thresh_volume = np.percentile(all_volumes_list, smallest_quantile) if len(all_volumes_list) > 1 else (all_volumes_list[0] + 1 if all_volumes_list else 1)
     smallest_object_labels_set = {label for label, vol in volumes.items() if vol <= smallest_thresh_volume}
-    target_soma_volume = np.median(all_volumes_list) if len(all_volumes_list) < min_samples_for_median*2 else np.median([volumes[l] for l in smallest_object_labels_set if l in volumes] or all_volumes_list)
-    target_soma_volume = max(target_soma_volume, 1.0)
+    target_soma_volume = np.median([v for l,v in volumes.items() if l in smallest_object_labels_set] or all_volumes_list)
     min_accepted_core_volume = max(min_seed_fragment_volume, target_soma_volume * core_volume_target_factor_lower)
     max_accepted_core_volume = target_soma_volume * core_volume_target_factor_upper
-    print(f"Core Volume filter range: [{min_accepted_core_volume:.2f} - {max_accepted_core_volume:.2f}] voxels (Abs min: {min_seed_fragment_volume})")
-
-    # Reference Thickness Calculation (based on max inscribed sphere radius of typical objects)
-    if len(all_volumes_list) <= 1: vol_thresh_lower, vol_thresh_upper = min(all_volumes_list)-1 if all_volumes_list else 0, max(all_volumes_list)+1 if all_volumes_list else 1
-    else: vol_thresh_lower, vol_thresh_upper = np.percentile(all_volumes_list, ref_vol_percentile_lower), np.percentile(all_volumes_list, ref_vol_percentile_upper)
-    reference_object_labels_for_ref = [l for l in unique_labels if vol_thresh_lower < volumes[l] <= vol_thresh_upper]
-    if len(reference_object_labels_for_ref) < min_samples_for_median: print(f"Warn: Only {len(reference_object_labels_for_ref)} ref objects. Using all {len(unique_labels)} for ref thickness."); reference_object_labels_for_ref = list(unique_labels)
-    print(f"Calculating reference thickness from {len(reference_object_labels_for_ref)} ref objects...");
-    max_thicknesses_reference_objs_um = [] # Store thickness in um
-    for label_ref in tqdm(reference_object_labels_for_ref, desc="Calc Ref Thickness", disable=len(reference_object_labels_for_ref) < 10):
+    print(f"Core Volume filter range: [{min_accepted_core_volume:.2f} - {max_accepted_core_volume:.2f}] voxels")
+    vol_thresh_lower, vol_thresh_upper = np.percentile(all_volumes_list, ref_vol_percentile_lower), np.percentile(all_volumes_list, ref_vol_percentile_upper)
+    reference_object_labels = [l for l in unique_labels if vol_thresh_lower < volumes[l] <= vol_thresh_upper]
+    if len(reference_object_labels) < 5: reference_object_labels = list(unique_labels)
+    max_thicknesses_um = []
+    for label_ref in tqdm(reference_object_labels, desc="Calc Ref Thickness", disable=len(reference_object_labels) < 10):
         bbox_slice = label_to_slice.get(label_ref);
-        if bbox_slice is None: continue
-        sub_segmentation, object_mask_sub, dist_transform_obj_ref = None, None, None
-        try:
-            sub_segmentation = segmentation_mask[bbox_slice]
-            object_mask_sub = (sub_segmentation == label_ref)
-            if not np.any(object_mask_sub): continue
-            # DT gives distance in physical units if spacing is provided
-            dist_transform_obj_ref = ndimage.distance_transform_edt(object_mask_sub, sampling=spacing)
-            max_dist_um = np.max(dist_transform_obj_ref) # This is already in um
-            if max_dist_um > 0: max_thicknesses_reference_objs_um.append(max_dist_um)
-        except Exception as e: print(f"Warn: Ref Thick Err L{label_ref}: {e}"); continue
-        finally:
-            if dist_transform_obj_ref is not None: del dist_transform_obj_ref
-            if object_mask_sub is not None: del object_mask_sub
-            if sub_segmentation is not None: del sub_segmentation
-
-    min_accepted_thickness_um = absolute_min_thickness_um
-    if max_thicknesses_reference_objs_um:
-        min_accepted_thickness_um = max(absolute_min_thickness_um, np.percentile(max_thicknesses_reference_objs_um, ref_thickness_percentile_lower))
-    # Cap the min_accepted_thickness to be less than absolute_max_thickness
-    min_accepted_thickness_um = min(min_accepted_thickness_um, absolute_max_thickness_um - 1e-6) # Ensure it's less
-    print(f"Final Core Thickness filter range (for fragments): [{min_accepted_thickness_um:.2f} - {absolute_max_thickness_um:.2f}] um")
+        if bbox_slice:
+            mask_sub = (segmentation_mask[bbox_slice] == label_ref)
+            if np.any(mask_sub):
+                dt = ndimage.distance_transform_edt(mask_sub, sampling=spacing)
+                max_thicknesses_um.append(np.max(dt))
+    min_accepted_thickness_um = max(absolute_min_thickness_um, np.percentile(max_thicknesses_um, ref_thickness_percentile_lower)) if max_thicknesses_um else absolute_min_thickness_um
+    min_accepted_thickness_um = min(min_accepted_thickness_um, absolute_max_thickness_um - 1e-6)
+    print(f"Final Core Thickness filter range: [{min_accepted_thickness_um:.2f} - {absolute_max_thickness_um:.2f}] um")
     min_peak_sep_pixels = get_min_distance_pixels(spacing, min_physical_peak_separation)
+    gc.collect()
 
-
-    # --- 2. Process Small Cells (Directly to Final Mask) ---
-    print("\nProcessing objects (3D)..."); final_seed_mask = np.zeros_like(segmentation_mask, dtype=np.int32); next_final_label = 1; added_small_labels: Set[int] = set()
-    small_cell_labels = [l for l in unique_labels if l in smallest_object_labels_set]; print(f"Processing {len(small_cell_labels)} small objects (3D)...")
-    disable_tqdm = len(small_cell_labels) < 10
-    for label in tqdm(small_cell_labels, desc="Small Cells", disable=disable_tqdm):
-        bbox_slice = label_to_slice.get(label);
-        if bbox_slice is None: continue
-        sub_segmentation, object_mask_sub, obj_coords = None, None, None # Init for finally
-        try:
-            sub_segmentation = segmentation_mask[bbox_slice]
-            object_mask_sub = (sub_segmentation == label); obj_volume = np.sum(object_mask_sub)
-            if obj_volume >= min_seed_fragment_volume:
-                offset = (bbox_slice[0].start, bbox_slice[1].start, bbox_slice[2].start)
-                obj_coords = np.argwhere(object_mask_sub)
-                gz=obj_coords[:,0]+offset[0]; gy=obj_coords[:,1]+offset[1]; gx=obj_coords[:,2]+offset[2]
-                valid=(gz>=0)&(gz<final_seed_mask.shape[0])&(gy>=0)&(gy<final_seed_mask.shape[1])&(gx>=0)&(gx<final_seed_mask.shape[2])
-                vg = (gz[valid], gy[valid], gx[valid])
-                if vg[0].size > 0 and np.all(final_seed_mask[vg] == 0):
-                     final_seed_mask[vg] = next_final_label; next_final_label += 1; added_small_labels.add(label)
-        except Exception as e: print(f"Warn: Error small L{label}: {e}")
-        finally:
-            if obj_coords is not None: del obj_coords
-            if object_mask_sub is not None: del object_mask_sub
-            if sub_segmentation is not None: del sub_segmentation
+    # --- 2. Process Small Cells & Initialize Final Mask ---
+    final_seed_mask = np.zeros_like(segmentation_mask, dtype=np.int32); next_final_label = 1; added_small_labels: Set[int] = set()
+    small_cell_labels = [l for l in unique_labels if l in smallest_object_labels_set]
+    print(f"\nProcessing {len(small_cell_labels)} small objects (3D)...")
+    for label in tqdm(small_cell_labels, desc="Small Cells", disable=len(small_cell_labels) < 10):
+        if volumes.get(label, 0) >= min_seed_fragment_volume:
+            coords = np.argwhere(segmentation_mask == label)
+            if coords.size > 0:
+                final_seed_mask[coords[:, 0], coords[:, 1], coords[:, 2]] = next_final_label
+                next_final_label += 1; added_small_labels.add(label)
     print(f"Added {len(added_small_labels)} initial seeds from small cells."); gc.collect()
 
-
     # --- 3. Generate Candidates from Large Cells ---
-    large_cell_labels = [l for l in unique_labels if l not in added_small_labels]; print(f"Generating candidates from {len(large_cell_labels)} large objects (3D - DT & Intensity)...")
-    valid_candidates = []; fallback_candidates = [] # Global lists
-
-    # Define structuring element for erosion once (3D, full connectivity for 3x3x3 neighborhood)
+    large_cell_labels = [l for l in unique_labels if l not in added_small_labels]
+    print(f"Generating and placing candidates from {len(large_cell_labels)} large objects (3D)...")
     struct_el_erosion = ndimage.generate_binary_structure(3, 3) if erosion_iterations > 0 else None
 
     for label in tqdm(large_cell_labels, desc="Large Cell Candidates"):
-        bbox_slice = label_to_slice.get(label);
-        if bbox_slice is None: continue
-        pad = 1
-        z_min=max(0,bbox_slice[0].start-pad); y_min=max(0,bbox_slice[1].start-pad); x_min=max(0,bbox_slice[2].start-pad)
-        z_max=min(segmentation_mask.shape[0],bbox_slice[0].stop+pad); y_max=min(segmentation_mask.shape[1],bbox_slice[1].stop+pad); x_max=min(segmentation_mask.shape[2],bbox_slice[2].stop+pad)
-        if z_min >= z_max or y_min >= y_max or x_min >= x_max: continue
-        slice_obj = np.s_[z_min:z_max, y_min:y_max, x_min:x_max]; offset = (z_min, y_min, x_min)
-
-        # Temporary lists for candidates from THIS specific parent label (across all its iterations)
+        bbox_slice = label_to_slice.get(label)
+        if not bbox_slice: continue
+        
         valid_candidates_for_this_label: List[Dict[str, Any]] = []
         fallback_candidates_for_this_label: List[Dict[str, Any]] = []
-
-        # Define variables used in both paths for potential cleanup in finally
-        seg_sub, mask_sub, int_sub_local = None, None, None # Renamed int_sub to avoid conflict
-        dist_transform_obj = None # For DT path
+        seg_sub, mask_sub, int_sub, dist_transform_obj = None, None, None, None
 
         try:
+            pad = 1
+            slice_obj_tuple = (slice(max(0, s.start-pad), min(sh, s.stop+pad)) for s, sh in zip(bbox_slice, segmentation_mask.shape))
+            slice_obj = tuple(slice_obj_tuple)
+            offset = (slice_obj[0].start, slice_obj[1].start, slice_obj[2].start)
+
             seg_sub = segmentation_mask[slice_obj]
-            mask_sub = (seg_sub == label) # Boolean mask of the parent object in subvolume
+            mask_sub = (seg_sub == label)
             if not np.any(mask_sub): continue
+            
+            def process_core_mask(core_mask_for_labeling: np.ndarray, time_log: Dict[str, float]) -> Tuple[int, int]:
+                t_start = time.time(); labeled_cores, num_cores = ndimage.label(core_mask_for_labeling); time_log['labeling'] += time.time() - t_start
+                if num_cores == 0: return 0, 0
 
+                t_start = time.time(); core_volumes = ndimage.sum_labels(core_mask_for_labeling, labeled_cores, range(1, num_cores + 1)); time_log['summing'] += time.time() - t_start
+                
+                kept_cores = 0
+                for core_idx in np.where(core_volumes >= min_seed_fragment_volume)[0]:
+                    kept_cores += 1
+                    core_lbl = core_idx + 1
+                    core_component_mask = (labeled_cores == core_lbl)
+                    core_volume = core_volumes[core_idx]
+                    
+                    t_ws_start = time.time()
+                    frags_masks, dt_core = [], None
+                    if core_volume > MAX_CORE_VOXELS_FOR_WS:
+                        frags_masks.append(core_component_mask)
+                        dt_core = ndimage.distance_transform_edt(core_component_mask, sampling=spacing)
+                    else:
+                        dt_core = ndimage.distance_transform_edt(core_component_mask, sampling=spacing)
+                        peaks = peak_local_max(dt_core, min_distance=min_peak_sep_pixels, labels=core_component_mask, exclude_border=False)
+                        if peaks.shape[0] > 1:
+                            markers = np.zeros(dt_core.shape, dtype=np.int32); markers[tuple(peaks.T)] = np.arange(1, peaks.shape[0] + 1)
+                            ws_core = watershed(-dt_core, markers, mask=core_component_mask, watershed_line=False)
+                            for l in np.unique(ws_core):
+                                if l > 0: frags_masks.append(ws_core == l)
+                        else: frags_masks.append(core_component_mask)
+                    time_log['mini_ws'] += time.time() - t_ws_start
+                    
+                    for f_mask in frags_masks:
+                        is_valid, vol, m_copy, dur = _filter_candidate_fragment_3d(f_mask, dt_core, spacing, min_seed_fragment_volume, min_accepted_core_volume, max_accepted_core_volume, min_accepted_thickness_um, absolute_max_thickness_um, max_allowed_core_aspect_ratio)
+                        time_log['filtering'] += dur
+                        if m_copy is not None:
+                            coords = np.argwhere(m_copy)
+                            candidate_data = {'coords': coords, 'volume': vol, 'offset': offset}
+                            if is_valid is True: valid_candidates_for_this_label.append(candidate_data)
+                            elif is_valid is False: fallback_candidates_for_this_label.append(candidate_data)
+                            del m_copy, coords
+                return num_cores, kept_cores
+            
             # --- A) DT Path ---
-            try:
-                dist_transform_obj = ndimage.distance_transform_edt(mask_sub, sampling=spacing)
-                max_dist_in_obj = np.max(dist_transform_obj)
-                if max_dist_in_obj > 1e-9:
-                    for ratio in ratios_to_process:
-                        initial_core_region_mask_sub = (dist_transform_obj >= max_dist_in_obj * ratio) & mask_sub
-                        if not np.any(initial_core_region_mask_sub): continue
-
-                        core_mask_for_labeling = initial_core_region_mask_sub
-                        if erosion_iterations > 0 and struct_el_erosion is not None:
-                            eroded_core_mask = ndimage.binary_erosion(initial_core_region_mask_sub, structure=struct_el_erosion, iterations=erosion_iterations)
-                            if not np.any(eroded_core_mask): continue
-                            core_mask_for_labeling = eroded_core_mask
-                        # else: use initial_core_region_mask_sub
-
-                        labeled_cores, num_cores = ndimage.label(core_mask_for_labeling)
-                        if num_cores == 0: continue
-
-                        for core_lbl in range(1, num_cores + 1):
-                            core_component_mask_sub = (labeled_cores == core_lbl) # Boolean
-                            if not np.any(core_component_mask_sub): continue
-                            
-                            frags_masks = [] # List of boolean fragment masks
-                            dt_core, peaks, markers_core, ws_core = None, None, None, None # Init for finally
-                            try: # Mini-WS
-                                dt_core = ndimage.distance_transform_edt(core_component_mask_sub, sampling=spacing)
-                                if np.max(dt_core) > 1e-9:
-                                    peaks = peak_local_max(dt_core, min_distance=min_peak_sep_pixels, labels=core_component_mask_sub, num_peaks_per_label=0, exclude_border=False)
-                                else: peaks = np.empty((0, dt_core.ndim), dtype=int)
-
-                                if peaks.shape[0] > 1:
-                                    markers_core = np.zeros(dt_core.shape, dtype=np.int32); markers_core[tuple(peaks.T)] = np.arange(1, peaks.shape[0] + 1)
-                                    ws_core = watershed(-dt_core, markers_core, mask=core_component_mask_sub, watershed_line=False)
-                                    for ws_l in np.unique(ws_core):
-                                        if ws_l == 0: continue
-                                        f_mask = (ws_core == ws_l) # Boolean
-                                        if np.any(f_mask): frags_masks.append(f_mask)
-                                else: # 0 or 1 peak
-                                    frags_masks.append(core_component_mask_sub)
-                            except Exception as e_ws: print(f"Warn: Mini-WS DT L{label} R{ratio} C{core_lbl}: {e_ws}. Using core."); frags_masks.append(core_component_mask_sub)
-                            finally:
-                                if dt_core is not None: del dt_core
-                                if peaks is not None: del peaks
-                                if markers_core is not None: del markers_core
-                                if ws_core is not None: del ws_core
-                            
-                            for f_mask_sub in frags_masks: # Filter fragments
-                                is_valid, vol, m_copy = _filter_candidate_fragment_3d(
-                                    f_mask_sub, spacing, min_seed_fragment_volume,
-                                    min_accepted_core_volume, max_accepted_core_volume,
-                                    min_accepted_thickness_um, absolute_max_thickness_um, # Use absolute_max_thickness_um here
-                                    max_allowed_core_aspect_ratio
-                                )
-                                if is_valid is True: valid_candidates_for_this_label.append({'mask': m_copy, 'volume': vol, 'offset': offset})
-                                elif is_valid is False: fallback_candidates_for_this_label.append({'mask': m_copy, 'volume': vol, 'offset': offset})
-                                # if None, m_copy is not returned/created by _filter
-                        # End core_lbl loop
-                        if 'labeled_cores' in locals(): del labeled_cores
-                    # End ratio loop
-            except Exception as e_dt: print(f"Warn: Error in DT path L{label}: {e_dt}")
-            finally:
-                if dist_transform_obj is not None: del dist_transform_obj
+            dist_transform_obj = ndimage.distance_transform_edt(mask_sub, sampling=spacing)
+            max_dist = np.max(dist_transform_obj)
+            if max_dist > 1e-9:
+                for ratio in ratios_to_process:
+                    t_iter_start = time.time(); time_log = {'labeling': 0, 'summing': 0, 'mini_ws': 0, 'filtering': 0}
+                    initial_core = (dist_transform_obj >= max_dist * ratio) & mask_sub
+                    if not np.any(initial_core): continue
+                    eroded_core = ndimage.binary_erosion(initial_core, structure=struct_el_erosion, iterations=erosion_iterations) if erosion_iterations > 0 else initial_core
+                    if np.any(eroded_core):
+                        num_found, num_kept = process_core_mask(eroded_core, time_log)
+                        total_time = time.time() - t_iter_start
+                        print(f"    L{label} DT R{ratio:.1f}: Found {num_found} cores, kept {num_kept}. Total time: {total_time:.2f}s "
+                                f"[label:{time_log['labeling']:.2f}s, sum:{time_log['summing']:.2f}s, "
+                                f"ws:{time_log['mini_ws']:.2f}s, filter:{time_log['filtering']:.2f}s]")
 
             # --- B) Intensity Path ---
-            if run_intensity_path and intensity_image is not None: # intensity_image is full-size
-                int_sub_local = intensity_image[slice_obj] # Get subvolume for intensity
-                try:
-                    ints_obj_values = int_sub_local[mask_sub] # Intensities only within parent object mask
-                    if ints_obj_values.size == 0: raise ValueError("No intensity values in object mask")
+            int_sub = intensity_image[slice_obj]
+            ints_obj_vals = int_sub[mask_sub]
+            if ints_obj_vals.size > 0:
+                for perc in intensity_percentiles_to_process:
+                    t_iter_start = time.time(); time_log = {'labeling': 0, 'summing': 0, 'mini_ws': 0, 'filtering': 0}
+                    thresh = np.percentile(ints_obj_vals, perc)
+                    initial_core = (int_sub >= thresh) & mask_sub
+                    if not np.any(initial_core): continue
+                    eroded_core = ndimage.binary_erosion(initial_core, structure=struct_el_erosion, iterations=erosion_iterations) if erosion_iterations > 0 else initial_core
+                    if np.any(eroded_core):
+                        num_found, num_kept = process_core_mask(eroded_core, time_log)
+                        total_time = time.time() - t_iter_start
+                        print(f"    L{label} INT P{perc:02d}: Found {num_found} cores, kept {num_kept}. Total time: {total_time:.2f}s "
+                                f"[label:{time_log['labeling']:.2f}s, sum:{time_log['summing']:.2f}s, "
+                                f"ws:{time_log['mini_ws']:.2f}s, filter:{time_log['filtering']:.2f}s]")
 
-                    for perc in intensity_percentiles_to_process:
-                        try: thresh = np.percentile(ints_obj_values, perc)
-                        except IndexError: continue # Should not happen if perc is 0-100
+            # --- Placement logic (run once per parent cell) ---
+            candidates_to_place = []
+            if valid_candidates_for_this_label: candidates_to_place.extend(valid_candidates_for_this_label)
+            elif fallback_candidates_for_this_label: candidates_to_place.append(max(fallback_candidates_for_this_label, key=lambda x: x['volume']))
+            
+            if candidates_to_place:
+                candidates_to_place.sort(key=lambda x: x['volume'])
+                for cand in candidates_to_place:
+                    coords_sub, offset_cand = cand['coords'], cand['offset']
+                    if coords_sub.size == 0: continue
+                    gz, gy, gx = coords_sub[:, 0] + offset_cand[0], coords_sub[:, 1] + offset_cand[1], coords_sub[:, 2] + offset_cand[2]
+                    vg = (gz, gy, gx)
+                    if np.all(final_seed_mask[vg] == 0):
+                        final_seed_mask[vg] = next_final_label
+                        next_final_label += 1
 
-                        initial_core_region_mask_sub = (int_sub_local >= thresh) & mask_sub
-                        if not np.any(initial_core_region_mask_sub): continue
-
-                        core_mask_for_labeling = initial_core_region_mask_sub
-                        if erosion_iterations > 0 and struct_el_erosion is not None:
-                            eroded_core_mask = ndimage.binary_erosion(initial_core_region_mask_sub, structure=struct_el_erosion, iterations=erosion_iterations)
-                            if not np.any(eroded_core_mask): continue
-                            core_mask_for_labeling = eroded_core_mask
-                        
-                        labeled_cores, num_cores = ndimage.label(core_mask_for_labeling)
-                        if num_cores == 0: continue
-
-                        for core_lbl in range(1, num_cores + 1):
-                            core_component_mask_sub = (labeled_cores == core_lbl) # Boolean
-                            if not np.any(core_component_mask_sub): continue
-                            
-                            frags_masks = []
-                            dt_core, peaks, markers_core, ws_core = None, None, None, None # Init for finally
-                            try: # Mini-WS (same logic as DT path)
-                                dt_core = ndimage.distance_transform_edt(core_component_mask_sub, sampling=spacing)
-                                if np.max(dt_core) > 1e-9:
-                                    peaks = peak_local_max(dt_core, min_distance=min_peak_sep_pixels, labels=core_component_mask_sub, num_peaks_per_label=0, exclude_border=False)
-                                else: peaks = np.empty((0, dt_core.ndim), dtype=int)
-                                
-                                if peaks.shape[0] > 1:
-                                    markers_core = np.zeros(dt_core.shape, dtype=np.int32); markers_core[tuple(peaks.T)] = np.arange(1, peaks.shape[0] + 1)
-                                    ws_core = watershed(-dt_core, markers_core, mask=core_component_mask_sub, watershed_line=False)
-                                    for ws_l in np.unique(ws_core):
-                                        if ws_l == 0: continue
-                                        f_mask = (ws_core == ws_l)
-                                        if np.any(f_mask): frags_masks.append(f_mask)
-                                else: frags_masks.append(core_component_mask_sub)
-                            except Exception as e_ws: print(f"Warn: Mini-WS Int L{label} P{perc} C{core_lbl}: {e_ws}. Using core."); frags_masks.append(core_component_mask_sub)
-                            finally:
-                                if dt_core is not None: del dt_core
-                                if peaks is not None: del peaks
-                                if markers_core is not None: del markers_core
-                                if ws_core is not None: del ws_core
-
-                            for f_mask_sub in frags_masks: # Filter fragments
-                                is_valid, vol, m_copy = _filter_candidate_fragment_3d(
-                                    f_mask_sub, spacing, min_seed_fragment_volume,
-                                    min_accepted_core_volume, max_accepted_core_volume,
-                                    min_accepted_thickness_um, absolute_max_thickness_um,
-                                    max_allowed_core_aspect_ratio
-                                )
-                                if is_valid is True: valid_candidates_for_this_label.append({'mask': m_copy, 'volume': vol, 'offset': offset})
-                                elif is_valid is False: fallback_candidates_for_this_label.append({'mask': m_copy, 'volume': vol, 'offset': offset})
-                        # End core_lbl loop
-                        if 'labeled_cores' in locals(): del labeled_cores
-                    # End percentile loop
-                except ValueError: pass # No intensity values, or other expected issue
-                except Exception as e_int: print(f"Warn: Error in Intensity path L{label}: {e_int}")
-                finally:
-                    if int_sub_local is not None: del int_sub_local # Clean up intensity subvolume
-            # End Intensity Path
-
-            # --- Combine Candidates from this parent label to global lists ---
-            if valid_candidates_for_this_label:
-                valid_candidates.extend(valid_candidates_for_this_label)
-            if fallback_candidates_for_this_label: # Add all fallbacks collected for this parent
-                fallback_candidates.extend(fallback_candidates_for_this_label)
-
-        except MemoryError: print(f"Warn: MemError processing L{label}."); gc.collect()
-        except Exception as e_label_proc: print(f"Warn: Uncaught Error L{label}: {e_label_proc}"); traceback.print_exc()
-        finally: # Cleanup for current parent label
+        except MemoryError: print(f"CRITICAL: MemoryError processing L{label}. Skipping this cell."); gc.collect()
+        except Exception as e: print(f"Warn: Uncaught Error L{label}: {e}"); traceback.print_exc()
+        finally:
+            del valid_candidates_for_this_label, fallback_candidates_for_this_label
             if seg_sub is not None: del seg_sub
             if mask_sub is not None: del mask_sub
-            # Clean up masks within the per-label lists as they are now in global or discarded
-            for item in valid_candidates_for_this_label:
-                if 'mask' in item: del item['mask']
-            for item in fallback_candidates_for_this_label:
-                if 'mask' in item: del item['mask']
-            del valid_candidates_for_this_label, fallback_candidates_for_this_label
+            if int_sub is not None: del int_sub
+            if dist_transform_obj is not None: del dist_transform_obj
             gc.collect()
-        # --- End Label Loop (Large Cells) ---
-
-    print(f"Generated {len(valid_candidates)} valid candidates and {len(fallback_candidates)} fallback candidates.")
-
-    # --- 4. Place Valid Candidates (Smallest First) ---
-    print("Placing smallest valid seeds..."); valid_candidates.sort(key=lambda x: x['volume'])
-    processed_count = 0
-    for cand in tqdm(valid_candidates, desc="Placing Valid Seeds"):
-        mask_sub = cand.get('mask'); offset_cand = cand.get('offset')
-        if mask_sub is None or offset_cand is None or mask_sub.size == 0: continue
-        try:
-            coords = np.argwhere(mask_sub)
-            if coords.size == 0: continue
-            gz=coords[:,0]+offset_cand[0]; gy=coords[:,1]+offset_cand[1]; gx=coords[:,2]+offset_cand[2]
-            valid=(gz>=0)&(gz<final_seed_mask.shape[0])&(gy>=0)&(gy<final_seed_mask.shape[1])&(gx>=0)&(gx<final_seed_mask.shape[2])
-            vg = (gz[valid], gy[valid], gx[valid])
-            if vg[0].size > 0 and np.all(final_seed_mask[vg] == 0):
-                final_seed_mask[vg] = next_final_label; next_final_label += 1; processed_count += 1
-        except Exception as e: print(f"Warn: Error Place Valid L: {e}")
-        finally:
-             if 'mask' in cand: del cand['mask'] # Critical: delete mask copy
-    print(f"Placed {processed_count} seeds from valid candidates."); del valid_candidates; gc.collect()
-
-
-    # --- 5. Place Fallback Candidates (Fill Gaps, Smallest First) ---
-    print("Placing fallback seeds..."); fallback_candidates.sort(key=lambda x: x['volume'])
-    fallback_count = 0
-    for fallbk in tqdm(fallback_candidates, desc="Placing Fallbacks"):
-        mask_sub = fallbk.get('mask'); offset_fallbk = fallbk.get('offset')
-        if mask_sub is None or offset_fallbk is None or mask_sub.size == 0: continue
-        try:
-            coords = np.argwhere(mask_sub)
-            if coords.size == 0: continue
-            gz=coords[:,0]+offset_fallbk[0]; gy=coords[:,1]+offset_fallbk[1]; gx=coords[:,2]+offset_fallbk[2]
-            valid=(gz>=0)&(gz<final_seed_mask.shape[0])&(gy>=0)&(gy<final_seed_mask.shape[1])&(gx>=0)&(gx<final_seed_mask.shape[2])
-            vg = (gz[valid], gy[valid], gx[valid])
-            if vg[0].size > 0 and np.all(final_seed_mask[vg] == 0):
-                final_seed_mask[vg] = next_final_label; next_final_label += 1; fallback_count += 1
-        except Exception as e: print(f"Warn: Error Place Fallback: {e}")
-        finally:
-            if 'mask' in fallbk: del fallbk['mask'] # Critical: delete mask copy
-    print(f"Placed {fallback_count} seeds from fallback candidates."); del fallback_candidates; gc.collect()
 
     total_final_seeds = next_final_label - 1
     print(f"\nGenerated {total_final_seeds} final aggregated seeds (3D)."); print("--- Finished 3D Intermediate Seed Extraction ---")
@@ -571,8 +400,8 @@ def separate_multi_soma_cells(
     spacing: Optional[Tuple[float, float, float]], # 3D
     min_size_threshold: int = 100, # Voxels, for merging small fragments post-watershed
     intensity_weight: float = 0.0, # For watershed landscape
-    max_seed_centroid_dist: float = 15.0, # um, for seed merging heuristic
-    min_path_intensity_ratio: float = 0.6, # For seed merging heuristic
+    max_seed_centroid_dist: float = 5.0, # um, for seed merging heuristic
+    min_path_intensity_ratio: float = 0.8, # For seed merging heuristic
     post_merge_min_interface_voxels: int = 20 # MODIFIED: Replaces neck thickness for simpler merge
     ) -> np.ndarray:
     """
