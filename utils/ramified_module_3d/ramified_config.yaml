@@ -6,10 +6,8 @@ execute_raw_segmentation_ramified:
       label: Tubular Scales (comma-sep floats)
       type: list
       value:
-      - 0.8
-      - 1.0
-      - 1.5
-      - 2.0
+      - 0.5
+      - 0.1
       element_type: float
     min_size:
       label: Minimum Size (Voxels, Raw Seg)
@@ -66,7 +64,7 @@ execute_trim_edges_ramified:
     brightness_cutoff_factor:
       label: Brightness Cutoff Factor
       type: float
-      value: 120000.0
+      value: 200000.0
       min: 0.0
       max: 10000000
       step: 0.1
@@ -90,17 +88,59 @@ execute_refine_rois_ramified:
     min_fragment_size:
       label: Min Fragment Size (Refine/Separate)
       type: int
-      value: 2000
+      value: 2500
       min: 1
       max: 1000000
       step: 10
+    core_volume_target_factor_lower:
+      label: Soma Vol Factor (Lower)
+      type: float
+      value: 0.1
+      min: 0.01
+      max: 1.0
+      step: 0.01
+    core_volume_target_factor_upper:
+      label: Soma Vol Factor (Upper)
+      type: float
+      value: 10.0
+      min: 1.0
+      max: 50.0
+      step: 0.1
+    erosion_iterations:
+      label: Soma Erosion Iterations
+      type: int
+      value: 0
+      min: 0
+      max: 5
+      step: 1
+    min_physical_peak_separation:
+      label: Soma Peak Separation (um)
+      type: float
+      value: 7.0
+      min: 1.0
+      max: 20.0
+      step: 0.1
+    absolute_min_thickness_um:
+      label: Soma Min Thickness (um)
+      type: float
+      value: 1.5
+      min: 0.5
+      max: 10.0
+      step: 0.1
+    absolute_max_thickness_um:
+      label: Soma Max Thickness (um)
+      type: float
+      value: 10.0
+      min: 5.0
+      max: 30.0
+      step: 0.1
     target_aspect_ratio:
       label: Target Aspect Ratio (PCA Refine)
       type: float
-      value: 1.05
-      min: 0.1
+      value: 1.1
+      min: 1.0
       max: 5.0
-      step: 0.1
+      step: 0.05
     projection_percentile_crop:
       label: Projection Crop % (PCA Refine)
       type: int
@@ -111,10 +151,31 @@ execute_refine_rois_ramified:
     intensity_weight:
       label: Intensity Weight (Separate)
       type: float
-      value: 5.0
+      value: 0.0
       min: 0.0
-      max: 10
+      max: 10.0
+      step: 0.1
+    max_seed_centroid_dist:
+      label: Max Seed Merge Dist (um)
+      type: float
+      value: 40.0
+      min: 0.0
+      max: 100.0
+      step: 1.0
+    min_path_intensity_ratio:
+      label: Min Path Intensity Ratio
+      type: float
+      value: 0.8
+      min: 0.0
+      max: 1.0
       step: 0.01
+    post_merge_min_interface_voxels:
+      label: Min Interface Voxels (Merge)
+      type: int
+      value: 50
+      min: 0
+      max: 500
+      step: 5
 voxel_dimensions:
   x: 424.27
   y: 424.27

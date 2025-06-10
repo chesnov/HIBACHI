@@ -40,56 +40,64 @@ def _filter_candidate_fragment_3d(
     min_accepted_thickness_um: float, # From fragment's own DT, in um
     max_accepted_thickness_um: float, # From fragment's own DT, in um
     max_allowed_core_aspect_ratio: float
-) -> Tuple[Optional[bool], Optional[float], Optional[np.ndarray], float]:
+) -> Tuple[str, Optional[str], Optional[np.ndarray], Optional[float], float]:
     """
-    Filters a single 3D candidate fragment based on volume, shape, and thickness.
-    Returns: (is_valid, volume, mask_copy, duration)
+    Filters a single 3D candidate fragment and returns a detailed status.
+    Returns: (status, reason, mask_copy, volume, duration)
+    - status: 'valid', 'fallback', or 'discard'.
+    - reason: The specific reason for fallback/discard (e.g., 'thickness', 'aspect').
     """
     t_start = time.time()
-    labeled_fragment_for_props, fragment_mask_copy_local = None, None
-
+    
     try:
         fragment_volume = np.sum(fragment_mask)
         if fragment_volume < min_seed_fragment_volume:
-            return None, None, None, time.time() - t_start
+            return 'discard', 'too_small', None, None, time.time() - t_start
 
-        fragment_mask_copy_local = fragment_mask.copy()
-
+        # --- Thickness Check (Already Spacing-Aware) ---
         max_dist_in_fragment_um = np.max(parent_dt[fragment_mask])
         passes_thickness = (min_accepted_thickness_um <= max_dist_in_fragment_um <= max_accepted_thickness_um)
+        
+        # --- Volume Check ---
         passes_volume_range = (min_accepted_core_volume <= fragment_volume <= max_accepted_core_volume)
 
+        # --- Aspect Ratio Check (NOW SPACING-AWARE) ---
         passes_aspect = True
-        if fragment_volume > 3:
+        if fragment_volume > 3: # Need more than 3 points for PCA
             try:
-                labeled_fragment_for_props, num_feat_prop = ndimage.label(fragment_mask_copy_local.astype(np.uint8))
-                if num_feat_prop > 0:
-                    props_list = regionprops(labeled_fragment_for_props)
-                    if props_list:
-                        frag_prop = props_list[0]
-                        eigvals_sq = frag_prop.inertia_tensor_eigvals
-                        if eigvals_sq is not None and len(eigvals_sq) == 3 and np.all(np.isfinite(eigvals_sq)):
-                            eigvals_sq_abs = np.abs(eigvals_sq)
-                            eigvals_sq_sorted = np.sort(eigvals_sq_abs)[::-1]
-                            if eigvals_sq_sorted[2] > 1e-12:
-                                aspect_ratio = math.sqrt(eigvals_sq_sorted[0]) / math.sqrt(eigvals_sq_sorted[2])
-                                if aspect_ratio > max_allowed_core_aspect_ratio: passes_aspect = False
+                # Get voxel coordinates and convert to physical coordinates
+                coords_vox = np.argwhere(fragment_mask)
+                coords_phys = coords_vox * np.array(spacing)
+
+                # Use PCA on physical coordinates to get axis lengths
+                pca = PCA(n_components=3)
+                pca.fit(coords_phys)
+                eigenvalues = pca.explained_variance_ # These are variances along principal axes
+                eigenvalues_sorted = np.sort(np.abs(eigenvalues))[::-1]
+                
+                if eigenvalues_sorted[2] > 1e-12: # Avoid division by zero
+                    aspect_ratio = math.sqrt(eigenvalues_sorted[0]) / math.sqrt(eigenvalues_sorted[2])
+                    if aspect_ratio > max_allowed_core_aspect_ratio:
+                        passes_aspect = False
             except Exception:
                 passes_aspect = True
-
+        
+        fragment_mask_copy = fragment_mask.copy()
         duration = time.time() - t_start
+
         if passes_thickness and passes_volume_range and passes_aspect:
-            return True, fragment_volume, fragment_mask_copy_local, duration
+            return 'valid', None, fragment_mask_copy, fragment_volume, duration
         else:
-            return False, fragment_volume, fragment_mask_copy_local, duration
+            # Determine the first reason for failure
+            reason = 'unknown'
+            if not passes_thickness: reason = 'thickness'
+            elif not passes_volume_range: reason = 'volume'
+            elif not passes_aspect: reason = 'aspect'
+            return 'fallback', reason, fragment_mask_copy, fragment_volume, duration
+            
     except Exception as e_filt:
         print(f"Warn: Unexpected error during 3D fragment filtering: {e_filt}")
-        # BUG FIX: Use 'is not None' to check for array existence before deleting
-        if fragment_mask_copy_local is not None: del fragment_mask_copy_local
-        return None, None, None, time.time() - t_start
-    finally:
-        # BUG FIX: Use 'is not None' to check for array existence before deleting
-        if labeled_fragment_for_props is not None: del labeled_fragment_for_props
+        return 'discard', 'error', None, None, time.time() - t_start
 
 
 def extract_soma_masks(
@@ -98,32 +106,38 @@ def extract_soma_masks(
     spacing: Optional[Tuple[float, float, float]],
     smallest_quantile: int = 25,
     min_fragment_size: int = 30, # Voxels
-    core_volume_target_factor_lower: float = 0.4,
+    core_volume_target_factor_lower: float = 0.1,
     core_volume_target_factor_upper: float = 10,
     erosion_iterations: int = 0,
-    intensity_percentiles_to_process: List[int] = [100 - i*5 for i in range(20)]
+    ratios_to_process = [0.3, 0.4, 0.5, 0.6],
+    intensity_percentiles_to_process: List[int] = [100, 90, 80, 70, 60, 50, 40, 30, 20, 10],
+    min_physical_peak_separation: float = 7.0, # um
+    max_allowed_core_aspect_ratio: float = 10.0,
+    ref_vol_percentile_lower: int = 30,
+    ref_vol_percentile_upper: int = 70,
+    ref_thickness_percentile_lower: int = 1,
+    absolute_min_thickness_um: float = 1.5,
+    absolute_max_thickness_um: float = 10.0
 ) -> np.ndarray:
     """
     Generates candidate seed mask using a memory-efficient strategy by storing
-    candidate coordinates and provides detailed performance profiling.
+    candidate coordinates and provides detailed performance and rejection profiling.
     """
-    print("--- Starting 3D Soma Extraction (Coordinate Storage Strategy with Profiling) ---")
+    print("--- Starting 3D Soma Extraction (Coordinate Storage Strategy with Rejection Profiling) ---")
 
-    ratios_to_process = [0.3, 0.4, 0.5, 0.6]; print(f"DT ratios: {ratios_to_process}")
-    intensity_percentiles_to_process = intensity_percentiles_to_process + [1]
+    print(f"DT ratios: {ratios_to_process}")
     intensity_percentiles_to_process = sorted([p for p in intensity_percentiles_to_process if 0 < p < 100], reverse=True)
     print(f"Intensity Percentiles: {intensity_percentiles_to_process}")
 
     # --- Internal Parameters & Setup ---
-    min_physical_peak_separation = 7.0; max_allowed_core_aspect_ratio = 10.0
-    min_seed_fragment_volume = max(30, min_fragment_size)
+    if min_fragment_size is None or min_fragment_size < 1:
+        min_seed_fragment_volume = 30
+    else:
+        min_seed_fragment_volume = min_fragment_size
     MAX_CORE_VOXELS_FOR_WS = 500_000 # SAFETY VALVE
     print(f"Watershed safety valve: cores > {MAX_CORE_VOXELS_FOR_WS} voxels will not be split.")
 
-    # --- Setup block remains the same ---
-    ref_vol_percentile_lower, ref_vol_percentile_upper = 30, 70
-    ref_thickness_percentile_lower = 15
-    absolute_min_thickness_um, absolute_max_thickness_um = 1.5, 10.0
+    # --- Setup block ---
     if spacing is None: spacing = (1.0, 1.0, 1.0)
     else:
         try: spacing = tuple(float(s) for s in spacing); assert len(spacing) == 3
@@ -204,15 +218,15 @@ def extract_soma_masks(
             mask_sub = (seg_sub == label)
             if not np.any(mask_sub): continue
             
-            def process_core_mask(core_mask_for_labeling: np.ndarray, time_log: Dict[str, float]) -> Tuple[int, int]:
+            def process_core_mask(core_mask_for_labeling: np.ndarray, time_log: Dict[str, float]) -> Tuple[int, int, Dict[str, int]]:
+                rejection_stats = {'too_small': 0, 'thickness': 0, 'volume': 0, 'aspect': 0, 'error': 0}
                 t_start = time.time(); labeled_cores, num_cores = ndimage.label(core_mask_for_labeling); time_log['labeling'] += time.time() - t_start
-                if num_cores == 0: return 0, 0
+                if num_cores == 0: return 0, 0, rejection_stats
 
                 t_start = time.time(); core_volumes = ndimage.sum_labels(core_mask_for_labeling, labeled_cores, range(1, num_cores + 1)); time_log['summing'] += time.time() - t_start
                 
-                kept_cores = 0
+                kept_fragments = 0
                 for core_idx in np.where(core_volumes >= min_seed_fragment_volume)[0]:
-                    kept_cores += 1
                     core_lbl = core_idx + 1
                     core_component_mask = (labeled_cores == core_lbl)
                     core_volume = core_volumes[core_idx]
@@ -234,15 +248,23 @@ def extract_soma_masks(
                     time_log['mini_ws'] += time.time() - t_ws_start
                     
                     for f_mask in frags_masks:
-                        is_valid, vol, m_copy, dur = _filter_candidate_fragment_3d(f_mask, dt_core, spacing, min_seed_fragment_volume, min_accepted_core_volume, max_accepted_core_volume, min_accepted_thickness_um, absolute_max_thickness_um, max_allowed_core_aspect_ratio)
+                        status, reason, m_copy, vol, dur = _filter_candidate_fragment_3d(f_mask, dt_core, spacing, min_seed_fragment_volume, min_accepted_core_volume, max_accepted_core_volume, min_accepted_thickness_um, absolute_max_thickness_um, max_allowed_core_aspect_ratio)
                         time_log['filtering'] += dur
-                        if m_copy is not None:
+                        
+                        if status == 'valid':
                             coords = np.argwhere(m_copy)
-                            candidate_data = {'coords': coords, 'volume': vol, 'offset': offset}
-                            if is_valid is True: valid_candidates_for_this_label.append(candidate_data)
-                            elif is_valid is False: fallback_candidates_for_this_label.append(candidate_data)
-                            del m_copy, coords
-                return num_cores, kept_cores
+                            valid_candidates_for_this_label.append({'coords': coords, 'volume': vol, 'offset': offset})
+                            kept_fragments += 1
+                        elif status == 'fallback':
+                            coords = np.argwhere(m_copy)
+                            fallback_candidates_for_this_label.append({'coords': coords, 'volume': vol, 'offset': offset})
+                            if reason: rejection_stats[reason] += 1
+                        elif status == 'discard' and reason:
+                            rejection_stats[reason] += 1
+                        
+                        if m_copy is not None: del m_copy
+
+                return num_cores, kept_fragments, rejection_stats
             
             # --- A) DT Path ---
             dist_transform_obj = ndimage.distance_transform_edt(mask_sub, sampling=spacing)
@@ -254,11 +276,13 @@ def extract_soma_masks(
                     if not np.any(initial_core): continue
                     eroded_core = ndimage.binary_erosion(initial_core, structure=struct_el_erosion, iterations=erosion_iterations) if erosion_iterations > 0 else initial_core
                     if np.any(eroded_core):
-                        num_found, num_kept = process_core_mask(eroded_core, time_log)
+                        num_found, num_kept, stats = process_core_mask(eroded_core, time_log)
                         total_time = time.time() - t_iter_start
-                        print(f"    L{label} DT R{ratio:.1f}: Found {num_found} cores, kept {num_kept}. Total time: {total_time:.2f}s "
-                                f"[label:{time_log['labeling']:.2f}s, sum:{time_log['summing']:.2f}s, "
-                                f"ws:{time_log['mini_ws']:.2f}s, filter:{time_log['filtering']:.2f}s]")
+                        rejection_str = ", ".join([f"rej {k}: {v}" for k, v in stats.items() if v > 0])
+                        print(f"    L{label} DT R{ratio:.1f}: Found {num_found} cores, kept {num_kept} frags. "
+                              f"{rejection_str}. Total time: {total_time:.2f}s "
+                              f"[label:{time_log['labeling']:.2f}s, sum:{time_log['summing']:.2f}s, "
+                              f"ws:{time_log['mini_ws']:.2f}s, filter:{time_log['filtering']:.2f}s]")
 
             # --- B) Intensity Path ---
             int_sub = intensity_image[slice_obj]
@@ -271,11 +295,13 @@ def extract_soma_masks(
                     if not np.any(initial_core): continue
                     eroded_core = ndimage.binary_erosion(initial_core, structure=struct_el_erosion, iterations=erosion_iterations) if erosion_iterations > 0 else initial_core
                     if np.any(eroded_core):
-                        num_found, num_kept = process_core_mask(eroded_core, time_log)
+                        num_found, num_kept, stats = process_core_mask(eroded_core, time_log)
                         total_time = time.time() - t_iter_start
-                        print(f"    L{label} INT P{perc:02d}: Found {num_found} cores, kept {num_kept}. Total time: {total_time:.2f}s "
-                                f"[label:{time_log['labeling']:.2f}s, sum:{time_log['summing']:.2f}s, "
-                                f"ws:{time_log['mini_ws']:.2f}s, filter:{time_log['filtering']:.2f}s]")
+                        rejection_str = ", ".join([f"rej {k}: {v}" for k, v in stats.items() if v > 0])
+                        print(f"    L{label} INT P{perc:02d}: Found {num_found} cores, kept {num_kept} frags. "
+                              f"{rejection_str}. Total time: {total_time:.2f}s "
+                              f"[label:{time_log['labeling']:.2f}s, sum:{time_log['summing']:.2f}s, "
+                              f"ws:{time_log['mini_ws']:.2f}s, filter:{time_log['filtering']:.2f}s]")
 
             # --- Placement logic (run once per parent cell) ---
             candidates_to_place = []
@@ -306,7 +332,6 @@ def extract_soma_masks(
     total_final_seeds = next_final_label - 1
     print(f"\nGenerated {total_final_seeds} final aggregated seeds (3D)."); print("--- Finished 3D Intermediate Seed Extraction ---")
     return final_seed_mask
-
 
 # --- refine_seeds_pca function remains the same ---
 def refine_seeds_pca(
@@ -400,9 +425,9 @@ def separate_multi_soma_cells(
     spacing: Optional[Tuple[float, float, float]], # 3D
     min_size_threshold: int = 100, # Voxels, for merging small fragments post-watershed
     intensity_weight: float = 0.0, # For watershed landscape
-    max_seed_centroid_dist: float = 5.0, # um, for seed merging heuristic
+    max_seed_centroid_dist: float = 40, # um, for seed merging heuristic
     min_path_intensity_ratio: float = 0.8, # For seed merging heuristic
-    post_merge_min_interface_voxels: int = 20 # MODIFIED: Replaces neck thickness for simpler merge
+    post_merge_min_interface_voxels: int = 50 # MODIFIED: Replaces neck thickness for simpler merge
     ) -> np.ndarray:
     """
     Separates 3D cell segmentations containing multiple seeds.

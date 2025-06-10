@@ -280,6 +280,10 @@ class ProcessingStrategy(abc.ABC):
         Ensures consistent scale and translation for display, aligning with the
         original image layer's display transformation.
         """
+        if viewer is None:
+            # print(f"  BATCH MODE: Viewer is None. Skipping layer addition for '{name}_{self.mode_name}'.")
+            return # Do nothing if no viewer
+        
         layer_name = f"{name}_{self.mode_name}"
 
         # Determine the spatial dimensionality of the data
@@ -439,6 +443,10 @@ class ProcessingStrategy(abc.ABC):
 
     def _remove_layer_safely(self, viewer, name):
         """Helper to remove a layer by its base name + mode suffix."""
+        if viewer is None:
+            # print(f"  BATCH MODE: Viewer is None. Skipping layer removal for '{name}_{self.mode_name}'.")
+            return # Do nothing if no viewer
+        
         layer_name = f"{name}_{self.mode_name}"
         if layer_name in viewer.layers:
             try:
