@@ -341,12 +341,18 @@ class RamifiedStrategy(ProcessingStrategy):
             min_fragment_size = int(params.get("min_fragment_size", 50))
 
             # Parameters for extract_soma_masks
+            default_percentiles = [100 - i for i in range(0, 99, 5)] + [99, 1]
+            ratios_to_process = params.get("ratios_to_process", [0.3, 0.4, 0.5, 0.6])
+            intensity_percentiles_to_process = params.get("intensity_percentiles_to_process", default_percentiles)
             smallest_quantile = float(params.get("smallest_quantile", 0.05))
             core_volume_target_factor_lower = float(params.get("core_volume_target_factor_lower", 0.1))
             core_volume_target_factor_upper = float(params.get("core_volume_target_factor_upper", 10.0))
             erosion_iterations = int(params.get("erosion_iterations", 0))
             min_physical_peak_separation = float(params.get("min_physical_peak_separation", 7.0))
             max_allowed_core_aspect_ratio = float(params.get("max_allowed_core_aspect_ratio", 10.0))
+            ref_vol_percentile_lower = int(params.get("ref_vol_percentile_lower", 30))
+            ref_vol_percentile_upper = int(params.get("ref_vol_percentile_upper", 70))
+            ref_thickness_percentile_lower = int(params.get("ref_thickness_percentile_lower", 1))
             absolute_min_thickness_um = float(params.get("absolute_min_thickness_um", 1.5))
             absolute_max_thickness_um = float(params.get("absolute_max_thickness_um", 10.0))
 
@@ -365,18 +371,24 @@ class RamifiedStrategy(ProcessingStrategy):
 
             # Step 3a: Extract initial soma candidates
             cell_bodies = extract_soma_masks(
-                labeled_cells, image_stack, self.spacing,
-                smallest_quantile=smallest_quantile,
-                min_fragment_size=min_fragment_size,
-                core_volume_target_factor_lower=core_volume_target_factor_lower,
-                core_volume_target_factor_upper=core_volume_target_factor_upper,
-                erosion_iterations=erosion_iterations,
-                min_physical_peak_separation=min_physical_peak_separation,
-                max_allowed_core_aspect_ratio=max_allowed_core_aspect_ratio,
-                absolute_min_thickness_um=absolute_min_thickness_um,
-                absolute_max_thickness_um=absolute_max_thickness_um
-                # Note: list-based params like ratios_to_process use their defaults
-            )
+                            labeled_cells, # 3D mask
+                            image_stack, # 3D intensity image
+                            self.spacing,
+                            smallest_quantile = smallest_quantile,
+                            min_fragment_size=min_fragment_size, # Voxels
+                            core_volume_target_factor_lower = core_volume_target_factor_lower,
+                            core_volume_target_factor_upper = core_volume_target_factor_upper,
+                            erosion_iterations = erosion_iterations,
+                            ratios_to_process = ratios_to_process,
+                            intensity_percentiles_to_process = intensity_percentiles_to_process,
+                            min_physical_peak_separation = min_physical_peak_separation, # um
+                            max_allowed_core_aspect_ratio = max_allowed_core_aspect_ratio,
+                            ref_vol_percentile_lower = ref_vol_percentile_lower,
+                            ref_vol_percentile_upper = ref_vol_percentile_upper,
+                            ref_thickness_percentile_lower = ref_thickness_percentile_lower,
+                            absolute_min_thickness_um = absolute_min_thickness_um,
+                            absolute_max_thickness_um = absolute_max_thickness_um
+                        )
 
             # Step 3b: Refine the shape of the soma candidates (Re-enabled this step)
             refined_mask = refine_seeds_pca(

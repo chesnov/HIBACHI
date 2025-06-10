@@ -3,7 +3,7 @@
 import numpy as np
 import os
 import time
-from PyQt5.QtWidgets import QMessageBox # type: ignore
+from PyQt5.QtWidgets import QMessageBox, QWidget, QVBoxLayout, QScrollArea, QLabel # type: ignore
 import yaml # type: ignore
 from typing import Dict, Any, List # Keep List
 import sys
@@ -447,7 +447,9 @@ class DynamicGUIManager:
 
 
     def create_step_widgets(self, step_method_name: str):
-        """Creates and displays widgets for the parameters of a given step."""
+        """
+        Creates and displays widgets for the parameters of a given step inside a single, scrollable dock widget.
+        """
         self.clear_current_widgets()
         self.parameter_values = {} # Reset dict for current step's params
 
@@ -459,33 +461,69 @@ class DynamicGUIManager:
             return
 
         step_config = self.config.get(config_key, {})
-        parameters = step_config.get("parameters") # Use .get for safety
+        parameters = step_config.get("parameters")
 
+        # --- Create the main scrollable container ---
+        # This will be the content of our single dock widget
+        
+        # 1. The main content widget that will hold the layout
+        scroll_content_widget = QWidget()
+        scroll_layout = QVBoxLayout(scroll_content_widget)
+        scroll_layout.setContentsMargins(10, 10, 10, 10) # Padding
+        scroll_layout.setSpacing(8)                      # Spacing between widgets
+
+        # 2. A title for the parameter group
+        title_label = QLabel(f"Parameters for: {step_display_name}")
+        font = title_label.font()
+        font.setBold(True)
+        font.setPointSize(12)
+        title_label.setFont(font)
+        scroll_layout.addWidget(title_label)
+        
         # Check if parameters exist and are a dictionary
         if not isinstance(parameters, dict) or not parameters:
-            print(f"Warning: No valid 'parameters' dict found for '{config_key}'. No parameter widgets created for '{step_display_name}'.")
-            # Optionally, add a label indicating no parameters for this step
-            return
+            print(f"Warning: No valid 'parameters' dict found for '{config_key}'.")
+            # Add a label indicating no parameters
+            no_params_label = QLabel("No parameters for this step.")
+            scroll_layout.addWidget(no_params_label)
+        else:
+            print(f"Creating widgets for: '{step_display_name}' (using config key: '{config_key}')")
+            for param_name, param_config in parameters.items():
+                if not isinstance(param_config, dict):
+                    print(f"Warning: Parameter config for '{param_name}' is not a dict. Skipping.")
+                    continue
+                try:
+                    current_value = param_config.get('value')
+                    callback = lambda value, key=config_key, pn=param_name: self.parameter_changed(key, pn, value)
+                    
+                    # Create the individual magicgui widget
+                    widget = create_parameter_widget(param_name, param_config, callback)
+                    
+                    # Add its native Qt widget to our layout instead of a new dock
+                    scroll_layout.addWidget(widget.native)
+                    
+                    self.parameter_values[param_name] = current_value
+                except Exception as e:
+                    print(f"ERROR creating widget for parameter '{param_name}': {str(e)}")
+                    traceback.print_exc()
+        
+        # Add a spacer at the bottom to push everything up
+        scroll_layout.addStretch()
 
-        print(f"Creating widgets for: '{step_display_name}' (using config key: '{config_key}')")
-        for param_name, param_config in parameters.items():
-            if not isinstance(param_config, dict):
-                print(f"Warning: Parameter config for '{param_name}' ('{config_key}') is not a dict. Skipping.")
-                continue
-            try:
-                # Value from self.config should be up-to-date (loaded or default)
-                current_value = param_config.get('value')
-                # Callback updates self.config and self.parameter_values
-                callback = lambda value, key=config_key, pn=param_name: self.parameter_changed(key, pn, value)
-                # Create the widget
-                widget = create_parameter_widget(param_name, param_config, callback)
-                # Add widget to viewer
-                dock_widget = self.viewer.window.add_dock_widget(widget, area="right", name=f"{step_display_name}: {param_name}")
-                self.current_widgets[dock_widget] = widget # Track widget
-                self.parameter_values[param_name] = current_value # Store value for current step run
-            except Exception as e:
-                print(f"ERROR creating widget for parameter '{param_name}' in step '{step_display_name}': {str(e)}")
-                traceback.print_exc()
+        # 3. The scroll area itself
+        scroll_area = QScrollArea()
+        scroll_area.setWidgetResizable(True) # This is crucial!
+        scroll_area.setWidget(scroll_content_widget)
+
+        # 4. Add the scroll_area as the *single* dock widget for this step
+        dock_widget = self.viewer.window.add_dock_widget(
+            scroll_area,
+            area="right",
+            name=f"Step: {step_display_name}"
+        )
+
+        # 5. Track the main dock widget for later cleanup
+        self.current_widgets[dock_widget] = scroll_area
 
 
     def parameter_changed(self, config_key: str, param_name: str, value: Any):
