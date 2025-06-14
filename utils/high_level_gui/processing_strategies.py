@@ -49,7 +49,7 @@ class ProcessingStrategy(abc.ABC):
     def _get_mode_name(self) -> str:
         """
         Abstract method: Subclasses must implement this to return their
-        unique mode identifier (e.g., 'nuclei', 'ramified').
+        unique mode identifier (e.g., 'ramified').
         """
         pass
 
@@ -487,5 +487,45 @@ class ProcessingStrategy(abc.ABC):
                 print(f"  Failed to delete {file_path}: {str(e)}")
         # Return False if path invalid, file not found, or deletion failed
         return False
+    
+
+def check_processing_state(processed_dir: str, mode: str, checkpoint_files: dict, num_steps: int) -> int:
+    """
+    Checks the processing state by looking for expected output files.
+    """
+    if not os.path.isdir(processed_dir):
+        # print(f"Processed directory not found: {processed_dir}. Starting from step 0.") # Less verbose
+        return 0
+
+    # print(f"Checking processing state in: {processed_dir} (Mode: {mode}, Steps: {num_steps})") # Less verbose
+    # print(f"  Available checkpoint keys: {list(checkpoint_files.keys())}") # Less verbose
+
+    completion_file_keys = {}
+    if mode == 'ramified' or mode == 'ramified_2d': # Shared logic for these two
+        completion_file_keys = {
+            1: "raw_segmentation",
+            2: "trimmed_segmentation",
+            3: "final_segmentation",
+            4: "metrics_df"
+        }
+    else:
+        print(f"Warning: Unknown mode '{mode}' in check_processing_state.")
+        return 0
+
+    last_completed_step = 0
+    for step in range(1, num_steps + 1):
+        file_key = completion_file_keys.get(step)
+        if not file_key:
+            # print(f"Warning: No completion file key defined for step {step} in mode '{mode}'. Cannot check.") # Less verbose
+            break
+        file_to_check = checkpoint_files.get(file_key)
+        if file_to_check and os.path.exists(file_to_check):
+            last_completed_step = step
+            # print(f"  Found output for step {step} (Key: '{file_key}'): {os.path.basename(file_to_check)}") # Less verbose
+        else:
+            # print(f"  Output for step {step} (Key: '{file_key}', Path: {file_to_check}) not found.") # Less verbose
+            break
+    # print(f"Determined last completed step: {last_completed_step}") # Less verbose
+    return last_completed_step
 
 # --- END OF FILE utils/high_level_gui/processing_strategies.py ---

@@ -15,7 +15,7 @@ from ..high_level_gui.processing_strategies import ProcessingStrategy
 try:
     # Import the refactored functions for raw seg and trimming
     from .initial_3d_segmentation import segment_microglia_first_pass_raw, apply_hull_trimming
-    from .ramified_segmenter import extract_soma_masks, refine_seeds_pca, separate_multi_soma_cells
+    from .ramified_segmenter import extract_soma_masks, separate_multi_soma_cells
     from ..calculate_features import analyze_segmentation
 except ImportError as e:
     expected_ramified_dir = os.path.dirname(os.path.abspath(__file__))
@@ -356,15 +356,11 @@ class RamifiedStrategy(ProcessingStrategy):
             absolute_min_thickness_um = float(params.get("absolute_min_thickness_um", 1.5))
             absolute_max_thickness_um = float(params.get("absolute_max_thickness_um", 10.0))
 
-            # Parameters for refine_seeds_pca
-            target_aspect_ratio = float(params.get("target_aspect_ratio", 1.1))
-            projection_percentile_crop = int(params.get("projection_percentile_crop", 10))
+            min_size_threshold = int(params.get("min_size_threshold", 18000))
 
             # Parameters for separate_multi_soma_cells
-            intensity_weight = float(params.get("intensity_weight", 0.5))
             max_seed_centroid_dist = float(params.get("max_seed_centroid_dist", 40.0))
             min_path_intensity_ratio = float(params.get("min_path_intensity_ratio", 0.8))
-            post_merge_min_interface_voxels = int(params.get("post_merge_min_interface_voxels", 50))
 
 
             # --- UPDATED: Call functions with all extracted parameters ---
@@ -390,22 +386,12 @@ class RamifiedStrategy(ProcessingStrategy):
                             absolute_max_thickness_um = absolute_max_thickness_um
                         )
 
-            # Step 3b: Refine the shape of the soma candidates (Re-enabled this step)
-            refined_mask = refine_seeds_pca(
-                cell_bodies, self.spacing,
-                target_aspect_ratio=target_aspect_ratio,
-                projection_percentile_crop=projection_percentile_crop,
-                min_fragment_size=min_fragment_size
-            )
-
             # Step 3c: Separate cells with multiple (now refined) somas
             merged_roi_array = separate_multi_soma_cells(
-                labeled_cells, image_stack, refined_mask, self.spacing,
-                min_size_threshold=min_fragment_size, # Maps to the same parameter
-                intensity_weight=intensity_weight,
+                labeled_cells, image_stack, cell_bodies, self.spacing,
+                min_size_threshold=min_size_threshold, # Maps to the same parameter
                 max_seed_centroid_dist=max_seed_centroid_dist,
-                min_path_intensity_ratio=min_path_intensity_ratio,
-                post_merge_min_interface_voxels=post_merge_min_interface_voxels
+                min_path_intensity_ratio=min_path_intensity_ratio
             )
 
         except Exception as e:
@@ -415,11 +401,11 @@ class RamifiedStrategy(ProcessingStrategy):
 
         # --- UPDATED: Saving logic to include refined_rois ---
         cell_bodies_path = files.get("cell_bodies")
-        refined_rois_path = files.get("refined_rois")
+        # refined_rois_path = files.get("refined_rois")
         final_seg_path = files.get("final_segmentation")
         try:
              if cell_bodies_path: np.save(cell_bodies_path, cell_bodies)
-             if refined_rois_path: np.save(refined_rois_path, refined_mask) # Re-enabled save
+            #  if refined_rois_path: np.save(refined_rois_path, refined_mask) # Re-enabled save
              if final_seg_path: np.save(final_seg_path, merged_roi_array)
              print(f"Saved cell bodies, refined ROIs, and final segmentation.")
 

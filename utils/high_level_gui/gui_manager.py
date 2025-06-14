@@ -11,14 +11,14 @@ import traceback
 import gc
 
 # --- Assumed relative imports based on structure ---
-from ..nuclear_module_3d._3D_nuclear_strategy import NuclearStrategy
 from ..ramified_module_3d._3D_ramified_strategy import RamifiedStrategy
 from ..ramified_module_2d._2D_ramified_strategy import Ramified2DStrategy
 from ..high_level_gui.processing_strategies import ProcessingStrategy # Import base class for type hint
 
 try:
     # Import helpers from the SAME directory (.)
-    from .helper_funcs import create_parameter_widget, check_processing_state
+    from .helper_funcs import create_parameter_widget
+    from .processing_strategies import check_processing_state
 except ImportError as e:
     expected_dir = os.path.dirname(os.path.abspath(__file__))
     print(f"Error importing helper_funcs in gui_manager.py: {e}")
@@ -41,7 +41,7 @@ class DynamicGUIManager:
             config (dict): The initial configuration loaded from YAML.
             image_stack (np.ndarray): The 3D image data.
             file_loc (str): The absolute path to the input image file.
-            processing_mode (str): The selected mode ('nuclei' or 'ramified').
+            processing_mode (str): The selected mode (''ramified').
         """
         self.viewer = viewer
         self.initial_config = config.copy() # Keep original defaults
@@ -66,7 +66,6 @@ class DynamicGUIManager:
         self.strategy: ProcessingStrategy # Type hint for clarity
         try:
             strategy_class = {
-                'nuclei': NuclearStrategy,
                 'ramified': RamifiedStrategy,
                 'ramified_2d': Ramified2DStrategy # <-- ADD THIS MAPPING
             }.get(self.processing_mode)

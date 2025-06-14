@@ -1,5 +1,5 @@
 import numpy as np
-from scipy import ndimage
+from scipy import ndimage, sparse
 from tqdm import tqdm
 from shutil import rmtree
 import gc
@@ -8,13 +8,16 @@ from functools import partial
 from skimage.measure import regionprops, label as skimage_label # type: ignore
 from skimage.segmentation import watershed # type: ignore
 from skimage.graph import route_through_array # type: ignore
-from skimage.morphology import binary_dilation # type: ignore
+from skimage.morphology import binary_erosion, binary_dilation, ball # type: ignore
 import math
 from sklearn.decomposition import PCA # type: ignore
 from skimage.feature import peak_local_max # type: ignore
 from typing import List, Dict, Optional, Tuple, Union, Any, Set
 from skimage.segmentation import relabel_sequential # type: ignore
 import traceback # For detailed error logging
+from scipy.sparse.csgraph import connected_components, dijkstra
+from skimage.measure import label, regionprops # type: ignore
+import heapq
 
 seed = 42
 np.random.seed(seed)         # For NumPy
@@ -333,423 +336,524 @@ def extract_soma_masks(
     print(f"\nGenerated {total_final_seeds} final aggregated seeds (3D)."); print("--- Finished 3D Intermediate Seed Extraction ---")
     return final_seed_mask
 
-# --- refine_seeds_pca function remains the same ---
-def refine_seeds_pca(
-    intermediate_seed_mask: np.ndarray,
-    spacing: Optional[Tuple[float, float, float]],
-    target_aspect_ratio: float = 1.1,
-    projection_percentile_crop: int = 10,
-    min_fragment_size: int = 30
+def separate_multi_soma_cells(
+    segmentation_mask: np.ndarray,
+    intensity_volume: np.ndarray,
+    soma_mask: np.ndarray,
+    spacing: Tuple[float, float, float],
+    min_size_threshold: int = 100,
+    max_seed_centroid_dist: float = 40.0,
+    min_path_intensity_ratio: float = 0.8
 ) -> np.ndarray:
     """
-    Refines the shape of preliminary seeds using PCA to make them more compact.
-    (Docstring from original file - details parameters and their influence)
-    """
-    print("--- Starting 3D PCA Seed Refinement ---")
-    if spacing is None: spacing = (1.0, 1.0, 1.0); print("Warn: No 3D spacing, assume isotropic.")
-    else: print(f"Using 3D spacing (z,y,x): {spacing}")
-    print(f"Parameters: target_aspect_ratio={target_aspect_ratio}, projection_crop%={projection_percentile_crop}, min_vol={min_fragment_size}")
-    final_refined_mask = np.zeros_like(intermediate_seed_mask, dtype=np.int32)
-    next_final_label = 1; kept_refined_count = 0
-    seed_labels = np.unique(intermediate_seed_mask); seed_labels = seed_labels[seed_labels > 0]
-    if len(seed_labels) == 0: print("Input intermediate seed mask is empty."); return final_refined_mask
-
-    # Efficiently get bounding boxes
-    seed_slices = ndimage.find_objects(intermediate_seed_mask)
-    label_to_slice = {}
-    if seed_slices is not None:
-        label_to_slice = {label: seed_slices[label-1] for label in seed_labels if label-1 < len(seed_slices) and seed_slices[label-1] is not None and len(seed_slices[label-1])==3}
-
-    for label in tqdm(seed_labels, desc="Refining Seeds PCA (3D)"):
-        bbox_slice = label_to_slice.get(label);
-        if bbox_slice is None: continue
-        offset = (bbox_slice[0].start, bbox_slice[1].start, bbox_slice[2].start); slice_obj = bbox_slice
-        # Define variables before try for robust finally block
-        seed_mask_sub, coords_vox, coords_phys, pca, refined_mask_sub = None, None, None, None, None
-        coords_centered_phys, proj1, kept_coords_vox, refined_coords = None, None, None, None
-        try:
-            seed_mask_sub = (intermediate_seed_mask[slice_obj] == label); current_volume = np.sum(seed_mask_sub)
-            if not np.any(seed_mask_sub) or current_volume < min_fragment_size: continue # Check if empty or too small
-
-            coords_vox = np.argwhere(seed_mask_sub)
-            if coords_vox.shape[0] <= 3: refined_mask_sub = seed_mask_sub # Need > 3 points for 3D PCA
-            else:
-                coords_phys = coords_vox * np.array(spacing) # Apply 3D spacing
-                pca = PCA(n_components=3); pca.fit(coords_phys); eigenvalues = pca.explained_variance_; eigenvectors = pca.components_ # 3 components
-                sorted_indices = np.argsort(eigenvalues)[::-1]; eigenvalues = eigenvalues[sorted_indices]; eigenvectors = eigenvectors[sorted_indices]
-                if eigenvalues[2] < 1e-9: eigenvalues[2] = 1e-9 # Avoid division by zero for aspect ratio
-                aspect_ratio = math.sqrt(eigenvalues[0]) / math.sqrt(eigenvalues[2]) # Longest/Shortest axis length ratio
-
-                if aspect_ratio >= target_aspect_ratio:
-                    coords_centered_phys = coords_phys - pca.mean_; proj1 = coords_centered_phys @ eigenvectors[0] # Project onto longest axis
-                    min_p = np.percentile(proj1, projection_percentile_crop); max_p = np.percentile(proj1, 100 - projection_percentile_crop)
-                    voxel_indices_to_keep = (proj1 >= min_p) & (proj1 <= max_p)
-                    refined_mask_sub = np.zeros_like(seed_mask_sub, dtype=bool)
-                    kept_coords_vox = coords_vox[voxel_indices_to_keep]
-                    if kept_coords_vox.shape[0] > 0: refined_mask_sub[tuple(kept_coords_vox.T)] = True
-                    refined_volume = np.sum(refined_mask_sub)
-                    if refined_volume < min_fragment_size: refined_mask_sub = None # Discard if refinement makes it too small
-                else: refined_mask_sub = seed_mask_sub # Keep original
-
-            if refined_mask_sub is not None and np.any(refined_mask_sub):
-                 final_volume = np.sum(refined_mask_sub) # Re-check volume
-                 if final_volume >= min_fragment_size:
-                     refined_coords = np.argwhere(refined_mask_sub)
-                     if refined_coords.size > 0:
-                         gz=refined_coords[:,0]+offset[0]; gy=refined_coords[:,1]+offset[1]; gx=refined_coords[:,2]+offset[2]
-                         valid=((gz>=0)&(gz<final_refined_mask.shape[0])&(gy>=0)&(gy<final_refined_mask.shape[1])&(gx>=0)&(gx<final_refined_mask.shape[2]))
-                         vgz,vgy,vgx = gz[valid],gy[valid],gx[valid]
-                         if vgz.size > 0: # Ensure not empty before writing
-                             final_refined_mask[vgz, vgy, vgx] = next_final_label
-                             next_final_label += 1; kept_refined_count += 1
-        except Exception as e: print(f"Warning: Error during 3D PCA refinement for seed label {label}: {e}")
-        finally: # Cleanup vars
-            if seed_mask_sub is not None: del seed_mask_sub
-            if coords_vox is not None: del coords_vox
-            if coords_phys is not None: del coords_phys
-            if pca is not None: del pca
-            if refined_mask_sub is not None: del refined_mask_sub
-            if coords_centered_phys is not None: del coords_centered_phys
-            if proj1 is not None: del proj1
-            if kept_coords_vox is not None: del kept_coords_vox
-            if refined_coords is not None: del refined_coords
-
-    print(f"Kept {kept_refined_count} refined 3D seeds after PCA.")
-    print("--- Finished 3D PCA Seed Refinement ---"); gc.collect(); return final_refined_mask
-
-
-def separate_multi_soma_cells(
-    segmentation_mask: np.ndarray, # 3D
-    intensity_volume: np.ndarray, # 3D
-    soma_mask: np.ndarray, # 3D, output from refine_seeds_pca
-    spacing: Optional[Tuple[float, float, float]], # 3D
-    min_size_threshold: int = 100, # Voxels, for merging small fragments post-watershed
-    intensity_weight: float = 0.0, # For watershed landscape
-    max_seed_centroid_dist: float = 40, # um, for seed merging heuristic
-    min_path_intensity_ratio: float = 0.8, # For seed merging heuristic
-    post_merge_min_interface_voxels: int = 50 # MODIFIED: Replaces neck thickness for simpler merge
-    ) -> np.ndarray:
-    """
-    Separates 3D cell segmentations containing multiple seeds.
-    Uses path intensity heuristic for seed merging, watershed, and post-watershed merging
-    based on interface voxel count. Output is sequentially relabeled.
-    """
-    print(f"--- Starting 3D Multi-Soma Separation (Path Heuristics + Interface Voxel Merge) ---")
-
-    # --- Parameter & Spacing Checks (3D) ---
-    print(f"Post-merge check: min_interface_voxels={post_merge_min_interface_voxels}") # MODIFIED parameter
-    if spacing is None: spacing = (1.0, 1.0, 1.0); print("Warn: No 3D spacing, assume isotropic.")
-    else:
-        try: spacing = tuple(float(s) for s in spacing); assert len(spacing) == 3
-        except: print(f"Error: Invalid 3D spacing ({spacing}). Using default."); spacing = (1.0, 1.0, 1.0)
-    print(f"Using 3D spacing (z,y,x): {spacing}")
-    print(f"Seed merging heuristics: max_dist={max_seed_centroid_dist}um, min_path_intensity_ratio={min_path_intensity_ratio}")
-
-    # --- Input Validation & Type Checks (3D) ---
-    if segmentation_mask.ndim != 3 or intensity_volume.ndim != 3 or soma_mask.ndim != 3:
-        raise ValueError("All input masks and volume must be 3D.")
-    if segmentation_mask.shape != intensity_volume.shape or segmentation_mask.shape != soma_mask.shape:
-        raise ValueError("Input mask/volume shapes do not match.")
-    if not np.issubdtype(intensity_volume.dtype, np.floating): intensity_volume = intensity_volume.astype(np.float32, copy=False)
-    else: intensity_volume = intensity_volume.astype(np.float32, copy=False) # Ensure float32
-    if not np.issubdtype(segmentation_mask.dtype, np.integer): segmentation_mask = segmentation_mask.astype(np.int32)
-    if not np.issubdtype(soma_mask.dtype, np.integer): soma_mask = soma_mask.astype(np.int32)
-
-    separated_mask = np.copy(segmentation_mask).astype(np.int32) # Work on a 3D copy
-
-    # --- Mapping (3D) ---
-    print("Mapping 3D seeds to original cell segments...")
-    unique_initial_labels = np.unique(segmentation_mask); unique_initial_labels = unique_initial_labels[unique_initial_labels > 0]
-    if unique_initial_labels.size == 0: print("No initial segments found."); return separated_mask # Already int32
-    cell_to_somas: Dict[int, Set[int]] = {cell_label: set() for cell_label in unique_initial_labels}
-    present_soma_labels = np.unique(soma_mask); present_soma_labels = present_soma_labels[present_soma_labels > 0]
-    if present_soma_labels.size == 0: print("No soma seeds found."); return separated_mask # Already int32
-
-    for soma_label in tqdm(present_soma_labels, desc="Mapping Seeds (3D)", disable=len(present_soma_labels) < 10):
-        soma_loc_mask = (soma_mask == soma_label)
-        if not np.any(soma_loc_mask): continue
-        try:
-            cell_labels_under_soma = np.unique(segmentation_mask[soma_loc_mask])
-            cell_labels_under_soma = cell_labels_under_soma[cell_labels_under_soma > 0]
-            for cell_label in cell_labels_under_soma:
-                if cell_label in cell_to_somas: cell_to_somas[cell_label].add(soma_label)
-        except IndexError: print(f"Warn: IndexError mapping soma {soma_label}. Skipping.")
-
-
-    multi_soma_cell_labels = [lbl for lbl, somas in cell_to_somas.items() if len(somas) > 1]
-    print(f"Found {len(multi_soma_cell_labels)} initial 3D segments with multiple seeds...")
-    if not multi_soma_cell_labels:
-        print("No multi-soma cells identified. Relabeling original mask sequentially.")
-        try: # Relabel and return if no splits needed
-            final_sequential_mask, _, inv_map = relabel_sequential(separated_mask.astype(np.int32)) # Ensure int before relabel
-            final_max_label = len(inv_map) -1 if len(inv_map) > 0 else 0
-            print(f"Relabeled 3D mask contains {final_max_label} objects.")
-            return final_sequential_mask.astype(np.int32)
-        except Exception as e_relabel:
-            print(f"Error during sequential relabeling (no splits): {e_relabel}. Returning original mask.");
-            return separated_mask.astype(np.int32)
-
-    max_orig_label = np.max(unique_initial_labels) if unique_initial_labels.size > 0 else 0
-    max_soma_label = np.max(present_soma_labels) if present_soma_labels.size > 0 else 0
-    next_label = max(max_orig_label, max_soma_label) + 1
-    print(f"Tentative starting label for new 3D segments: {next_label}")
-
-    skipped_count = 0; processed_count = 0
-    current_max_label_in_use = next_label - 1
-
-    for cell_label in tqdm(multi_soma_cell_labels, desc="Separating Segments (3D)"):
-        processed_count += 1
-        # Initialize loop variables for finally block
-        cell_mask, bbox_slice, slice_obj, offset = None, None, None, None
-        cell_mask_sub, soma_sub, intensity_sub_local, cell_soma_sub_mask = None, None, None, None
-        seed_props, seed_prop_dict, adj, cost_array = None, None, None, None
-        watershed_markers, marker_id_reverse_map, used_new_labels = None, None, set()
-        distance_transform, landscape, watershed_result, temp_mask = None, None, None, None
-        full_subvol = None
-
-        try:
-            cell_mask = (segmentation_mask == cell_label)
-            obj_slice_list = ndimage.find_objects(cell_mask)
-            if not obj_slice_list or obj_slice_list[0] is None or len(obj_slice_list[0]) != 3: continue
-            bbox_slice = obj_slice_list[0]; pad = 5
-            z_min=max(0,bbox_slice[0].start-pad); y_min=max(0,bbox_slice[1].start-pad); x_min=max(0,bbox_slice[2].start-pad)
-            z_max=min(segmentation_mask.shape[0],bbox_slice[0].stop+pad); y_max=min(segmentation_mask.shape[1],bbox_slice[1].stop+pad); x_max=min(segmentation_mask.shape[2],bbox_slice[2].stop+pad)
-            if z_min >= z_max or y_min >= y_max or x_min >= x_max: continue
-            slice_obj=np.s_[z_min:z_max, y_min:y_max, x_min:x_max]; offset=(z_min,y_min,x_min)
-
-            cell_mask_sub = cell_mask[slice_obj]
-            if not np.any(cell_mask_sub): continue
-            soma_sub = soma_mask[slice_obj]; intensity_sub_local = intensity_volume[slice_obj]
-
-            cell_soma_sub_mask = np.zeros_like(soma_sub, dtype=np.int32); cell_soma_sub_mask[cell_mask_sub] = soma_sub[cell_mask_sub]
-            soma_labels_in_cell = np.unique(cell_soma_sub_mask); soma_labels_in_cell = soma_labels_in_cell[soma_labels_in_cell > 0]
-            if len(soma_labels_in_cell) <= 1: continue
-
-            try:
-                seed_props = regionprops(cell_soma_sub_mask, intensity_image=intensity_sub_local)
-                seed_prop_dict = {prop.label: prop for prop in seed_props}
-                valid_soma_labels_in_cell = [lbl for lbl in soma_labels_in_cell if lbl in seed_prop_dict]
-                if len(valid_soma_labels_in_cell) <= 1: continue
-                soma_labels_in_cell = np.array(valid_soma_labels_in_cell)
-            except Exception as e_rp: print(f"Warn: RP Error L{cell_label}: {e_rp}"); continue
-
-            num_seeds = len(soma_labels_in_cell); seed_indices = {lbl: i for i, lbl in enumerate(soma_labels_in_cell)}
-            adj = np.zeros((num_seeds, num_seeds), dtype=bool); merge_candidates = False
-            max_I_sub = np.max(intensity_sub_local[cell_mask_sub]) if np.any(cell_mask_sub) else 1.0
-            cost_array = np.full(intensity_sub_local.shape, np.inf, dtype=np.float32)
-            cost_array[cell_mask_sub] = np.maximum(1e-6, max_I_sub - intensity_sub_local[cell_mask_sub])
-
-            for i in range(num_seeds):
-                for j in range(i + 1, num_seeds):
-                    label1, label2 = soma_labels_in_cell[i], soma_labels_in_cell[j]
-                    prop1, prop2 = seed_prop_dict.get(label1), seed_prop_dict.get(label2)
-                    if prop1 is None or prop2 is None: continue
-                    c1p=np.array(prop1.centroid)*np.array(spacing); c2p=np.array(prop2.centroid)*np.array(spacing); dist=np.linalg.norm(c1p-c2p)
-                    if dist > max_seed_centroid_dist: continue
-                    c1b=tuple(np.clip(int(round(c)),0,s-1) for c,s in zip(prop1.centroid, cost_array.shape))
-                    c2b=tuple(np.clip(int(round(c)),0,s-1) for c,s in zip(prop2.centroid, cost_array.shape))
-                    if not cell_mask_sub[c1b] or not cell_mask_sub[c2b] or cost_array[c1b]==np.inf or cost_array[c2b]==np.inf: continue
-                    
-                    median_intensity_on_path = 0.0
-                    try: # Pathfinding
-                        indices, _ = route_through_array(cost_array, c1b, c2b, fully_connected=True, geometric=False)
-                        if isinstance(indices, np.ndarray) and indices.ndim == 2 and indices.shape[0] == 3 and indices.shape[1] > 0:
-                            path_intensities = intensity_sub_local[tuple(indices)]
-                            if path_intensities.size > 0: median_intensity_on_path = np.median(path_intensities)
-                    except ValueError: median_intensity_on_path = 0.0 # Path not found
-                    except Exception as er: print(f"Warn L{cell_label}: Route Err {label1}/{label2}: {er}")
-
-                    # Using mean_intensity as in 2D for reference
-                    m1 = prop1.mean_intensity if hasattr(prop1, 'mean_intensity') and prop1.mean_intensity is not None and prop1.mean_intensity > 1e-6 else 1.0
-                    m2 = prop2.mean_intensity if hasattr(prop2, 'mean_intensity') and prop2.mean_intensity is not None and prop2.mean_intensity > 1e-6 else 1.0
-                    ref_I = max(m1, m2)
-                    ratio = median_intensity_on_path / ref_I if ref_I > 1e-6 else 0.0
-                    if ratio >= min_path_intensity_ratio:
-                        adj[seed_indices[label1], seed_indices[label2]] = adj[seed_indices[label2], seed_indices[label1]] = True
-                        merge_candidates = True
-            
-            watershed_markers = np.zeros_like(cell_mask_sub, dtype=np.int32); marker_id_reverse_map = {}
-            largest_soma_label = -1; max_soma_size = -1; num_markers_final = 0; current_marker_id = 1
-            if merge_candidates:
-                n_comp, comp_labels = ndimage.label(adj) # comp_labels are 0-based if input is bool, 1-based if int
-                # Assuming ndimage.label on boolean adj gives 0-based components if any, or 0 if no components.
-                # If n_comp is based on unique labels in comp_labels (excluding 0 if it's background), range should be fine.
-                # Let's adjust comp_labels to be 1-based for groups if they are 0-based.
-                # If adj is all False, n_comp could be 0. If all True, n_comp=1.
-                if n_comp == num_seeds and not np.any(adj): # No merges actually happened, all are separate components
-                     pass # Fall through to individual seed marker logic
-                elif n_comp == 1 and np.all(adj): # All seeds merged into one group
-                    print(f"    L{cell_label}: All seeds merged. Skip split."); skipped_count+=1; continue
-                
-                # Process merged groups
-                print(f"    L{cell_label}: {n_comp} seed groups after merge attempt.")
-                unique_comp_labels = np.unique(comp_labels) # These are the actual component labels assigned by ndimage.label
-                
-                processed_as_merged_group = False
-                for group_val in unique_comp_labels: # Iterate through actual component labels
-                    # This loop structure assumes comp_labels from ndimage.label are 0..N-1 or 1..N for N components
-                    # It's safer to iterate unique_comp_labels and map them to current_marker_id
-                    if np.sum(comp_labels == group_val) == 0 : continue # Skip if somehow an empty component label shows up
-
-                    group_marker_id = current_marker_id
-                    seed_indices_in_group = np.where(comp_labels == group_val)[0]
-                    if not seed_indices_in_group.size: continue
-
-                    processed_as_merged_group = True
-                    group_mask = np.zeros_like(cell_mask_sub, dtype=bool); original_labels_in_group = set()
-                    group_max_soma_size = -1; group_largest_soma_label = -1
-                    for seed_idx in seed_indices_in_group:
-                        original_label = soma_labels_in_cell[seed_idx]; original_labels_in_group.add(original_label)
-                        group_mask |= (cell_soma_sub_mask == original_label)
-                        prop = seed_prop_dict.get(original_label)
-                        if prop and prop.area > group_max_soma_size: group_max_soma_size = prop.area; group_largest_soma_label = original_label
-                    
-                    watershed_markers[group_mask] = group_marker_id
-                    marker_id_reverse_map[group_marker_id] = {'orig_labels': tuple(sorted(list(original_labels_in_group))), 'largest_label': group_largest_soma_label}
-                    current_marker_id += 1
-                    if group_max_soma_size > max_soma_size: max_soma_size = group_max_soma_size; largest_soma_label = group_largest_soma_label
-                
-                num_markers_final = current_marker_id -1 # Number of groups formed
-                if not processed_as_merged_group : # Fallback to individual if merge logic was skipped
-                    merge_candidates = False # Force individual processing
-
-            if not merge_candidates: # Individual seeds (no merges or merge attempt resulted in no actual groups)
-                 print(f"    L{cell_label}: No merges. Using {num_seeds} individual markers.")
-                 for soma_label_val in soma_labels_in_cell: # Use a different var name
-                     prop = seed_prop_dict.get(soma_label_val)
-                     if not prop: continue
-                     watershed_markers[cell_soma_sub_mask == soma_label_val] = current_marker_id
-                     marker_id_reverse_map[current_marker_id] = {'orig_labels': (soma_label_val,), 'largest_label': soma_label_val}
-                     if prop.area > max_soma_size: max_soma_size = prop.area; largest_soma_label = soma_label_val
-                     current_marker_id += 1
-                 num_markers_final = num_seeds
-
-            if num_markers_final <= 1: print(f"    L{cell_label}: Only {num_markers_final} marker. Skip split."); skipped_count+=1; continue
-
-            distance_transform = ndimage.distance_transform_edt(cell_mask_sub, sampling=spacing); landscape = -distance_transform
-            if intensity_weight > 1e-6:
-                 I_cell = intensity_sub_local[cell_mask_sub]
-                 if I_cell.size > 0:
-                     minI, maxI = np.min(I_cell), np.max(I_cell); rangeI = maxI - minI
-                     if rangeI > 1e-9:
-                          inverted_intensity_term = np.zeros_like(distance_transform, dtype=np.float32)
-                          inverted_intensity_term[cell_mask_sub] = (maxI - intensity_sub_local[cell_mask_sub]) / rangeI
-                          max_dist_val = np.max(distance_transform) # Consistent var name
-                          landscape += intensity_weight * inverted_intensity_term * (max_dist_val if max_dist_val > 1e-6 else 1.0)
-            
-            watershed_markers[~cell_mask_sub] = 0 # Ensure markers are only within the cell mask
-            watershed_result = watershed(landscape, watershed_markers, mask=cell_mask_sub, watershed_line=True)
-
-            temp_mask = np.zeros_like(cell_mask_sub, dtype=np.int32); used_new_labels.clear()
-            current_temp_next_label = current_max_label_in_use + 1
-            marker_id_for_main_label = next((mid for mid, data in marker_id_reverse_map.items() if data['largest_label'] == largest_soma_label), -1)
-
-            ws_labels_unique = np.unique(watershed_result); ws_labels_unique = ws_labels_unique[ws_labels_unique > 0]
-            for marker_id_val in ws_labels_unique: # Iterate over actual watershed labels present
-                if marker_id_val not in marker_id_reverse_map: continue # Should not happen if markers are correct
-                final_label_val = cell_label if marker_id_val == marker_id_for_main_label else current_temp_next_label
-                if final_label_val != cell_label: used_new_labels.add(final_label_val); current_temp_next_label += 1
-                temp_mask[watershed_result == marker_id_val] = final_label_val
-                current_max_label_in_use = max(current_max_label_in_use, final_label_val)
-
-            ws_lines = (watershed_result == 0) & cell_mask_sub
-            if np.any(ws_lines):
-                 labeled_pixels_mask = temp_mask != 0
-                 if np.any(labeled_pixels_mask):
-                      _, nearest_label_indices = ndimage.distance_transform_edt(~labeled_pixels_mask, return_indices=True, sampling=spacing)
-                      # Clip indices to be within bounds of temp_mask
-                      idx_z = np.clip(nearest_label_indices[0], 0, temp_mask.shape[0]-1)
-                      idx_y = np.clip(nearest_label_indices[1], 0, temp_mask.shape[1]-1)
-                      idx_x = np.clip(nearest_label_indices[2], 0, temp_mask.shape[2]-1)
-                      nearest_labels = temp_mask[idx_z, idx_y, idx_x]
-                      temp_mask[ws_lines] = nearest_labels[ws_lines]
-                 else: temp_mask[cell_mask_sub] = cell_label # Whole cell became watershed line
-
-            fragments_merged = True; iter_count = 0; max_iters = 10 # Small frag merge
-            while fragments_merged and iter_count < max_iters:
-                 fragments_merged = False; iter_count += 1
-                 labels_to_check = np.unique(temp_mask); labels_to_check = labels_to_check[labels_to_check > 0]
-                 if len(labels_to_check) <= 1: break
-                 for lbl_val in labels_to_check:
-                      lbl_mask = temp_mask == lbl_val; size = np.sum(lbl_mask)
-                      if 0 < size < min_size_threshold:
-                           struct = ndimage.generate_binary_structure(temp_mask.ndim, 1) # 6-connectivity for neighbors
-                           dilated_mask = ndimage.binary_dilation(lbl_mask, structure=struct)
-                           neighbor_region = dilated_mask & (~lbl_mask) & cell_mask_sub & (temp_mask != 0)
-                           if not np.any(neighbor_region): continue
-                           neighbor_labels, neighbor_counts = np.unique(temp_mask[neighbor_region], return_counts=True)
-                           if neighbor_labels.size == 0: continue
-                           largest_neighbor_label = neighbor_labels[np.argmax(neighbor_counts)]
-                           temp_mask[lbl_mask] = largest_neighbor_label; fragments_merged = True
-                           if lbl_val in used_new_labels: used_new_labels.discard(lbl_val)
-                           break # Restart check
-            
-            # MODIFIED Post-Watershed Merging (Interface Voxel Count)
-            struct_dilate = ndimage.generate_binary_structure(temp_mask.ndim, 1) # For finding interface
-            labels_after_frag_merge = np.unique(temp_mask); labels_after_frag_merge = labels_after_frag_merge[labels_after_frag_merge > 0]
-            main_label_in_temp = cell_label if cell_label in labels_after_frag_merge else -1 # Check if original label still exists
-            new_labels_remaining = used_new_labels.intersection(labels_after_frag_merge)
-
-            if main_label_in_temp != -1 and new_labels_remaining:
-                 main_mask = (temp_mask == main_label_in_temp)
-                 merged_in_pass = True; merge_iter = 0; max_merge_iter=5 # Allow multiple passes for chained merges
-                 while merged_in_pass and merge_iter < max_merge_iter:
-                    merged_in_pass = False; merge_iter +=1
-                    current_new_labels_list = list(new_labels_remaining) # Iterate over a copy
-                    for new_lbl in current_new_labels_list:
-                        if new_lbl not in np.unique(temp_mask): # Already merged in this pass by another
-                            if new_lbl in new_labels_remaining: new_labels_remaining.remove(new_lbl)
-                            continue
-                        new_lbl_mask = (temp_mask == new_lbl)
-                        # Find interface: dilate new_lbl_mask and AND with main_mask AND cell_mask_sub
-                        dilated_new_mask = ndimage.binary_dilation(new_lbl_mask, structure=struct_dilate)
-                        interface_mask = main_mask & dilated_new_mask & cell_mask_sub # Ensure interface is within cell
-                        
-                        if np.any(interface_mask):
-                             interface_voxels_count = np.sum(interface_mask)
-                             if interface_voxels_count >= post_merge_min_interface_voxels:
-                                 temp_mask[new_lbl_mask] = main_label_in_temp # Merge
-                                 if new_lbl in used_new_labels: used_new_labels.discard(new_lbl)
-                                 if new_lbl in new_labels_remaining: new_labels_remaining.remove(new_lbl)
-                                 main_mask = (temp_mask == main_label_in_temp) # Update main_mask
-                                 merged_in_pass = True # Signal a merge happened, might need another pass
-            
-            final_labels_in_temp = np.unique(temp_mask); final_labels_in_temp = final_labels_in_temp[final_labels_in_temp > 0]
-            if final_labels_in_temp.size > 0: current_max_label_in_use = max(current_max_label_in_use, np.max(final_labels_in_temp))
-
-            full_subvol = separated_mask[slice_obj]
-            original_cell_pixels_in_sub = (segmentation_mask[slice_obj] == cell_label)
-            full_subvol[original_cell_pixels_in_sub] = temp_mask[original_cell_pixels_in_sub]
-            separated_mask[slice_obj] = full_subvol
-
-        except MemoryError as e_mem: print(f"MEM ERR L{cell_label}: {e_mem}"); gc.collect(); continue
-        except Exception as e_outer: print(f"ERR L{cell_label}: {e_outer}"); traceback.print_exc(); continue
-        finally:
-            vars_to_del = [
-                'cell_mask', 'bbox_slice', 'slice_obj', 'offset', 'cell_mask_sub', 'soma_sub',
-                'intensity_sub_local', 'cell_soma_sub_mask', 'seed_props', 'seed_prop_dict',
-                'adj', 'cost_array', 'watershed_markers', 'marker_id_reverse_map',
-                'distance_transform', 'landscape', 'watershed_result', 'temp_mask', 'full_subvol'
-            ]
-            for var_name in vars_to_del:
-                if var_name in locals() and locals()[var_name] is not None:
-                    del locals()[var_name]
-            if 'used_new_labels' in locals(): del used_new_labels # it's a set
-            if processed_count > 0 and processed_count % 20 == 0: gc.collect() # More frequent GC
-
-    print(f"Finished processing {processed_count} 3D multi-soma cells. Skipped splitting {skipped_count}.")
-    gc.collect()
-
-    print("\nRelabeling final 3D mask sequentially...")
-    try:
-        if not np.issubdtype(separated_mask.dtype, np.integer): separated_mask = separated_mask.astype(np.int32)
-        final_unique_vals = np.unique(separated_mask)
-        if len(final_unique_vals) <=1 and 0 in final_unique_vals: print("Final mask empty or only background."); return separated_mask
+    Memory-efficient separation of cells with multiple somas by finding weakest intensity links.
+    
+    Parameters:
+    -----------
+    segmentation_mask : np.ndarray
+        3D array with integer labels for cell regions
+    intensity_volume : np.ndarray
+        3D fluorescence intensity volume
+    soma_mask : np.ndarray
+        3D binary or labeled mask indicating soma locations
+    spacing : Tuple[float, float, float]
+        Voxel spacing in (z, y, x) dimensions
+    min_size_threshold : int
+        Minimum size for a valid cell region
+    max_seed_centroid_dist : float
+        Maximum distance between soma centroids to consider separation
+    min_path_intensity_ratio : float
+        Minimum ratio of path intensity to mean cell intensity
+    post_merge_min_interface_voxels : int
+        Minimum interface size for post-separation merging
         
-        final_sequential_mask, _, inv_map = relabel_sequential(separated_mask)
-        final_max_label = len(inv_map)-1 if len(inv_map)>0 else 0 # Max label is N if N objects
-        print(f"Relabeled 3D mask contains {final_max_label} objects.")
-        return final_sequential_mask.astype(np.int32)
-    except Exception as e_relabel_final:
-        print(f"Error during final sequential relabeling: {e_relabel_final}."); traceback.print_exc()
-        return separated_mask.astype(np.int32) # Return as is, but ensure int32
+    Returns:
+    --------
+    np.ndarray
+        Refined segmentation mask with separated cells
+    """
+    
+    def calculate_physical_distance(coord1, coord2, spacing):
+        """Calculate physical distance between two coordinates"""
+        diff = np.array(coord1) - np.array(coord2)
+        physical_diff = diff * np.array(spacing)
+        return np.linalg.norm(physical_diff)
+    
+    def get_cell_bounding_box(cell_mask, padding=5):
+        """Get tight bounding box around cell with padding"""
+        coords = np.where(cell_mask)
+        if len(coords[0]) == 0:
+            return None
+        
+        min_coords = [max(0, np.min(coords[i]) - padding) for i in range(3)]
+        max_coords = [min(cell_mask.shape[i], np.max(coords[i]) + padding + 1) for i in range(3)]
+        
+        return tuple(slice(min_coords[i], max_coords[i]) for i in range(3))
+    
+    def find_connecting_path_and_cut_plane(cell_region, soma1_region, soma2_region, intensity_vol):
+        """
+        Find the connecting path between somas using watershed separation to follow dim regions
+        """
+        print(f"    Analyzing connection between somas (sizes: {np.sum(soma1_region)}, {np.sum(soma2_region)})")
+        
+        # Get soma centroids for reference
+        soma1_coords = np.where(soma1_region)
+        soma1_centroid = [np.mean(soma1_coords[i]) for i in range(3)]
+        
+        soma2_coords = np.where(soma2_region)
+        soma2_centroid = [np.mean(soma2_coords[i]) for i in range(3)]
+        
+        print(f"    Soma centroids: {[f'{c:.1f}' for c in soma1_centroid]} -> {[f'{c:.1f}' for c in soma2_centroid]}")
+        
+        # Calculate soma intensities
+        soma1_intensity = np.mean(intensity_vol[soma1_region])
+        soma2_intensity = np.mean(intensity_vol[soma2_region])
+        mean_soma_intensity = (soma1_intensity + soma2_intensity) / 2
+        
+        print(f"    Soma intensities: {soma1_intensity:.2f}, {soma2_intensity:.2f} (mean: {mean_soma_intensity:.2f})")
+        
+        # METHOD: Watershed-based separation following intensity valleys
+        print(f"    Using watershed-based separation following intensity valleys")
+        
+        from scipy.ndimage import distance_transform_edt, gaussian_filter
+        from skimage.segmentation import watershed # type: ignore
+        
+        # Step 1: Create inverted intensity for watershed (valleys become peaks)
+        cell_intensities = intensity_vol * cell_region.astype(float)
+        cell_intensities[~cell_region] = 0
+        
+        # Get intensity range within the cell for normalization
+        cell_intensity_values = intensity_vol[cell_region]
+        min_intensity = np.min(cell_intensity_values)
+        max_intensity = np.max(cell_intensity_values)
+        intensity_range = max_intensity - min_intensity
+        
+        print(f"    Cell intensity range: {min_intensity:.1f} to {max_intensity:.1f}")
+        
+        # Check if there's sufficient intensity variation for separation
+        if intensity_range < mean_soma_intensity * 0.1:  # Less than 10% variation
+            print(f"    Insufficient intensity variation for watershed separation ({intensity_range:.1f} < {mean_soma_intensity * 0.1:.1f})")
+            return None
+        
+        # Normalize and invert intensities (dim regions become hills for watershed)
+        normalized_intensities = (cell_intensities - min_intensity) / intensity_range
+        inverted_intensities = 1.0 - normalized_intensities
+        inverted_intensities[~cell_region] = 0
+        
+        # Step 2: Smooth slightly to reduce noise but preserve main structures
+        smoothed_inverted = gaussian_filter(inverted_intensities, sigma=0.8)
+        
+        # Step 3: Create markers from soma regions
+        markers = np.zeros_like(cell_region, dtype=int)
+        markers[soma1_region] = 1
+        markers[soma2_region] = 2
+        
+        # Step 4: Apply watershed using inverted intensities
+        # This will grow regions from somas following paths of increasing brightness
+        # The watershed boundaries will naturally follow the dimmest paths
+        watershed_labels = watershed(smoothed_inverted, markers, mask=cell_region)
+        
+        print(f"    Watershed segmentation complete")
+        
+        # Step 5: Extract the two regions
+        region1 = watershed_labels == 1
+        region2 = watershed_labels == 2
+        
+        # Verify we have valid regions
+        if np.sum(region1) == 0 or np.sum(region2) == 0:
+            print(f"    Watershed failed - empty regions (sizes: {np.sum(region1)}, {np.sum(region2)})")
+            return None
+        
+        print(f"    Watershed regions: {np.sum(region1)} and {np.sum(region2)} voxels")
+        
+        # Step 6: Find the boundary between regions (the watershed line)
+        # This represents the dimmest path between somas
+        boundary_mask = cell_region & (watershed_labels == 0)
+        
+        if np.sum(boundary_mask) > 0:
+            boundary_intensities = intensity_vol[boundary_mask]
+            boundary_mean_intensity = np.mean(boundary_intensities)
+            boundary_min_intensity = np.min(boundary_intensities)
+            
+            print(f"    Watershed boundary analysis:")
+            print(f"      Boundary voxels: {np.sum(boundary_mask)}")
+            print(f"      Boundary mean intensity: {boundary_mean_intensity:.2f}")
+            print(f"      Boundary min intensity: {boundary_min_intensity:.2f}")
+            print(f"      Boundary/Soma intensity ratio: {boundary_mean_intensity/mean_soma_intensity:.3f}")
+            
+            # Check if boundary is dim enough
+            intensity_ratio = boundary_mean_intensity / mean_soma_intensity
+            if intensity_ratio >= min_path_intensity_ratio:
+                print(f"    Boundary too bright for separation ({intensity_ratio:.3f} >= {min_path_intensity_ratio})")
+                return None
+            
+            print(f"    Boundary is dim enough for separation ({intensity_ratio:.3f} < {min_path_intensity_ratio})")
+            
+            # For watershed, we don't "cut" - we already have the separated regions
+            # The boundary voxels will be assigned to the nearest region based on intensity
+            
+            # Assign boundary voxels to the region with more similar intensity
+            region1_mean_intensity = np.mean(intensity_vol[region1])
+            region2_mean_intensity = np.mean(intensity_vol[region2])
+            
+            print(f"    Region intensities: {region1_mean_intensity:.2f}, {region2_mean_intensity:.2f}")
+            
+            # For each boundary voxel, assign to the region with closer intensity
+            boundary_coords = np.where(boundary_mask)
+            for i in range(len(boundary_coords[0])):
+                coord = (boundary_coords[0][i], boundary_coords[1][i], boundary_coords[2][i])
+                voxel_intensity = intensity_vol[coord]
+                
+                dist_to_region1 = abs(voxel_intensity - region1_mean_intensity)
+                dist_to_region2 = abs(voxel_intensity - region2_mean_intensity)
+                
+                if dist_to_region1 < dist_to_region2:
+                    region1[coord] = True
+                else:
+                    region2[coord] = True
+            
+            print(f"    Boundary voxels assigned. Final regions: {np.sum(region1)} and {np.sum(region2)} voxels")
+            
+            # Use boundary mean intensity for validation
+            separation_intensity = boundary_mean_intensity
+        else:
+            # No explicit boundary - regions touch directly
+            print(f"    No explicit watershed boundary found")
+            
+            # Find the interface between regions for intensity analysis
+            from scipy.ndimage import binary_dilation
+            from skimage.morphology import ball # type: ignore
+            
+            # Dilate both regions slightly and find overlap - this is the interface
+            dilated_region1 = binary_dilation(region1, ball(1))
+            dilated_region2 = binary_dilation(region2, ball(1))
+            interface = dilated_region1 & dilated_region2 & cell_region
+            
+            if np.sum(interface) > 0:
+                interface_intensities = intensity_vol[interface]
+                interface_mean_intensity = np.mean(interface_intensities)
+                
+                print(f"    Interface analysis:")
+                print(f"      Interface voxels: {np.sum(interface)}")
+                print(f"      Interface mean intensity: {interface_mean_intensity:.2f}")
+                print(f"      Interface/Soma intensity ratio: {interface_mean_intensity/mean_soma_intensity:.3f}")
+                
+                # Check if interface is dim enough
+                intensity_ratio = interface_mean_intensity / mean_soma_intensity
+                if intensity_ratio >= min_path_intensity_ratio:
+                    print(f"    Interface too bright for separation ({intensity_ratio:.3f} >= {min_path_intensity_ratio})")
+                    return None
+                
+                separation_intensity = interface_mean_intensity
+            else:
+                print(f"    Could not find interface for intensity analysis")
+                # Use the minimum intensity along the line between soma centroids as approximation
+                line_coords = bresenham_line_3d(soma1_centroid, soma2_centroid)
+                line_coords = [(int(c[0]), int(c[1]), int(c[2])) for c in line_coords if 
+                            0 <= c[0] < cell_region.shape[0] and 
+                            0 <= c[1] < cell_region.shape[1] and 
+                            0 <= c[2] < cell_region.shape[2] and
+                            cell_region[int(c[0]), int(c[1]), int(c[2])]]
+                
+                if line_coords:
+                    line_intensities = [intensity_vol[coord] for coord in line_coords]
+                    separation_intensity = np.min(line_intensities)
+                    
+                    intensity_ratio = separation_intensity / mean_soma_intensity
+                    print(f"    Line-based separation intensity: {separation_intensity:.2f} (ratio: {intensity_ratio:.3f})")
+                    
+                    if intensity_ratio >= min_path_intensity_ratio:
+                        print(f"    Line intensity too bright for separation ({intensity_ratio:.3f} >= {min_path_intensity_ratio})")
+                        return None
+                else:
+                    print(f"    Could not analyze separation intensity - allowing separation")
+                    separation_intensity = mean_soma_intensity * 0.5  # Conservative estimate
+        
+        # Final validation
+        total_original = np.sum(cell_region)
+        total_separated = np.sum(region1) + np.sum(region2)
+        
+        print(f"    Region conservation check: {total_original} -> {total_separated} voxels")
+        
+        if total_separated != total_original:
+            print(f"    WARNING: Voxel count mismatch! Some voxels may be lost.")
+            # This shouldn't happen with proper watershed, but let's be safe
+            
+        # Ensure no overlap
+        if np.any(region1 & region2):
+            print(f"    ERROR: Regions overlap! This shouldn't happen with watershed.")
+            return None
+        
+        print(f"    SUCCESSFUL WATERSHED SEPARATION: regions of {np.sum(region1)} and {np.sum(region2)} voxels")
+        
+        return region1, region2, separation_intensity, mean_soma_intensity
+
+
+    def bresenham_line_3d(start, end):
+        """
+        Generate 3D line coordinates between two points using Bresenham-like algorithm
+        """
+        start = np.array(start, dtype=float)
+        end = np.array(end, dtype=float)
+        
+        # Number of steps
+        diff = end - start
+        steps = int(np.max(np.abs(diff))) + 1
+        
+        # Generate coordinates
+        if steps <= 1:
+            return [start]
+        
+        coords = []
+        for i in range(steps):
+            t = i / (steps - 1)
+            coord = start + t * diff
+            coords.append(coord)
+        
+        return coords
+    
+    def validate_separation(region1, region2, bridge_intensity, soma_intensity):
+        """
+        Validate if separation results in valid cell regions
+        """
+        print(f"    Validating separation:")
+        print(f"      Region sizes: {np.sum(region1)}, {np.sum(region2)} (min threshold: {min_size_threshold})")
+        
+        # Size validation
+        if np.sum(region1) < min_size_threshold:
+            print(f"      FAILED: Region 1 too small ({np.sum(region1)} < {min_size_threshold})")
+            return False
+        if np.sum(region2) < min_size_threshold:
+            print(f"      FAILED: Region 2 too small ({np.sum(region2)} < {min_size_threshold})")
+            return False
+            
+        # Intensity validation (already done in path analysis, but double-check)
+        intensity_ratio = bridge_intensity / soma_intensity
+        print(f"      Bridge/Soma intensity ratio: {intensity_ratio:.3f} (threshold: {min_path_intensity_ratio})")
+        
+        if intensity_ratio >= min_path_intensity_ratio:
+            print(f"      FAILED: Bridge too bright ({intensity_ratio:.3f} >= {min_path_intensity_ratio})")
+            return False
+            
+        print(f"      PASSED: All validation criteria met")
+        return True
+    
+    def process_cell_region(cell_label, cell_region, soma_regions_in_cell):
+        """Process a single cell region for potential separation"""
+        print(f"\n  Processing cell {cell_label} (size: {np.sum(cell_region)} voxels)")
+        
+        # Get bounding box to work with smaller arrays
+        bbox = get_cell_bounding_box(cell_region)
+        if bbox is None:
+            print(f"    ERROR: Could not get bounding box for cell {cell_label}")
+            return None
+        
+        print(f"    Bounding box: {[slice_obj.start for slice_obj in bbox]} to {[slice_obj.stop-1 for slice_obj in bbox]}")
+        
+        # Extract local regions
+        local_cell = cell_region[bbox]
+        local_intensity = intensity_volume[bbox]
+        
+        # Calculate original cell intensity
+        original_intensity = np.mean(local_intensity[local_cell])
+        print(f"    Original cell mean intensity: {original_intensity:.2f}")
+        
+        # Process soma pairs
+        soma_centroids = []
+        local_soma_regions = []
+        
+        for i, (soma_label, soma_region) in enumerate(soma_regions_in_cell):
+            # Convert to local coordinates
+            local_soma = soma_region[bbox]
+            if np.sum(local_soma) == 0:
+                print(f"      WARNING: Soma region {soma_label} empty in bounding box")
+                continue
+                
+            # Calculate centroid in local coordinates
+            coords = np.where(local_soma)
+            centroid_local = [np.mean(coords[j]) for j in range(3)]
+            
+            # Convert back to global coordinates for distance calculation
+            centroid_global = [centroid_local[j] + bbox[j].start for j in range(3)]
+            
+            soma_centroids.append(centroid_global)
+            local_soma_regions.append((i, local_soma))
+            print(f"      Soma {i}: centroid at {[f'{c:.1f}' for c in centroid_global]} (local: {[f'{c:.1f}' for c in centroid_local]})")
+        
+        if len(local_soma_regions) < 2:
+            print(f"    Insufficient somas for separation ({len(local_soma_regions)} < 2)")
+            return None
+        
+        # Find soma pairs that should be separated (far apart)
+        # Logic: if centroids are > max_seed_centroid_dist apart, they should be separated
+        valid_pairs = []
+        for i in range(len(soma_centroids)):
+            for j in range(i + 1, len(soma_centroids)):
+                dist = calculate_physical_distance(
+                    soma_centroids[i], soma_centroids[j], spacing
+                )
+                print(f"      Distance between soma {i} and {j}: {dist:.1f} µm")
+                
+                if dist > max_seed_centroid_dist:
+                    valid_pairs.append((i, j, dist))
+                    print(f"        -> SHOULD SEPARATE (> {max_seed_centroid_dist:.1f} µm)")
+                else:
+                    print(f"        -> KEEP TOGETHER (≤ {max_seed_centroid_dist:.1f} µm)")
+        
+        if not valid_pairs:
+            print(f"    No soma pairs need separation (all are close together)")
+            return None
+        
+        print(f"    Found {len(valid_pairs)} soma pairs that need separation")
+        
+        # Process the most distant pair first (most clearly needs separation)
+        valid_pairs.sort(key=lambda x: x[2], reverse=True)  # Sort by distance, descending
+        
+        for pair_idx, (soma_i, soma_j, pair_dist) in enumerate(valid_pairs):
+            print(f"    \n    Attempt {pair_idx + 1}: Separating soma {soma_i} and {soma_j} (distance: {pair_dist:.1f} µm)")
+            
+            # Get local soma regions
+            local_soma1 = local_soma_regions[soma_i][1]
+            local_soma2 = local_soma_regions[soma_j][1]
+            
+            # Find separation using bridge/path analysis
+            separation_result = find_connecting_path_and_cut_plane(
+                local_cell, local_soma1, local_soma2, local_intensity
+            )
+            
+            if separation_result is None:
+                print(f"      FAILED: Could not find valid separation path")
+                continue
+                
+            region1, region2, bridge_intensity, soma_intensity = separation_result
+            
+            # Validate separation
+            if validate_separation(region1, region2, bridge_intensity, soma_intensity):
+                print(f"      SUCCESS: Valid separation found!")
+                
+                # Convert back to global coordinates
+                global_region1 = np.zeros_like(cell_region, dtype=bool)
+                global_region2 = np.zeros_like(cell_region, dtype=bool)
+                
+                global_region1[bbox] = region1
+                global_region2[bbox] = region2
+                
+                return global_region1, global_region2
+            else:
+                print(f"      FAILED: Separation validation failed")
+                continue
+        
+        print(f"    All separation attempts failed for cell {cell_label}")
+        return None
+    
+    # Main processing
+    print("=== Starting Multi-Soma Cell Separation ===")
+    print(f"Input parameters:")
+    print(f"  Segmentation mask shape: {segmentation_mask.shape}")
+    print(f"  Intensity volume shape: {intensity_volume.shape}")
+    print(f"  Soma mask shape: {soma_mask.shape}")
+    print(f"  Spacing: {spacing}")
+    print(f"  Min size threshold: {min_size_threshold}")
+    print(f"  Max soma distance: {max_seed_centroid_dist} (pairs > this distance will be separated)")
+    print(f"  Min intensity ratio: {min_path_intensity_ratio} (bridge must be dimmer than this ratio to soma intensity)")
+    
+    result_mask = segmentation_mask.copy()
+    
+    # Get unique cell labels
+    cell_labels = np.unique(segmentation_mask[segmentation_mask > 0])
+    print(f"\nFound {len(cell_labels)} cells to process: {cell_labels}")
+    
+    cells_processed = 0
+    cells_separated = 0
+    
+    # Process each cell
+    for cell_idx, cell_label in enumerate(cell_labels):
+        print(f"\n{'='*60}")
+        print(f"Processing cell {cell_idx + 1}/{len(cell_labels)}: Label {cell_label}")
+        
+        cell_region = segmentation_mask == cell_label
+        
+        # Find somas within this cell
+        cell_soma_mask = soma_mask * cell_region
+        
+        if np.sum(cell_soma_mask) == 0:
+            print(f"  No somas found in cell {cell_label} - skipping")
+            continue
+        
+        # Label individual soma regions
+        labeled_somas = label(cell_soma_mask > 0)
+        soma_labels = np.unique(labeled_somas[labeled_somas > 0])
+        
+        print(f"  Found {len(soma_labels)} soma regions in cell {cell_label}")
+        
+        if len(soma_labels) < 2:
+            print(f"  Only {len(soma_labels)} soma region(s) - no separation needed")
+            continue
+        
+        # Collect soma regions
+        soma_regions_in_cell = []
+        for soma_label in soma_labels:
+            soma_region = labeled_somas == soma_label
+            soma_size = np.sum(soma_region)
+            soma_regions_in_cell.append((soma_label, soma_region))
+            print(f"    Soma {soma_label}: {soma_size} voxels")
+        
+        cells_processed += 1
+        
+        # Process this cell
+        separation_result = process_cell_region(cell_label, cell_region, soma_regions_in_cell)
+        
+        if separation_result is not None:
+            region1, region2 = separation_result
+            
+            # Update result mask
+            max_label = np.max(result_mask)
+            new_label = max_label + 1
+            
+            print(f"  EXECUTING SEPARATION:")
+            print(f"    Original cell {cell_label} -> cells {cell_label} and {new_label}")
+            print(f"    Region sizes: {np.sum(region1)} and {np.sum(region2)} voxels")
+            
+            # Clear original cell
+            result_mask[cell_region] = 0
+            
+            # Assign new labels
+            result_mask[region1] = cell_label
+            result_mask[region2] = new_label
+            
+            cells_separated += 1
+            print(f"  ✓ SEPARATION COMPLETED")
+        else:
+            print(f"  ✗ NO SEPARATION PERFORMED")
+        
+        # Force garbage collection to manage memory
+        if cell_idx % 10 == 0:
+            gc.collect()
+    
+    print(f"\n{'='*60}")
+    print(f"SEPARATION SUMMARY:")
+    print(f"  Total cells examined: {len(cell_labels)}")
+    print(f"  Cells with multiple somas: {cells_processed}")
+    print(f"  Cells successfully separated: {cells_separated}")
+    print(f"  Final number of cells: {len(np.unique(result_mask[result_mask > 0]))}")
+    
+    # Post-processing: Remove very small fragments
+    print(f"\nPost-processing: Removing fragments smaller than {min_size_threshold} voxels")
+    final_labels = np.unique(result_mask[result_mask > 0])
+    fragments_removed = 0
+    
+    for label_val in final_labels:
+        region = result_mask == label_val
+        region_size = np.sum(region)
+        
+        if region_size < min_size_threshold:
+            print(f"  Removing small fragment: label {label_val} ({region_size} voxels)")
+            result_mask[region] = 0
+            fragments_removed += 1
+    
+    print(f"  Removed {fragments_removed} small fragments")
+    print(f"  Final cell count: {len(np.unique(result_mask[result_mask > 0]))}")
+    
+    print("=== Multi-Soma Cell Separation Complete ===\n")
+    
+    return result_mask

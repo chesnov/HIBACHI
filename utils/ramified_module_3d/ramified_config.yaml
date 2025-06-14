@@ -193,10 +193,10 @@ execute_refine_rois_ramified:
     target_aspect_ratio:
       label: Target Aspect Ratio (PCA Refine)
       type: float
-      value: 1.1
-      min: 1.0
+      value: 1.05
+      min: 0.1
       max: 5.0
-      step: 0.05
+      step: 0.1
     projection_percentile_crop:
       label: Projection Crop % (PCA Refine)
       type: int
@@ -207,28 +207,28 @@ execute_refine_rois_ramified:
     intensity_weight:
       label: Intensity Weight (Separate)
       type: float
-      value: 0.0
+      value: 5.0
       min: 0.0
-      max: 10.0
-      step: 0.1
+      max: 10
+      step: 0.01
     max_seed_centroid_dist:
       label: Max Seed Merge Dist (um)
       type: float
-      value: 40.0
+      value: 3.0
       min: 0.0
-      max: 100.0
+      max: 10000.0
       step: 1.0
     min_path_intensity_ratio:
       label: Min Path Intensity Ratio
       type: float
-      value: 0.8
+      value: 0.3
       min: 0.0
-      max: 1.0
+      max: 100.0
       step: 0.01
     post_merge_min_interface_voxels:
       label: Min Interface Voxels (Merge)
       type: int
-      value: 50
+      value: 500
       min: 0
       max: 500
       step: 5
@@ -237,4 +237,4 @@ voxel_dimensions:
   y: 424.27
   z: 191.0
 saved_state:
-  segmentation_threshold: 0.08478374034166336
+  segmentation_threshold: 0.045702096074819565

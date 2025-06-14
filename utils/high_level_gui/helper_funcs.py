@@ -114,52 +114,6 @@ def create_parameter_widget(param_name: str, param_config: Dict[str, Any], callb
     return widget
 
 
-def check_processing_state(processed_dir: str, mode: str, checkpoint_files: dict, num_steps: int) -> int:
-    """
-    Checks the processing state by looking for expected output files.
-    """
-    if not os.path.isdir(processed_dir):
-        # print(f"Processed directory not found: {processed_dir}. Starting from step 0.") # Less verbose
-        return 0
-
-    # print(f"Checking processing state in: {processed_dir} (Mode: {mode}, Steps: {num_steps})") # Less verbose
-    # print(f"  Available checkpoint keys: {list(checkpoint_files.keys())}") # Less verbose
-
-    completion_file_keys = {}
-    if mode == 'ramified' or mode == 'ramified_2d': # Shared logic for these two
-        completion_file_keys = {
-            1: "raw_segmentation",
-            2: "trimmed_segmentation",
-            3: "final_segmentation",
-            4: "metrics_df"
-        }
-    elif mode == 'nuclei':
-         completion_file_keys = {
-            1: "initial_segmentation",
-            2: "final_segmentation",
-            3: "metrics_df"
-        }
-    else:
-        print(f"Warning: Unknown mode '{mode}' in check_processing_state.")
-        return 0
-
-    last_completed_step = 0
-    for step in range(1, num_steps + 1):
-        file_key = completion_file_keys.get(step)
-        if not file_key:
-            # print(f"Warning: No completion file key defined for step {step} in mode '{mode}'. Cannot check.") # Less verbose
-            break
-        file_to_check = checkpoint_files.get(file_key)
-        if file_to_check and os.path.exists(file_to_check):
-            last_completed_step = step
-            # print(f"  Found output for step {step} (Key: '{file_key}'): {os.path.basename(file_to_check)}") # Less verbose
-        else:
-            # print(f"  Output for step {step} (Key: '{file_key}', Path: {file_to_check}) not found.") # Less verbose
-            break
-    # print(f"Determined last completed step: {last_completed_step}") # Less verbose
-    return last_completed_step
-
-
 def organize_processing_dir(drctry, mode):
     """
     Organizes a directory for processing.
@@ -200,8 +154,7 @@ def organize_processing_dir(drctry, mode):
         raise ValueError(error_msg)
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    if mode == 'nuclei': config_template_name = os.path.join('..','nuclear_module_3d','nuclear_config.yaml')
-    elif mode == 'ramified': config_template_name = os.path.join('..','ramified_module_3d', 'ramified_config.yaml')
+    if mode == 'ramified': config_template_name = os.path.join('..','ramified_module_3d', 'ramified_config.yaml')
     elif mode == 'ramified_2d': config_template_name = os.path.join('..','ramified_module_2d', 'ramified_config_2d.yaml')
     else: raise ValueError(f"Invalid mode '{mode}' specified.")
 
@@ -422,7 +375,7 @@ class ProjectViewWindow(QMainWindow):
             if needs_organizing:
                 reply = QMessageBox.question(self, "Organize Project?", f"Unorganized structure detected in: {selected_path}.\nOrganize now?", QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes)
                 if reply == QMessageBox.Yes:
-                    modes = ["nuclei", "ramified", "ramified_2d"]; selected_mode, ok = QInputDialog.getItem(self, "Select Processing Mode", "Choose mode for organizing:", modes, 0, False)
+                    modes = ["ramified", "ramified_2d"]; selected_mode, ok = QInputDialog.getItem(self, "Select Processing Mode", "Choose mode for organizing:", modes, 0, False)
                     if ok and selected_mode:
                         try: organize_processing_dir(selected_path, selected_mode); QMessageBox.information(self, "Organization Complete", f"Project organized for '{selected_mode}' mode.")
                         except Exception as e: QMessageBox.critical(self, "Organization Failed", f"Failed to organize project:\n{e}\n{traceback.format_exc()}")
@@ -561,7 +514,7 @@ def interactive_segmentation_with_config(selected_folder=None):
         except Exception as e: QMessageBox.critical(None, "Config Error", f"Failed to load/parse YAML: {config_path}\n{e}"); app_state.show_project_view_signal.emit(); return
         processing_mode = config.get('mode')
         if not processing_mode: QMessageBox.critical(None, "Config Error", f"YAML ({config_path}) must have 'mode'."); app_state.show_project_view_signal.emit(); return
-        if processing_mode not in ["nuclei", "ramified", "ramified_2d"]: QMessageBox.critical(None, "Config Error", f"Invalid mode '{processing_mode}' in YAML."); app_state.show_project_view_signal.emit(); return
+        if processing_mode not in ["ramified", "ramified_2d"]: QMessageBox.critical(None, "Config Error", f"Invalid mode '{processing_mode}' in YAML."); app_state.show_project_view_signal.emit(); return
         try:
             image_stack = tiff.imread(file_loc); # print(f"Loaded: {file_loc}, shape {image_stack.shape}, dtype {image_stack.dtype}") # Less verbose
             expected_ndim = 2 if processing_mode == "ramified_2d" else 3

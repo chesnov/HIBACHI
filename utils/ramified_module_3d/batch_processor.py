@@ -12,7 +12,7 @@ try:
     from ._3D_ramified_strategy import RamifiedStrategy
     from ..high_level_gui.processing_strategies import ProcessingStrategy
     # For check_processing_state, we can adapt it or use strategy's file knowledge
-    from ..high_level_gui.helper_funcs import check_processing_state as global_check_processing_state
+    from ..high_level_gui.processing_strategies import check_processing_state as global_check_processing_state
 except ImportError as e:
     print(f"Error importing strategies/helpers in batch_processor.py: {e}")
     raise
