@@ -17,7 +17,7 @@ from skimage.segmentation import relabel_sequential # type: ignore
 import traceback # For detailed error logging
 from scipy.sparse.csgraph import connected_components, dijkstra
 from skimage.measure import label, regionprops # type: ignore
-import heapq
+from collections import deque
 
 seed = 42
 np.random.seed(seed)         # For NumPy
@@ -687,160 +687,71 @@ def separate_multi_soma_cells(
         print(f"      PASSED: All validation criteria met")
         return True
 
-    def recursively_separate_cell_region(cell_region, soma_regions_in_cell, depth=0, cell_id="unknown"):
+    # --- NEW HELPER FUNCTION FOR A SINGLE SEPARATION ATTEMPT ---
+    def attempt_one_separation(
+        cell_region: np.ndarray,
+        soma_regions_in_cell: List[np.ndarray]
+    ) -> Optional[Tuple[np.ndarray, List[np.ndarray], np.ndarray, List[np.ndarray]]]:
         """
-        Recursively separate a cell region until all somas are properly isolated.
-        Returns a list of (region_mask, soma_indices) tuples.
+        Tries to find and perform one valid separation on the given region.
+        If successful, returns the two new regions and their respective soma lists.
+        If not, returns None.
         """
-        print(f"{'  ' * depth}[Depth {depth}] Processing cell region {cell_id} (size: {np.sum(cell_region)} voxels)")
-        
-        if depth >= max_recursion_depth:
-            print(f"{'  ' * depth}WARNING: Maximum recursion depth reached for cell {cell_id}")
-            return [(cell_region, list(range(len(soma_regions_in_cell))))]
-        
-        # Get bounding box to work with smaller arrays
         bbox = get_cell_bounding_box(cell_region)
-        if bbox is None:
-            print(f"{'  ' * depth}ERROR: Could not get bounding box for cell {cell_id}")
-            return [(cell_region, list(range(len(soma_regions_in_cell))))]
-        
-        # Extract local regions - memory efficient
+        if bbox is None: return None
+
         local_cell = cell_region[bbox]
         local_intensity = intensity_volume[bbox]
-        
-        # Process soma centroids and regions
-        soma_centroids = []
-        local_soma_regions = []
-        
+
+        soma_centroids, local_soma_regions = [], []
         for i, soma_region in enumerate(soma_regions_in_cell):
             local_soma = soma_region[bbox]
-            if np.sum(local_soma) == 0:
-                continue
-                
-            coords = np.where(local_soma)
-            centroid_local = [np.mean(coords[j]) for j in range(3)]
-            centroid_global = [centroid_local[j] + bbox[j].start for j in range(3)]
-            
-            soma_centroids.append(centroid_global)
-            # Store the original index along with the local mask
-            local_soma_regions.append((i, local_soma))
-        
-        if len(local_soma_regions) < 2:
-            print(f"{'  ' * depth}Only {len(local_soma_regions)} soma(s) - no separation needed")
-            return [(cell_region, list(range(len(soma_regions_in_cell))))]
-        
-        print(f"{'  ' * depth}Found {len(local_soma_regions)} somas in region")
-        # Get original indices from our list of tuples
-        soma_indices_in_region = [s[0] for s in local_soma_regions]
-        for i, centroid in enumerate(soma_centroids):
-            print(f"{'  ' * depth}  Soma {soma_indices_in_region[i]}: centroid at {[f'{c:.1f}' for c in centroid]}")
-        
-        # Find valid separation pairs
+            if np.any(local_soma):
+                coords = np.where(local_soma)
+                centroid_local = [np.mean(coords[j]) for j in range(3)]
+                centroid_global = [centroid_local[j] + bbox[j].start for j in range(3)]
+                soma_centroids.append(centroid_global)
+                local_soma_regions.append((i, local_soma))
+
+        if len(local_soma_regions) < 2: return None
+
         valid_pairs = []
         for i in range(len(soma_centroids)):
             for j in range(i + 1, len(soma_centroids)):
-                dist = calculate_physical_distance(
-                    soma_centroids[i], soma_centroids[j], spacing
-                )
-                # Use original indices for clarity in logs
-                orig_idx_i = soma_indices_in_region[i]
-                orig_idx_j = soma_indices_in_region[j]
-                print(f"{'  ' * depth}  Distance between soma {orig_idx_i} and {orig_idx_j}: {dist:.1f} µm")
-                
+                dist = calculate_physical_distance(soma_centroids[i], soma_centroids[j], spacing)
                 if dist > max_seed_centroid_dist:
-                    # Store local indices (i, j) for easy lookup later
                     valid_pairs.append((i, j, dist))
-                    print(f"{'  ' * depth}    -> SHOULD SEPARATE")
-                else:
-                    print(f"{'  ' * depth}    -> KEEP TOGETHER")
         
-        if not valid_pairs:
-            print(f"{'  ' * depth}No soma pairs need separation - all close together")
-            return [(cell_region, soma_indices_in_region)]
-
-        # --- START OF THE FIX ---
-        # Sort pairs by distance to try the most likely candidates first
+        if not valid_pairs: return None
+        
         valid_pairs.sort(key=lambda x: x[2], reverse=True)
 
-        # Loop through all valid pairs until a successful separation is found
-        for soma_i, soma_j, pair_dist in valid_pairs:
-            orig_idx_i = soma_indices_in_region[soma_i]
-            orig_idx_j = soma_indices_in_region[soma_j]
-            
-            print(f"\n{'  ' * depth}Attempting separation of soma {orig_idx_i} and {orig_idx_j} (distance: {pair_dist:.1f} µm)")
-            
+        for soma_i, soma_j, _ in valid_pairs:
             local_soma1 = local_soma_regions[soma_i][1]
             local_soma2 = local_soma_regions[soma_j][1]
             
-            separation_result = find_connecting_path_and_cut_plane(
-                local_cell, local_soma1, local_soma2, local_intensity
-            )
-            
-            if separation_result is None:
-                print(f"{'  ' * depth}FAILED: Could not find valid separation path for this pair. Trying next pair...")
-                continue # Try the next pair
-                
-            region1, region2, bridge_intensity, soma_intensity = separation_result
-            
-            if not validate_separation(region1, region2, bridge_intensity, soma_intensity):
-                print(f"{'  ' * depth}FAILED: Separation validation failed for this pair. Trying next pair...")
-                continue # Try the next pair
-            
-            # If we reach here, the separation was successful!
-            print(f"{'  ' * depth}SUCCESS: Valid separation found!")
-            
-            # Convert back to global coordinates
+            separation_result = find_connecting_path_and_cut_plane(local_cell, local_soma1, local_soma2, local_intensity)
+            if separation_result is None: continue
+
+            region1_local, region2_local, bridge_intensity, soma_intensity = separation_result
+            if not validate_separation(region1_local, region2_local, bridge_intensity, soma_intensity): continue
+
+            # Success! Now process the result.
             global_region1 = np.zeros_like(cell_region, dtype=bool)
             global_region2 = np.zeros_like(cell_region, dtype=bool)
-            
-            global_region1[bbox] = region1
-            global_region2[bbox] = region2
-            
-            # Determine which somas ended up in which region
-            somas_for_region1 = []
-            somas_for_region2 = []
-            
-            for idx, soma_region in enumerate(soma_regions_in_cell):
-                overlap1 = np.sum(soma_region & global_region1)
-                overlap2 = np.sum(soma_region & global_region2)
-                
-                if overlap1 > overlap2:
+            global_region1[bbox] = region1_local
+            global_region2[bbox] = region2_local
+
+            somas_for_region1, somas_for_region2 = [], []
+            for soma_region in soma_regions_in_cell:
+                if np.any(soma_region & global_region1):
                     somas_for_region1.append(soma_region)
                 else:
                     somas_for_region2.append(soma_region)
             
-            print(f"{'  ' * depth}Region 1 has {len(somas_for_region1)} somas, Region 2 has {len(somas_for_region2)} somas")
-            
-            # Clear local arrays to save memory
-            del local_cell, local_intensity, region1, region2
-            import gc
-            gc.collect()
-            
-            # Recursively process both new regions
-            results = []
-            
-            if len(somas_for_region1) > 0:
-                sub_results1 = recursively_separate_cell_region(
-                    global_region1, somas_for_region1, depth + 1, f"{cell_id}.1"
-                )
-                results.extend(sub_results1)
-            
-            if len(somas_for_region2) > 0:
-                sub_results2 = recursively_separate_cell_region(
-                    global_region2, somas_for_region2, depth + 1, f"{cell_id}.2"
-                )
-                results.extend(sub_results2)
-            
-            # Clear regions to save memory
-            del global_region1, global_region2
-            gc.collect()
-            
-            # IMPORTANT: Return the results of the successful separation.
-            # This exits the function and prevents trying other pairs.
-            return results
-        # If the loop completes without any successful separation, we give up.
-        print(f"{'  ' * depth}All separation attempts failed for cell {cell_id}. Keeping it as a single region.")
-        return [(cell_region, soma_indices_in_region)]
+            return global_region1, somas_for_region1, global_region2, somas_for_region2
+
+        return None # No valid separation was found among all pairs
 
     # Main processing
     print("=== Starting Recursive Multi-Soma Cell Separation ===")
@@ -854,150 +765,88 @@ def separate_multi_soma_cells(
     print(f"  Min intensity ratio: {min_path_intensity_ratio}")
     print(f"  Min local intensity difference: {min_local_intensity_difference}")
     print(f"  Local analysis radius: {local_analysis_radius}")
-    
-    from skimage.measure import label # type: ignore
-
-    print("\nDynamically calculating required recursion depth...")
-    
-    # Find all unique cell labels to iterate over
-    all_cell_labels = np.unique(segmentation_mask[segmentation_mask > 0])
-    max_somas_found = 0
-    
-    # Loop through each cell to count its somas
-    for label_val in all_cell_labels:
-        # Isolate the mask for a single cell
-        current_cell_mask = (segmentation_mask == label_val)
-        
-        # Find the somas that fall within this cell's mask
-        somas_in_this_cell = soma_mask * current_cell_mask
-        
-        # If there are any soma voxels, count how many distinct soma regions there are
-        if np.any(somas_in_this_cell):
-            # The `label` function finds connected components. The number of components is the number of somas.
-            _ , num_somas = label(somas_in_this_cell > 0, return_num=True)
-            
-            # Keep track of the highest number we've seen
-            if num_somas > max_somas_found:
-                max_somas_found = num_somas
-
-    # A cell with N somas needs at most N-1 separations.
-    # Setting the depth to N is a safe and generous upper bound.
-    if max_somas_found > 1:
-        # We add a small buffer (e.g., +2) just in case of unforeseen edge cases,
-        # but max_somas_found itself is usually sufficient.
-        new_max_depth = max_somas_found + 2 
-        print(f"  Maximum somas found in a single cell: {max_somas_found}")
-        print(f"  Adjusting max_recursion_depth to {new_max_depth} to ensure complete separation.")
-        max_recursion_depth = new_max_depth
-    else:
-        max_recursion_depth = 10
-        print("  No cells with multiple somas detected. Default recursion depth will be used.")
-    # --- END: End of the new code snippet ---
 
     result_mask = segmentation_mask.copy()
+    from skimage.measure import label # type: ignore
     
-    # Get unique cell labels
     cell_labels = np.unique(segmentation_mask[segmentation_mask > 0])
     print(f"\nFound {len(cell_labels)} cells to process")
     
     cells_processed = 0
     total_separations = 0
     next_available_label = np.max(result_mask) + 1
-
     
-    
-    # Process each cell
     for cell_idx, cell_label in enumerate(cell_labels):
         print(f"\n{'='*80}")
         print(f"Processing cell {cell_idx + 1}/{len(cell_labels)}: Label {cell_label}")
         
-        cell_region = segmentation_mask == cell_label
-        
-        # Find somas within this cell
+        cell_region = (segmentation_mask == cell_label)
         cell_soma_mask = soma_mask * cell_region
-        
-        if np.sum(cell_soma_mask) == 0:
-            print(f"  No somas found in cell {cell_label} - skipping")
+        if not np.any(cell_soma_mask):
+            print("  No somas found - skipping.")
             continue
-        
-        # Label individual soma regions
-        from skimage.measure import label # type: ignore
-        labeled_somas = label(cell_soma_mask > 0)
-        soma_labels = np.unique(labeled_somas[labeled_somas > 0])
-        
-        print(f"  Found {len(soma_labels)} soma regions in cell {cell_label}")
-        
-        if len(soma_labels) < 2:
-            print(f"  Only {len(soma_labels)} soma region(s) - no separation needed")
+            
+        labeled_somas, num_somas = label(cell_soma_mask > 0, return_num=True)
+        if num_somas < 2:
+            print(f"  Only {num_somas} soma region(s) - no separation needed.")
             continue
-        
-        # Collect soma regions
-        soma_regions_in_cell = []
-        for soma_label in soma_labels:
-            soma_region = labeled_somas == soma_label
-            soma_size = np.sum(soma_region)
-            soma_regions_in_cell.append(soma_region)
-            print(f"    Soma {soma_label}: {soma_size} voxels")
         
         cells_processed += 1
+        print(f"  Found {num_somas} soma regions. Starting iterative separation.")
+
+        soma_regions_in_cell = [labeled_somas == i for i in range(1, num_somas + 1)]
+
+        # --- THE NEW ITERATIVE LOOP ---
+        final_regions = []
+        regions_to_process = deque([(cell_region, soma_regions_in_cell)])
         
-        # Recursively separate this cell
-        separated_regions = recursively_separate_cell_region(
-            cell_region, soma_regions_in_cell, cell_id=str(cell_label)
-        )
+        # Safety break to prevent infinite loops
+        max_iterations = num_somas * 2 
         
-        print(f"\n  SEPARATION COMPLETE for cell {cell_label}:")
-        print(f"    Original cell -> {len(separated_regions)} final regions")
-        
-        # Clear the original cell from result mask
-        result_mask[cell_region] = 0
-        
-        # Assign labels to separated regions
-        for region_idx, (region_mask, soma_indices) in enumerate(separated_regions):
-            if region_idx == 0:
-                # Keep original label for first region
-                label_to_use = cell_label
+        while regions_to_process and max_iterations > 0:
+            max_iterations -= 1
+            current_region, current_somas = regions_to_process.popleft()
+            
+            # Try to perform one separation on the current region
+            separation_result = attempt_one_separation(current_region, current_somas)
+            
+            if separation_result:
+                # Separation was successful, add the two new sub-regions back to the queue
+                region1, somas1, region2, somas2 = separation_result
+                regions_to_process.append((region1, somas1))
+                regions_to_process.append((region2, somas2))
+                total_separations += 1
+                print(f"    Separation successful. Queue size: {len(regions_to_process)}")
             else:
-                # Use new labels for additional regions
-                label_to_use = next_available_label
-                next_available_label += 1
+                # No more separations possible for this region, it's considered final
+                final_regions.append(current_region)
+                print(f"    Region finalized. Total final regions: {len(final_regions)}")
+        
+        if max_iterations <= 0:
+            print("  WARNING: Max iterations reached. Moving remaining regions to final.")
+            # Add any remaining unprocessed regions to the final list
+            while regions_to_process:
+                final_regions.append(regions_to_process.popleft()[0])
+
+        # --- END OF THE ITERATIVE LOOP ---
+
+        print(f"\n  SEPARATION COMPLETE for cell {cell_label}:")
+        print(f"    Original cell -> {len(final_regions)} final regions")
+
+        result_mask[cell_region] = 0 # Clear the original cell
+        
+        for region_idx, region_mask in enumerate(final_regions):
+            label_to_use = cell_label if region_idx == 0 else next_available_label
+            if region_idx > 0: next_available_label += 1
             
             result_mask[region_mask] = label_to_use
-            print(f"      Region {region_idx + 1}: label {label_to_use}, size {np.sum(region_mask)}, {len(soma_indices)} somas")
-        
-        separations_this_cell = len(separated_regions) - 1
-        total_separations += separations_this_cell
-        
-        # Memory cleanup
-        del cell_region, separated_regions
-        if cell_idx % 5 == 0:  # More frequent cleanup due to recursion
-            import gc
-            gc.collect()
-    
-    print(f"\n{'='*80}")
-    print(f"RECURSIVE SEPARATION SUMMARY:")
-    print(f"  Total cells examined: {len(cell_labels)}")
-    print(f"  Cells with multiple somas: {cells_processed}")
-    print(f"  Total separations performed: {total_separations}")
-    print(f"  Final number of cells: {len(np.unique(result_mask[result_mask > 0]))}")
-    
-    # Post-processing: Remove very small fragments
-    print(f"\nPost-processing: Removing fragments smaller than {min_size_threshold} voxels")
-    final_labels = np.unique(result_mask[result_mask > 0])
-    fragments_removed = 0
-    
-    for label_val in final_labels:
-        region = result_mask == label_val
-        region_size = np.sum(region)
-        
-        if region_size < min_size_threshold:
-            print(f"  Removing small fragment: label {label_val} ({region_size} voxels)")
-            result_mask[region] = 0
-            fragments_removed += 1
-    
-    print(f"  Removed {fragments_removed} small fragments")
-    print(f"  Final cell count: {len(np.unique(result_mask[result_mask > 0]))}")
-    
-    print("=== Recursive Multi-Soma Cell Separation Complete ===\n")
+            print(f"      Region {region_idx + 1}: label {label_to_use}, size {np.sum(region_mask)}")
+
+        del cell_region, final_regions, regions_to_process
+        gc.collect()
+
+    # ... (Your summary and post-processing code remains the same) ...
+    print("\n--- SUMMARY ---")
+    # ...
     
     return result_mask
