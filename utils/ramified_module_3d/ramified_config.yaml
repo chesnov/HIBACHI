@@ -79,7 +79,7 @@ execute_refine_rois_ramified:
   name: Execute Refine ROIs
   parameters:
     ratios_to_process:
-      label: Ratios to Process (comma-sep floats)
+      label: Ratios to Process (Soma extraction; comma-sep floats)
       type: list
       value:
       - 0.3
@@ -88,7 +88,7 @@ execute_refine_rois_ramified:
       - 0.6
       element_type: float
     intensity_percentiles_to_process:
-      label: Intensity Percentiles (comma-sep integers)
+      label: Intensity Percentiles (Soma extraction; comma-sep integers)
       type: list
       value:
       - 99
@@ -114,124 +114,117 @@ execute_refine_rois_ramified:
       - 1
       element_type: int
     smallest_quantile:
-      label: Smallest Quantile (Soma)
+      label: Smallest Quantile (Soma extraction)
       type: float
       value: 0.05
       min: 0.0
       max: 1.0
       step: 0.01
     min_fragment_size:
-      label: Min Fragment Size (Refine/Separate)
+      label: Min Fragment Size (Soma extraction)
       type: int
       value: 2500
       min: 1
       max: 1000000
       step: 10
     core_volume_target_factor_lower:
-      label: Soma Vol Factor (Lower)
+      label: Soma Vol Factor (Soma extraction; Lower)
       type: float
       value: 0.1
       min: 0.01
       max: 1.0
       step: 0.01
     core_volume_target_factor_upper:
-      label: Soma Vol Factor (Upper)
+      label: Soma Vol Factor (Soma extraction; Upper)
       type: float
       value: 10.0
       min: 1.0
       max: 50.0
       step: 0.1
     erosion_iterations:
-      label: Soma Erosion Iterations
+      label: Soma Erosion Iterations (Soma extraction)
       type: int
       value: 0
       min: 0
       max: 5
       step: 1
     min_physical_peak_separation:
-      label: Soma Peak Separation (um)
+      label: Soma Peak Separation (Soma extraction; um)
       type: float
       value: 7.0
       min: 1.0
       max: 20.0
       step: 0.1
     ref_vol_percentile_lower:
-      label: Reference Volume Percentile (Lower)
+      label: Reference Volume Percentile (Soma extraction; Lower)
       type: int
       value: 5
       min: 0
       max: 100
       step: 1
     ref_vol_percentile_upper:
-      label: Reference Volume Percentile (Upper)
+      label: Reference Volume Percentile (Soma extraction; Upper)
       type: int
       value: 95
       min: 0
       max: 100
       step: 1
     ref_thickness_percentile_lower:
-      label: Reference Thickness Percentile (Lower)
+      label: Reference Thickness Percentile (Soma extraction; Lower)
       type: int
       value: 5
       min: 0
       max: 100
       step: 1
     absolute_min_thickness_um:
-      label: Soma Min Thickness (um)
+      label: Soma Min Thickness (Soma extraction; um)
       type: float
       value: 1.5
       min: 0.5
       max: 10.0
       step: 0.1
     absolute_max_thickness_um:
-      label: Soma Max Thickness (um)
+      label: Soma Max Thickness (Soma extraction; um)
       type: float
       value: 10.0
       min: 5.0
       max: 30.0
       step: 0.1
-    target_aspect_ratio:
-      label: Target Aspect Ratio (PCA Refine)
+    min_size_threshold:
+      label: Min Size Threshold (Separate cells; um^3)
       type: float
-      value: 1.05
-      min: 0.1
-      max: 5.0
-      step: 0.1
-    projection_percentile_crop:
-      label: Projection Crop % (PCA Refine)
-      type: int
-      value: 10
-      min: 0
-      max: 49
-      step: 1
-    intensity_weight:
-      label: Intensity Weight (Separate)
-      type: float
-      value: 5.0
+      value: 20000.0
       min: 0.0
-      max: 10
-      step: 0.01
+      max: 1000000.0
+      step: 1.0
     max_seed_centroid_dist:
-      label: Max Seed Merge Dist (um)
+      label: Max Seed Merge Dist (Separate cells; um)
       type: float
-      value: 3.0
+      value: 20.0
       min: 0.0
       max: 10000.0
       step: 1.0
     min_path_intensity_ratio:
-      label: Min Path Intensity Ratio
+      label: Min Path Intensity Ratio (Separate cells)
       type: float
-      value: 0.3
+      value: 0.5
       min: 0.0
       max: 100.0
       step: 0.01
-    post_merge_min_interface_voxels:
-      label: Min Interface Voxels (Merge)
+    min_local_intensity_difference:
+      label: Min Local Intensity Difference (Separate cells)
+      type: float
+      value: 2.0
+      min: 0.0
+      max: 100.0
+      step: 0.01
+    local_analysis_radius:
+      label: Local Analysis Radius (Separate cells; um)
       type: int
-      value: 500
-      min: 0
-      max: 500
-      step: 5
+      value: 10
+      min: 1
+      max: 1000
+      step: 1
 voxel_dimensions:
   x: 424.27
   y: 424.27

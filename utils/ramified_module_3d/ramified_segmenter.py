@@ -343,10 +343,13 @@ def separate_multi_soma_cells(
     spacing: Tuple[float, float, float],
     min_size_threshold: int = 100,
     max_seed_centroid_dist: float = 40.0,
-    min_path_intensity_ratio: float = 0.8
+    min_path_intensity_ratio: float = 0.8,
+    min_local_intensity_difference: float = 0.05,
+    local_analysis_radius: int = 10
 ) -> np.ndarray:
     """
-    Memory-efficient separation of cells with multiple somas by finding weakest intensity links.
+    Memory-efficient recursive separation of cells with multiple somas.
+    Continues separating until all somas are properly isolated.
     
     Parameters:
     -----------
@@ -364,8 +367,10 @@ def separate_multi_soma_cells(
         Maximum distance between soma centroids to consider separation
     min_path_intensity_ratio : float
         Minimum ratio of path intensity to mean cell intensity
-    post_merge_min_interface_voxels : int
-        Minimum interface size for post-separation merging
+    min_local_intensity_difference : float
+        Minimum relative intensity difference between regions adjacent to cut site
+    local_analysis_radius : int
+        Radius (in voxels) for local intensity analysis around cut site
         
     Returns:
     --------
@@ -390,217 +395,81 @@ def separate_multi_soma_cells(
         
         return tuple(slice(min_coords[i], max_coords[i]) for i in range(3))
     
-    def find_connecting_path_and_cut_plane(cell_region, soma1_region, soma2_region, intensity_vol):
-        """
-        Find the connecting path between somas using watershed separation to follow dim regions
-        """
-        print(f"    Analyzing connection between somas (sizes: {np.sum(soma1_region)}, {np.sum(soma2_region)})")
+    def get_local_regions_around_interface(region1, region2, cell_region, radius=3):
+        """Get voxels that are within 'radius' distance from the interface between two regions."""
+        from scipy.ndimage import binary_dilation
+        from skimage.morphology import ball # type: ignore
         
-        # Get soma centroids for reference
-        soma1_coords = np.where(soma1_region)
-        soma1_centroid = [np.mean(soma1_coords[i]) for i in range(3)]
-        
-        soma2_coords = np.where(soma2_region)
-        soma2_centroid = [np.mean(soma2_coords[i]) for i in range(3)]
-        
-        print(f"    Soma centroids: {[f'{c:.1f}' for c in soma1_centroid]} -> {[f'{c:.1f}' for c in soma2_centroid]}")
-        
-        # Calculate soma intensities
-        soma1_intensity = np.mean(intensity_vol[soma1_region])
-        soma2_intensity = np.mean(intensity_vol[soma2_region])
-        mean_soma_intensity = (soma1_intensity + soma2_intensity) / 2
-        
-        print(f"    Soma intensities: {soma1_intensity:.2f}, {soma2_intensity:.2f} (mean: {mean_soma_intensity:.2f})")
-        
-        # METHOD: Watershed-based separation following intensity valleys
-        print(f"    Using watershed-based separation following intensity valleys")
-        
-        from scipy.ndimage import distance_transform_edt, gaussian_filter
-        from skimage.segmentation import watershed # type: ignore
-        
-        # Step 1: Create inverted intensity for watershed (valleys become peaks)
-        cell_intensities = intensity_vol * cell_region.astype(float)
-        cell_intensities[~cell_region] = 0
-        
-        # Get intensity range within the cell for normalization
-        cell_intensity_values = intensity_vol[cell_region]
-        min_intensity = np.min(cell_intensity_values)
-        max_intensity = np.max(cell_intensity_values)
-        intensity_range = max_intensity - min_intensity
-        
-        print(f"    Cell intensity range: {min_intensity:.1f} to {max_intensity:.1f}")
-        
-        # Check if there's sufficient intensity variation for separation
-        if intensity_range < mean_soma_intensity * 0.1:  # Less than 10% variation
-            print(f"    Insufficient intensity variation for watershed separation ({intensity_range:.1f} < {mean_soma_intensity * 0.1:.1f})")
-            return None
-        
-        # Normalize and invert intensities (dim regions become hills for watershed)
-        normalized_intensities = (cell_intensities - min_intensity) / intensity_range
-        inverted_intensities = 1.0 - normalized_intensities
-        inverted_intensities[~cell_region] = 0
-        
-        # Step 2: Smooth slightly to reduce noise but preserve main structures
-        smoothed_inverted = gaussian_filter(inverted_intensities, sigma=0.8)
-        
-        # Step 3: Create markers from soma regions
-        markers = np.zeros_like(cell_region, dtype=int)
-        markers[soma1_region] = 1
-        markers[soma2_region] = 2
-        
-        # Step 4: Apply watershed using inverted intensities
-        # This will grow regions from somas following paths of increasing brightness
-        # The watershed boundaries will naturally follow the dimmest paths
-        watershed_labels = watershed(smoothed_inverted, markers, mask=cell_region)
-        
-        print(f"    Watershed segmentation complete")
-        
-        # Step 5: Extract the two regions
-        region1 = watershed_labels == 1
-        region2 = watershed_labels == 2
-        
-        # Verify we have valid regions
-        if np.sum(region1) == 0 or np.sum(region2) == 0:
-            print(f"    Watershed failed - empty regions (sizes: {np.sum(region1)}, {np.sum(region2)})")
-            return None
-        
-        print(f"    Watershed regions: {np.sum(region1)} and {np.sum(region2)} voxels")
-        
-        # Step 6: Find the boundary between regions (the watershed line)
-        # This represents the dimmest path between somas
-        boundary_mask = cell_region & (watershed_labels == 0)
-        
-        if np.sum(boundary_mask) > 0:
-            boundary_intensities = intensity_vol[boundary_mask]
-            boundary_mean_intensity = np.mean(boundary_intensities)
-            boundary_min_intensity = np.min(boundary_intensities)
-            
-            print(f"    Watershed boundary analysis:")
-            print(f"      Boundary voxels: {np.sum(boundary_mask)}")
-            print(f"      Boundary mean intensity: {boundary_mean_intensity:.2f}")
-            print(f"      Boundary min intensity: {boundary_min_intensity:.2f}")
-            print(f"      Boundary/Soma intensity ratio: {boundary_mean_intensity/mean_soma_intensity:.3f}")
-            
-            # Check if boundary is dim enough
-            intensity_ratio = boundary_mean_intensity / mean_soma_intensity
-            if intensity_ratio >= min_path_intensity_ratio:
-                print(f"    Boundary too bright for separation ({intensity_ratio:.3f} >= {min_path_intensity_ratio})")
-                return None
-            
-            print(f"    Boundary is dim enough for separation ({intensity_ratio:.3f} < {min_path_intensity_ratio})")
-            
-            # For watershed, we don't "cut" - we already have the separated regions
-            # The boundary voxels will be assigned to the nearest region based on intensity
-            
-            # Assign boundary voxels to the region with more similar intensity
-            region1_mean_intensity = np.mean(intensity_vol[region1])
-            region2_mean_intensity = np.mean(intensity_vol[region2])
-            
-            print(f"    Region intensities: {region1_mean_intensity:.2f}, {region2_mean_intensity:.2f}")
-            
-            # For each boundary voxel, assign to the region with closer intensity
-            boundary_coords = np.where(boundary_mask)
-            for i in range(len(boundary_coords[0])):
-                coord = (boundary_coords[0][i], boundary_coords[1][i], boundary_coords[2][i])
-                voxel_intensity = intensity_vol[coord]
-                
-                dist_to_region1 = abs(voxel_intensity - region1_mean_intensity)
-                dist_to_region2 = abs(voxel_intensity - region2_mean_intensity)
-                
-                if dist_to_region1 < dist_to_region2:
-                    region1[coord] = True
-                else:
-                    region2[coord] = True
-            
-            print(f"    Boundary voxels assigned. Final regions: {np.sum(region1)} and {np.sum(region2)} voxels")
-            
-            # Use boundary mean intensity for validation
-            separation_intensity = boundary_mean_intensity
+        if radius <= 1:
+            struct_elem = np.ones((3, 3, 3), dtype=bool)
         else:
-            # No explicit boundary - regions touch directly
-            print(f"    No explicit watershed boundary found")
-            
-            # Find the interface between regions for intensity analysis
-            from scipy.ndimage import binary_dilation
-            from skimage.morphology import ball # type: ignore
-            
-            # Dilate both regions slightly and find overlap - this is the interface
-            dilated_region1 = binary_dilation(region1, ball(1))
-            dilated_region2 = binary_dilation(region2, ball(1))
-            interface = dilated_region1 & dilated_region2 & cell_region
-            
-            if np.sum(interface) > 0:
-                interface_intensities = intensity_vol[interface]
-                interface_mean_intensity = np.mean(interface_intensities)
-                
-                print(f"    Interface analysis:")
-                print(f"      Interface voxels: {np.sum(interface)}")
-                print(f"      Interface mean intensity: {interface_mean_intensity:.2f}")
-                print(f"      Interface/Soma intensity ratio: {interface_mean_intensity/mean_soma_intensity:.3f}")
-                
-                # Check if interface is dim enough
-                intensity_ratio = interface_mean_intensity / mean_soma_intensity
-                if intensity_ratio >= min_path_intensity_ratio:
-                    print(f"    Interface too bright for separation ({intensity_ratio:.3f} >= {min_path_intensity_ratio})")
-                    return None
-                
-                separation_intensity = interface_mean_intensity
-            else:
-                print(f"    Could not find interface for intensity analysis")
-                # Use the minimum intensity along the line between soma centroids as approximation
-                line_coords = bresenham_line_3d(soma1_centroid, soma2_centroid)
-                line_coords = [(int(c[0]), int(c[1]), int(c[2])) for c in line_coords if 
-                            0 <= c[0] < cell_region.shape[0] and 
-                            0 <= c[1] < cell_region.shape[1] and 
-                            0 <= c[2] < cell_region.shape[2] and
-                            cell_region[int(c[0]), int(c[1]), int(c[2])]]
-                
-                if line_coords:
-                    line_intensities = [intensity_vol[coord] for coord in line_coords]
-                    separation_intensity = np.min(line_intensities)
-                    
-                    intensity_ratio = separation_intensity / mean_soma_intensity
-                    print(f"    Line-based separation intensity: {separation_intensity:.2f} (ratio: {intensity_ratio:.3f})")
-                    
-                    if intensity_ratio >= min_path_intensity_ratio:
-                        print(f"    Line intensity too bright for separation ({intensity_ratio:.3f} >= {min_path_intensity_ratio})")
-                        return None
-                else:
-                    print(f"    Could not analyze separation intensity - allowing separation")
-                    separation_intensity = mean_soma_intensity * 0.5  # Conservative estimate
+            struct_elem = ball(radius)
         
-        # Final validation
-        total_original = np.sum(cell_region)
-        total_separated = np.sum(region1) + np.sum(region2)
+        dilated_region1 = binary_dilation(region1, struct_elem)
+        dilated_region2 = binary_dilation(region2, struct_elem)
         
-        print(f"    Region conservation check: {total_original} -> {total_separated} voxels")
+        interface_zone = dilated_region1 & dilated_region2 & cell_region
+        local_region1 = interface_zone & dilated_region1 & ~region1
+        local_region2 = interface_zone & dilated_region2 & ~region2
         
-        if total_separated != total_original:
-            print(f"    WARNING: Voxel count mismatch! Some voxels may be lost.")
-            # This shouldn't happen with proper watershed, but let's be safe
-            
-        # Ensure no overlap
-        if np.any(region1 & region2):
-            print(f"    ERROR: Regions overlap! This shouldn't happen with watershed.")
-            return None
+        return local_region1, local_region2, interface_zone
+    
+    def analyze_local_intensity_difference(region1, region2, cell_region, intensity_vol, radius=3):
+        """Analyze intensity differences in regions immediately adjacent to the separation interface."""
+        print(f"    Analyzing local intensity differences around interface (radius: {radius})")
         
-        print(f"    SUCCESSFUL WATERSHED SEPARATION: regions of {np.sum(region1)} and {np.sum(region2)} voxels")
+        local_region1, local_region2, interface_zone = get_local_regions_around_interface(
+            region1, region2, cell_region, radius
+        )
         
-        return region1, region2, separation_intensity, mean_soma_intensity
-
-
+        print(f"      Interface zone size: {np.sum(interface_zone)} voxels")
+        print(f"      Local region 1 size: {np.sum(local_region1)} voxels")
+        print(f"      Local region 2 size: {np.sum(local_region2)} voxels")
+        
+        if np.sum(local_region1) == 0 or np.sum(local_region2) == 0:
+            print(f"      WARNING: One or both local regions are empty - cannot analyze")
+            return None, False
+        
+        local1_intensities = intensity_vol[local_region1]
+        local2_intensities = intensity_vol[local_region2]
+        
+        local1_mean = np.mean(local1_intensities)
+        local1_std = np.std(local1_intensities)
+        local2_mean = np.mean(local2_intensities)
+        local2_std = np.std(local2_intensities)
+        
+        print(f"      Local region 1: mean={local1_mean:.2f}, std={local1_std:.2f}")
+        print(f"      Local region 2: mean={local2_mean:.2f}, std={local2_std:.2f}")
+        
+        reference_intensity = max(local1_mean, local2_mean)
+        if reference_intensity == 0:
+            print(f"      ERROR: Reference intensity is zero")
+            return None, False
+        
+        intensity_difference = abs(local1_mean - local2_mean)
+        relative_difference = intensity_difference / reference_intensity
+        
+        print(f"      Absolute intensity difference: {intensity_difference:.2f}")
+        print(f"      Relative intensity difference: {relative_difference:.3f}")
+        print(f"      Threshold: {min_local_intensity_difference:.3f}")
+        
+        is_valid = relative_difference >= min_local_intensity_difference
+        
+        if is_valid:
+            print(f"      PASSED: Local intensity difference is sufficient ({relative_difference:.3f} >= {min_local_intensity_difference:.3f})")
+        else:
+            print(f"      FAILED: Local intensity difference too small ({relative_difference:.3f} < {min_local_intensity_difference:.3f})")
+        
+        return relative_difference, is_valid
+    
     def bresenham_line_3d(start, end):
-        """
-        Generate 3D line coordinates between two points using Bresenham-like algorithm
-        """
+        """Generate 3D line coordinates between two points"""
         start = np.array(start, dtype=float)
         end = np.array(end, dtype=float)
         
-        # Number of steps
         diff = end - start
         steps = int(np.max(np.abs(diff))) + 1
         
-        # Generate coordinates
         if steps <= 1:
             return [start]
         
@@ -612,14 +481,195 @@ def separate_multi_soma_cells(
         
         return coords
     
+    def find_connecting_path_and_cut_plane(cell_region, soma1_region, soma2_region, intensity_vol):
+        """Find the connecting path between somas using watershed separation."""
+        print(f"    Analyzing connection between somas (sizes: {np.sum(soma1_region)}, {np.sum(soma2_region)})")
+        
+        soma1_coords = np.where(soma1_region)
+        soma1_centroid = [np.mean(soma1_coords[i]) for i in range(3)]
+        
+        soma2_coords = np.where(soma2_region)
+        soma2_centroid = [np.mean(soma2_coords[i]) for i in range(3)]
+        
+        print(f"    Soma centroids: {[f'{c:.1f}' for c in soma1_centroid]} -> {[f'{c:.1f}' for c in soma2_centroid]}")
+        
+        soma1_intensity = np.mean(intensity_vol[soma1_region])
+        soma2_intensity = np.mean(intensity_vol[soma2_region])
+        mean_soma_intensity = (soma1_intensity + soma2_intensity) / 2
+        
+        print(f"    Soma intensities: {soma1_intensity:.2f}, {soma2_intensity:.2f} (mean: {mean_soma_intensity:.2f})")
+        print(f"    Using watershed-based separation following intensity valleys")
+        
+        from scipy.ndimage import distance_transform_edt, gaussian_filter, binary_dilation
+        from skimage.segmentation import watershed # type: ignore
+        from skimage.morphology import cube # type: ignore
+        
+        cell_intensities = intensity_vol * cell_region.astype(float)
+        cell_intensities[~cell_region] = 0
+        
+        cell_intensity_values = intensity_vol[cell_region]
+        min_intensity = np.min(cell_intensity_values)
+        max_intensity = np.max(cell_intensity_values)
+        intensity_range = max_intensity - min_intensity
+        
+        print(f"    Cell intensity range: {min_intensity:.1f} to {max_intensity:.1f}")
+        
+        if intensity_range < mean_soma_intensity * 0.1:
+            print(f"    Insufficient intensity variation for watershed separation ({intensity_range:.1f} < {mean_soma_intensity * 0.1:.1f})")
+            return None
+        
+        normalized_intensities = (cell_intensities - min_intensity) / intensity_range
+        inverted_intensities = 1.0 - normalized_intensities
+        inverted_intensities[~cell_region] = 0
+        
+        smoothed_inverted = gaussian_filter(inverted_intensities, sigma=0.8)
+        
+        markers = np.zeros_like(cell_region, dtype=int)
+        markers[soma1_region] = 1
+        markers[soma2_region] = 2
+        
+        watershed_labels = watershed(smoothed_inverted, markers, mask=cell_region)
+        
+        print(f"    Watershed segmentation complete")
+        
+        region1 = watershed_labels == 1
+        region2 = watershed_labels == 2
+        
+        if np.sum(region1) == 0 or np.sum(region2) == 0:
+            print(f"    Watershed failed - empty regions (sizes: {np.sum(region1)}, {np.sum(region2)})")
+            return None
+        
+        print(f"    Watershed regions: {np.sum(region1)} and {np.sum(region2)} voxels")
+        
+        boundary_mask = cell_region & (watershed_labels == 0)
+        
+        if np.sum(boundary_mask) > 0:
+            boundary_intensities = intensity_vol[boundary_mask]
+            separation_intensity = np.mean(boundary_intensities)
+            
+            print(f"    Watershed boundary analysis:")
+            print(f"      Boundary voxels: {np.sum(boundary_mask)}")
+            print(f"      Boundary mean intensity: {separation_intensity:.2f}")
+            print(f"      Boundary/Soma intensity ratio: {separation_intensity/mean_soma_intensity:.3f}")
+            
+            boundary_coords = np.where(boundary_mask)
+            region1_mean_intensity = np.mean(intensity_vol[region1])
+            region2_mean_intensity = np.mean(intensity_vol[region2])
+            
+            for i in range(len(boundary_coords[0])):
+                coord = (boundary_coords[0][i], boundary_coords[1][i], boundary_coords[2][i])
+                voxel_intensity = intensity_vol[coord]
+                
+                dist_to_region1 = abs(voxel_intensity - region1_mean_intensity)
+                dist_to_region2 = abs(voxel_intensity - region2_mean_intensity)
+                
+                if dist_to_region1 < dist_to_region2:
+                    region1[coord] = True
+                else:
+                    region2[coord] = True
+        else:
+            print(f"    No explicit watershed boundary found - analyzing region interface")
+            
+            struct_elem = cube(3)
+            dilated_region1 = binary_dilation(region1, struct_elem)
+            dilated_region2 = binary_dilation(region2, struct_elem)
+            
+            interface_mask = (dilated_region1 & dilated_region2 & cell_region & 
+                            ~region1 & ~region2)
+            
+            if np.sum(interface_mask) > 0:
+                interface_intensities = intensity_vol[interface_mask]
+                separation_intensity = np.mean(interface_intensities)
+                
+                print(f"      Found interface region: {np.sum(interface_mask)} voxels")
+                print(f"      Interface mean intensity: {separation_intensity:.2f}")
+                print(f"      Interface/Soma intensity ratio: {separation_intensity/mean_soma_intensity:.3f}")
+                
+                interface_coords = np.where(interface_mask)
+                region1_mean_intensity = np.mean(intensity_vol[region1])
+                region2_mean_intensity = np.mean(intensity_vol[region2])
+                
+                for i in range(len(interface_coords[0])):
+                    coord = (interface_coords[0][i], interface_coords[1][i], interface_coords[2][i])
+                    voxel_intensity = intensity_vol[coord]
+                    
+                    dist_to_region1 = abs(voxel_intensity - region1_mean_intensity)
+                    dist_to_region2 = abs(voxel_intensity - region2_mean_intensity)
+                    
+                    if dist_to_region1 < dist_to_region2:
+                        region1[coord] = True
+                    else:
+                        region2[coord] = True
+            else:
+                print(f"      No clear interface found - sampling direct path between somas")
+                
+                path_coords = bresenham_line_3d(soma1_centroid, soma2_centroid)
+                
+                path_intensities = []
+                for coord in path_coords:
+                    int_coord = tuple(int(round(c)) for c in coord)
+                    
+                    if all(0 <= int_coord[i] < cell_region.shape[i] for i in range(3)):
+                        if (cell_region[int_coord] and 
+                            not soma1_region[int_coord] and 
+                            not soma2_region[int_coord]):
+                            path_intensities.append(intensity_vol[int_coord])
+                
+                if len(path_intensities) > 0:
+                    separation_intensity = np.mean(path_intensities)
+                    print(f"      Path sampling: {len(path_intensities)} voxels, mean intensity: {separation_intensity:.2f}")
+                else:
+                    non_soma_mask = cell_region & ~soma1_region & ~soma2_region
+                    if np.sum(non_soma_mask) > 0:
+                        separation_intensity = np.min(intensity_vol[non_soma_mask])
+                        print(f"      Using minimum non-soma intensity: {separation_intensity:.2f}")
+                    else:
+                        print(f"      ERROR: Cannot determine separation intensity")
+                        return None
+        
+        intensity_ratio = separation_intensity / mean_soma_intensity
+        print(f"    Final separation analysis:")
+        print(f"      Separation intensity: {separation_intensity:.2f}")
+        print(f"      Mean soma intensity: {mean_soma_intensity:.2f}")
+        print(f"      Intensity ratio: {intensity_ratio:.3f} (threshold: {min_path_intensity_ratio})")
+        
+        if intensity_ratio >= min_path_intensity_ratio:
+            print(f"    Separation region too bright for valid separation ({intensity_ratio:.3f} >= {min_path_intensity_ratio})")
+            return None
+        
+        print(f"    \n    === LOCAL INTENSITY ANALYSIS ===")
+        relative_diff, local_validation_passed = analyze_local_intensity_difference(
+            region1, region2, cell_region, intensity_vol, local_analysis_radius
+        )
+        
+        if not local_validation_passed:
+            print(f"    FAILED: Local intensity analysis indicates regions are too similar")
+            return None
+        
+        total_original = np.sum(cell_region)
+        total_separated = np.sum(region1) + np.sum(region2)
+        
+        print(f"    Region conservation check: {total_original} -> {total_separated} voxels")
+        
+        if abs(total_separated - total_original) > total_original * 0.01:
+            print(f"    WARNING: Significant voxel count mismatch!")
+        
+        if np.any(region1 & region2):
+            print(f"    ERROR: Regions overlap!")
+            return None
+        
+        print(f"    SUCCESSFUL WATERSHED SEPARATION with local validation")
+        print(f"      Final regions: {np.sum(region1)} and {np.sum(region2)} voxels")
+        print(f"      Local intensity difference: {relative_diff:.3f}")
+        print(f"      Separation intensity ratio: {intensity_ratio:.3f}")
+        
+        return region1, region2, separation_intensity, mean_soma_intensity
+
     def validate_separation(region1, region2, bridge_intensity, soma_intensity):
-        """
-        Validate if separation results in valid cell regions
-        """
+        """Validate if separation results in valid cell regions"""
         print(f"    Validating separation:")
         print(f"      Region sizes: {np.sum(region1)}, {np.sum(region2)} (min threshold: {min_size_threshold})")
         
-        # Size validation
         if np.sum(region1) < min_size_threshold:
             print(f"      FAILED: Region 1 too small ({np.sum(region1)} < {min_size_threshold})")
             return False
@@ -627,7 +677,6 @@ def separate_multi_soma_cells(
             print(f"      FAILED: Region 2 too small ({np.sum(region2)} < {min_size_threshold})")
             return False
             
-        # Intensity validation (already done in path analysis, but double-check)
         intensity_ratio = bridge_intensity / soma_intensity
         print(f"      Bridge/Soma intensity ratio: {intensity_ratio:.3f} (threshold: {min_path_intensity_ratio})")
         
@@ -637,138 +686,229 @@ def separate_multi_soma_cells(
             
         print(f"      PASSED: All validation criteria met")
         return True
-    
-    def process_cell_region(cell_label, cell_region, soma_regions_in_cell):
-        """Process a single cell region for potential separation"""
-        print(f"\n  Processing cell {cell_label} (size: {np.sum(cell_region)} voxels)")
+
+    def recursively_separate_cell_region(cell_region, soma_regions_in_cell, depth=0, cell_id="unknown"):
+        """
+        Recursively separate a cell region until all somas are properly isolated.
+        Returns a list of (region_mask, soma_indices) tuples.
+        """
+        print(f"{'  ' * depth}[Depth {depth}] Processing cell region {cell_id} (size: {np.sum(cell_region)} voxels)")
+        
+        if depth >= max_recursion_depth:
+            print(f"{'  ' * depth}WARNING: Maximum recursion depth reached for cell {cell_id}")
+            return [(cell_region, list(range(len(soma_regions_in_cell))))]
         
         # Get bounding box to work with smaller arrays
         bbox = get_cell_bounding_box(cell_region)
         if bbox is None:
-            print(f"    ERROR: Could not get bounding box for cell {cell_label}")
-            return None
+            print(f"{'  ' * depth}ERROR: Could not get bounding box for cell {cell_id}")
+            return [(cell_region, list(range(len(soma_regions_in_cell))))]
         
-        print(f"    Bounding box: {[slice_obj.start for slice_obj in bbox]} to {[slice_obj.stop-1 for slice_obj in bbox]}")
-        
-        # Extract local regions
+        # Extract local regions - memory efficient
         local_cell = cell_region[bbox]
         local_intensity = intensity_volume[bbox]
         
-        # Calculate original cell intensity
-        original_intensity = np.mean(local_intensity[local_cell])
-        print(f"    Original cell mean intensity: {original_intensity:.2f}")
-        
-        # Process soma pairs
+        # Process soma centroids and regions
         soma_centroids = []
         local_soma_regions = []
         
-        for i, (soma_label, soma_region) in enumerate(soma_regions_in_cell):
-            # Convert to local coordinates
+        for i, soma_region in enumerate(soma_regions_in_cell):
             local_soma = soma_region[bbox]
             if np.sum(local_soma) == 0:
-                print(f"      WARNING: Soma region {soma_label} empty in bounding box")
                 continue
                 
-            # Calculate centroid in local coordinates
             coords = np.where(local_soma)
             centroid_local = [np.mean(coords[j]) for j in range(3)]
-            
-            # Convert back to global coordinates for distance calculation
             centroid_global = [centroid_local[j] + bbox[j].start for j in range(3)]
             
             soma_centroids.append(centroid_global)
+            # Store the original index along with the local mask
             local_soma_regions.append((i, local_soma))
-            print(f"      Soma {i}: centroid at {[f'{c:.1f}' for c in centroid_global]} (local: {[f'{c:.1f}' for c in centroid_local]})")
         
         if len(local_soma_regions) < 2:
-            print(f"    Insufficient somas for separation ({len(local_soma_regions)} < 2)")
-            return None
+            print(f"{'  ' * depth}Only {len(local_soma_regions)} soma(s) - no separation needed")
+            return [(cell_region, list(range(len(soma_regions_in_cell))))]
         
-        # Find soma pairs that should be separated (far apart)
-        # Logic: if centroids are > max_seed_centroid_dist apart, they should be separated
+        print(f"{'  ' * depth}Found {len(local_soma_regions)} somas in region")
+        # Get original indices from our list of tuples
+        soma_indices_in_region = [s[0] for s in local_soma_regions]
+        for i, centroid in enumerate(soma_centroids):
+            print(f"{'  ' * depth}  Soma {soma_indices_in_region[i]}: centroid at {[f'{c:.1f}' for c in centroid]}")
+        
+        # Find valid separation pairs
         valid_pairs = []
         for i in range(len(soma_centroids)):
             for j in range(i + 1, len(soma_centroids)):
                 dist = calculate_physical_distance(
                     soma_centroids[i], soma_centroids[j], spacing
                 )
-                print(f"      Distance between soma {i} and {j}: {dist:.1f} µm")
+                # Use original indices for clarity in logs
+                orig_idx_i = soma_indices_in_region[i]
+                orig_idx_j = soma_indices_in_region[j]
+                print(f"{'  ' * depth}  Distance between soma {orig_idx_i} and {orig_idx_j}: {dist:.1f} µm")
                 
                 if dist > max_seed_centroid_dist:
+                    # Store local indices (i, j) for easy lookup later
                     valid_pairs.append((i, j, dist))
-                    print(f"        -> SHOULD SEPARATE (> {max_seed_centroid_dist:.1f} µm)")
+                    print(f"{'  ' * depth}    -> SHOULD SEPARATE")
                 else:
-                    print(f"        -> KEEP TOGETHER (≤ {max_seed_centroid_dist:.1f} µm)")
+                    print(f"{'  ' * depth}    -> KEEP TOGETHER")
         
         if not valid_pairs:
-            print(f"    No soma pairs need separation (all are close together)")
-            return None
-        
-        print(f"    Found {len(valid_pairs)} soma pairs that need separation")
-        
-        # Process the most distant pair first (most clearly needs separation)
-        valid_pairs.sort(key=lambda x: x[2], reverse=True)  # Sort by distance, descending
-        
-        for pair_idx, (soma_i, soma_j, pair_dist) in enumerate(valid_pairs):
-            print(f"    \n    Attempt {pair_idx + 1}: Separating soma {soma_i} and {soma_j} (distance: {pair_dist:.1f} µm)")
+            print(f"{'  ' * depth}No soma pairs need separation - all close together")
+            return [(cell_region, soma_indices_in_region)]
+
+        # --- START OF THE FIX ---
+        # Sort pairs by distance to try the most likely candidates first
+        valid_pairs.sort(key=lambda x: x[2], reverse=True)
+
+        # Loop through all valid pairs until a successful separation is found
+        for soma_i, soma_j, pair_dist in valid_pairs:
+            orig_idx_i = soma_indices_in_region[soma_i]
+            orig_idx_j = soma_indices_in_region[soma_j]
             
-            # Get local soma regions
+            print(f"\n{'  ' * depth}Attempting separation of soma {orig_idx_i} and {orig_idx_j} (distance: {pair_dist:.1f} µm)")
+            
             local_soma1 = local_soma_regions[soma_i][1]
             local_soma2 = local_soma_regions[soma_j][1]
             
-            # Find separation using bridge/path analysis
             separation_result = find_connecting_path_and_cut_plane(
                 local_cell, local_soma1, local_soma2, local_intensity
             )
             
             if separation_result is None:
-                print(f"      FAILED: Could not find valid separation path")
-                continue
+                print(f"{'  ' * depth}FAILED: Could not find valid separation path for this pair. Trying next pair...")
+                continue # Try the next pair
                 
             region1, region2, bridge_intensity, soma_intensity = separation_result
             
-            # Validate separation
-            if validate_separation(region1, region2, bridge_intensity, soma_intensity):
-                print(f"      SUCCESS: Valid separation found!")
+            if not validate_separation(region1, region2, bridge_intensity, soma_intensity):
+                print(f"{'  ' * depth}FAILED: Separation validation failed for this pair. Trying next pair...")
+                continue # Try the next pair
+            
+            # If we reach here, the separation was successful!
+            print(f"{'  ' * depth}SUCCESS: Valid separation found!")
+            
+            # Convert back to global coordinates
+            global_region1 = np.zeros_like(cell_region, dtype=bool)
+            global_region2 = np.zeros_like(cell_region, dtype=bool)
+            
+            global_region1[bbox] = region1
+            global_region2[bbox] = region2
+            
+            # Determine which somas ended up in which region
+            somas_for_region1 = []
+            somas_for_region2 = []
+            
+            for idx, soma_region in enumerate(soma_regions_in_cell):
+                overlap1 = np.sum(soma_region & global_region1)
+                overlap2 = np.sum(soma_region & global_region2)
                 
-                # Convert back to global coordinates
-                global_region1 = np.zeros_like(cell_region, dtype=bool)
-                global_region2 = np.zeros_like(cell_region, dtype=bool)
-                
-                global_region1[bbox] = region1
-                global_region2[bbox] = region2
-                
-                return global_region1, global_region2
-            else:
-                print(f"      FAILED: Separation validation failed")
-                continue
-        
-        print(f"    All separation attempts failed for cell {cell_label}")
-        return None
-    
+                if overlap1 > overlap2:
+                    somas_for_region1.append(soma_region)
+                else:
+                    somas_for_region2.append(soma_region)
+            
+            print(f"{'  ' * depth}Region 1 has {len(somas_for_region1)} somas, Region 2 has {len(somas_for_region2)} somas")
+            
+            # Clear local arrays to save memory
+            del local_cell, local_intensity, region1, region2
+            import gc
+            gc.collect()
+            
+            # Recursively process both new regions
+            results = []
+            
+            if len(somas_for_region1) > 0:
+                sub_results1 = recursively_separate_cell_region(
+                    global_region1, somas_for_region1, depth + 1, f"{cell_id}.1"
+                )
+                results.extend(sub_results1)
+            
+            if len(somas_for_region2) > 0:
+                sub_results2 = recursively_separate_cell_region(
+                    global_region2, somas_for_region2, depth + 1, f"{cell_id}.2"
+                )
+                results.extend(sub_results2)
+            
+            # Clear regions to save memory
+            del global_region1, global_region2
+            gc.collect()
+            
+            # IMPORTANT: Return the results of the successful separation.
+            # This exits the function and prevents trying other pairs.
+            return results
+        # If the loop completes without any successful separation, we give up.
+        print(f"{'  ' * depth}All separation attempts failed for cell {cell_id}. Keeping it as a single region.")
+        return [(cell_region, soma_indices_in_region)]
+
     # Main processing
-    print("=== Starting Multi-Soma Cell Separation ===")
+    print("=== Starting Recursive Multi-Soma Cell Separation ===")
     print(f"Input parameters:")
     print(f"  Segmentation mask shape: {segmentation_mask.shape}")
     print(f"  Intensity volume shape: {intensity_volume.shape}")
     print(f"  Soma mask shape: {soma_mask.shape}")
     print(f"  Spacing: {spacing}")
     print(f"  Min size threshold: {min_size_threshold}")
-    print(f"  Max soma distance: {max_seed_centroid_dist} (pairs > this distance will be separated)")
-    print(f"  Min intensity ratio: {min_path_intensity_ratio} (bridge must be dimmer than this ratio to soma intensity)")
+    print(f"  Max soma distance: {max_seed_centroid_dist}")
+    print(f"  Min intensity ratio: {min_path_intensity_ratio}")
+    print(f"  Min local intensity difference: {min_local_intensity_difference}")
+    print(f"  Local analysis radius: {local_analysis_radius}")
     
+    from skimage.measure import label # type: ignore
+
+    print("\nDynamically calculating required recursion depth...")
+    
+    # Find all unique cell labels to iterate over
+    all_cell_labels = np.unique(segmentation_mask[segmentation_mask > 0])
+    max_somas_found = 0
+    
+    # Loop through each cell to count its somas
+    for label_val in all_cell_labels:
+        # Isolate the mask for a single cell
+        current_cell_mask = (segmentation_mask == label_val)
+        
+        # Find the somas that fall within this cell's mask
+        somas_in_this_cell = soma_mask * current_cell_mask
+        
+        # If there are any soma voxels, count how many distinct soma regions there are
+        if np.any(somas_in_this_cell):
+            # The `label` function finds connected components. The number of components is the number of somas.
+            _ , num_somas = label(somas_in_this_cell > 0, return_num=True)
+            
+            # Keep track of the highest number we've seen
+            if num_somas > max_somas_found:
+                max_somas_found = num_somas
+
+    # A cell with N somas needs at most N-1 separations.
+    # Setting the depth to N is a safe and generous upper bound.
+    if max_somas_found > 1:
+        # We add a small buffer (e.g., +2) just in case of unforeseen edge cases,
+        # but max_somas_found itself is usually sufficient.
+        new_max_depth = max_somas_found + 2 
+        print(f"  Maximum somas found in a single cell: {max_somas_found}")
+        print(f"  Adjusting max_recursion_depth to {new_max_depth} to ensure complete separation.")
+        max_recursion_depth = new_max_depth
+    else:
+        max_recursion_depth = 10
+        print("  No cells with multiple somas detected. Default recursion depth will be used.")
+    # --- END: End of the new code snippet ---
+
     result_mask = segmentation_mask.copy()
     
     # Get unique cell labels
     cell_labels = np.unique(segmentation_mask[segmentation_mask > 0])
-    print(f"\nFound {len(cell_labels)} cells to process: {cell_labels}")
+    print(f"\nFound {len(cell_labels)} cells to process")
     
     cells_processed = 0
-    cells_separated = 0
+    total_separations = 0
+    next_available_label = np.max(result_mask) + 1
+
+    
     
     # Process each cell
     for cell_idx, cell_label in enumerate(cell_labels):
-        print(f"\n{'='*60}")
+        print(f"\n{'='*80}")
         print(f"Processing cell {cell_idx + 1}/{len(cell_labels)}: Label {cell_label}")
         
         cell_region = segmentation_mask == cell_label
@@ -781,6 +921,7 @@ def separate_multi_soma_cells(
             continue
         
         # Label individual soma regions
+        from skimage.measure import label # type: ignore
         labeled_somas = label(cell_soma_mask > 0)
         soma_labels = np.unique(labeled_somas[labeled_somas > 0])
         
@@ -795,46 +936,49 @@ def separate_multi_soma_cells(
         for soma_label in soma_labels:
             soma_region = labeled_somas == soma_label
             soma_size = np.sum(soma_region)
-            soma_regions_in_cell.append((soma_label, soma_region))
+            soma_regions_in_cell.append(soma_region)
             print(f"    Soma {soma_label}: {soma_size} voxels")
         
         cells_processed += 1
         
-        # Process this cell
-        separation_result = process_cell_region(cell_label, cell_region, soma_regions_in_cell)
+        # Recursively separate this cell
+        separated_regions = recursively_separate_cell_region(
+            cell_region, soma_regions_in_cell, cell_id=str(cell_label)
+        )
         
-        if separation_result is not None:
-            region1, region2 = separation_result
-            
-            # Update result mask
-            max_label = np.max(result_mask)
-            new_label = max_label + 1
-            
-            print(f"  EXECUTING SEPARATION:")
-            print(f"    Original cell {cell_label} -> cells {cell_label} and {new_label}")
-            print(f"    Region sizes: {np.sum(region1)} and {np.sum(region2)} voxels")
-            
-            # Clear original cell
-            result_mask[cell_region] = 0
-            
-            # Assign new labels
-            result_mask[region1] = cell_label
-            result_mask[region2] = new_label
-            
-            cells_separated += 1
-            print(f"  ✓ SEPARATION COMPLETED")
-        else:
-            print(f"  ✗ NO SEPARATION PERFORMED")
+        print(f"\n  SEPARATION COMPLETE for cell {cell_label}:")
+        print(f"    Original cell -> {len(separated_regions)} final regions")
         
-        # Force garbage collection to manage memory
-        if cell_idx % 10 == 0:
+        # Clear the original cell from result mask
+        result_mask[cell_region] = 0
+        
+        # Assign labels to separated regions
+        for region_idx, (region_mask, soma_indices) in enumerate(separated_regions):
+            if region_idx == 0:
+                # Keep original label for first region
+                label_to_use = cell_label
+            else:
+                # Use new labels for additional regions
+                label_to_use = next_available_label
+                next_available_label += 1
+            
+            result_mask[region_mask] = label_to_use
+            print(f"      Region {region_idx + 1}: label {label_to_use}, size {np.sum(region_mask)}, {len(soma_indices)} somas")
+        
+        separations_this_cell = len(separated_regions) - 1
+        total_separations += separations_this_cell
+        
+        # Memory cleanup
+        del cell_region, separated_regions
+        if cell_idx % 5 == 0:  # More frequent cleanup due to recursion
+            import gc
             gc.collect()
     
-    print(f"\n{'='*60}")
-    print(f"SEPARATION SUMMARY:")
+    print(f"\n{'='*80}")
+    print(f"RECURSIVE SEPARATION SUMMARY:")
     print(f"  Total cells examined: {len(cell_labels)}")
     print(f"  Cells with multiple somas: {cells_processed}")
-    print(f"  Cells successfully separated: {cells_separated}")
+    print(f"  Total separations performed: {total_separations}")
     print(f"  Final number of cells: {len(np.unique(result_mask[result_mask > 0]))}")
     
     # Post-processing: Remove very small fragments
@@ -854,6 +998,6 @@ def separate_multi_soma_cells(
     print(f"  Removed {fragments_removed} small fragments")
     print(f"  Final cell count: {len(np.unique(result_mask[result_mask > 0]))}")
     
-    print("=== Multi-Soma Cell Separation Complete ===\n")
+    print("=== Recursive Multi-Soma Cell Separation Complete ===\n")
     
     return result_mask
