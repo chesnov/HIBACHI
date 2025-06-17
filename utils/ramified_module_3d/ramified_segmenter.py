@@ -18,6 +18,7 @@ import traceback # For detailed error logging
 from scipy.sparse.csgraph import connected_components, dijkstra
 from skimage.measure import label, regionprops # type: ignore
 from collections import deque
+from scipy.ndimage import binary_fill_holes, find_objects
 
 seed = 42
 np.random.seed(seed)         # For NumPy
@@ -687,71 +688,184 @@ def separate_multi_soma_cells(
         print(f"      PASSED: All validation criteria met")
         return True
 
-    # --- NEW HELPER FUNCTION FOR A SINGLE SEPARATION ATTEMPT ---
     def attempt_one_separation(
-        cell_region: np.ndarray,
-        soma_regions_in_cell: List[np.ndarray]
-    ) -> Optional[Tuple[np.ndarray, List[np.ndarray], np.ndarray, List[np.ndarray]]]:
+        cropped_cell_region: np.ndarray,
+        bbox: Tuple[slice, ...],
+        soma_regions_in_cell: List[np.ndarray],
+        cell_label_for_log: int
+    ) -> Optional[Tuple[np.ndarray, Tuple[slice, ...], List[np.ndarray], np.ndarray, Tuple[slice, ...], List[np.ndarray]]]:
         """
-        Tries to find and perform one valid separation on the given region.
-        If successful, returns the two new regions and their respective soma lists.
-        If not, returns None.
+        Tries to perform one valid separation on the given CROPPED region, with detailed logging.
         """
-        bbox = get_cell_bounding_box(cell_region)
-        if bbox is None: return None
-
-        local_cell = cell_region[bbox]
         local_intensity = intensity_volume[bbox]
+        local_soma_masks_in_piece = [soma_mask[bbox] for soma_mask in soma_regions_in_cell]
 
-        soma_centroids, local_soma_regions = [], []
-        for i, soma_region in enumerate(soma_regions_in_cell):
-            local_soma = soma_region[bbox]
-            if np.any(local_soma):
-                coords = np.where(local_soma)
+        soma_centroids, present_somas_info = [], []
+        for i, local_soma_mask in enumerate(local_soma_masks_in_piece):
+            if np.any(local_soma_mask):
+                coords = np.where(local_soma_mask)
                 centroid_local = [np.mean(coords[j]) for j in range(3)]
                 centroid_global = [centroid_local[j] + bbox[j].start for j in range(3)]
                 soma_centroids.append(centroid_global)
-                local_soma_regions.append((i, local_soma))
+                present_somas_info.append({'mask': local_soma_mask, 'original_index': i})
 
-        if len(local_soma_regions) < 2: return None
+        if len(soma_centroids) < 2:
+            return None
+        
+        print(f"      Found {len(soma_centroids)} somas in this piece. Analyzing pairs for separation.")
 
         valid_pairs = []
         for i in range(len(soma_centroids)):
             for j in range(i + 1, len(soma_centroids)):
                 dist = calculate_physical_distance(soma_centroids[i], soma_centroids[j], spacing)
+                print(f"        Distance between soma pair ({i}, {j}): {dist:.1f} µm")
                 if dist > max_seed_centroid_dist:
                     valid_pairs.append((i, j, dist))
+                    print(f"          -> SHOULD SEPARATE (dist > {max_seed_centroid_dist:.1f})")
+                else:
+                    print(f"          -> KEEP TOGETHER (dist <= {max_seed_centroid_dist:.1f})")
         
-        if not valid_pairs: return None
+        if not valid_pairs:
+            print("      No soma pairs are distant enough to require separation.")
+            return None
         
         valid_pairs.sort(key=lambda x: x[2], reverse=True)
 
-        for soma_i, soma_j, _ in valid_pairs:
-            local_soma1 = local_soma_regions[soma_i][1]
-            local_soma2 = local_soma_regions[soma_j][1]
+        for soma_i, soma_j, pair_dist in valid_pairs:
+            print(f"\n      Attempting separation of most distant pair ({soma_i}, {soma_j}) with distance {pair_dist:.1f} µm")
+            local_soma1 = present_somas_info[soma_i]['mask']
+            local_soma2 = present_somas_info[soma_j]['mask']
             
-            separation_result = find_connecting_path_and_cut_plane(local_cell, local_soma1, local_soma2, local_intensity)
-            if separation_result is None: continue
+            separation_result = find_connecting_path_and_cut_plane(
+                cropped_cell_region, local_soma1, local_soma2, local_intensity
+            )
+            
+            if separation_result is None:
+                print(f"      FAILED: Could not find valid separation path for this pair. Trying next pair...")
+                continue
 
             region1_local, region2_local, bridge_intensity, soma_intensity = separation_result
-            if not validate_separation(region1_local, region2_local, bridge_intensity, soma_intensity): continue
+            
+            if not validate_separation(region1_local, region2_local, bridge_intensity, soma_intensity):
+                print(f"      FAILED: Separation validation failed for this pair. Trying next pair...")
+                continue
+                
+            print("      SUCCESS: Valid separation found for this pair!")
+            
+            bboxes1_local_list = find_objects(region1_local.astype(int))
+            bboxes2_local_list = find_objects(region2_local.astype(int))
+            if not bboxes1_local_list or not bboxes2_local_list:
+                print("      ERROR: Separation resulted in an empty piece. Skipping.")
+                continue
 
-            # Success! Now process the result.
-            global_region1 = np.zeros_like(cell_region, dtype=bool)
-            global_region2 = np.zeros_like(cell_region, dtype=bool)
-            global_region1[bbox] = region1_local
-            global_region2[bbox] = region2_local
+            bbox1_local = bboxes1_local_list[0]
+            bbox2_local = bboxes2_local_list[0]
+            new_cropped_region1 = region1_local[bbox1_local]
+            new_cropped_region2 = region2_local[bbox2_local]
+
+            def get_global_bbox(parent_bbox, local_bbox):
+                return tuple(slice(parent_bbox[i].start + local_bbox[i].start,
+                                parent_bbox[i].start + local_bbox[i].start + (local_bbox[i].stop - local_bbox[i].start))
+                            for i in range(3))
+
+            new_global_bbox1 = get_global_bbox(bbox, bbox1_local)
+            new_global_bbox2 = get_global_bbox(bbox, bbox2_local)
 
             somas_for_region1, somas_for_region2 = [], []
-            for soma_region in soma_regions_in_cell:
-                if np.any(soma_region & global_region1):
-                    somas_for_region1.append(soma_region)
-                else:
-                    somas_for_region2.append(soma_region)
+            for i in range(len(soma_regions_in_cell)):
+                original_full_soma_mask = soma_regions_in_cell[i]
+                if np.any(original_full_soma_mask[new_global_bbox1]):
+                    somas_for_region1.append(original_full_soma_mask)
+                elif np.any(original_full_soma_mask[new_global_bbox2]):
+                    somas_for_region2.append(original_full_soma_mask)
             
-            return global_region1, somas_for_region1, global_region2, somas_for_region2
+            return (new_cropped_region1, new_global_bbox1, somas_for_region1,
+                    new_cropped_region2, new_global_bbox2, somas_for_region2)
 
-        return None # No valid separation was found among all pairs
+        print("      FAILED: No valid separation path found for any pair in this piece.")
+        return None
+    
+    def fill_internal_voids(segmentation_mask: np.ndarray) -> np.ndarray:
+        """
+        Identifies and fills internal voids (holes) in each labeled region of a 3D segmentation mask.
+
+        This function processes each labeled cell independently to ensure that filling a hole
+        in one cell does not bleed into a neighboring cell. It operates efficiently by
+        processing each cell within its tight bounding box.
+
+        Parameters:
+        -----------
+        segmentation_mask : np.ndarray
+            A 3D integer array where each integer represents a unique cell label.
+            The background is expected to be 0.
+
+        Returns:
+        --------
+        np.ndarray
+            A new 3D array of the same shape and dtype as the input, where all
+            internal voids in each labeled region have been filled.
+        """
+        print("=== Starting Internal Void Filling ===")
+        
+        # We create a copy to store the results, leaving the original mask untouched.
+        filled_mask = segmentation_mask.copy()
+        
+        # find_objects is highly efficient. It returns a list of slice objects (bounding boxes)
+        # for each label. The index of the list corresponds to `label - 1`.
+        # e.g., bboxes[0] is the bounding box for label 1.
+        bboxes = find_objects(segmentation_mask)
+        
+        voids_filled_count = 0
+        voxels_added_total = 0
+        
+        # We iterate through the bounding boxes. The index `i` corresponds to label `i + 1`.
+        for i, bbox in enumerate(bboxes):
+            label = i + 1
+            
+            # Skip if the label does not exist in the mask (find_objects returns None for it)
+            if bbox is None:
+                continue
+            
+            # Extract the small region of interest (ROI) from the original mask
+            # This is the key to memory and speed efficiency.
+            original_roi = segmentation_mask[bbox]
+            
+            # Create a binary mask of just the current cell within its ROI
+            cell_mask_roi = (original_roi == label)
+            
+            # Get the number of voxels before filling
+            original_voxels = np.sum(cell_mask_roi)
+            
+            # Perform the hole filling on the small binary ROI
+            filled_cell_roi = binary_fill_holes(cell_mask_roi)
+            
+            # Get the number of voxels after filling
+            filled_voxels = np.sum(filled_cell_roi)
+            
+            # Check if any holes were actually filled
+            if filled_voxels > original_voxels:
+                voxels_added = filled_voxels - original_voxels
+                voxels_added_total += voxels_added
+                voids_filled_count += 1
+                
+                print(f"  - Filling void in cell {label}: added {voxels_added} voxels.")
+                
+                # Update the corresponding ROI in our result mask.
+                # We use the filled_cell_roi (a boolean mask) to specify which
+                # voxels within the bounding box should be set to the current label.
+                result_roi = filled_mask[bbox]
+                result_roi[filled_cell_roi] = label
+        
+        print("\n--- Void Filling Summary ---")
+        if voids_filled_count > 0:
+            print(f"  Filled voids in {voids_filled_count} cells.")
+            print(f"  Total voxels added: {voxels_added_total}")
+        else:
+            print("  No internal voids were found to fill.")
+            
+        print("=== Internal Void Filling Complete ===\n")
+        
+        return filled_mask
 
     # Main processing
     print("=== Starting Recursive Multi-Soma Cell Separation ===")
@@ -796,57 +910,84 @@ def separate_multi_soma_cells(
 
         soma_regions_in_cell = [labeled_somas == i for i in range(1, num_somas + 1)]
 
-        # --- THE NEW ITERATIVE LOOP ---
-        final_regions = []
-        regions_to_process = deque([(cell_region, soma_regions_in_cell)])
-        
-        # Safety break to prevent infinite loops
-        max_iterations = num_somas * 2 
-        
+        # 1. SETUP THE QUEUE using tightly cropped data
+        final_regions = [] # This will store tuples of (cropped_mask, bbox)
+        initial_bbox_list = find_objects(cell_region.astype(int))
+
+        # Safety check in case the cell is empty or weird
+        if not initial_bbox_list:
+            print(f"  WARNING: Could not find bounding box for cell {cell_label}. Skipping.")
+            continue
+        initial_bbox = initial_bbox_list[0]
+
+        initial_cropped_mask = cell_region[initial_bbox]
+        regions_to_process = deque([(initial_cropped_mask, initial_bbox, soma_regions_in_cell)])
+        max_iterations = num_somas * 3 # Generous safety break
+
+        print(f"  Starting iterative separation. Initial queue size: 1, Max iterations: {max_iterations}")
+
+        # 2. THE MAIN MEMORY-EFFICIENT ITERATIVE LOOP
+        iteration_count = 0
         while regions_to_process and max_iterations > 0:
+            iteration_count += 1
             max_iterations -= 1
-            current_region, current_somas = regions_to_process.popleft()
             
-            # Try to perform one separation on the current region
-            separation_result = attempt_one_separation(current_region, current_somas)
+            current_cropped_region, current_bbox, current_somas = regions_to_process.popleft()
+            
+            print(f"\n  [Iter {iteration_count}] Processing piece with {len(current_somas)} somas, size {np.sum(current_cropped_region)} voxels")
+            print(f"    Global BBox: {current_bbox}")
+            
+            # Pass the cell_label for logging purposes
+            separation_result = attempt_one_separation(current_cropped_region, current_bbox, current_somas, cell_label)
             
             if separation_result:
-                # Separation was successful, add the two new sub-regions back to the queue
-                region1, somas1, region2, somas2 = separation_result
-                regions_to_process.append((region1, somas1))
-                regions_to_process.append((region2, somas2))
-                total_separations += 1
-                print(f"    Separation successful. Queue size: {len(regions_to_process)}")
-            else:
-                # No more separations possible for this region, it's considered final
-                final_regions.append(current_region)
-                print(f"    Region finalized. Total final regions: {len(final_regions)}")
-        
-        if max_iterations <= 0:
-            print("  WARNING: Max iterations reached. Moving remaining regions to final.")
-            # Add any remaining unprocessed regions to the final list
-            while regions_to_process:
-                final_regions.append(regions_to_process.popleft()[0])
+                # SUCCESS: The region was split.
+                (crop1, bbox1, somas1, crop2, bbox2, somas2) = separation_result
+                
+                if np.any(crop1): regions_to_process.append((crop1, bbox1, somas1))
+                if np.any(crop2): regions_to_process.append((crop2, bbox2, somas2))
+                
+                print(f"    --> Split successful. Queue size is now: {len(regions_to_process)}")
 
-        # --- END OF THE ITERATIVE LOOP ---
+            else:
+                # FAILURE: This piece is final.
+                final_regions.append((current_cropped_region, current_bbox))
+                print(f"    --> Region finalized (no further split). Final regions so far: {len(final_regions)}")
+
+        # 3. HANDLE LEFTOVERS AND RECONSTRUCT
+        if max_iterations <= 0 and len(regions_to_process) > 0:
+            print(f"  WARNING: Max iterations reached for cell {cell_label}. Moving {len(regions_to_process)} remaining regions to final list.")
+            while regions_to_process:
+                # We only need the mask and its bbox for the final list
+                final_regions.append(regions_to_process.popleft()[:2])
 
         print(f"\n  SEPARATION COMPLETE for cell {cell_label}:")
         print(f"    Original cell -> {len(final_regions)} final regions")
 
-        result_mask[cell_region] = 0 # Clear the original cell
-        
-        for region_idx, region_mask in enumerate(final_regions):
+        print(f"  Reconstructing final mask from {len(final_regions)} pieces...")
+        result_mask[cell_region] = 0
+
+        for region_idx, (cropped_mask, bbox) in enumerate(final_regions):
             label_to_use = cell_label if region_idx == 0 else next_available_label
             if region_idx > 0: next_available_label += 1
             
-            result_mask[region_mask] = label_to_use
-            print(f"      Region {region_idx + 1}: label {label_to_use}, size {np.sum(region_mask)}")
+            # Place the small cropped mask back into the full-sized result mask
+            result_roi = result_mask[bbox]
+            # Use the boolean cropped_mask to indicate where to place the label
+            result_roi[cropped_mask] = label_to_use
+            # Assign the modified ROI back to the main mask
+            result_mask[bbox] = result_roi 
+            
+            print(f"      Region {region_idx + 1}: assigned label {label_to_use}, size {np.sum(cropped_mask)} voxels")
 
-        del cell_region, final_regions, regions_to_process
+        # --- END: New iterative processing block ---
+
+        # The gc.collect() can happen after this block
         gc.collect()
 
     # ... (Your summary and post-processing code remains the same) ...
+    final_solid_mask = fill_internal_voids(result_mask)
     print("\n--- SUMMARY ---")
     # ...
     
-    return result_mask
+    return final_solid_mask

@@ -361,6 +361,8 @@ class RamifiedStrategy(ProcessingStrategy):
             # Parameters for separate_multi_soma_cells
             max_seed_centroid_dist = float(params.get("max_seed_centroid_dist", 40.0))
             min_path_intensity_ratio = float(params.get("min_path_intensity_ratio", 0.8))
+            min_local_intensity_difference = float(params.get("min_local_intensity_difference", 0.05))
+            local_analysis_radius = float(params.get("local_analysis_radius", 5.0))
 
 
             # --- UPDATED: Call functions with all extracted parameters ---
@@ -391,7 +393,9 @@ class RamifiedStrategy(ProcessingStrategy):
                 labeled_cells, image_stack, cell_bodies, self.spacing,
                 min_size_threshold=min_size_threshold, # Maps to the same parameter
                 max_seed_centroid_dist=max_seed_centroid_dist,
-                min_path_intensity_ratio=min_path_intensity_ratio
+                min_path_intensity_ratio=min_path_intensity_ratio,
+                min_local_intensity_difference=min_local_intensity_difference,
+                local_analysis_radius=local_analysis_radius
             )
 
         except Exception as e:
