@@ -1,6 +1,6 @@
-import numpy as np
-from scipy import ndimage, sparse
-from tqdm import tqdm
+import numpy as np # type: ignore
+from scipy import ndimage, sparse # type: ignore
+from tqdm import tqdm # type: ignore
 from shutil import rmtree
 import gc
 import time # For profiling
@@ -15,10 +15,9 @@ from skimage.feature import peak_local_max # type: ignore
 from typing import List, Dict, Optional, Tuple, Union, Any, Set
 from skimage.segmentation import relabel_sequential # type: ignore
 import traceback # For detailed error logging
-from scipy.sparse.csgraph import connected_components, dijkstra
 from skimage.measure import label, regionprops # type: ignore
 from collections import deque
-from scipy.ndimage import binary_fill_holes, find_objects
+from scipy.ndimage import binary_fill_holes, find_objects # type: ignore
 
 seed = 42
 np.random.seed(seed)         # For NumPy
@@ -398,7 +397,7 @@ def separate_multi_soma_cells(
     
     def get_local_regions_around_interface(region1, region2, cell_region, radius=3):
         """Get voxels that are within 'radius' distance from the interface between two regions."""
-        from scipy.ndimage import binary_dilation
+        from scipy.ndimage import binary_dilation # type: ignore
         from skimage.morphology import ball # type: ignore
         
         if radius <= 1:
@@ -501,7 +500,7 @@ def separate_multi_soma_cells(
         print(f"    Soma intensities: {soma1_intensity:.2f}, {soma2_intensity:.2f} (mean: {mean_soma_intensity:.2f})")
         print(f"    Using watershed-based separation following intensity valleys")
         
-        from scipy.ndimage import distance_transform_edt, gaussian_filter, binary_dilation
+        from scipy.ndimage import distance_transform_edt, gaussian_filter, binary_dilation # type: ignore
         from skimage.segmentation import watershed # type: ignore
         from skimage.morphology import cube # type: ignore
         

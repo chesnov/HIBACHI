@@ -64,7 +64,7 @@ execute_trim_edges_ramified:
     brightness_cutoff_factor:
       label: Brightness Cutoff Factor
       type: float
-      value: 200000.0
+      value: 500000.0
       min: 0.0
       max: 10000000
       step: 0.1
@@ -207,14 +207,14 @@ execute_refine_rois_ramified:
     min_path_intensity_ratio:
       label: Min Path Intensity Ratio (Separate cells)
       type: float
-      value: 0.5
+      value: 0.55
       min: 0.0
       max: 100.0
       step: 0.01
     min_local_intensity_difference:
       label: Min Local Intensity Difference (Separate cells)
       type: float
-      value: 2.0
+      value: 0.2
       min: 0.0
       max: 100.0
       step: 0.01

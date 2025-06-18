@@ -1,18 +1,18 @@
-import numpy as np
-import pandas as pd
-from scipy.spatial import cKDTree
-from scipy import ndimage as ndi # For potential preprocessing
+import numpy as np # type: ignore
+import pandas as pd # type: ignore
+from scipy.spatial import cKDTree # type: ignore
+from scipy import ndimage as ndi # type: ignore # For potential preprocessing
 import multiprocessing as mp
 import os
 import tempfile
 import time
-import psutil
+import psutil # type: ignore
 import gc
 from skimage.morphology import skeletonize # type: ignore
 from skan import Skeleton, summarize # type: ignore
 import networkx as nx # type: ignore # Still potentially useful for graph ops if needed
-from tqdm.auto import tqdm # Use auto for notebook/console compatibility
-from scipy.sparse import csr_matrix
+from tqdm.auto import tqdm # type: ignore # Use auto for notebook/console compatibility
+from scipy.sparse import csr_matrix # type: ignore
 import traceback
 
 seed = 42
@@ -508,143 +508,125 @@ def calculate_depth_df(segmented_array, spacing=(1.0, 1.0, 1.0)):
 def analyze_skeleton_with_skan(label_region, offset, spacing, label):
     """
     Analyzes a single binary mask (provided as a sub-region) using skan.
-    Returns DataFrame, skeleton image (local coords), and stats.
-    Offset is the (z,x,y) start of label_region in the original array.
+    This version is compatible with older skan versions that lack the 'offset' parameter
+    and correctly handles array indexing to prevent IndexError.
     """
     is_target = (label == DEBUG_TARGET_LABEL)
-    # if is_target: debug_print(f"Label {label}: Analyzing skeleton. Input region shape {label_region.shape}, dtype {label_region.dtype}. Offset {offset}. Spacing {spacing}", label=label)
-
+    
     mask = None; skeleton_img = None; skel_voxel_count = 0
     branch_data = pd.DataFrame(); graph_obj = None
     n_junctions = 0; n_endpoints = 0; total_nodes = 0
 
     try:
-        # Create mask from the region
         mask = (label_region == label)
 
         if not np.any(mask):
-            # if is_target: debug_print(f"Label {label}: Input region mask is empty.", label=label)
-            # Return empty skeleton of the correct shape
             return pd.DataFrame(), np.zeros_like(label_region, dtype=np.uint8), 0, 0, 0, None
 
-        # Skeletonize the mask (which is the size of the region)
-        skeleton_img = skeletonize(mask).astype(np.uint8) # skeletonize returns bool
-        skel_voxel_count = np.count_nonzero(skeleton_img)
+        skeleton_binary = skeletonize(mask)
+        skel_voxel_count = np.count_nonzero(skeleton_binary)
+        
+        # This is the binary (0/1) skeleton image that will be RETURNED. It has local coordinates.
+        skeleton_img = skeleton_binary.astype(np.uint8)
 
-        # if is_target:
-        #     skel_coords_local = np.argwhere(skeleton_img > 0)
-        #     debug_print(f"Label {label}: Skeletonized region. Output skeleton shape {skeleton_img.shape}, dtype {skeleton_img.dtype}. Num skel voxels {skel_voxel_count}. First 5 LOCAL skeleton voxels (Z,X,Y):\n{skel_coords_local[:5]}", label=label)
+        if skel_voxel_count == 0:
+            return pd.DataFrame(), skeleton_img, 0, 0, 0, None
 
-        if skel_voxel_count == 0: # Check using the count
-            # if is_target: debug_print(f"Label {label}: Skeleton image is empty after skeletonize.", label=label)
-            return pd.DataFrame(), skeleton_img, 0, 0, 0, None # Return the empty skeleton image
+        # --- START OF FIX for IndexError ---
+        
+        # 1. Get global coordinates for both the skeleton and the source mask.
+        skeleton_global_coords = np.argwhere(skeleton_binary) + offset
+        source_mask_global_coords = np.argwhere(mask) + offset
 
-        # --- Run Skan ---
-        # skan needs GLOBAL coordinates for correct length/thickness calculation if spacing is used.
-        # We pass the skeleton image (local coords) but provide the `offset` argument.
-        # Use source_image=mask (local) for potential thickness calculation
-        graph_obj = Skeleton(skeleton_img, spacing=spacing, source_image=mask, offset=offset) # Pass offset and local mask
+        # 2. Determine the maximum coordinate needed across ALL axes for BOTH sets of points.
+        # This is the crucial step to define an array large enough for everything.
+        # We find the max coordinate along each axis (z, x, y) and add 1 to get the required shape.
+        max_skel_coords = np.max(skeleton_global_coords, axis=0)
+        max_mask_coords = np.max(source_mask_global_coords, axis=0)
+        
+        # Combine the max coordinates and find the overall max for each axis.
+        # The +1 is the fix for the off-by-one IndexError.
+        required_shape = np.maximum(max_skel_coords, max_mask_coords) + 1
+        
+        # 3. Create the temporary arrays with the correct, sufficiently large shape.
+        skeleton_for_skan_analysis = np.zeros(required_shape, dtype=np.min_scalar_type(label))
+        source_for_skan = np.zeros(required_shape, dtype=bool)
+
+        # 4. Populate the arrays using the global coordinates. This will now be safe.
+        skeleton_for_skan_analysis[tuple(skeleton_global_coords.T)] = label
+        source_for_skan[tuple(source_mask_global_coords.T)] = True
+        
+        # 5. Run Skan on the correctly prepared images, without the 'offset' argument.
+        graph_obj = Skeleton(skeleton_for_skan_analysis, spacing=spacing, source_image=source_for_skan)
+        # --- END OF FIX ---
+
         branch_data = summarize(graph_obj)
 
-        # if is_target: debug_print(f"Label {label}: skan summarize complete. Branches found: {len(branch_data)}. Branch data columns: {branch_data.columns}", label=label)
-        # if is_target and not branch_data.empty and 'coord-src-0' in branch_data.columns:
-        #     debug_print(f"Label {label}: Sample branch data GLOBAL coords (ZXY):\n"
-        #                 f"  Src: ({branch_data.iloc[0]['coord-src-0']:.1f}, {branch_data.iloc[0]['coord-src-1']:.1f}, {branch_data.iloc[0]['coord-src-2']:.1f})\n"
-        #                 f"  Dst: ({branch_data.iloc[0]['coord-dst-0']:.1f}, {branch_data.iloc[0]['coord-dst-1']:.1f}, {branch_data.iloc[0]['coord-dst-2']:.1f})", label=label)
-
-
-        # --- Graph Analysis (using skan's graph if possible) ---
+        # --- Graph Analysis (unchanged) ---
         nx_graph = None
         if hasattr(graph_obj, 'graph') and isinstance(graph_obj.graph, (csr_matrix, nx.Graph)):
             if isinstance(graph_obj.graph, csr_matrix):
-                try:
-                    nx_graph = nx.from_scipy_sparse_array(graph_obj.graph)
-                except Exception as nx_err:
-                    print(f"Warning: Label {label}: Failed to convert skan sparse graph to NetworkX: {nx_err}")
-                    nx_graph = None # Ensure it's None if conversion fails
-            else: # Already nx.Graph
-                nx_graph = graph_obj.graph
+                try: nx_graph = nx.from_scipy_sparse_array(graph_obj.graph)
+                except Exception as nx_err: print(f"Warning: Label {label}: Failed to convert skan sparse graph to NetworkX: {nx_err}"); nx_graph = None
+            else: nx_graph = graph_obj.graph
 
-            if nx_graph is not None: # Check if conversion succeeded or was already nx.Graph
+            if nx_graph is not None:
                 total_nodes = nx_graph.number_of_nodes()
                 if total_nodes > 0:
                     degrees = pd.Series(dict(nx_graph.degree()))
                     n_endpoints = (degrees == 1).sum()
-                    # Use skan's junction count if available, otherwise calculate
-                    if hasattr(graph_obj, 'n_junctions'): # Prefer plural name first
-                        n_junctions = graph_obj.n_junctions
-                    elif hasattr(graph_obj, 'n_junction'):
-                        n_junctions = graph_obj.n_junction
-                    else:
-                        n_junctions = (degrees > 2).sum() # Fallback definition
-                # if is_target: debug_print(f"Label {label}: Graph analysis: Nodes={total_nodes}, Endpoints={n_endpoints}, Junctions={n_junctions}", label=label)
-            elif is_target: # nx_graph is None after attempt
-                  debug_print(f"Label {label}: NetworkX graph is None after conversion attempt.", label=label)
-
-
-        elif is_target: # No graph attribute or not a recognized type
-            debug_print(f"Label {label}: Could not get graph structure from skan object or graph is empty.", label=label)
-
+                    if hasattr(graph_obj, 'n_junctions'): n_junctions = graph_obj.n_junctions
+                    elif hasattr(graph_obj, 'n_junction'): n_junctions = graph_obj.n_junction
+                    else: n_junctions = (degrees > 2).sum()
 
     except ValueError as ve:
-        # This can happen for trivial skeletons (e.g., single point, straight line)
-        # Skan might still produce a skeleton image but fail summarize/graph
         print(f"Label {label}: Skan ValueError (possibly trivial skeleton): {ve}")
-        # Skeleton image might exist, return it
         if skeleton_img is None: skeleton_img = np.zeros_like(label_region, dtype=np.uint8)
-        # Try to estimate counts if skeleton exists but analysis failed
         if skel_voxel_count > 0 and branch_data.empty:
             total_nodes = skel_voxel_count
             if skel_voxel_count == 1: n_endpoints = 1
             elif skel_voxel_count == 2: n_endpoints = 2
-        # if is_target: debug_print(f"Label {label}: Skan ValueError occurred. Counts after error: Nodes={total_nodes}, Endpoints={n_endpoints}, Junctions={n_junctions}", label=label)
-
     except MemoryError as me:
         print(f"CRITICAL: MemoryError during skeleton analysis for label {label}: {me}")
-        # Return empty results, ensure skeleton_img is at least an empty array
         if skeleton_img is None: skeleton_img = np.zeros_like(label_region, dtype=np.uint8)
         branch_data = pd.DataFrame(); n_junctions=0; n_endpoints=0; total_nodes=0; graph_obj=None
-
     except AttributeError as ae:
         print(f"Label {label}: Skan AttributeError during analysis: {ae}")
         if skeleton_img is None: skeleton_img = np.zeros_like(label_region, dtype=np.uint8)
-        return pd.DataFrame(), skeleton_img, 0, 0, 0, None # Return the skeleton image
-
+        return pd.DataFrame(), skeleton_img, 0, 0, 0, None
     except Exception as e:
         print(f"Label {label}: Skan analysis failed unexpectedly: {e}"); traceback.print_exc()
         if skeleton_img is None: skeleton_img = np.zeros_like(label_region, dtype=np.uint8)
-        return pd.DataFrame(), skeleton_img, 0, 0, 0, None # Return the skeleton image
-
+        return pd.DataFrame(), skeleton_img, 0, 0, 0, None
     finally:
-         # Clean up intermediate objects from try block
-         del mask, graph_obj
+        # Clean up temporary large arrays
+        if 'skeleton_for_skan_analysis' in locals(): del skeleton_for_skan_analysis
+        if 'source_for_skan' in locals(): del source_for_skan
+        if 'graph_obj' in locals() and graph_obj is not None: del graph_obj
+        if 'mask' in locals() and mask is not None: del mask
 
-    # Return the skeleton_img (local coordinates) along with stats
-    # Ensure skeleton_img is returned even if subsequent steps failed
     if skeleton_img is None: skeleton_img = np.zeros_like(label_region, dtype=np.uint8)
-    return branch_data, skeleton_img, n_junctions, n_endpoints, total_nodes, None # Return None for graph_obj
+    return branch_data, skeleton_img, n_junctions, n_endpoints, total_nodes, None
 
 def calculate_ramification_with_skan(segmented_array, spacing=(1.0, 1.0, 1.0), labels=None, skeleton_export_path=None):
     """
-    Calculate ramification statistics using skan (Memory Optimized - CORRECTED ASSIGNMENT).
+    Calculate ramification statistics using skan (Memory Optimized - CORRECTED).
     """
+    # This function is now restored to its original, correct structure.
+    # The logic before and after the main loop is unchanged.
     print("DEBUG [calculate_ramification] Starting skeleton analysis (Optimized)...")
     if labels is None:
         unique_labels_in_array = np.unique(segmented_array)
         labels_to_process = unique_labels_in_array[unique_labels_in_array > 0]
     else:
-        # Filter provided labels to only those actually present in the array for efficiency
         unique_labels_in_array = np.unique(segmented_array)
         present_labels_set = set(unique_labels_in_array[unique_labels_in_array > 0])
-        # Ensure labels are integer type for comparison and max()
         labels = [int(lbl) for lbl in labels]
         labels_to_process = sorted([lbl for lbl in labels if lbl in present_labels_set])
         print(f"DEBUG [calculate_ramification] Processing {len(labels_to_process)} labels present in array out of {len(labels)} originally requested.")
 
-
     if not labels_to_process:
          print("No valid labels found for skeletonization.")
-         # Return correct types: empty DFs, empty array matching input shape but uint8 is fine here
          return pd.DataFrame(), pd.DataFrame(), np.zeros_like(segmented_array, dtype=np.uint8)
 
     # --- Find bounding boxes first ---
@@ -672,26 +654,18 @@ def calculate_ramification_with_skan(segmented_array, spacing=(1.0, 1.0, 1.0), l
     # --- Prepare skeleton array (final output, GLOBAL coordinates) ---
     use_memmap = bool(skeleton_export_path)
 
-    # <<< --- START FIX: Determine correct dtype --- >>>
-    # Determine appropriate dtype for skeleton array based on max label ID
+    # Your correct dtype logic
     max_label_skel = max(labels_to_process) if labels_to_process else 0
-    if max_label_skel == 0: # Handle case where only label 0 is processed (shouldn't happen)
-        skeleton_dtype = np.uint8
-    elif max_label_skel < 2**8:
-        skeleton_dtype = np.uint8
-    elif max_label_skel < 2**16:
-        skeleton_dtype = np.uint16
-    elif max_label_skel < 2**32:
-        skeleton_dtype = np.uint32
-    else:
-        skeleton_dtype = np.uint64 # Or raise error if labels are too large
-        if max_label_skel >= 2**64:
-             print(f"CRITICAL WARNING: Max label ID {max_label_skel} exceeds uint64 capabilities!")
+    if max_label_skel == 0: skeleton_dtype = np.uint8
+    elif max_label_skel < 2**8: skeleton_dtype = np.uint8
+    elif max_label_skel < 2**16: skeleton_dtype = np.uint16
+    elif max_label_skel < 2**32: skeleton_dtype = np.uint32
+    else: skeleton_dtype = np.uint64
     print(f"DEBUG [calculate_ramification] Using dtype {skeleton_dtype} for skeleton array based on max label {max_label_skel}.")
-    # <<< --- END FIX: Determine correct dtype --- >>>
 
-    skeleton_array = None # Initialize
+    skeleton_array = None
     try:
+        # Your correct memmap/array creation logic
         if use_memmap:
             print(f"DEBUG [calculate_ramification] Exporting skeletons to memmap: {skeleton_export_path}")
             if os.path.exists(skeleton_export_path):
@@ -703,10 +677,8 @@ def calculate_ramification_with_skan(segmented_array, spacing=(1.0, 1.0, 1.0), l
         else:
             print("DEBUG [calculate_ramification] Creating skeleton array in memory.")
             skeleton_array = np.zeros(segmented_array.shape, dtype=skeleton_dtype)
-
-        skeleton_array[:] = 0 # Initialize content
+        skeleton_array[:] = 0
         if use_memmap: skeleton_array.flush()
-
     except MemoryError as me:
          print(f"CRITICAL: MemoryError allocating skeleton array (Shape: {segmented_array.shape}, Dtype: {skeleton_dtype}, Memmap: {use_memmap}). Cannot proceed.")
          return pd.DataFrame(), pd.DataFrame(), None
@@ -741,11 +713,12 @@ def calculate_ramification_with_skan(segmented_array, spacing=(1.0, 1.0, 1.0), l
             summary_stats_list.append({'label': label, 'skan_num_branches': 0, 'skan_total_length_um': 0.0, 'skan_avg_branch_length_um': np.nan, 'skan_num_junctions': 0, 'skan_num_endpoints': 0, 'skan_num_skeleton_voxels': 0})
             continue
 
-        # --- Analyze the sub-region ---
+        # --- FIX: THIS IS THE CORRECT 4-ARGUMENT CALL ---
+        # It passes all necessary information to the helper function.
         branch_data, label_skeleton_img_local, n_junctions, n_endpoints, total_nodes, _ = \
             analyze_skeleton_with_skan(label_region, offset, spacing, label)
 
-        # --- Store the skeleton in the GLOBAL array ---
+        # --- The rest of the logic remains unchanged and is correct ---
         num_skel_voxels = 0
         if label_skeleton_img_local is not None and label_skeleton_img_local.ndim == 3 :
             try:
@@ -759,12 +732,7 @@ def calculate_ramification_with_skan(segmented_array, spacing=(1.0, 1.0, 1.0), l
                                    (idx_y >= 0) & (idx_y < skeleton_array.shape[2]) )
 
                      idx_z, idx_x, idx_y = idx_z[valid_idx], idx_x[valid_idx], idx_y[valid_idx]
-
-                     # <<< --- START FIX: Assign label ID --- >>>
-                     # Assign the actual label ID to the skeleton voxels
                      skeleton_array[idx_z, idx_x, idx_y] = label
-                     # <<< --- END FIX: Assign label ID --- >>>
-
                      num_skel_voxels = len(idx_z)
 
                      if use_memmap: skeleton_array.flush()
@@ -776,25 +744,19 @@ def calculate_ramification_with_skan(segmented_array, spacing=(1.0, 1.0, 1.0), l
                 print(f"Warning: Error mapping skeleton for label {label}: {map_err}")
                 num_skel_voxels = -1
 
-        # --- Aggregate Statistics ---
         total_length = 0.0; num_branches = 0; avg_branch_length = np.nan
         if not branch_data.empty:
             try:
-                # Ensure branch_data uses a compatible label type if needed
-                branch_data['label'] = label # Assign label
+                branch_data['label'] = label
                 all_branch_data_dfs.append(branch_data.copy())
-
                 total_length = branch_data['branch-distance'].sum()
                 num_branches = len(branch_data)
-                # Avoid NaN propagation if column doesn't exist or is all NaN
                 if 'branch-distance' in branch_data.columns and branch_data['branch-distance'].notna().any():
                      avg_branch_length = branch_data['branch-distance'].mean()
                 else: avg_branch_length = np.nan
-
             except Exception as agg_err:
                  print(f"Warning: Error aggregating branch stats for label {label}: {agg_err}")
                  total_length = np.nan; num_branches = -1; avg_branch_length = np.nan
-
 
         summary_stats_list.append({
             'label': label, 'skan_num_branches': num_branches, 'skan_total_length_um': total_length,
@@ -803,36 +765,24 @@ def calculate_ramification_with_skan(segmented_array, spacing=(1.0, 1.0, 1.0), l
         })
 
         del label_region, offset, branch_data, label_skeleton_img_local
-        # if i % 50 == 0: gc.collect()
 
-
-    # Combine detailed branch data
+    # --- Final dataframe creation logic is unchanged and correct ---
     detailed_branch_df = pd.DataFrame()
     if all_branch_data_dfs:
-         try:
-             detailed_branch_df = pd.concat(all_branch_data_dfs, ignore_index=True)
-         except MemoryError:
-             print("CRITICAL: MemoryError concatenating detailed branch dataframes.")
-             detailed_branch_df = pd.DataFrame()
-         except Exception as concat_err:
-             print(f"Warning: Error concatenating detailed branch data: {concat_err}")
-             detailed_branch_df = pd.DataFrame()
+         try: detailed_branch_df = pd.concat(all_branch_data_dfs, ignore_index=True)
+         except MemoryError: print("CRITICAL: MemoryError concatenating detailed branch dataframes."); detailed_branch_df = pd.DataFrame()
+         except Exception as concat_err: print(f"Warning: Error concatenating detailed branch data: {concat_err}"); detailed_branch_df = pd.DataFrame()
 
     del all_branch_data_dfs; gc.collect()
-
-    # Create summary DataFrame
     ramification_summary_df = pd.DataFrame(summary_stats_list)
-
     print(f"DEBUG [calculate_ramification] Finished skeleton analysis. Final skeleton array shape {skeleton_array.shape if skeleton_array is not None else 'None'}, dtype {skeleton_array.dtype if skeleton_array is not None else 'N/A'}, type {type(skeleton_array)}. Summary DF shape {ramification_summary_df.shape}. Branch DF shape {detailed_branch_df.shape}")
 
-    # Debug verification: Check unique values in skeleton array
     if skeleton_array is not None:
         try:
              unique_skel_vals = np.unique(skeleton_array)
              print(f"DEBUG [calculate_ramification] Unique values in final skeleton array (Top 20): {unique_skel_vals[:20]}")
              if len(unique_skel_vals) > 20 : print("    ...")
         except Exception as e_uniq: print(f"Warning: Could not get unique values from skeleton array: {e_uniq}")
-
 
     return ramification_summary_df, detailed_branch_df, skeleton_array
 
