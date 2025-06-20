@@ -18,6 +18,8 @@ import traceback # For detailed error logging
 from skimage.measure import label, regionprops # type: ignore
 from collections import deque
 from scipy.ndimage import binary_fill_holes, find_objects # type: ignore
+from skimage.morphology import binary_dilation, ball, footprint_rectangle # type: ignore
+from scipy.ndimage import binary_fill_holes, find_objects, gaussian_filter, distance_transform_edt # type: ignore
 
 seed = 42
 np.random.seed(seed)         # For NumPy
@@ -277,7 +279,7 @@ def extract_soma_masks(
                     t_iter_start = time.time(); time_log = {'labeling': 0, 'summing': 0, 'mini_ws': 0, 'filtering': 0}
                     initial_core = (dist_transform_obj >= max_dist * ratio) & mask_sub
                     if not np.any(initial_core): continue
-                    eroded_core = ndimage.binary_erosion(initial_core, structure=struct_el_erosion, iterations=erosion_iterations) if erosion_iterations > 0 else initial_core
+                    eroded_core = ndimage.binary_erosion(initial_core, footprint=struct_el_erosion, iterations=erosion_iterations) if erosion_iterations > 0 else initial_core
                     if np.any(eroded_core):
                         num_found, num_kept, stats = process_core_mask(eroded_core, time_log)
                         total_time = time.time() - t_iter_start
@@ -296,7 +298,7 @@ def extract_soma_masks(
                     thresh = np.percentile(ints_obj_vals, perc)
                     initial_core = (int_sub >= thresh) & mask_sub
                     if not np.any(initial_core): continue
-                    eroded_core = ndimage.binary_erosion(initial_core, structure=struct_el_erosion, iterations=erosion_iterations) if erosion_iterations > 0 else initial_core
+                    eroded_core = ndimage.binary_erosion(initial_core, footprint=struct_el_erosion, iterations=erosion_iterations) if erosion_iterations > 0 else initial_core
                     if np.any(eroded_core):
                         num_found, num_kept, stats = process_core_mask(eroded_core, time_log)
                         total_time = time.time() - t_iter_start
@@ -336,657 +338,649 @@ def extract_soma_masks(
     print(f"\nGenerated {total_final_seeds} final aggregated seeds (3D)."); print("--- Finished 3D Intermediate Seed Extraction ---")
     return final_seed_mask
 
-def separate_multi_soma_cells(
-    segmentation_mask: np.ndarray,
-    intensity_volume: np.ndarray,
-    soma_mask: np.ndarray,
-    spacing: Tuple[float, float, float],
-    min_size_threshold: int = 100,
-    max_seed_centroid_dist: float = 40.0,
-    min_path_intensity_ratio: float = 0.8,
-    min_local_intensity_difference: float = 0.05,
-    local_analysis_radius: int = 10
-) -> np.ndarray:
-    """
-    Memory-efficient recursive separation of cells with multiple somas.
-    Continues separating until all somas are properly isolated.
-    
-    Parameters:
-    -----------
-    segmentation_mask : np.ndarray
-        3D array with integer labels for cell regions
-    intensity_volume : np.ndarray
-        3D fluorescence intensity volume
-    soma_mask : np.ndarray
-        3D binary or labeled mask indicating soma locations
-    spacing : Tuple[float, float, float]
-        Voxel spacing in (z, y, x) dimensions
-    min_size_threshold : int
-        Minimum size for a valid cell region
-    max_seed_centroid_dist : float
-        Maximum distance between soma centroids to consider separation
-    min_path_intensity_ratio : float
-        Minimum ratio of path intensity to mean cell intensity
-    min_local_intensity_difference : float
-        Minimum relative intensity difference between regions adjacent to cut site
-    local_analysis_radius : int
-        Radius (in voxels) for local intensity analysis around cut site
-        
-    Returns:
-    --------
-    np.ndarray
-        Refined segmentation mask with separated cells
-    """
-    
-    def calculate_physical_distance(coord1, coord2, spacing):
-        """Calculate physical distance between two coordinates"""
-        diff = np.array(coord1) - np.array(coord2)
-        physical_diff = diff * np.array(spacing)
-        return np.linalg.norm(physical_diff)
-    
-    def get_cell_bounding_box(cell_mask, padding=5):
-        """Get tight bounding box around cell with padding"""
-        coords = np.where(cell_mask)
-        if len(coords[0]) == 0:
-            return None
-        
-        min_coords = [max(0, np.min(coords[i]) - padding) for i in range(3)]
-        max_coords = [min(cell_mask.shape[i], np.max(coords[i]) + padding + 1) for i in range(3)]
-        
-        return tuple(slice(min_coords[i], max_coords[i]) for i in range(3))
-    
-    def get_local_regions_around_interface(region1, region2, cell_region, radius=3):
-        """Get voxels that are within 'radius' distance from the interface between two regions."""
-        from scipy.ndimage import binary_dilation # type: ignore
-        from skimage.morphology import ball # type: ignore
-        
-        if radius <= 1:
-            struct_elem = np.ones((3, 3, 3), dtype=bool)
-        else:
-            struct_elem = ball(radius)
-        
-        dilated_region1 = binary_dilation(region1, struct_elem)
-        dilated_region2 = binary_dilation(region2, struct_elem)
-        
-        interface_zone = dilated_region1 & dilated_region2 & cell_region
-        local_region1 = interface_zone & dilated_region1 & ~region1
-        local_region2 = interface_zone & dilated_region2 & ~region2
-        
-        return local_region1, local_region2, interface_zone
-    
-    def analyze_local_intensity_difference(region1, region2, cell_region, intensity_vol, radius=3):
-        """Analyze intensity differences in regions immediately adjacent to the separation interface."""
-        print(f"    Analyzing local intensity differences around interface (radius: {radius})")
-        
-        local_region1, local_region2, interface_zone = get_local_regions_around_interface(
-            region1, region2, cell_region, radius
-        )
-        
-        print(f"      Interface zone size: {np.sum(interface_zone)} voxels")
-        print(f"      Local region 1 size: {np.sum(local_region1)} voxels")
-        print(f"      Local region 2 size: {np.sum(local_region2)} voxels")
-        
-        if np.sum(local_region1) == 0 or np.sum(local_region2) == 0:
-            print(f"      WARNING: One or both local regions are empty - cannot analyze")
-            return None, False
-        
-        local1_intensities = intensity_vol[local_region1]
-        local2_intensities = intensity_vol[local_region2]
-        
-        local1_mean = np.mean(local1_intensities)
-        local1_std = np.std(local1_intensities)
-        local2_mean = np.mean(local2_intensities)
-        local2_std = np.std(local2_intensities)
-        
-        print(f"      Local region 1: mean={local1_mean:.2f}, std={local1_std:.2f}")
-        print(f"      Local region 2: mean={local2_mean:.2f}, std={local2_std:.2f}")
-        
-        reference_intensity = max(local1_mean, local2_mean)
-        if reference_intensity == 0:
-            print(f"      ERROR: Reference intensity is zero")
-            return None, False
-        
-        intensity_difference = abs(local1_mean - local2_mean)
-        relative_difference = intensity_difference / reference_intensity
-        
-        print(f"      Absolute intensity difference: {intensity_difference:.2f}")
-        print(f"      Relative intensity difference: {relative_difference:.3f}")
-        print(f"      Threshold: {min_local_intensity_difference:.3f}")
-        
-        is_valid = relative_difference >= min_local_intensity_difference
-        
-        if is_valid:
-            print(f"      PASSED: Local intensity difference is sufficient ({relative_difference:.3f} >= {min_local_intensity_difference:.3f})")
-        else:
-            print(f"      FAILED: Local intensity difference too small ({relative_difference:.3f} < {min_local_intensity_difference:.3f})")
-        
-        return relative_difference, is_valid
-    
-    def bresenham_line_3d(start, end):
-        """Generate 3D line coordinates between two points"""
-        start = np.array(start, dtype=float)
-        end = np.array(end, dtype=float)
-        
-        diff = end - start
-        steps = int(np.max(np.abs(diff))) + 1
-        
-        if steps <= 1:
-            return [start]
-        
-        coords = []
-        for i in range(steps):
-            t = i / (steps - 1)
-            coord = start + t * diff
-            coords.append(coord)
-        
-        return coords
-    
-    def find_connecting_path_and_cut_plane(cell_region, soma1_region, soma2_region, intensity_vol):
-        """Find the connecting path between somas using watershed separation."""
-        print(f"    Analyzing connection between somas (sizes: {np.sum(soma1_region)}, {np.sum(soma2_region)})")
-        
-        soma1_coords = np.where(soma1_region)
-        soma1_centroid = [np.mean(soma1_coords[i]) for i in range(3)]
-        
-        soma2_coords = np.where(soma2_region)
-        soma2_centroid = [np.mean(soma2_coords[i]) for i in range(3)]
-        
-        print(f"    Soma centroids: {[f'{c:.1f}' for c in soma1_centroid]} -> {[f'{c:.1f}' for c in soma2_centroid]}")
-        
-        soma1_intensity = np.mean(intensity_vol[soma1_region])
-        soma2_intensity = np.mean(intensity_vol[soma2_region])
-        mean_soma_intensity = (soma1_intensity + soma2_intensity) / 2
-        
-        print(f"    Soma intensities: {soma1_intensity:.2f}, {soma2_intensity:.2f} (mean: {mean_soma_intensity:.2f})")
-        print(f"    Using watershed-based separation following intensity valleys")
-        
-        from scipy.ndimage import distance_transform_edt, gaussian_filter, binary_dilation # type: ignore
-        from skimage.segmentation import watershed # type: ignore
-        from skimage.morphology import cube # type: ignore
-        
-        cell_intensities = intensity_vol * cell_region.astype(float)
-        cell_intensities[~cell_region] = 0
-        
-        cell_intensity_values = intensity_vol[cell_region]
-        min_intensity = np.min(cell_intensity_values)
-        max_intensity = np.max(cell_intensity_values)
-        intensity_range = max_intensity - min_intensity
-        
-        print(f"    Cell intensity range: {min_intensity:.1f} to {max_intensity:.1f}")
-        
-        if intensity_range < mean_soma_intensity * 0.1:
-            print(f"    Insufficient intensity variation for watershed separation ({intensity_range:.1f} < {mean_soma_intensity * 0.1:.1f})")
-            return None
-        
-        normalized_intensities = (cell_intensities - min_intensity) / intensity_range
-        inverted_intensities = 1.0 - normalized_intensities
-        inverted_intensities[~cell_region] = 0
-        
-        smoothed_inverted = gaussian_filter(inverted_intensities, sigma=0.8)
-        
-        markers = np.zeros_like(cell_region, dtype=int)
-        markers[soma1_region] = 1
-        markers[soma2_region] = 2
-        
-        watershed_labels = watershed(smoothed_inverted, markers, mask=cell_region)
-        
-        print(f"    Watershed segmentation complete")
-        
-        region1 = watershed_labels == 1
-        region2 = watershed_labels == 2
-        
-        if np.sum(region1) == 0 or np.sum(region2) == 0:
-            print(f"    Watershed failed - empty regions (sizes: {np.sum(region1)}, {np.sum(region2)})")
-            return None
-        
-        print(f"    Watershed regions: {np.sum(region1)} and {np.sum(region2)} voxels")
-        
-        boundary_mask = cell_region & (watershed_labels == 0)
-        
-        if np.sum(boundary_mask) > 0:
-            boundary_intensities = intensity_vol[boundary_mask]
-            separation_intensity = np.mean(boundary_intensities)
-            
-            print(f"    Watershed boundary analysis:")
-            print(f"      Boundary voxels: {np.sum(boundary_mask)}")
-            print(f"      Boundary mean intensity: {separation_intensity:.2f}")
-            print(f"      Boundary/Soma intensity ratio: {separation_intensity/mean_soma_intensity:.3f}")
-            
-            boundary_coords = np.where(boundary_mask)
-            region1_mean_intensity = np.mean(intensity_vol[region1])
-            region2_mean_intensity = np.mean(intensity_vol[region2])
-            
-            for i in range(len(boundary_coords[0])):
-                coord = (boundary_coords[0][i], boundary_coords[1][i], boundary_coords[2][i])
-                voxel_intensity = intensity_vol[coord]
-                
-                dist_to_region1 = abs(voxel_intensity - region1_mean_intensity)
-                dist_to_region2 = abs(voxel_intensity - region2_mean_intensity)
-                
-                if dist_to_region1 < dist_to_region2:
-                    region1[coord] = True
-                else:
-                    region2[coord] = True
-        else:
-            print(f"    No explicit watershed boundary found - analyzing region interface")
-            
-            struct_elem = cube(3)
-            dilated_region1 = binary_dilation(region1, struct_elem)
-            dilated_region2 = binary_dilation(region2, struct_elem)
-            
-            interface_mask = (dilated_region1 & dilated_region2 & cell_region & 
-                            ~region1 & ~region2)
-            
-            if np.sum(interface_mask) > 0:
-                interface_intensities = intensity_vol[interface_mask]
-                separation_intensity = np.mean(interface_intensities)
-                
-                print(f"      Found interface region: {np.sum(interface_mask)} voxels")
-                print(f"      Interface mean intensity: {separation_intensity:.2f}")
-                print(f"      Interface/Soma intensity ratio: {separation_intensity/mean_soma_intensity:.3f}")
-                
-                interface_coords = np.where(interface_mask)
-                region1_mean_intensity = np.mean(intensity_vol[region1])
-                region2_mean_intensity = np.mean(intensity_vol[region2])
-                
-                for i in range(len(interface_coords[0])):
-                    coord = (interface_coords[0][i], interface_coords[1][i], interface_coords[2][i])
-                    voxel_intensity = intensity_vol[coord]
-                    
-                    dist_to_region1 = abs(voxel_intensity - region1_mean_intensity)
-                    dist_to_region2 = abs(voxel_intensity - region2_mean_intensity)
-                    
-                    if dist_to_region1 < dist_to_region2:
-                        region1[coord] = True
-                    else:
-                        region2[coord] = True
-            else:
-                print(f"      No clear interface found - sampling direct path between somas")
-                
-                path_coords = bresenham_line_3d(soma1_centroid, soma2_centroid)
-                
-                path_intensities = []
-                for coord in path_coords:
-                    int_coord = tuple(int(round(c)) for c in coord)
-                    
-                    if all(0 <= int_coord[i] < cell_region.shape[i] for i in range(3)):
-                        if (cell_region[int_coord] and 
-                            not soma1_region[int_coord] and 
-                            not soma2_region[int_coord]):
-                            path_intensities.append(intensity_vol[int_coord])
-                
-                if len(path_intensities) > 0:
-                    separation_intensity = np.mean(path_intensities)
-                    print(f"      Path sampling: {len(path_intensities)} voxels, mean intensity: {separation_intensity:.2f}")
-                else:
-                    non_soma_mask = cell_region & ~soma1_region & ~soma2_region
-                    if np.sum(non_soma_mask) > 0:
-                        separation_intensity = np.min(intensity_vol[non_soma_mask])
-                        print(f"      Using minimum non-soma intensity: {separation_intensity:.2f}")
-                    else:
-                        print(f"      ERROR: Cannot determine separation intensity")
-                        return None
-        
-        intensity_ratio = separation_intensity / mean_soma_intensity
-        print(f"    Final separation analysis:")
-        print(f"      Separation intensity: {separation_intensity:.2f}")
-        print(f"      Mean soma intensity: {mean_soma_intensity:.2f}")
-        print(f"      Intensity ratio: {intensity_ratio:.3f} (threshold: {min_path_intensity_ratio})")
-        
-        if intensity_ratio >= min_path_intensity_ratio:
-            print(f"    Separation region too bright for valid separation ({intensity_ratio:.3f} >= {min_path_intensity_ratio})")
-            return None
-        
-        print(f"    \n    === LOCAL INTENSITY ANALYSIS ===")
-        relative_diff, local_validation_passed = analyze_local_intensity_difference(
-            region1, region2, cell_region, intensity_vol, local_analysis_radius
-        )
-        
-        if not local_validation_passed:
-            print(f"    FAILED: Local intensity analysis indicates regions are too similar")
-            return None
-        
-        total_original = np.sum(cell_region)
-        total_separated = np.sum(region1) + np.sum(region2)
-        
-        print(f"    Region conservation check: {total_original} -> {total_separated} voxels")
-        
-        if abs(total_separated - total_original) > total_original * 0.01:
-            print(f"    WARNING: Significant voxel count mismatch!")
-        
-        if np.any(region1 & region2):
-            print(f"    ERROR: Regions overlap!")
-            return None
-        
-        print(f"    SUCCESSFUL WATERSHED SEPARATION with local validation")
-        print(f"      Final regions: {np.sum(region1)} and {np.sum(region2)} voxels")
-        print(f"      Local intensity difference: {relative_diff:.3f}")
-        print(f"      Separation intensity ratio: {intensity_ratio:.3f}")
-        
-        return region1, region2, separation_intensity, mean_soma_intensity
+# --- Helper: Analyze local intensity difference ---
+def _analyze_local_intensity_difference_hybrid(
+    region1_mask: np.ndarray, region2_mask: np.ndarray, parent_cell_mask: np.ndarray,
+    intensity_vol_local: np.ndarray, local_analysis_radius: int,
+    min_local_intensity_difference_threshold: float, log_prefix: str = "    [LID]"
+) -> bool:
+    t_start_lid = time.time()
+    print(f"{log_prefix} Start LID. R1:{np.sum(region1_mask)}, R2:{np.sum(region2_mask)}, Parent:{np.sum(parent_cell_mask)}, Radius:{local_analysis_radius}, Thresh:{min_local_intensity_difference_threshold:.3f}")
+    footprint_elem = ball(local_analysis_radius) if local_analysis_radius > 1 else footprint_rectangle((3,3,3))
 
-    def validate_separation(region1, region2, bridge_intensity, soma_intensity):
-        """Validate if separation results in valid cell regions"""
-        print(f"    Validating separation:")
-        print(f"      Region sizes: {np.sum(region1)}, {np.sum(region2)} (min threshold: {min_size_threshold})")
-        
-        if np.sum(region1) < min_size_threshold:
-            print(f"      FAILED: Region 1 too small ({np.sum(region1)} < {min_size_threshold})")
-            return False
-        if np.sum(region2) < min_size_threshold:
-            print(f"      FAILED: Region 2 too small ({np.sum(region2)} < {min_size_threshold})")
-            return False
-            
-        intensity_ratio = bridge_intensity / soma_intensity
-        print(f"      Bridge/Soma intensity ratio: {intensity_ratio:.3f} (threshold: {min_path_intensity_ratio})")
-        
-        if intensity_ratio >= min_path_intensity_ratio:
-            print(f"      FAILED: Bridge too bright ({intensity_ratio:.3f} >= {min_path_intensity_ratio})")
-            return False
-            
-        print(f"      PASSED: All validation criteria met")
+    r1m, r2m, pcm = region1_mask.astype(bool), region2_mask.astype(bool), parent_cell_mask.astype(bool)
+    
+    dr1 = binary_dilation(r1m, footprint=footprint_elem)
+    dr2 = binary_dilation(r2m, footprint=footprint_elem)
+
+    # Define the zone where dilated regions overlap within the parent mask
+    interface_overlap_zone = dr1 & dr2 & pcm
+    
+    # Local region 1: Part of the overlap zone, but strictly outside r1 itself.
+    # These are voxels effectively "on r2's side" of the r1/r2 interface.
+    la_r1 = interface_overlap_zone & ~r1m 
+    
+    # Local region 2: Part of the overlap zone, but strictly outside r2 itself.
+    # These are voxels "on r1's side" of the r1/r2 interface.
+    la_r2 = interface_overlap_zone & ~r2m
+    la_r1 = dr1 & dr2 & pcm & ~r1m & dr2 # Voxels near r1's boundary but in r2's dilation, within parent, outside r1
+    la_r2 = dr1 & dr2 & pcm & ~r2m & dr1 # Voxels near r2's boundary but in r1's dilation, within parent, outside r2
+
+    sa1, sa2 = np.sum(la_r1), np.sum(la_r2)
+    print(f"{log_prefix} Adj. region sizes: LA_R1={sa1}, LA_R2={sa2}")
+    MIN_ADJ_SIZE = 20
+    if sa1 < MIN_ADJ_SIZE or sa2 < MIN_ADJ_SIZE:
+        print(f"{log_prefix} Small adj. regions. LID returns False. Time:{time.time()-t_start_lid:.3f}s")
+        return False
+    i1, i2 = intensity_vol_local[la_r1], intensity_vol_local[la_r2]
+    m1, m2 = (np.mean(i1) if i1.size > 0 else 0), (np.mean(i2) if i2.size > 0 else 0)
+    print(f"{log_prefix} Adj. means: M1={m1:.2f}, M2={m2:.2f}")
+    ref_i = max(m1, m2)
+    if ref_i < 1e-6: 
+        print(f"{log_prefix} Ref intensity near zero. LID True. Time:{time.time()-t_start_lid:.3f}s"); 
         return True
+    rel_d = abs(m1 - m2) / ref_i
+    is_valid = rel_d >= min_local_intensity_difference_threshold
+    print(f"{log_prefix} Rel.Diff={rel_d:.3f} (Thresh {min_local_intensity_difference_threshold:.3f}). Valid={is_valid}. Time:{time.time()-t_start_lid:.3f}s")
+    return is_valid
 
-    def attempt_one_separation(
-        cropped_cell_region: np.ndarray,
-        bbox: Tuple[slice, ...],
-        soma_regions_in_cell: List[np.ndarray],
-        cell_label_for_log: int
-    ) -> Optional[Tuple[np.ndarray, Tuple[slice, ...], List[np.ndarray], np.ndarray, Tuple[slice, ...], List[np.ndarray]]]:
-        """
-        Tries to perform one valid separation on the given CROPPED region, with detailed logging.
-        """
-        local_intensity = intensity_volume[bbox]
-        local_soma_masks_in_piece = [soma_mask[bbox] for soma_mask in soma_regions_in_cell]
+def _calculate_interface_metrics(
+    mask_A_local: np.ndarray, # Boolean mask of segment A in its local crop
+    mask_B_local: np.ndarray, # Boolean mask of segment B in its local crop
+    parent_mask_local: np.ndarray, # Boolean mask of the original cell these segments belong to
+    intensity_local: np.ndarray, # Intensity image for the crop
+    avg_soma_intensity_for_interface: float, # Avg intensity of somas seeding A & B
+    spacing_tuple: Tuple[float, float, float],
+    local_analysis_radius: int,
+    min_local_intensity_difference: float,
+    min_path_intensity_ratio_heuristic: float, # Pass this for comparison printout
+    log_prefix: str = "      [IfaceMetrics]"
+) -> Dict[str, Any]:
+    """
+    Calculates metrics for the interface between two adjacent segments A and B.
+    Now includes mean_interface_intensity and ratio checks.
+    """
+    metrics = {
+        'interface_voxel_count': 0,
+        'mean_interface_intensity': 0.0,
+        'interface_intensity_ratio': float('inf'), # High if no interface or low soma intensity
+        'ratio_threshold_passed': False, # Did it pass the min_path_intensity_ratio check? (i.e., dark enough)
+        'lid_passed_separation': True, # Assume distinct unless LID fails (i.e., True if different enough)
+        'should_merge_decision': False # Final decision based on heuristics
+    }
+    if not np.any(mask_A_local) or not np.any(mask_B_local):
+        print(f"{log_prefix} One or both masks empty, cannot calculate metrics.")
+        return metrics
 
-        soma_centroids, present_somas_info = [], []
-        for i, local_soma_mask in enumerate(local_soma_masks_in_piece):
-            if np.any(local_soma_mask):
-                coords = np.where(local_soma_mask)
-                centroid_local = [np.mean(coords[j]) for j in range(3)]
-                centroid_global = [centroid_local[j] + bbox[j].start for j in range(3)]
-                soma_centroids.append(centroid_global)
-                present_somas_info.append({'mask': local_soma_mask, 'original_index': i})
+    footprint_dilation = footprint_rectangle((3,3,3))
 
-        if len(soma_centroids) < 2:
-            return None
+    dilated_A = binary_dilation(mask_A_local, footprint=footprint_dilation)
+    interface_A_B = dilated_A & mask_B_local 
+
+    dilated_B = binary_dilation(mask_B_local, footprint=footprint_dilation)
+    interface_B_A = dilated_B & mask_A_local 
+
+    combined_interface_mask = (interface_A_B | interface_B_A) & parent_mask_local
+    metrics['interface_voxel_count'] = np.sum(combined_interface_mask)
+    print(f"{log_prefix} Interface Voxel Count: {metrics['interface_voxel_count']}")
+
+    if metrics['interface_voxel_count'] > 0:
+        interface_intensity_values = intensity_local[combined_interface_mask]
+        if interface_intensity_values.size > 0:
+            metrics['mean_interface_intensity'] = np.mean(interface_intensity_values)
         
-        print(f"      Found {len(soma_centroids)} somas in this piece. Analyzing pairs for separation.")
-
-        valid_pairs = []
-        for i in range(len(soma_centroids)):
-            for j in range(i + 1, len(soma_centroids)):
-                dist = calculate_physical_distance(soma_centroids[i], soma_centroids[j], spacing)
-                print(f"        Distance between soma pair ({i}, {j}): {dist:.1f} µm")
-                if dist > max_seed_centroid_dist:
-                    valid_pairs.append((i, j, dist))
-                    print(f"          -> SHOULD SEPARATE (dist > {max_seed_centroid_dist:.1f})")
-                else:
-                    print(f"          -> KEEP TOGETHER (dist <= {max_seed_centroid_dist:.1f})")
+        if avg_soma_intensity_for_interface > 1e-6:
+            metrics['interface_intensity_ratio'] = metrics['mean_interface_intensity'] / avg_soma_intensity_for_interface
         
-        if not valid_pairs:
-            print("      No soma pairs are distant enough to require separation.")
-            return None
+        # Check against min_path_intensity_ratio heuristic
+        # A "good" separation has a LOW ratio (dark interface compared to somas)
+        metrics['ratio_threshold_passed'] = metrics['interface_intensity_ratio'] < min_path_intensity_ratio_heuristic
         
-        valid_pairs.sort(key=lambda x: x[2], reverse=True)
-
-        for soma_i, soma_j, pair_dist in valid_pairs:
-            print(f"\n      Attempting separation of most distant pair ({soma_i}, {soma_j}) with distance {pair_dist:.1f} µm")
-            local_soma1 = present_somas_info[soma_i]['mask']
-            local_soma2 = present_somas_info[soma_j]['mask']
-            
-            separation_result = find_connecting_path_and_cut_plane(
-                cropped_cell_region, local_soma1, local_soma2, local_intensity
-            )
-            
-            if separation_result is None:
-                print(f"      FAILED: Could not find valid separation path for this pair. Trying next pair...")
-                continue
-
-            region1_local, region2_local, bridge_intensity, soma_intensity = separation_result
-            
-            if not validate_separation(region1_local, region2_local, bridge_intensity, soma_intensity):
-                print(f"      FAILED: Separation validation failed for this pair. Trying next pair...")
-                continue
-                
-            print("      SUCCESS: Valid separation found for this pair!")
-            
-            bboxes1_local_list = find_objects(region1_local.astype(int))
-            bboxes2_local_list = find_objects(region2_local.astype(int))
-            if not bboxes1_local_list or not bboxes2_local_list:
-                print("      ERROR: Separation resulted in an empty piece. Skipping.")
-                continue
-
-            bbox1_local = bboxes1_local_list[0]
-            bbox2_local = bboxes2_local_list[0]
-            new_cropped_region1 = region1_local[bbox1_local]
-            new_cropped_region2 = region2_local[bbox2_local]
-
-            def get_global_bbox(parent_bbox, local_bbox):
-                return tuple(slice(parent_bbox[i].start + local_bbox[i].start,
-                                parent_bbox[i].start + local_bbox[i].start + (local_bbox[i].stop - local_bbox[i].start))
-                            for i in range(3))
-
-            new_global_bbox1 = get_global_bbox(bbox, bbox1_local)
-            new_global_bbox2 = get_global_bbox(bbox, bbox2_local)
-
-            somas_for_region1, somas_for_region2 = [], []
-            for i in range(len(soma_regions_in_cell)):
-                original_full_soma_mask = soma_regions_in_cell[i]
-                if np.any(original_full_soma_mask[new_global_bbox1]):
-                    somas_for_region1.append(original_full_soma_mask)
-                elif np.any(original_full_soma_mask[new_global_bbox2]):
-                    somas_for_region2.append(original_full_soma_mask)
-            
-            return (new_cropped_region1, new_global_bbox1, somas_for_region1,
-                    new_cropped_region2, new_global_bbox2, somas_for_region2)
-
-        print("      FAILED: No valid separation path found for any pair in this piece.")
-        return None
-    
-    def fill_internal_voids(segmentation_mask: np.ndarray) -> np.ndarray:
-        """
-        Identifies and fills internal voids (holes) in each labeled region of a 3D segmentation mask.
-
-        This function processes each labeled cell independently to ensure that filling a hole
-        in one cell does not bleed into a neighboring cell. It operates efficiently by
-        processing each cell within its tight bounding box.
-
-        Parameters:
-        -----------
-        segmentation_mask : np.ndarray
-            A 3D integer array where each integer represents a unique cell label.
-            The background is expected to be 0.
-
-        Returns:
-        --------
-        np.ndarray
-            A new 3D array of the same shape and dtype as the input, where all
-            internal voids in each labeled region have been filled.
-        """
-        print("=== Starting Internal Void Filling ===")
-        
-        # We create a copy to store the results, leaving the original mask untouched.
-        filled_mask = segmentation_mask.copy()
-        
-        # find_objects is highly efficient. It returns a list of slice objects (bounding boxes)
-        # for each label. The index of the list corresponds to `label - 1`.
-        # e.g., bboxes[0] is the bounding box for label 1.
-        bboxes = find_objects(segmentation_mask)
-        
-        voids_filled_count = 0
-        voxels_added_total = 0
-        
-        # We iterate through the bounding boxes. The index `i` corresponds to label `i + 1`.
-        for i, bbox in enumerate(bboxes):
-            label = i + 1
-            
-            # Skip if the label does not exist in the mask (find_objects returns None for it)
-            if bbox is None:
-                continue
-            
-            # Extract the small region of interest (ROI) from the original mask
-            # This is the key to memory and speed efficiency.
-            original_roi = segmentation_mask[bbox]
-            
-            # Create a binary mask of just the current cell within its ROI
-            cell_mask_roi = (original_roi == label)
-            
-            # Get the number of voxels before filling
-            original_voxels = np.sum(cell_mask_roi)
-            
-            # Perform the hole filling on the small binary ROI
-            filled_cell_roi = binary_fill_holes(cell_mask_roi)
-            
-            # Get the number of voxels after filling
-            filled_voxels = np.sum(filled_cell_roi)
-            
-            # Check if any holes were actually filled
-            if filled_voxels > original_voxels:
-                voxels_added = filled_voxels - original_voxels
-                voxels_added_total += voxels_added
-                voids_filled_count += 1
-                
-                print(f"  - Filling void in cell {label}: added {voxels_added} voxels.")
-                
-                # Update the corresponding ROI in our result mask.
-                # We use the filled_cell_roi (a boolean mask) to specify which
-                # voxels within the bounding box should be set to the current label.
-                result_roi = filled_mask[bbox]
-                result_roi[filled_cell_roi] = label
-        
-        print("\n--- Void Filling Summary ---")
-        if voids_filled_count > 0:
-            print(f"  Filled voids in {voids_filled_count} cells.")
-            print(f"  Total voxels added: {voxels_added_total}")
+        print(f"{log_prefix} Mean Interface Intensity: {metrics['mean_interface_intensity']:.2f}")
+        print(f"{log_prefix} Avg Soma Intensity Ref: {avg_soma_intensity_for_interface:.2f}")
+        print(f"{log_prefix} Interface/Soma Intensity Ratio: {metrics['interface_intensity_ratio']:.3f} (Threshold for merge if >= {min_path_intensity_ratio_heuristic:.3f})")
+        if metrics['ratio_threshold_passed']:
+            print(f"{log_prefix} --> Path Ratio Check: PASSED (interface is dark enough relative to somas)")
         else:
-            print("  No internal voids were found to fill.")
-            
-        print("=== Internal Void Filling Complete ===\n")
+            print(f"{log_prefix} --> Path Ratio Check: FAILED (interface is too bright, suggests merge)")
+
+
+        metrics['lid_passed_separation'] = _analyze_local_intensity_difference_hybrid(
+            mask_A_local, mask_B_local, parent_mask_local, intensity_local,
+            local_analysis_radius, min_local_intensity_difference,
+            log_prefix=log_prefix + " LID"
+        )
+        if metrics['lid_passed_separation']:
+            print(f"{log_prefix} --> LID Check: PASSED (segments are locally distinct)")
+        else:
+            print(f"{log_prefix} --> LID Check: FAILED (segments are too similar locally, suggests merge)")
         
-        return filled_mask
+        # Decision to merge:
+        # Merge if EITHER the interface is too bright (FAILS ratio_threshold_passed)
+        # OR if the local regions are too similar (FAILS lid_passed_separation)
+        if not metrics['ratio_threshold_passed'] or not metrics['lid_passed_separation']:
+            metrics['should_merge_decision'] = True
+            print(f"{log_prefix} ===> Merge Decision: YES (RatioFail: {not metrics['ratio_threshold_passed']}, LIDFail: {not metrics['lid_passed_separation']})")
+        else:
+            metrics['should_merge_decision'] = False
+            print(f"{log_prefix} ===> Merge Decision: NO (Separation seems valid by both heuristics)")
 
-    # Main processing
-    print("=== Starting Recursive Multi-Soma Cell Separation ===")
-    print(f"Input parameters:")
-    print(f"  Segmentation mask shape: {segmentation_mask.shape}")
-    print(f"  Intensity volume shape: {intensity_volume.shape}")
-    print(f"  Soma mask shape: {soma_mask.shape}")
-    print(f"  Spacing: {spacing}")
-    print(f"  Min size threshold: {min_size_threshold}")
-    print(f"  Max soma distance: {max_seed_centroid_dist}")
-    print(f"  Min intensity ratio: {min_path_intensity_ratio}")
-    print(f"  Min local intensity difference: {min_local_intensity_difference}")
-    print(f"  Local analysis radius: {local_analysis_radius}")
+    else: # No direct interface voxels found
+        print(f"{log_prefix} No interface voxels found between segments. Defaulting to NO MERGE.")
+        metrics['ratio_threshold_passed'] = True # No interface to be "too bright"
+        metrics['lid_passed_separation'] = True  # No interface for LID to fail on
+        metrics['should_merge_decision'] = False
 
-    result_mask = segmentation_mask.copy()
-    from skimage.measure import label # type: ignore
+    return metrics
+
+def _build_adjacency_graph_for_cell(
+    current_cell_segments_mask_local: np.ndarray, 
+    original_cell_mask_local: np.ndarray,
+    soma_mask_local: np.ndarray, # Original full soma mask, in local crop
+    soma_props_for_cell: Dict[int, Dict[str, Any]], # Pre-calculated props for ORIGINAL somas in this cell's crop
+    intensity_local: np.ndarray, 
+    spacing_tuple: Tuple[float, float, float],
+    local_analysis_radius: int,
+    min_local_intensity_difference: float,
+    min_path_intensity_ratio_heuristic: float, # Pass this for comparison printout in metrics
+    log_prefix: str = "    [GraphBuild]"
+) -> Tuple[Dict[int, Dict[str, Any]], Dict[Tuple[int, int], Dict[str, Any]]]:
+    print(f"{log_prefix} Building graph. SegMaskShape:{current_cell_segments_mask_local.shape}")
+    nodes: Dict[int, Dict[str, Any]] = {}
+    edges: Dict[Tuple[int, int], Dict[str, Any]] = {}
+    seg_lbls = np.unique(current_cell_segments_mask_local[current_cell_segments_mask_local > 0])
+    print(f"{log_prefix} Found {len(seg_lbls)} P1 segments: {seg_lbls}")
+
+    if len(seg_lbls) <= 1:
+        # ... (single node creation logic - same as before) ...
+        if len(seg_lbls) == 1:
+            lbl = seg_lbls[0]; m_node = (current_cell_segments_mask_local == lbl)
+            s_in_node_vals = soma_mask_local[m_node] # Values from soma_mask_local
+            s_in_node_unique = np.unique(s_in_node_vals[s_in_node_vals > 0]) # Unique positive labels
+            s_in_node = sorted([s_lbl for s_lbl in s_in_node_unique if s_lbl in soma_props_for_cell]) # Filter by those in props
+
+            obj_sl = find_objects(m_node.astype(np.int32))
+            nodes[lbl] = {'mask_bbox_local': obj_sl[0] if obj_sl and obj_sl[0] else None, 
+                          'orig_somas': s_in_node, 'volume': np.sum(m_node)}
+        print(f"{log_prefix} <=1 segment. Graph: {len(nodes)} nodes, {len(edges)} edges.")
+        return nodes, edges
     
-    cell_labels = np.unique(segmentation_mask[segmentation_mask > 0])
-    print(f"\nFound {len(cell_labels)} cells to process")
-    
-    cells_processed = 0
-    total_separations = 0
-    next_available_label = np.max(result_mask) + 1
-    
-    for cell_idx, cell_label in enumerate(cell_labels):
-        print(f"\n{'='*80}")
-        print(f"Processing cell {cell_idx + 1}/{len(cell_labels)}: Label {cell_label}")
+    footprint_d_graph = footprint_rectangle((3,3,3)) # Renamed
+
+    for lbl_node in seg_lbls: # Renamed lbl to lbl_node
+        m_node_build = (current_cell_segments_mask_local == lbl_node) # Renamed
+        if not np.any(m_node_build): continue
         
-        cell_region = (segmentation_mask == cell_label)
-        cell_soma_mask = soma_mask * cell_region
-        if not np.any(cell_soma_mask):
-            print("  No somas found - skipping.")
-            continue
-            
-        labeled_somas, num_somas = label(cell_soma_mask > 0, return_num=True)
-        if num_somas < 2:
-            print(f"  Only {num_somas} soma region(s) - no separation needed.")
-            continue
+        s_in_node_vals_build = soma_mask_local[m_node_build] # Renamed
+        s_in_node_unique_build = np.unique(s_in_node_vals_build[s_in_node_vals_build > 0]) # Renamed
+        # Filter somas to only those for which we have properties (valid original somas)
+        orig_somas_list_build = sorted([s_lbl for s_lbl in s_in_node_unique_build if s_lbl in soma_props_for_cell]) # Renamed
         
-        cells_processed += 1
-        print(f"  Found {num_somas} soma regions. Starting iterative separation.")
+        obj_sl_build = find_objects(m_node_build.astype(np.int32)) # Renamed
+        nodes[lbl_node] = {
+            'mask_bbox_local': obj_sl_build[0] if obj_sl_build and obj_sl_build[0] else None,
+            'orig_somas': orig_somas_list_build, 
+            'volume': np.sum(m_node_build)
+        }
+        print(f"{log_prefix}   Node {lbl_node}: Vol={nodes[lbl_node]['volume']}, OrigSomas={nodes[lbl_node]['orig_somas']}")
 
-        soma_regions_in_cell = [labeled_somas == i for i in range(1, num_somas + 1)]
+    for i_idx_graph in range(len(seg_lbls)): # Renamed i_idx
+        lbl_A_graph = seg_lbls[i_idx_graph] # Renamed
+        mask_A_graph = (current_cell_segments_mask_local == lbl_A_graph) # Renamed
+        if not np.any(mask_A_graph) or lbl_A_graph not in nodes: continue # Ensure node_A exists
 
-        # 1. SETUP THE QUEUE using tightly cropped data
-        final_regions = [] # This will store tuples of (cropped_mask, bbox)
-        initial_bbox_list = find_objects(cell_region.astype(int))
-
-        # Safety check in case the cell is empty or weird
-        if not initial_bbox_list:
-            print(f"  WARNING: Could not find bounding box for cell {cell_label}. Skipping.")
-            continue
-        initial_bbox = initial_bbox_list[0]
-
-        initial_cropped_mask = cell_region[initial_bbox]
-        regions_to_process = deque([(initial_cropped_mask, initial_bbox, soma_regions_in_cell)])
-        max_iterations = num_somas * 3 # Generous safety break
-
-        print(f"  Starting iterative separation. Initial queue size: 1, Max iterations: {max_iterations}")
-
-        # 2. THE MAIN MEMORY-EFFICIENT ITERATIVE LOOP
-        iteration_count = 0
-        while regions_to_process and max_iterations > 0:
-            iteration_count += 1
-            max_iterations -= 1
+        dil_A_graph = binary_dilation(mask_A_graph, footprint=footprint_d_graph) # Renamed
+        pot_neigh_mask_graph = dil_A_graph & original_cell_mask_local & \
+                               (current_cell_segments_mask_local != lbl_A_graph) & \
+                               (current_cell_segments_mask_local > 0) # Renamed
+        if not np.any(pot_neigh_mask_graph): continue
+        
+        neigh_lbls_graph = np.unique(current_cell_segments_mask_local[pot_neigh_mask_graph]) # Renamed
+        for lbl_B_graph in neigh_lbls_graph: # Renamed
+            if lbl_B_graph <= lbl_A_graph or lbl_B_graph not in nodes: continue # Avoid duplicates and ensure node_B exists
             
-            current_cropped_region, current_bbox, current_somas = regions_to_process.popleft()
+            mask_B_graph = (current_cell_segments_mask_local == lbl_B_graph) # Renamed
+            if not np.any(mask_B_graph): continue
+
+            edge_key_graph = tuple(sorted((lbl_A_graph, lbl_B_graph))) # Renamed
+            if edge_key_graph in edges: continue
+
+            print(f"{log_prefix}   Checking interface: {edge_key_graph}")
             
-            print(f"\n  [Iter {iteration_count}] Processing piece with {len(current_somas)} somas, size {np.sum(current_cropped_region)} voxels")
-            print(f"    Global BBox: {current_bbox}")
+            # Calculate avg_soma_intensity for this specific interface
+            somas_A = nodes[lbl_A_graph].get('orig_somas', [])
+            somas_B = nodes[lbl_B_graph].get('orig_somas', [])
+            combined_interface_somas = list(set(somas_A + somas_B))
             
-            # Pass the cell_label for logging purposes
-            separation_result = attempt_one_separation(current_cropped_region, current_bbox, current_somas, cell_label)
+            interface_soma_intensities = [soma_props_for_cell[s_lbl]['mean_intensity'] 
+                                          for s_lbl in combined_interface_somas 
+                                          if s_lbl in soma_props_for_cell and 'mean_intensity' in soma_props_for_cell[s_lbl]]
             
-            if separation_result:
-                # SUCCESS: The region was split.
-                (crop1, bbox1, somas1, crop2, bbox2, somas2) = separation_result
+            avg_soma_intensity_for_this_interface = np.mean(interface_soma_intensities) if interface_soma_intensities else 1.0 # Default to 1.0 to avoid div by zero
+            if avg_soma_intensity_for_this_interface < 1e-6 : avg_soma_intensity_for_this_interface = 1.0
+            
+            print(f"{log_prefix}     Edge{edge_key_graph}: OrigSomasA={somas_A}, OrigSomasB={somas_B}, AvgSomaIntensityForIface={avg_soma_intensity_for_this_interface:.2f}")
+
+            if_metrics_graph = _calculate_interface_metrics( # Renamed
+                mask_A_graph, mask_B_graph, original_cell_mask_local, intensity_local, 
+                avg_soma_intensity_for_this_interface, # Pass the calculated average
+                spacing_tuple, local_analysis_radius, min_local_intensity_difference,
+                min_path_intensity_ratio_heuristic, # For comparison printout
+                log_prefix=f"{log_prefix}     Edge{edge_key_graph}")
+            edges[edge_key_graph] = if_metrics_graph
+            
+    print(f"{log_prefix} Graph built: {len(nodes)} nodes, {len(edges)} edges.")
+    return nodes, edges
+
+
+# --- Main Function ---
+def separate_multi_soma_cells(
+    segmentation_mask: np.ndarray, intensity_volume: np.ndarray, soma_mask: np.ndarray,
+    spacing: Optional[Tuple[float, float, float]], min_size_threshold: int = 100,
+    intensity_weight: float = 0.0, max_seed_centroid_dist: float = 40,
+    min_path_intensity_ratio: float = 0.8, # This is the min_path_intensity_ratio_heuristic for P1.5
+    post_merge_min_interface_voxels: int = 50, 
+    min_local_intensity_difference: float = 0.05, local_analysis_radius: int = 10
+) -> np.ndarray:
+    
+    log_main_prefix = "[SepMultiSomaSerialV7]" # New prefix for this version
+    overall_start_time = time.time()
+    print(f"{log_main_prefix} Starting Serialized Hybrid Separation v7 (Detailed P1.5 Heuristics)")
+    # ... (Initial parameter prints, spacing setup, type checks - same as before) ...
+    if spacing is None: spacing_arr = np.array([1.0, 1.0, 1.0]); spacing_tuple = (1.0,1.0,1.0)
+    else:
+        try: spacing_tuple = tuple(float(s) for s in spacing); assert len(spacing_tuple) == 3; spacing_arr = np.array(spacing_tuple)
+        except: spacing_tuple = (1.0,1.0,1.0); spacing_arr = np.array([1.0,1.0,1.0])
+    print(f"{log_main_prefix} Using 3D spacing (z,y,x): {spacing_tuple}")
+    if not np.issubdtype(intensity_volume.dtype, np.floating): intensity_volume = intensity_volume.astype(np.float32, copy=False)
+    if not np.issubdtype(segmentation_mask.dtype, np.integer): segmentation_mask = segmentation_mask.astype(np.int32)
+    if not np.issubdtype(soma_mask.dtype, np.integer): soma_mask = soma_mask.astype(np.int32)
+
+    final_output_mask = np.zeros_like(segmentation_mask, dtype=np.int32)
+    unique_initial_labels = np.unique(segmentation_mask[segmentation_mask > 0])
+    if unique_initial_labels.size == 0: print(f"{log_main_prefix} Seg mask empty."); return final_output_mask
+    
+    cell_to_somas_orig: Dict[int, Set[int]] = {lbl: set() for lbl in unique_initial_labels}
+    present_soma_labels_orig = np.unique(soma_mask[soma_mask > 0])
+    if present_soma_labels_orig.size == 0: 
+        print(f"{log_main_prefix} Soma mask empty. Returning original seg (relabelled).")
+        final_output_mask = segmentation_mask.copy()
+        if np.any(final_output_mask): return relabel_sequential(final_output_mask.astype(np.int32), offset=1)[0]
+        return final_output_mask
+
+    for soma_lbl_init in present_soma_labels_orig:
+        soma_loc_mask_init = (soma_mask == soma_lbl_init)
+        cell_lbls_under_soma_init = np.unique(segmentation_mask[soma_loc_mask_init])
+        for cell_lbl_init in cell_lbls_under_soma_init:
+            if cell_lbl_init > 0 and cell_lbl_init in cell_to_somas_orig:
+                cell_to_somas_orig[cell_lbl_init].add(soma_lbl_init)
+
+    multi_soma_cell_labels_list = [lbl for lbl, somas in cell_to_somas_orig.items() if len(somas) > 1]
+    
+    for lbl_init in unique_initial_labels:
+        if lbl_init not in multi_soma_cell_labels_list:
+            final_output_mask[segmentation_mask == lbl_init] = lbl_init
+    
+    if not multi_soma_cell_labels_list:
+        print(f"{log_main_prefix} No multi-soma cells. Relabeling initial output. Time:{time.time()-overall_start_time:.2f}s")
+        if np.any(final_output_mask): return relabel_sequential(final_output_mask.astype(np.int32), offset=1)[0]
+        return final_output_mask
+    
+    print(f"{log_main_prefix} Found {len(multi_soma_cell_labels_list)} multi-soma cells to process.")
+    current_max_overall_label_val = np.max(final_output_mask) if np.any(final_output_mask) else 0
+    if present_soma_labels_orig.size > 0 : current_max_overall_label_val = max(current_max_overall_label_val, np.max(present_soma_labels_orig))
+    next_global_label_offset_val = current_max_overall_label_val + 1
+    print(f"{log_main_prefix} Initial next_global_label_offset: {next_global_label_offset_val}")
+
+    phase1_combined_time = time.time()
+    print(f"\n{log_main_prefix} Phase 1 (GWS + Graph-Merge per cell).")
+    footprint_p1_dilation_val = footprint_rectangle((3,3,3)) 
+
+    for cell_idx_p1, cell_label_p1 in enumerate(tqdm(multi_soma_cell_labels_list, desc=f"{log_main_prefix} P1:CellProc")):
+        print(f"\n{log_main_prefix}   P1 Processing cell L{cell_label_p1} ({cell_idx_p1+1}/{len(multi_soma_cell_labels_list)})")
+        
+        # --- GWS LOGIC FOR ONE CELL (populates temp_gws_mask_local_p1gws) ---
+        # ... (This is the same extensive GWS block as in the previous answer, using _p1gws suffixes)
+        # ... It defines: temp_gws_mask_local_p1gws, local_bbox_slices_p1gws,
+        # ... original_cell_mask_local_for_gws_p1gws, soma_mask_local_orig_labels_gws_p1gws, intensity_local_gws_p1gws
+        # ... and importantly soma_props_local_gws_p1gws (which has 'mean_intensity' for original somas)
+        # --- START OF COPIED GWS LOGIC ---
+        original_cell_mask_full_p1gws = (segmentation_mask == cell_label_p1)
+        obj_slices_p1gws = find_objects(original_cell_mask_full_p1gws)
+        if not obj_slices_p1gws or obj_slices_p1gws[0] is None: print(f"{log_main_prefix}     L{cell_label_p1} No object slices. Skip."); continue
+        bbox_p1gws = obj_slices_p1gws[0]
+        pad_p1gws = 3 
+        local_bbox_slices_p1gws = tuple(slice(max(0, s.start - pad_p1gws), min(dim_size, s.stop + pad_p1gws))
+                           for s, dim_size in zip(bbox_p1gws, segmentation_mask.shape))
+        original_cell_mask_local_for_gws_p1gws = original_cell_mask_full_p1gws[local_bbox_slices_p1gws]
+        if not np.any(original_cell_mask_local_for_gws_p1gws): print(f"{log_main_prefix}     L{cell_label_p1} Empty local cell mask. Skip."); continue
+        soma_mask_local_orig_labels_gws_p1gws = soma_mask[local_bbox_slices_p1gws]
+        intensity_local_gws_p1gws = intensity_volume[local_bbox_slices_p1gws]
+        active_soma_labels_in_cell_gws_p1gws = sorted(list(cell_to_somas_orig[cell_label_p1]))
+        
+        # This soma_props_local_gws_p1gws is crucial for providing reference intensities later
+        soma_props_local_gws_p1gws: Dict[int, Dict[str, Any]] = {} 
+        temp_soma_labeled_for_props_gws_p1gws = np.zeros_like(soma_mask_local_orig_labels_gws_p1gws, dtype=np.int32)
+        for sl_orig_gws_p1gws in active_soma_labels_in_cell_gws_p1gws:
+            temp_soma_labeled_for_props_gws_p1gws[(soma_mask_local_orig_labels_gws_p1gws == sl_orig_gws_p1gws) & original_cell_mask_local_for_gws_p1gws] = sl_orig_gws_p1gws
+        if np.any(temp_soma_labeled_for_props_gws_p1gws):
+            try:
+                props_gws_p1gws = regionprops(temp_soma_labeled_for_props_gws_p1gws, intensity_image=intensity_local_gws_p1gws)
+                for p_item_gws_p1gws in props_gws_p1gws:
+                    if p_item_gws_p1gws.area > 0 : 
+                         soma_props_local_gws_p1gws[p_item_gws_p1gws.label] = {'centroid': p_item_gws_p1gws.centroid, 'area': p_item_gws_p1gws.area, 'mean_intensity': p_item_gws_p1gws.mean_intensity if hasattr(p_item_gws_p1gws, 'mean_intensity') and p_item_gws_p1gws.mean_intensity is not None else 0.0}
+            except Exception as e_rp_gws:
+                print(f"{log_main_prefix}     L{cell_label_p1} regionprops error: {e_rp_gws}. Fallback.")
+                for sl_orig_gws_p1gws in active_soma_labels_in_cell_gws_p1gws:
+                    coords_gws_p1gws = np.argwhere((soma_mask_local_orig_labels_gws_p1gws == sl_orig_gws_p1gws) & original_cell_mask_local_for_gws_p1gws)
+                    if coords_gws_p1gws.shape[0] > 0:
+                        soma_mean_int = np.mean(intensity_local_gws_p1gws[coords_gws_p1gws[:,0], coords_gws_p1gws[:,1], coords_gws_p1gws[:,2]]) if coords_gws_p1gws.size > 0 else 0.0
+                        soma_props_local_gws_p1gws[sl_orig_gws_p1gws] = {'centroid': np.mean(coords_gws_p1gws, axis=0), 'area': coords_gws_p1gws.shape[0], 'mean_intensity': soma_mean_int}
+        
+        valid_soma_labels_for_ws_gws_p1gws = [lbl for lbl in active_soma_labels_in_cell_gws_p1gws if lbl in soma_props_local_gws_p1gws and soma_props_local_gws_p1gws[lbl]['area'] > 0]
+        if len(valid_soma_labels_for_ws_gws_p1gws) <= 1: print(f"{log_main_prefix}     L{cell_label_p1} <=1 valid GWS soma. Skip GWS."); continue
+        
+        # ... (Seed merging logic using adj_matrix - same as before, using _gws suffixes) ...
+        # ... (Marker preparation logic - same as before, using _gws suffixed vars) ...
+        # ... (Global watershed execution - same as before, using _gws suffixed vars, result in global_ws_result_local_p1gws) ...
+        # ... (Assigning labels to temp_gws_mask_local_p1gws based on global_ws_result_local_p1gws - same as before) ...
+        # ... (Watershed line assignment to temp_gws_mask_local_p1gws - same as before) ...
+        # ... (Small fragment merge on temp_gws_mask_local_p1gws - same as before) ...
+        # (This is the extensive block from previous answers. For brevity, assuming it correctly populates temp_gws_mask_local_p1gws
+        #  and updates next_global_label_offset_val via current_temp_next_label_for_cell_gws_val)
+        # --- START OF THE GWS CORE LOGIC (condensed) ---
+        num_seeds_gws_p1gws = len(valid_soma_labels_for_ws_gws_p1gws); soma_idx_map_gws_p1gws = {lbl: i for i, lbl in enumerate(valid_soma_labels_for_ws_gws_p1gws)}; adj_matrix_gws_p1gws = np.zeros((num_seeds_gws_p1gws, num_seeds_gws_p1gws), dtype=bool)
+        max_intensity_val_local_gws_p1gws = np.max(intensity_local_gws_p1gws[original_cell_mask_local_for_gws_p1gws]) if np.any(original_cell_mask_local_for_gws_p1gws) else 1.0
+        cost_array_local_gws_p1gws = np.full(intensity_local_gws_p1gws.shape, np.inf, dtype=np.float32)
+        if np.any(original_cell_mask_local_for_gws_p1gws): cost_array_local_gws_p1gws[original_cell_mask_local_for_gws_p1gws] = np.maximum(1e-6, max_intensity_val_local_gws_p1gws - intensity_local_gws_p1gws[original_cell_mask_local_for_gws_p1gws])
+        for i_gws_p1gws in range(num_seeds_gws_p1gws):
+            for j_gws_p1gws in range(i_gws_p1gws + 1, num_seeds_gws_p1gws):
+                lbl1_gws_p1gws, lbl2_gws_p1gws = valid_soma_labels_for_ws_gws_p1gws[i_gws_p1gws], valid_soma_labels_for_ws_gws_p1gws[j_gws_p1gws]; prop1_gws_p1gws, prop2_gws_p1gws = soma_props_local_gws_p1gws[lbl1_gws_p1gws], soma_props_local_gws_p1gws[lbl2_gws_p1gws]
+                c1_phys_gws_p1gws, c2_phys_gws_p1gws = np.array(prop1_gws_p1gws['centroid']) * spacing_arr, np.array(prop2_gws_p1gws['centroid']) * spacing_arr; dist_um_gws_p1gws = np.linalg.norm(c1_phys_gws_p1gws - c2_phys_gws_p1gws)
+                if dist_um_gws_p1gws > max_seed_centroid_dist: continue
+                c1_vox_gws_p1gws, c2_vox_gws_p1gws = tuple(np.round(prop1_gws_p1gws['centroid']).astype(int)), tuple(np.round(prop2_gws_p1gws['centroid']).astype(int))
+                c1_vox_c_gws_p1gws, c2_vox_c_gws_p1gws = tuple(np.clip(c1_vox_gws_p1gws[d_idx],0,s-1)for d_idx,s in enumerate(cost_array_local_gws_p1gws.shape)), tuple(np.clip(c2_vox_gws_p1gws[d_idx],0,s-1)for d_idx,s in enumerate(cost_array_local_gws_p1gws.shape))
+                if not original_cell_mask_local_for_gws_p1gws[c1_vox_c_gws_p1gws] or not original_cell_mask_local_for_gws_p1gws[c2_vox_c_gws_p1gws]: continue
+                path_median_intensity_gws_p1gws = 0.0
+                try:
+                    path_indices_tup_gws_p1gws, _ = route_through_array(cost_array_local_gws_p1gws, c1_vox_c_gws_p1gws, c2_vox_c_gws_p1gws, fully_connected=True, geometric=False)
+                    if isinstance(path_indices_tup_gws_p1gws, np.ndarray) and path_indices_tup_gws_p1gws.ndim==2 and path_indices_tup_gws_p1gws.shape[1]>0:
+                        path_intensities_vals_gws_p1gws = intensity_local_gws_p1gws[path_indices_tup_gws_p1gws[0], path_indices_tup_gws_p1gws[1], path_indices_tup_gws_p1gws[2]]
+                        if path_intensities_vals_gws_p1gws.size > 0: path_median_intensity_gws_p1gws = np.median(path_intensities_vals_gws_p1gws)
+                except: pass
+                ref_intensity_val_gws_p1gws = max(prop1_gws_p1gws.get('mean_intensity',1.0), prop2_gws_p1gws.get('mean_intensity',1.0), 1e-6)
+                ratio_val_gws_p1gws = path_median_intensity_gws_p1gws / ref_intensity_val_gws_p1gws if ref_intensity_val_gws_p1gws > 1e-6 else float('inf')
+                if ratio_val_gws_p1gws >= min_path_intensity_ratio: adj_matrix_gws_p1gws[soma_idx_map_gws_p1gws[lbl1_gws_p1gws], soma_idx_map_gws_p1gws[lbl2_gws_p1gws]] = adj_matrix_gws_p1gws[soma_idx_map_gws_p1gws[lbl2_gws_p1gws], soma_idx_map_gws_p1gws[lbl1_gws_p1gws]] = True
+        ws_markers_local_gws_p1gws = np.zeros_like(original_cell_mask_local_for_gws_p1gws, dtype=np.int32); current_ws_marker_id_gws_p1gws = 1
+        ws_marker_to_orig_somas_gws_p1gws: Dict[int, List[int]] = {}; orig_soma_to_ws_marker_gws_p1gws: Dict[int, int] = {}
+        if np.any(adj_matrix_gws_p1gws):
+            n_comps_adj_gws, comp_lbls_adj_gws = ndimage.label(adj_matrix_gws_p1gws) # Renamed n_components_adj_gws, component_labels_adj_gws
+            for k_comp_adj in np.unique(comp_lbls_adj_gws[comp_lbls_adj_gws>0]): # Iterate actual component labels (usually 1-based from ndimage.label if input is not bool) or ensure it handles 0-based if input adj_matrix is bool.
+                # If adj_matrix is bool, ndimage.label output is 0 for background, 1..N for components.
+                # Let's assume it's 0 for no-component, or 1..N for components.
+                soma_indices_in_group_gws = np.where(comp_lbls_adj_gws == k_comp_adj)[0] # Renamed
+                if not soma_indices_in_group_gws.size: continue
+                group_marker_id_gws = current_ws_marker_id_gws_p1gws # Renamed
+                current_group_somas_gws = [] # Renamed
+                for seed_idx_gws in soma_indices_in_group_gws: # Renamed
+                    orig_s_lbl_gws = valid_soma_labels_for_ws_gws_p1gws[seed_idx_gws] # Renamed
+                    current_group_somas_gws.append(orig_s_lbl_gws)
+                    ws_markers_local_gws_p1gws[(soma_mask_local_orig_labels_gws_p1gws == orig_s_lbl_gws) & original_cell_mask_local_for_gws_p1gws] = group_marker_id_gws
+                    orig_soma_to_ws_marker_gws_p1gws[orig_s_lbl_gws] = group_marker_id_gws
+                if current_group_somas_gws: ws_marker_to_orig_somas_gws_p1gws[group_marker_id_gws] = sorted(current_group_somas_gws); current_ws_marker_id_gws_p1gws +=1
+        for sl_orig_gws in valid_soma_labels_for_ws_gws_p1gws: # Renamed
+            if sl_orig_gws not in orig_soma_to_ws_marker_gws_p1gws:
+                group_marker_id_gws = current_ws_marker_id_gws_p1gws
+                ws_markers_local_gws_p1gws[(soma_mask_local_orig_labels_gws_p1gws == sl_orig_gws) & original_cell_mask_local_for_gws_p1gws] = group_marker_id_gws
+                orig_soma_to_ws_marker_gws_p1gws[sl_orig_gws] = group_marker_id_gws
+                ws_marker_to_orig_somas_gws_p1gws[group_marker_id_gws] = [sl_orig_gws]; current_ws_marker_id_gws_p1gws +=1
+        num_final_ws_markers_gws_p1gws = current_ws_marker_id_gws_p1gws - 1
+        if num_final_ws_markers_gws_p1gws <= 1: print(f"{log_main_prefix}     L{cell_label_p1} <=1 final WS marker. Skip WS."); continue
+        dt_local_gws = distance_transform_edt(original_cell_mask_local_for_gws_p1gws, sampling=spacing_tuple) # Renamed
+        ws_landscape_gws = -dt_local_gws.astype(np.float32) # Renamed
+        if intensity_weight > 1e-6:
+            icell_gws = intensity_local_gws_p1gws[original_cell_mask_local_for_gws_p1gws] # Renamed
+            if icell_gws.size > 0:
+                min_ic_gws, max_ic_gws = np.min(icell_gws), np.max(icell_gws) # Renamed
+                if (max_ic_gws - min_ic_gws) > 1e-6:
+                    norm_int_term_gws = np.zeros_like(ws_landscape_gws); norm_int_term_gws[original_cell_mask_local_for_gws_p1gws] = (max_ic_gws - icell_gws) / (max_ic_gws - min_ic_gws) # Renamed
+                    max_dt_gws = np.max(dt_local_gws); ws_landscape_gws += intensity_weight * norm_int_term_gws * (max_dt_gws if max_dt_gws > 1e-6 else 1.0) # Renamed
+        ws_markers_local_gws_p1gws[~original_cell_mask_local_for_gws_p1gws] = 0
+        global_ws_result_local_p1gws = watershed(ws_landscape_gws, ws_markers_local_gws_p1gws, mask=original_cell_mask_local_for_gws_p1gws, watershed_line=True)
+        temp_gws_mask_local_p1gws = np.zeros_like(global_ws_result_local_p1gws, dtype=np.int32)
+        largest_soma_lbl_gws, max_area_s_gws = -1, -1 # Renamed
+        for sl_prop_gws in valid_soma_labels_for_ws_gws_p1gws: # Renamed
+            if soma_props_local_gws_p1gws[sl_prop_gws]['area'] > max_area_s_gws: max_area_s_gws = soma_props_local_gws_p1gws[sl_prop_gws]['area']; largest_soma_lbl_gws = sl_prop_gws
+        main_marker_id_gws = orig_soma_to_ws_marker_gws_p1gws.get(largest_soma_lbl_gws, -1) # Renamed
+        unique_ws_res_lbls_gws = np.unique(global_ws_result_local_p1gws[global_ws_result_local_p1gws > 0]) # Renamed
+        current_next_lbl_cell_gws = next_global_label_offset_val # Renamed
+        for res_lbl_gws in unique_ws_res_lbls_gws: # Renamed
+            final_lbl_gws = cell_label_p1 if res_lbl_gws == main_marker_id_gws else current_next_lbl_cell_gws # Renamed
+            if res_lbl_gws != main_marker_id_gws: current_next_lbl_cell_gws +=1
+            temp_gws_mask_local_p1gws[global_ws_result_local_p1gws == res_lbl_gws] = final_lbl_gws
+        next_global_label_offset_val = max(next_global_label_offset_val, current_next_lbl_cell_gws)
+        ws_lines_gws = (global_ws_result_local_p1gws == 0) & original_cell_mask_local_for_gws_p1gws # Renamed
+        if np.any(ws_lines_gws):
+            line_coords_gws = np.argwhere(ws_lines_gws) # Renamed
+            for zlg,ylg,xlg in line_coords_gws: # Renamed zc_gws, yc_gws, xc_gws
+                nh_slice_gws = tuple(slice(max(0,c-1),min(s,c+2))for c,s in zip((zlg,ylg,xlg),temp_gws_mask_local_p1gws.shape)) # Renamed
+                nh_vals_gws = temp_gws_mask_local_p1gws[nh_slice_gws]; un_nh_gws,cts_nh_gws=np.unique(nh_vals_gws[nh_vals_gws>0],return_counts=True) # Renamed
+                if un_nh_gws.size > 0: temp_gws_mask_local_p1gws[zlg,ylg,xlg] = un_nh_gws[np.argmax(cts_nh_gws)]
+        frag_merged_gws,sfm_iters_gws=True,0 # Renamed
+        while frag_merged_gws and sfm_iters_gws < 10:
+            sfm_iters_gws+=1; frag_merged_gws=False
+            curr_lbls_tgws = np.unique(temp_gws_mask_local_p1gws[temp_gws_mask_local_p1gws>0]) # Renamed
+            if len(curr_lbls_tgws)<=1:break
+            for lbl_sfm_gws in curr_lbls_tgws: # Renamed
+                curr_frag_gws=(temp_gws_mask_local_p1gws==lbl_sfm_gws);size_sfm_gws=np.sum(curr_frag_gws) # Renamed
+                if size_sfm_gws > 0 and size_sfm_gws < min_size_threshold:
+                    dil_frag_gws=binary_dilation(curr_frag_gws,footprint=footprint_p1_dilation_val) # Renamed
+                    neigh_reg_gws = dil_frag_gws & (~curr_frag_gws) & original_cell_mask_local_for_gws_p1gws & (temp_gws_mask_local_p1gws!=0) & (temp_gws_mask_local_p1gws!=lbl_sfm_gws) # Renamed
+                    if not np.any(neigh_reg_gws): continue
+                    neigh_lbls_gws,neigh_cts_gws=np.unique(temp_gws_mask_local_p1gws[neigh_reg_gws],return_counts=True) # Renamed
+                    if neigh_lbls_gws.size==0:continue
+                    largest_neigh_lbl_gws=neigh_lbls_gws[np.argmax(neigh_cts_gws)];temp_gws_mask_local_p1gws[curr_frag_gws]=largest_neigh_lbl_gws # Renamed
+                    frag_merged_gws=True;break
+        # --- END OF GWS CORE LOGIC ---
+        
+        # --- Phase 1.5: Build Local Graph & Merge Weak Interfaces for THIS CELL ---
+        print(f"{log_main_prefix}     P1 L{cell_label_p1}: Building local graph for P1.5 merges on {np.sum(np.unique(temp_gws_mask_local_p1gws)>0)} GWS segments.")
+        local_nodes_p15, local_edges_p15 = _build_adjacency_graph_for_cell( # Renamed
+            temp_gws_mask_local_p1gws,
+            original_cell_mask_local_for_gws_p1gws,
+            soma_mask_local_orig_labels_gws_p1gws, # This is soma_mask for the crop
+            soma_props_local_gws_p1gws, # Pass the dict of original soma properties for this cell crop
+            intensity_local_gws_p1gws,
+            spacing_tuple,
+            local_analysis_radius, min_local_intensity_difference,
+            min_path_intensity_ratio, # Pass the heuristic for comparison prints
+            log_prefix=f"{log_main_prefix}       GraphBuild_P1.5 L{cell_label_p1}"
+        )
+
+        if local_edges_p15: 
+            print(f"{log_main_prefix}     P1 L{cell_label_p1}: P1.5 - Checking {len(local_edges_p15)} interfaces for merging.")
+            p1_5_local_merge_passes = 0; MAX_P1_5_LOCAL_PASSES = 5 # Renamed
+            p1_5_merged_in_pass_loc = True # Renamed
+            while p1_5_merged_in_pass_loc and p1_5_local_merge_passes < MAX_P1_5_LOCAL_PASSES:
+                p1_5_local_merge_passes += 1; p1_5_merged_in_pass_loc = False
+                print(f"{log_main_prefix}       P1.5 L{cell_label_p1} Merge Pass {p1_5_local_merge_passes}")
                 
-                if np.any(crop1): regions_to_process.append((crop1, bbox1, somas1))
-                if np.any(crop2): regions_to_process.append((crop2, bbox2, somas2))
-                
-                print(f"    --> Split successful. Queue size is now: {len(regions_to_process)}")
+                current_local_labels_in_temp_gws = np.unique(temp_gws_mask_local_p1gws[temp_gws_mask_local_p1gws > 0]) # Renamed
+                if len(current_local_labels_in_temp_gws) <=1: print(f"{log_main_prefix}         P1.5 L{cell_label_p1}: Only {len(current_local_labels_in_temp_gws)} segment(s) left. No more P1.5 merges."); break
 
-            else:
-                # FAILURE: This piece is final.
-                final_regions.append((current_cropped_region, current_bbox))
-                print(f"    --> Region finalized (no further split). Final regions so far: {len(final_regions)}")
+                sorted_local_edges_to_check_p15 = sorted(list(local_edges_p15.keys())) # Renamed
 
-        # 3. HANDLE LEFTOVERS AND RECONSTRUCT
-        if max_iterations <= 0 and len(regions_to_process) > 0:
-            print(f"  WARNING: Max iterations reached for cell {cell_label}. Moving {len(regions_to_process)} remaining regions to final list.")
-            while regions_to_process:
-                # We only need the mask and its bbox for the final list
-                final_regions.append(regions_to_process.popleft()[:2])
+                for edge_key_local_p1_5_val in sorted_local_edges_to_check_p15: # Renamed
+                    lbl_A_loc_p15, lbl_B_loc_p15 = edge_key_local_p1_5_val # Renamed
+                    edge_metrics_local_p1_5_val = local_edges_p15.get(edge_key_local_p1_5_val) # Renamed
 
-        print(f"\n  SEPARATION COMPLETE for cell {cell_label}:")
-        print(f"    Original cell -> {len(final_regions)} final regions")
+                    if not edge_metrics_local_p1_5_val: continue 
 
-        print(f"  Reconstructing final mask from {len(final_regions)} pieces...")
-        result_mask[cell_region] = 0
+                    mask_A_exists_loc_p15 = np.any(temp_gws_mask_local_p1gws == lbl_A_loc_p15) # Renamed
+                    mask_B_exists_loc_p15 = np.any(temp_gws_mask_local_p1gws == lbl_B_loc_p15) # Renamed
+                    if not mask_A_exists_loc_p15 or not mask_B_exists_loc_p15 or lbl_A_loc_p15 == lbl_B_loc_p15: 
+                        if edge_key_local_p1_5_val in local_edges_p15: del local_edges_p15[edge_key_local_p1_5_val] 
+                        continue
+                    
+                    # Decision to merge from pre-calculated metrics in the graph edge
+                    should_merge_local_p1_5_val = edge_metrics_local_p1_5_val.get('should_merge_decision', False) # Renamed
+                    
+                    if should_merge_local_p1_5_val:
+                        print(f"{log_main_prefix}       P1.5 L{cell_label_p1} Edge ({lbl_A_loc_p15},{lbl_B_loc_p15}): Metrics indicate MERGE.")
+                        label_to_keep_loc_p15 = lbl_A_loc_p15; label_to_remove_loc_p15 = lbl_B_loc_p15 # Renamed
+                        vol_A_loc_p15 = local_nodes_p15.get(lbl_A_loc_p15,{}).get('volume',0) # Renamed
+                        vol_B_loc_p15 = local_nodes_p15.get(lbl_B_loc_p15,{}).get('volume',0) # Renamed
 
-        for region_idx, (cropped_mask, bbox) in enumerate(final_regions):
-            label_to_use = cell_label if region_idx == 0 else next_available_label
-            if region_idx > 0: next_available_label += 1
+                        if lbl_A_loc_p15 != cell_label_p1 and lbl_B_loc_p15 == cell_label_p1:
+                            label_to_keep_loc_p15, label_to_remove_loc_p15 = lbl_B_loc_p15, lbl_A_loc_p15
+                        elif lbl_A_loc_p15 == cell_label_p1 and lbl_B_loc_p15 != cell_label_p1:
+                            pass 
+                        elif vol_A_loc_p15 < vol_B_loc_p15:
+                            label_to_keep_loc_p15, label_to_remove_loc_p15 = lbl_B_loc_p15, lbl_A_loc_p15
+                        
+                        print(f"{log_main_prefix}         Merging L{label_to_remove_loc_p15} into L{label_to_keep_loc_p15} in temp_gws_mask_local_p1gws.")
+                        temp_gws_mask_local_p1gws[temp_gws_mask_local_p1gws == label_to_remove_loc_p15] = label_to_keep_loc_p15
+                        p1_5_merged_in_pass_loc = True
+                        
+                        if label_to_remove_loc_p15 in local_nodes_p15: 
+                            local_nodes_p15[label_to_keep_loc_p15]['volume'] += local_nodes_p15[label_to_remove_loc_p15]['volume']
+                            local_nodes_p15[label_to_keep_loc_p15]['orig_somas'] = sorted(list(set(local_nodes_p15[label_to_keep_loc_p15]['orig_somas'] + local_nodes_p15[label_to_remove_loc_p15]['orig_somas'])))
+                            del local_nodes_p15[label_to_remove_loc_p15]
+                        
+                        stale_edges_p15 = [ek for ek in local_edges_p15 if label_to_remove_loc_p15 in ek] # Renamed
+                        for sek_p15 in stale_edges_p15: # Renamed 
+                            if sek_p15 in local_edges_p15: del local_edges_p15[sek_p15]
+                        break 
+                if p1_5_merged_in_pass_loc: continue 
+                if not p1_5_merged_in_pass_loc: break 
+        else:
+            print(f"{log_main_prefix}     P1 L{cell_label_p1}: P1.5 - No interfaces or no merges needed based on graph.")
             
-            # Place the small cropped mask back into the full-sized result mask
-            result_roi = result_mask[bbox]
-            # Use the boolean cropped_mask to indicate where to place the label
-            result_roi[cropped_mask] = label_to_use
-            # Assign the modified ROI back to the main mask
-            result_mask[bbox] = result_roi 
-            
-            print(f"      Region {region_idx + 1}: assigned label {label_to_use}, size {np.sum(cropped_mask)} voxels")
+        output_mask_local_view_final_p1_val = final_output_mask[local_bbox_slices_p1gws] # Renamed
+        output_mask_local_view_final_p1_val[original_cell_mask_local_for_gws_p1gws] = \
+            temp_gws_mask_local_p1gws[original_cell_mask_local_for_gws_p1gws]
+        final_output_mask[local_bbox_slices_p1gws] = output_mask_local_view_final_p1_val
+        
+        max_lbl_in_cell_after_p15_val = np.max(temp_gws_mask_local_p1gws) if np.any(temp_gws_mask_local_p1gws) else 0 # Renamed
+        if max_lbl_in_cell_after_p15_val >= cell_label_p1 : 
+             next_global_label_offset_val = max(next_global_label_offset_val, max_lbl_in_cell_after_p15_val + 1)
+        
+        print(f"{log_main_prefix}     P1 L{cell_label_p1}: Finished P1 & P1.5. Max label in cell: {max_lbl_in_cell_after_p15_val}. Next global offset: {next_global_label_offset_val}.")
+        del temp_gws_mask_local_p1gws, local_nodes_p15, local_edges_p15 # Explicit cleanup
+        if cell_idx_p1 > 0 and cell_idx_p1 % 5 == 0: gc.collect()
 
-        # --- END: New iterative processing block ---
+    print(f"{log_main_prefix} Phase 1 & 1.5 (GWS + Per-Cell Graph Merging) completed. Time: {time.time()-phase1_combined_time:.2f}s. Final next_global_label_offset after P1.5: {next_global_label_offset_val}")
 
-        # The gc.collect() can happen after this block
-        gc.collect()
+    # --- Phase 2 IS REMOVED as per request ---
+    print(f"\n{log_main_prefix} Phase 2 (Local Splitting) has been REMOVED as per request.")
 
-    # ... (Your summary and post-processing code remains the same) ...
-    final_solid_mask = fill_internal_voids(result_mask)
-    print("\n--- SUMMARY ---")
-    # ...
+# --- Phase 3: Finalization ---
+    phase3_start_time = time.time()
+    print(f"\n{log_main_prefix} Phase 3: Finalizing mask.")
+    try:
+        # print(f"{log_main_prefix} Filling internal voids...")
+        final_mask_filled = fill_internal_voids(final_output_mask) 
+    except NameError:
+        print(f"{log_main_prefix} Warning: fill_internal_voids not defined. Skipping this step.")
+        final_mask_filled = final_output_mask.copy()
+
+    if np.any(final_mask_filled):
+        print(f"{log_main_prefix} Relabeling final mask sequentially...")
+        
+        # Call relabel_sequential without return_num
+        # It returns (relabeled_array, forward_map, inverse_map)
+        relabeled_array, forward_map, inverse_map = relabel_sequential(
+            final_mask_filled.astype(np.int32), offset=1 
+        )
+        
+        # Calculate num_objects_final:
+        # If offset=1, labels are 1...N. np.max will give N.
+        # Or, more robustly from unique labels if there could be gaps (though offset=1 prevents this).
+        unique_labels_in_relabeled = np.unique(relabeled_array)
+        # Count positive labels only
+        num_objects_final = len(unique_labels_in_relabeled[unique_labels_in_relabeled > 0])
+
+        max_label_val = num_objects_final if num_objects_final > 0 else 0 # Max label is num_objects if offset=1
+        
+        print(f"{log_main_prefix} Relabeled final mask contains {num_objects_final} objects (max label: {max_label_val}).")
+        output_to_return = relabeled_array.astype(np.int32)
+    else:
+        print(f"{log_main_prefix} Final mask is empty.")
+        output_to_return = final_mask_filled.astype(np.int32) # Should be all zeros
+
+    print(f"{log_main_prefix} Phase 3 (Finalization) completed. Time: {time.time()-phase3_start_time:.2f}s")
+    print(f"{log_main_prefix} Total processing time: {time.time()-overall_start_time:.2f}s")
+    return output_to_return
+
+# --- fill_internal_voids (ensure it's defined as before) ---
+def fill_internal_voids(segmentation_mask_input: np.ndarray) -> np.ndarray:
+    log_fill_prefix = "[FillVoids]"
+    print(f"{log_fill_prefix} Starting Internal Void Filling...")
+    t_start_fill = time.time()
+    filled_mask_output = segmentation_mask_input.copy()
     
-    return final_solid_mask
+    # find_objects requires positive integer labels. Ensure input is appropriate.
+    # If mask contains 0s, find_objects will skip them.
+    # It returns a list where index i corresponds to label i+1.
+    input_for_find_objects = segmentation_mask_input.astype(np.int32)
+    if np.max(input_for_find_objects) == 0 : # All zeros or empty
+        print(f"{log_fill_prefix} Input mask is empty or all zeros. No voids to fill.")
+        print(f"{log_fill_prefix} Void Filling Complete. Time: {time.time()-t_start_fill:.2f}s")
+        return filled_mask_output
+
+    bboxes = find_objects(input_for_find_objects)
+    
+    voids_filled_count = 0
+    voxels_added_total = 0
+
+    if bboxes is None: # Should not happen if max > 0, but defensive.
+        print(f"{log_fill_prefix} No objects found by find_objects. No voids to fill.")
+        print(f"{log_fill_prefix} Void Filling Complete. Time: {time.time()-t_start_fill:.2f}s")
+        return filled_mask_output
+
+    for i, bbox_slices in enumerate(bboxes):
+        label_val_fill = i + 1 # find_objects list is indexed by label-1
+        
+        if bbox_slices is None: continue # This label doesn't exist (e.g., if labels are not sequential from 1)
+
+        if not (isinstance(bbox_slices, tuple) and len(bbox_slices) == segmentation_mask_input.ndim and \
+                all(isinstance(s, slice) for s in bbox_slices)):
+            print(f"{log_fill_prefix}   Skipping label {label_val_fill} due to invalid bbox: {bbox_slices}")
+            continue
+
+        original_roi_fill = segmentation_mask_input[bbox_slices] # Use original mask for ROI
+        cell_mask_roi_fill = (original_roi_fill == label_val_fill) # Create binary mask for current label in ROI
+        
+        if not np.any(cell_mask_roi_fill):
+            print(f"{log_fill_prefix}   ROI for label {label_val_fill} is empty for this label. Skipping fill.")
+            continue
+
+        original_voxels_fill = np.sum(cell_mask_roi_fill)
+        try:
+            # binary_fill_holes expects a 2D or 3D binary image.
+            filled_cell_roi_fill = binary_fill_holes(cell_mask_roi_fill)
+        except Exception as e_fill:
+            print(f"{log_fill_prefix}   Error filling holes for label {label_val_fill} in ROI: {e_fill}. Skipping.")
+            continue
+
+        filled_voxels_fill = np.sum(filled_cell_roi_fill)
+        if filled_voxels_fill > original_voxels_fill:
+            voxels_added_fill = filled_voxels_fill - original_voxels_fill
+            voxels_added_total += voxels_added_fill
+            voids_filled_count += 1
+            print(f"{log_fill_prefix}   Filled void in label {label_val_fill}: added {voxels_added_fill} voxels.")
+            
+            # Update the corresponding ROI in our result mask (filled_mask_output)
+            # We use the filled_cell_roi_fill (a boolean mask) to specify which
+            # voxels *within the bounding box* should be set to the current label.
+            result_roi_view_fill = filled_mask_output[bbox_slices] # Get a view of the output mask's ROI
+            result_roi_view_fill[filled_cell_roi_fill] = label_val_fill # Modify the view (updates filled_mask_output)
+    
+    print(f"{log_fill_prefix} --- Void Filling Summary ---")
+    if voids_filled_count > 0:
+        print(f"{log_fill_prefix}   Filled voids in {voids_filled_count} objects.")
+        print(f"{log_fill_prefix}   Total voxels added: {voxels_added_total}")
+    else:
+        print(f"{log_fill_prefix}   No internal voids were found to fill.")
+    print(f"{log_fill_prefix} Void Filling Complete. Time: {time.time()-t_start_fill:.2f}s")
+    return filled_mask_output
