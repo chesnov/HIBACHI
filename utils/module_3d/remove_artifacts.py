@@ -6,6 +6,7 @@ from scipy.ndimage import (distance_transform_edt, label as ndimage_label, find_
                            binary_opening, binary_closing, binary_dilation)
 from skimage.filters import threshold_otsu # type: ignore
 from skimage.morphology import convex_hull_image, remove_small_objects # type: ignore
+import traceback
 import tempfile
 import os
 from tqdm import tqdm
@@ -216,6 +217,164 @@ def generate_hull_boundary_and_stack(
 
     # Return the boundary AND the (potentially smoothed) hull stack
     return hull_boundary, smoothed_hull_stack
+
+def apply_hull_trimming(
+    raw_labels_path,          # Path to the memmap from previous step
+    original_volume,          # Original intensity volume (can be memmap or array)
+    spacing,
+    # hull_opening_radius_phys, # Parameter NOT USED by generate_hull_boundary_and_stack
+    # hull_closing_radius_phys, # Parameter NOT USED by generate_hull_boundary_and_stack
+    hull_boundary_thickness_phys, # USED to calculate erosion iterations
+    edge_trim_distance_threshold,
+    brightness_cutoff_factor, # Factor to apply to seg_threshold
+    segmentation_threshold,   # Absolute threshold calculated previously
+    min_size_voxels,          # For re-cleaning after trimming
+    edge_distance_chunk_size_z = 32, # For trim_object_edges fallback
+    smoothing_iterations = 1, # For generate_hull_boundary_and_stack
+    heal_iterations = 1       # For trim_object_edges_by_distance
+    ):
+    """
+    Applies hull generation and edge trimming to a raw labeled segmentation.
+    MODIFIES the data pointed to by raw_labels_path if it's writable, OR
+    creates a new temporary memmap for the output.
+
+    Args:
+        raw_labels_path (str): Path to the labeled segmentation memmap (.dat file).
+                               MUST BE WRITABLE (mode='r+' or 'w+') for in-place modification.
+        original_volume (np.ndarray or np.memmap): Original intensity data.
+        spacing (tuple): Voxel spacing (z, y, x).
+        hull_boundary_thickness_phys (float): Physical thickness for hull boundary.
+        edge_trim_distance_threshold (float): Physical distance for trimming.
+        brightness_cutoff_factor (float): Factor to multiply segmentation_threshold by.
+        segmentation_threshold (float): The absolute threshold used previously.
+        min_size_voxels (int): Minimum size for final object cleaning.
+        edge_distance_chunk_size_z (int): Chunk size for distance calc.
+        smoothing_iterations (int): Iterations for hull smoothing.
+        heal_iterations (int): Iterations for grey closing healing.
+
+
+    Returns:
+    --------
+    trimmed_labels_path : str
+        Path to the memmap file containing the trimmed labels (this will be the
+        same as raw_labels_path if modified in-place, or a new temp path).
+    trimmed_labels_temp_dir : str or None
+        Directory containing the trimmed labels memmap ONLY IF a new temp file
+        was created. None if modified in-place.
+    hull_boundary_mask : np.ndarray (bool)
+        The calculated hull boundary mask (in memory).
+    """
+    print(f"\n--- Applying Hull Generation and Edge Trimming (Outputting New File) ---")
+    print(f"Params: hull_thick={hull_boundary_thickness_phys}, smoothing_iters={smoothing_iterations}, heal_iters={heal_iterations}, trim_dist={edge_trim_distance_threshold:.2f}, "
+          f"bright_factor={brightness_cutoff_factor:.2f}, seg_thresh={segmentation_threshold:.4f}")
+    initial_mem = psutil.Process().memory_info().rss / (1024 * 1024)
+    print(f"Initial memory usage for trimming: {initial_mem:.2f} MB")
+
+    # --- Get shape and validate input ---
+    if not os.path.exists(raw_labels_path):
+        print(f"Error: Input raw labels file not found: {raw_labels_path}")
+        return None, None, None
+    # Infer shape from input file (assuming headerless .dat needs original_shape)
+    # It's safer if original_shape is passed or read from metadata if possible.
+    # For now, assume original_volume has the correct shape.
+    if original_volume is None:
+        print("Error: original_volume is required to get shape.")
+        return None, None, None
+    original_shape = original_volume.shape
+
+    spacing = tuple(float(s) for s in spacing)
+    hull_boundary_mask = np.zeros(original_shape, dtype=bool) # Default
+
+    global_brightness_cutoff = segmentation_threshold * brightness_cutoff_factor if brightness_cutoff_factor > 0 else np.inf
+    print(f"  Using Global Brightness Cutoff: {global_brightness_cutoff:.4f}")
+
+    # --- Create a *NEW* temporary directory and memmap for the output ---
+    trimmed_labels_temp_dir = None
+    trimmed_labels_path = None
+    trimmed_labels_memmap = None # Handle for the new output memmap
+
+    try:
+        trimmed_labels_temp_dir = tempfile.mkdtemp(prefix="trimmed_labels_")
+        trimmed_labels_path = os.path.join(trimmed_labels_temp_dir, 'trimmed_l.dat')
+        print(f"  Creating NEW output memmap for trimmed labels: {trimmed_labels_path}")
+        trimmed_labels_memmap = np.memmap(trimmed_labels_path, dtype=np.int32, mode='w+', shape=original_shape)
+
+        # --- Open the input raw labels memmap for reading ---
+        print(f"  Opening raw labels for reading: {raw_labels_path}")
+        raw_labels_memmap = np.memmap(raw_labels_path, dtype=np.int32, mode='r', shape=original_shape)
+
+        # --- Copy data from input to new output memmap (chunked) ---
+        chunk_size_copy = min(100, original_shape[0]) if original_shape[0] > 0 else 1
+        print("  Copying raw labels to new output memmap...")
+        for i in tqdm(range(0, original_shape[0], chunk_size_copy), desc="  Copying labels"):
+            end_idx = min(i + chunk_size_copy, original_shape[0])
+            trimmed_labels_memmap[i:end_idx] = raw_labels_memmap[i:end_idx]
+        trimmed_labels_memmap.flush()
+        # --- Close the input raw labels handle ---
+        del raw_labels_memmap; gc.collect()
+        print("  Copying complete.")
+
+        # --- Generate Smooth Hull Boundary (using copied data if needed by func) ---
+        print("  Generating smoothed hull boundary...")
+        min_spacing_val = min(spacing) if min(spacing) > 1e-9 else 1.0
+        erosion_iterations = math.ceil(hull_boundary_thickness_phys / min_spacing_val)
+        print(f"    Calculated hull erosion iterations: {erosion_iterations}")
+
+        # generate_hull needs the cell mask - use the newly created writable memmap
+        hull_boundary_mask, smoothed_hull_stack = generate_hull_boundary_and_stack(
+            volume=original_volume,
+            cell_mask=trimmed_labels_memmap, # Pass handle to the NEW memmap
+            hull_erosion_iterations=erosion_iterations,
+            smoothing_iterations=smoothing_iterations
+        )
+        if smoothed_hull_stack is not None: del smoothed_hull_stack; gc.collect()
+
+        # --- Trim based on the new boundary (modifies the NEW trimmed_labels_memmap in-place) ---
+        if hull_boundary_mask is None or not np.any(hull_boundary_mask):
+            print("  Hull boundary mask empty/not generated. Skipping edge trimming steps.")
+            if hull_boundary_mask is None: hull_boundary_mask = np.zeros(original_shape, dtype=bool)
+        else:
+            print("  Applying edge trimming to the NEW output memmap...")
+            # Pass the handle to the NEW writable memmap
+            trimmed_voxels_mask = trim_object_edges_by_distance(
+                segmentation_memmap=trimmed_labels_memmap, # Modify this NEW memmap
+                original_volume=original_volume,
+                hull_boundary_mask=hull_boundary_mask,
+                spacing=spacing,
+                distance_threshold=edge_trim_distance_threshold,
+                global_brightness_cutoff=global_brightness_cutoff,
+                min_remaining_size=min_size_voxels,
+                chunk_size_z=edge_distance_chunk_size_z)
+            trimmed_labels_memmap.flush() # Ensure modifications are written
+            print(f"  Trimming applied. Mask of initially trimmed voxels captured (Sum: {np.sum(trimmed_voxels_mask)}).")
+
+        # --- Finalization ---
+        print("\n--- Hull Trimming Step Finished ---")
+        final_mem = psutil.Process().memory_info().rss / (1024 * 1024)
+        print(f"Final memory usage for trimming step: {final_mem:.2f} MB")
+
+        # --- IMPORTANT: Close the output memmap handle before returning path ---
+        if trimmed_labels_memmap is not None and hasattr(trimmed_labels_memmap, '_mmap'):
+            print(f"  Closing NEW trimmed labels memmap handle: {trimmed_labels_path}")
+            del trimmed_labels_memmap
+            gc.collect()
+
+        # Return path to *new* temporary trimmed labels memmap, its dir, and the hull mask
+        return trimmed_labels_path, trimmed_labels_temp_dir, hull_boundary_mask
+
+    except Exception as e:
+        print(f"\n!!! ERROR during Hull Trimming: {e} !!!")
+        traceback.print_exc()
+        # Ensure handles are closed on error
+        if 'raw_labels_memmap' in locals() and raw_labels_memmap is not None and hasattr(raw_labels_memmap, '_mmap'): del raw_labels_memmap; gc.collect()
+        if 'trimmed_labels_memmap' in locals() and trimmed_labels_memmap is not None and hasattr(trimmed_labels_memmap, '_mmap'): del trimmed_labels_memmap; gc.collect()
+        # Attempt cleanup of the output temp dir if created
+        if 'trimmed_labels_temp_dir' in locals() and trimmed_labels_temp_dir and os.path.exists(trimmed_labels_temp_dir):
+            rmtree(trimmed_labels_temp_dir, ignore_errors=True)
+        # Return None to indicate failure
+        return None, None, np.zeros(original_shape, dtype=bool)
+    finally:
+         gc.collect() # General cleanup
 
 
 def find_set(i):

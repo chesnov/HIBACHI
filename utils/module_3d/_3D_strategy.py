@@ -14,14 +14,15 @@ import tempfile
 from ..high_level_gui.processing_strategies import ProcessingStrategy
 try:
     # Import the refactored functions for raw seg and trimming
-    from .initial_3d_segmentation import segment_microglia_first_pass_raw, apply_hull_trimming
+    from .initial_3d_segmentation import segment_cells_first_pass_raw
+    from .remove_artifacts import apply_hull_trimming
     from .ramified_segmenter import extract_soma_masks, separate_multi_soma_cells
-    from ..calculate_features import analyze_segmentation
+    from .calculate_features_3d import analyze_segmentation
 except ImportError as e:
     expected_ramified_dir = os.path.dirname(os.path.abspath(__file__))
     expected_utils_dir = os.path.dirname(expected_ramified_dir)
     print(f"Error importing segmentation functions in _3D_ramified_strategy.py: {e}")
-    print(f"Ensure initial_3d_segmentation.py (with segment_microglia_first_pass_raw, apply_hull_trimming), "
+    print(f"Ensure initial_3d_segmentation.py (with segment_cells_first_pass_raw), "
           f"ramified_segmenter.py are in: {expected_ramified_dir}")
     print(f"Ensure calculate_features.py is in: {expected_utils_dir}")
     raise
@@ -118,6 +119,10 @@ class RamifiedStrategy(ProcessingStrategy):
             tubular_scales_list = params.get("tubular_scales", [0.8, 1.0, 1.5, 2.0])
             if not isinstance(tubular_scales_list, list) or not all(isinstance(x, (float, int)) for x in tubular_scales_list) or not tubular_scales_list:
                  print(f"Warning: Invalid 'tubular_scales'. Using default."); tubular_scales_list = [0.8, 1.0, 1.5, 2.0]
+            if len(tubular_scales_list) == 1 and tubular_scales_list[0] == 0.0:
+                skip_tubular_enhancement = True
+            else:
+                skip_tubular_enhancement = False
             min_size_voxels = int(params.get("min_size", 2000))
             smooth_sigma = float(params.get("smooth_sigma", 1.3))
             low_threshold_percentile = float(params.get("low_threshold_percentile", 98.0))
@@ -125,12 +130,13 @@ class RamifiedStrategy(ProcessingStrategy):
             connect_max_gap_physical = float(params.get("connect_max_gap_physical", 1.0))
 
             temp_raw_labels_dat_path, temp_raw_labels_dir, segmentation_threshold, first_pass_params = \
-                segment_microglia_first_pass_raw(
+                segment_cells_first_pass_raw(
                     volume=image_stack, spacing=self.spacing,
                     tubular_scales=tubular_scales_list, smooth_sigma=smooth_sigma,
                     connect_max_gap_physical=connect_max_gap_physical, min_size_voxels=min_size_voxels,
                     low_threshold_percentile=low_threshold_percentile,
-                    high_threshold_percentile=high_threshold_percentile
+                    high_threshold_percentile=high_threshold_percentile,
+                    skip_tubular_enhancement=skip_tubular_enhancement
                 )
 
             if temp_raw_labels_dat_path is None or not os.path.exists(temp_raw_labels_dat_path):
@@ -390,7 +396,10 @@ class RamifiedStrategy(ProcessingStrategy):
 
             # Step 3c: Separate cells with multiple (now refined) somas
             merged_roi_array = separate_multi_soma_cells(
-                labeled_cells, image_stack, cell_bodies, self.spacing,
+                labeled_cells, 
+                image_stack, 
+                cell_bodies, 
+                self.spacing,
                 min_size_threshold=min_size_threshold, # Maps to the same parameter
                 max_seed_centroid_dist=max_seed_centroid_dist,
                 min_path_intensity_ratio=min_path_intensity_ratio,

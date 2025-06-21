@@ -9,7 +9,7 @@ import time
 
 # Relative imports for strategies
 try:
-    from ._3D_ramified_strategy import RamifiedStrategy
+    from ._3D_strategy import RamifiedStrategy
     from ..high_level_gui.processing_strategies import ProcessingStrategy
     # For check_processing_state, we can adapt it or use strategy's file knowledge
     from ..high_level_gui.processing_strategies import check_processing_state as global_check_processing_state

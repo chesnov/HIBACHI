@@ -17,15 +17,15 @@ from PyQt5.QtWidgets import QMessageBox # type: ignore
 from ..high_level_gui.processing_strategies import ProcessingStrategy
 try:
     # Import the 2D segmentation functions
-    from .initial_2d_segmentation import segment_microglia_first_pass_raw_2d, apply_hull_trimming_2d
-    # Placeholder imports for 2D refinement and features (needs implementation later)
+    from .initial_2d_segmentation import segment_cells_first_pass_raw_2d
+    from .remove_artifacts_2d import apply_hull_trimming_2d
     from .ramified_segmenter_2d import extract_soma_masks_2d, refine_seeds_pca_2d, separate_multi_soma_cells_2d
     from .calculate_features_2d import analyze_segmentation_2d
 except ImportError as e:
     expected_ramified_dir = os.path.dirname(os.path.abspath(__file__))
     expected_utils_dir = os.path.dirname(expected_ramified_dir)
     print(f"Error importing 2D segmentation functions in _2D_ramified_strategy.py: {e}")
-    print(f"Ensure initial_2d_segmentation.py (with segment_microglia_first_pass_raw_2d, apply_hull_trimming_2d) exists.")
+    print(f"Ensure initial_2d_segmentation.py (with segment_cells_first_pass_raw_2d, apply_hull_trimming_2d) exists.")
     print(f"Ensure ramified_segmenter_2d.py (placeholder) exists in: {expected_ramified_dir}")
     print(f"Ensure calculate_features.py exists in: {expected_utils_dir}")
     raise
@@ -111,7 +111,7 @@ class Ramified2DStrategy(ProcessingStrategy):
             # --- Call 2D raw segmentation function ---
             # It returns path to temp .dat, its dir, threshold, params
             temp_raw_labels_dat_path, temp_raw_labels_dir, segmentation_threshold, first_pass_params = \
-                segment_microglia_first_pass_raw_2d(
+                segment_cells_first_pass_raw_2d(
                     image=image_2d, spacing=self.spacing, # Pass 2D image and 2D spacing
                     tubular_scales=tubular_scales_list, smooth_sigma=smooth_sigma,
                     connect_max_gap_physical=connect_max_gap_physical, min_size_pixels=min_size_pixels, # Use pixels

@@ -11,8 +11,8 @@ import traceback
 import gc
 
 # --- Assumed relative imports based on structure ---
-from ..ramified_module_3d._3D_ramified_strategy import RamifiedStrategy
-from ..ramified_module_2d._2D_ramified_strategy import Ramified2DStrategy
+from ..module_3d._3D_strategy import RamifiedStrategy
+from ..module_2d._2D_strategy import Ramified2DStrategy
 from ..high_level_gui.processing_strategies import ProcessingStrategy # Import base class for type hint
 
 try:

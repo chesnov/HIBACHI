@@ -578,9 +578,8 @@ def separate_multi_soma_cells(
     segmentation_mask: np.ndarray, intensity_volume: np.ndarray, soma_mask: np.ndarray,
     spacing: Optional[Tuple[float, float, float]], min_size_threshold: int = 100,
     intensity_weight: float = 0.0, max_seed_centroid_dist: float = 40,
-    min_path_intensity_ratio: float = 0.8, # This is the min_path_intensity_ratio_heuristic for P1.5
-    post_merge_min_interface_voxels: int = 50, 
-    min_local_intensity_difference: float = 0.05, local_analysis_radius: int = 10
+    min_path_intensity_ratio: float = 0.8, # If the metric for two tentative segments is >= this, they are considered "too bright" and merged
+    min_local_intensity_difference: float = 0.05, local_analysis_radius: int = 10 #If the local intensity difference between two segments is less than this, they are merged
 ) -> np.ndarray:
     
     log_main_prefix = "[SepMultiSomaSerialV7]" # New prefix for this version
@@ -710,7 +709,8 @@ def separate_multi_soma_cells(
                 except: pass
                 ref_intensity_val_gws_p1gws = max(prop1_gws_p1gws.get('mean_intensity',1.0), prop2_gws_p1gws.get('mean_intensity',1.0), 1e-6)
                 ratio_val_gws_p1gws = path_median_intensity_gws_p1gws / ref_intensity_val_gws_p1gws if ref_intensity_val_gws_p1gws > 1e-6 else float('inf')
-                if ratio_val_gws_p1gws >= min_path_intensity_ratio: adj_matrix_gws_p1gws[soma_idx_map_gws_p1gws[lbl1_gws_p1gws], soma_idx_map_gws_p1gws[lbl2_gws_p1gws]] = adj_matrix_gws_p1gws[soma_idx_map_gws_p1gws[lbl2_gws_p1gws], soma_idx_map_gws_p1gws[lbl1_gws_p1gws]] = True
+                if ratio_val_gws_p1gws >= min_path_intensity_ratio:
+                    adj_matrix_gws_p1gws[soma_idx_map_gws_p1gws[lbl1_gws_p1gws], soma_idx_map_gws_p1gws[lbl2_gws_p1gws]] = adj_matrix_gws_p1gws[soma_idx_map_gws_p1gws[lbl2_gws_p1gws], soma_idx_map_gws_p1gws[lbl1_gws_p1gws]] = True
         ws_markers_local_gws_p1gws = np.zeros_like(original_cell_mask_local_for_gws_p1gws, dtype=np.int32); current_ws_marker_id_gws_p1gws = 1
         ws_marker_to_orig_somas_gws_p1gws: Dict[int, List[int]] = {}; orig_soma_to_ws_marker_gws_p1gws: Dict[int, int] = {}
         if np.any(adj_matrix_gws_p1gws):

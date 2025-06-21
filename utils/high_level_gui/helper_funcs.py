@@ -20,7 +20,7 @@ from PyQt5.QtWidgets import ( # type: ignore
 
 # Corrected path for BatchProcessor import
 try:
-    from ..ramified_module_3d.batch_processor import BatchProcessor
+    from ..module_3d.batch_processor import BatchProcessor
 except ImportError as e:
     print(f"WARNING: Failed to import BatchProcessor in helper_funcs.py: {e}. Batch processing button will be disabled.")
     BatchProcessor = None
