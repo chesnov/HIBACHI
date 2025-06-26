@@ -154,8 +154,8 @@ def organize_processing_dir(drctry, mode):
         raise ValueError(error_msg)
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    if mode == 'ramified': config_template_name = os.path.join('..','ramified_module_3d', 'ramified_config.yaml')
-    elif mode == 'ramified_2d': config_template_name = os.path.join('..','ramified_module_2d', 'ramified_config_2d.yaml')
+    if mode == 'ramified': config_template_name = os.path.join('..','module_3d', 'ramified_config.yaml')
+    elif mode == 'ramified_2d': config_template_name = os.path.join('..','module_2d', 'ramified_config_2d.yaml')
     else: raise ValueError(f"Invalid mode '{mode}' specified.")
 
     config_template_path = os.path.join(script_dir, config_template_name)

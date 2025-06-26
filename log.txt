@@ -1,0 +1,178 @@
+Starting 3D Microglia Segmentation Tool...
+Starting Qt Application event loop...
+Project folder selected: /home/kirill/Desktop/For_Kirill/Iba1_Morpho_BB_Blind (Copy)
+Opening image view for: /home/kirill/Desktop/For_Kirill/Iba1_Morpho_BB_Blind (Copy)/D
+Calculated 3D Pixel/Voxel Size (Z, Y, X): [0.9940476190476191, 0.27621744791666664, 0.27621744791666664]
+Calculated Z Scale Factor for display: 3.5988
+Initialized strategy for 'ramified' with 4 steps: ['execute_raw_segmentation', 'execute_trim_edges', 'execute_refine_rois', 'execute_calculate_features']
+Applying 3D scale: (3.598786487041608, 1, 1)
+Found completed steps up to step 4/4.
+Loading saved configuration from: /home/kirill/Desktop/For_Kirill/Iba1_Morpho_BB_Blind (Copy)/D/D_processed_ramified/processing_config_ramified.yaml
+Loaded and applied saved parameters to manager's config from /home/kirill/Desktop/For_Kirill/Iba1_Morpho_BB_Blind (Copy)/D/D_processed_ramified/processing_config_ramified.yaml
+Calculated 3D Pixel/Voxel Size (Z, Y, X): [0.9940476190476191, 0.27621744791666664, 0.27621744791666664]
+Calculated Z Scale Factor for display: 3.5988
+Updating strategy object's spacing and scale factor from loaded config...
+  Strategy spacing updated to: [0.9940476190476191, 0.27621744791666664, 0.27621744791666664]
+  Strategy z_scale_factor updated to: 3.5988
+Transferring loaded state to strategy: ['segmentation_threshold']
+  Restored 'segmentation_threshold' (0.0435) to strategy.intermediate_state.
+Loading data artifacts up to completed step 4...
+Loading Ramified checkpoint data artifacts up to step 4 for viewer...
+Pre-removing potentially existing layers before loading checkpoint...
+  DEBUG [_add_layer_safely] Preparing layer 'Raw Intermediate Segmentation_ramified' (Type: labels)
+    Input data shape: (168, 1536, 1536), dtype: int32
+    Determined spatial_ndim: 3
+    Applied DISPLAY scale: (3.598786487041608, 1.0, 1.0)
+    Applied DISPLAY translate: (0.0, 0.0, 0.0)
+    Attempting ADD layer 'Raw Intermediate Segmentation_ramified'
+ Added: raw_segmentation_ramified.npy
+  DEBUG [_add_layer_safely] Preparing layer 'Trimmed Intermediate Segmentation_ramified' (Type: labels)
+    Input data shape: (168, 1536, 1536), dtype: int32
+    Determined spatial_ndim: 3
+    Applied DISPLAY scale: (3.598786487041608, 1.0, 1.0)
+    Applied DISPLAY translate: (0.0, 0.0, 0.0)
+    Attempting ADD layer 'Trimmed Intermediate Segmentation_ramified'
+ Added: trimmed_segmentation_ramified.npy
+  DEBUG [_add_layer_safely] Preparing layer 'Edge Mask_ramified' (Type: image)
+    Input data shape: (168, 1536, 1536), dtype: bool
+    Determined spatial_ndim: 3
+    Applied DISPLAY scale: (3.598786487041608, 1.0, 1.0)
+    Applied DISPLAY translate: (0.0, 0.0, 0.0)
+    Attempting ADD layer 'Edge Mask_ramified'
+ Added: ramified_edge_mask.npy
+  DEBUG [_add_layer_safely] Preparing layer 'Final segmentation_ramified' (Type: labels)
+    Input data shape: (168, 1536, 1536), dtype: int32
+    Determined spatial_ndim: 3
+    Applied DISPLAY scale: (3.598786487041608, 1.0, 1.0)
+    Applied DISPLAY translate: (0.0, 0.0, 0.0)
+    Attempting ADD layer 'Final segmentation_ramified'
+ Added: final_segmentation_ramified.npy
+  DEBUG [_add_layer_safely] Preparing layer 'Cell bodies_ramified' (Type: labels)
+    Input data shape: (168, 1536, 1536), dtype: int32
+    Determined spatial_ndim: 3
+    Applied DISPLAY scale: (3.598786487041608, 1.0, 1.0)
+    Applied DISPLAY translate: (0.0, 0.0, 0.0)
+    Attempting ADD layer 'Cell bodies_ramified'
+ Added: ramified_cell_bodies.npy
+ Loaded: metrics_df_ramified.csv (114 rows)
+  DEBUG [_add_layer_safely] Preparing layer 'Skeletons_ramified' (Type: labels)
+    Input data shape: (168, 1536, 1536), dtype: uint8
+    Determined spatial_ndim: 3
+    Applied DISPLAY scale: (3.598786487041608, 1.0, 1.0)
+    Applied DISPLAY translate: (0.0, 0.0, 0.0)
+    Attempting ADD layer 'Skeletons_ramified'
+ Loaded: skeleton_array_ramified.npy
+DEBUG: First few lines_to_draw coords (Z,Y,X):
+[[[  89. 1213.  932.]
+  [  89. 1213.  933.]]
+
+ [[  46.  651.  986.]
+  [  46.  657.  986.]]
+
+ [[  28.  414.  838.]
+  [  28.  414.  839.]]]
+  DEBUG [_add_layer_safely] Preparing layer 'Closest Connections_ramified' (Type: shapes)
+    Input data shape: (114, 2, 3), dtype: float64
+    Determined spatial_ndim: 3
+    Applied DISPLAY scale: (3.598786487041608, 1.0, 1.0)
+    Applied DISPLAY translate: (0.0, 0.0, 0.0)
+    Attempting ADD layer 'Closest Connections_ramified'
+Visualizing 114 closest connections.
+Displaying results.
+Requesting cleanup for artifacts of step 4
+Cleaning Ramified artifacts for step 4 (Viewer present: True)...
+Removed layer: Closest Connections_ramified
+Removed layer: Skeletons_ramified
+Attempting to delete file: /home/kirill/Desktop/For_Kirill/Iba1_Morpho_BB_Blind (Copy)/D/D_processed_ramified/metrics_df_ramified.csv
+  Deleted file successfully: /home/kirill/Desktop/For_Kirill/Iba1_Morpho_BB_Blind (Copy)/D/D_processed_ramified/metrics_df_ramified.csv
+Attempting to delete file: /home/kirill/Desktop/For_Kirill/Iba1_Morpho_BB_Blind (Copy)/D/D_processed_ramified/distances_matrix_ramified.csv
+  Deleted file successfully: /home/kirill/Desktop/For_Kirill/Iba1_Morpho_BB_Blind (Copy)/D/D_processed_ramified/distances_matrix_ramified.csv
+Attempting to delete file: /home/kirill/Desktop/For_Kirill/Iba1_Morpho_BB_Blind (Copy)/D/D_processed_ramified/points_matrix_ramified.csv
+  Deleted file successfully: /home/kirill/Desktop/For_Kirill/Iba1_Morpho_BB_Blind (Copy)/D/D_processed_ramified/points_matrix_ramified.csv
+Attempting to delete file: /home/kirill/Desktop/For_Kirill/Iba1_Morpho_BB_Blind (Copy)/D/D_processed_ramified/branch_data_ramified.csv
+  Deleted file successfully: /home/kirill/Desktop/For_Kirill/Iba1_Morpho_BB_Blind (Copy)/D/D_processed_ramified/branch_data_ramified.csv
+Attempting to delete file: /home/kirill/Desktop/For_Kirill/Iba1_Morpho_BB_Blind (Copy)/D/D_processed_ramified/skeleton_array_ramified.npy
+  Deleted file successfully: /home/kirill/Desktop/For_Kirill/Iba1_Morpho_BB_Blind (Copy)/D/D_processed_ramified/skeleton_array_ramified.npy
+Cleaned step 4 artifacts.
+Error: Config key 'execute_calculate_features_ramified' not found for step 'Calculate Features'. Cannot create widgets.
+Requesting cleanup for artifacts of step 3
+Cleaning Ramified artifacts for step 3 (Viewer present: True)...
+Removed layer: Final segmentation_ramified
+Removed layer: Cell bodies_ramified
+Attempting to delete file: /home/kirill/Desktop/For_Kirill/Iba1_Morpho_BB_Blind (Copy)/D/D_processed_ramified/final_segmentation_ramified.npy
+  Deleted file successfully: /home/kirill/Desktop/For_Kirill/Iba1_Morpho_BB_Blind (Copy)/D/D_processed_ramified/final_segmentation_ramified.npy
+Attempting to delete file: /home/kirill/Desktop/For_Kirill/Iba1_Morpho_BB_Blind (Copy)/D/D_processed_ramified/ramified_cell_bodies.npy
+  Deleted file successfully: /home/kirill/Desktop/For_Kirill/Iba1_Morpho_BB_Blind (Copy)/D/D_processed_ramified/ramified_cell_bodies.npy
+Cleaned step 3 artifacts.
+Creating widgets for: 'Refine Rois' (using config key: 'execute_refine_rois_ramified')
+Requesting cleanup for artifacts of step 2
+Cleaning Ramified artifacts for step 2 (Viewer present: True)...
+Removed layer: Trimmed Intermediate Segmentation_ramified
+Removed layer: Edge Mask_ramified
+Attempting to delete file: /home/kirill/Desktop/For_Kirill/Iba1_Morpho_BB_Blind (Copy)/D/D_processed_ramified/trimmed_segmentation_ramified.npy
+  Deleted file successfully: /home/kirill/Desktop/For_Kirill/Iba1_Morpho_BB_Blind (Copy)/D/D_processed_ramified/trimmed_segmentation_ramified.npy
+Attempting to delete file: /home/kirill/Desktop/For_Kirill/Iba1_Morpho_BB_Blind (Copy)/D/D_processed_ramified/ramified_edge_mask.npy
+  Deleted file successfully: /home/kirill/Desktop/For_Kirill/Iba1_Morpho_BB_Blind (Copy)/D/D_processed_ramified/ramified_edge_mask.npy
+Cleaned step 2 artifacts.
+Creating widgets for: 'Trim Edges' (using config key: 'execute_trim_edges_ramified')
+Saving parameters before executing Trim Edges...
+DEBUG save_config: Processing current_config keys...
+  Included key: mode
+  Included key: execute_raw_segmentation_ramified
+  Included key: execute_trim_edges_ramified
+  Included key: execute_refine_rois_ramified
+  Included key: voxel_dimensions
+  Ignoring existing 'saved_state' key in input config.
+DEBUG save_config: Checking intermediate_state keys: ['segmentation_threshold']
+  Adding segmentation_threshold (0.043508924543857574) to saved_state.
+DEBUG: Final 'saved_state' content: {'segmentation_threshold': 0.043508924543857574}
+Saving final configuration keys to /home/kirill/Desktop/For_Kirill/Iba1_Morpho_BB_Blind (Copy)/D/D_processed_ramified/processing_config_ramified.yaml: ['mode', 'execute_raw_segmentation_ramified', 'execute_trim_edges_ramified', 'execute_refine_rois_ramified', 'voxel_dimensions', 'saved_state']
+Configuration successfully saved.
+Cleaning up potential old artifacts for Trim Edges (Step 2) onwards...
+Requesting cleanup for artifacts of step 2
+Cleaning Ramified artifacts for step 2 (Viewer present: True)...
+Cleaned step 2 artifacts.
+Requesting cleanup for artifacts of step 3
+Cleaning Ramified artifacts for step 3 (Viewer present: True)...
+Cleaned step 3 artifacts.
+Requesting cleanup for artifacts of step 4
+Cleaning Ramified artifacts for step 4 (Viewer present: True)...
+Cleaned step 4 artifacts.
+
+--- Attempting Step 2/4: 'Trim Edges' (Method: 'execute_trim_edges') ---
+Executing Step 2: Edge Trimming...
+Error: Original volume missing.
+--- Step 2 ('Trim Edges') finished (Success: False) ---
+Trim Edges failed or returned False.
+'Trim Edges' execution attempt took 2.39 seconds.
+Saving parameters before executing Trim Edges...
+DEBUG save_config: Processing current_config keys...
+  Included key: mode
+  Included key: execute_raw_segmentation_ramified
+  Included key: execute_trim_edges_ramified
+  Included key: execute_refine_rois_ramified
+  Included key: voxel_dimensions
+  Ignoring existing 'saved_state' key in input config.
+DEBUG save_config: Checking intermediate_state keys: ['segmentation_threshold']
+  Adding segmentation_threshold (0.043508924543857574) to saved_state.
+DEBUG: Final 'saved_state' content: {'segmentation_threshold': 0.043508924543857574}
+Saving final configuration keys to /home/kirill/Desktop/For_Kirill/Iba1_Morpho_BB_Blind (Copy)/D/D_processed_ramified/processing_config_ramified.yaml: ['mode', 'execute_raw_segmentation_ramified', 'execute_trim_edges_ramified', 'execute_refine_rois_ramified', 'voxel_dimensions', 'saved_state']
+Configuration successfully saved.
+Cleaning up potential old artifacts for Trim Edges (Step 2) onwards...
+Requesting cleanup for artifacts of step 2
+Cleaning Ramified artifacts for step 2 (Viewer present: True)...
+Cleaned step 2 artifacts.
+Requesting cleanup for artifacts of step 3
+Cleaning Ramified artifacts for step 3 (Viewer present: True)...
+Cleaned step 3 artifacts.
+Requesting cleanup for artifacts of step 4
+Cleaning Ramified artifacts for step 4 (Viewer present: True)...
+Cleaned step 4 artifacts.
+
+--- Attempting Step 2/4: 'Trim Edges' (Method: 'execute_trim_edges') ---
+Executing Step 2: Edge Trimming...
+Error: Original volume missing.
+--- Step 2 ('Trim Edges') finished (Success: False) ---
+Trim Edges failed or returned False.
+'Trim Edges' execution attempt took 2.38 seconds.
+Qt Application event loop finished with exit code: 0

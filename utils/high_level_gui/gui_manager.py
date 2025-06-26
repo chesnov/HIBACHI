@@ -226,7 +226,7 @@ class DynamicGUIManager:
                         # Update self.config (manager's copy)
                         for step_key, step_data in saved_config.items():
                             # (logic to update self.config parameters and saved_state dict - unchanged)
-                            if step_key == 'voxel_dimensions' and isinstance(step_data, dict):
+                            if (step_key == 'voxel_dimensions' or step_key == 'pixel_dimensions') and isinstance(step_data, dict):
                                 if step_key in self.config: self.config[step_key] = step_data
                             elif step_key.startswith("execute_") and step_key in self.config and isinstance(step_data, dict) and isinstance(self.config.get(step_key), dict):
                                 if "parameters" in step_data and isinstance(step_data.get("parameters"), dict) and \

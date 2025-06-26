@@ -19,7 +19,7 @@ try:
     # Import the 2D segmentation functions
     from .initial_2d_segmentation import segment_cells_first_pass_raw_2d
     from .remove_artifacts_2d import apply_hull_trimming_2d
-    from .ramified_segmenter_2d import extract_soma_masks_2d, refine_seeds_pca_2d, separate_multi_soma_cells_2d
+    from .ramified_segmenter_2d import extract_soma_masks_2d, separate_multi_soma_cells_2d
     from .calculate_features_2d import analyze_segmentation_2d
 except ImportError as e:
     expected_ramified_dir = os.path.dirname(os.path.abspath(__file__))
@@ -328,43 +328,70 @@ class Ramified2DStrategy(ProcessingStrategy):
         except Exception as e: print(f"Error loading trimmed 2D segmentation {initial_seg_path}: {e}"); return False
 
         try:
-            # --- Parameter Handling ---
+            # Shared parameters
+            min_fragment_size = int(params.get("min_fragment_size", 50))
+
+            # Parameters for extract_soma_masks
+            default_percentiles = [100 - i for i in range(0, 99, 5)] + [99, 1]
+            ratios_to_process = params.get("ratios_to_process", [0.3, 0.4, 0.5, 0.6])
+            intensity_percentiles_to_process = params.get("intensity_percentiles_to_process", default_percentiles)
             smallest_quantile = float(params.get("smallest_quantile", 0.05))
-            min_fragment_size = int(params.get("min_fragment_size", 50)) # Pixels?
-            target_aspect_ratio = float(params.get("target_aspect_ratio", 1.05))
-            projection_percentile_crop = int(params.get("projection_percentile_crop", 10)) # Keep param, maybe PCA func uses it?
-            intensity_weight = float(params.get("intensity_weight", 1.0)) # Default adjusted earlier
-            # Get separation-specific params
-            max_seed_centroid_dist = float(params.get("max_seed_centroid_dist", 15.0))
-            min_path_intensity_ratio = float(params.get("min_path_intensity_ratio", 0.6))
-            # Get post-merge param if added to config later
-            post_merge_min_interface_pixels = int(params.get("post_merge_min_interface_pixels", 10)) # Default if not in config
+            core_volume_target_factor_lower = float(params.get("core_volume_target_factor_lower", 0.1))
+            core_volume_target_factor_upper = float(params.get("core_volume_target_factor_upper", 10.0))
+            erosion_iterations = int(params.get("erosion_iterations", 0))
+            min_physical_peak_separation = float(params.get("min_physical_peak_separation", 7.0))
+            max_allowed_core_aspect_ratio = float(params.get("max_allowed_core_aspect_ratio", 10.0))
+            ref_vol_percentile_lower = int(params.get("ref_vol_percentile_lower", 30))
+            ref_vol_percentile_upper = int(params.get("ref_vol_percentile_upper", 70))
+            ref_thickness_percentile_lower = int(params.get("ref_thickness_percentile_lower", 1))
+            absolute_min_thickness_um = float(params.get("absolute_min_thickness_um", 1.5))
+            absolute_max_thickness_um = float(params.get("absolute_max_thickness_um", 10.0))
+
+            min_size_threshold = int(params.get("min_size_threshold", 18000))
+
+            # Parameters for separate_multi_soma_cells
+            max_seed_centroid_dist = float(params.get("max_seed_centroid_dist", 40.0))
+            min_path_intensity_ratio = float(params.get("min_path_intensity_ratio", 0.8))
+            min_local_intensity_difference = float(params.get("min_local_intensity_difference", 0.05))
+            local_analysis_radius = float(params.get("local_analysis_radius", 5.0))
 
             # --- Call 2D Functions with CORRECT spacing_yx ---
             print("  Calling extract_soma_masks_2d...")
+
+
             cell_bodies = extract_soma_masks_2d(
-                    segmentation_mask=labeled_cells,
-                    intensity_image=original_image, # Pass the intensity image
-                    spacing=spacing_yx, # Pass 2D spacing
-                    smallest_quantile=smallest_quantile, min_fragment_size=min_fragment_size,
+                segmentation_mask=labeled_cells, # 2D mask
+                intensity_image=original_image, # 2D intensity image
+                spacing=spacing_yx, # 2D spacing (dy, dx)
+                smallest_quantile=smallest_quantile,
+                min_fragment_size=min_fragment_size, # Pixels (area for 2D)
+                core_volume_target_factor_lower=core_volume_target_factor_lower, # "Volume" means area
+                core_volume_target_factor_upper=core_volume_target_factor_upper,  # "Volume" means area
+                erosion_iterations=erosion_iterations,
+                ratios_to_process=ratios_to_process,
+                intensity_percentiles_to_process=intensity_percentiles_to_process,
+                min_physical_peak_separation=min_physical_peak_separation, # um (consistent with 2D)
+                max_allowed_core_aspect_ratio=max_allowed_core_aspect_ratio,
+                ref_vol_percentile_lower=ref_vol_percentile_lower, # "Volume" means area
+                ref_vol_percentile_upper=ref_vol_percentile_upper, # "Volume" means area
+                ref_thickness_percentile_lower=ref_thickness_percentile_lower, # "Thickness" means max inscribed disk radius
+                absolute_min_thickness_um=absolute_min_thickness_um, # Max inscribed disk radius in um
+                absolute_max_thickness_um=absolute_max_thickness_um  # Max inscribed disk radius in um
             )
             print("  Calling refine_seeds_pca_2d...")
-            refined_mask = refine_seeds_pca_2d(
-                 cell_bodies, spacing_yx, # Pass 2D spacing
-                 target_aspect_ratio=target_aspect_ratio,
-                 projection_percentile_crop=projection_percentile_crop,
-                 min_fragment_size=min_fragment_size
-                 )
             print("  Calling separate_multi_soma_cells_2d...")
             merged_roi_array = separate_multi_soma_cells_2d(
-                labeled_cells, original_image, # Pass 2D image
-                refined_mask, spacing_yx, # Pass 2D spacing
-                min_size_threshold=min_fragment_size, intensity_weight=intensity_weight,
-                # Pass heuristics params
-                max_seed_centroid_dist=max_seed_centroid_dist,
-                min_path_intensity_ratio=min_path_intensity_ratio,
-                post_merge_min_interface_pixels=post_merge_min_interface_pixels
-            )
+                                    segmentation_mask=labeled_cells, 
+                                    intensity_volume=original_image, 
+                                    soma_mask=cell_bodies, # All 2D
+                                    spacing=spacing_yx, 
+                                    min_size_threshold=min_size_threshold, # Adjusted for 2D
+                                    max_seed_centroid_dist=max_seed_centroid_dist, # Adjusted for 2D
+                                    min_path_intensity_ratio=min_path_intensity_ratio, 
+                                    min_local_intensity_difference=min_local_intensity_difference, 
+                                    local_analysis_radius=local_analysis_radius # Adjusted for 2D
+                                )
+            
             print("  Placeholder functions executed.")
         except NotImplementedError:
             print("ERROR: 2D Refinement functions (extract_soma_masks_2d, etc.) not implemented yet.")
@@ -380,12 +407,10 @@ class Ramified2DStrategy(ProcessingStrategy):
         final_seg_path = files.get("final_segmentation")
         try:
              if cell_bodies_path: np.save(cell_bodies_path, cell_bodies)
-             if refined_rois_path: np.save(refined_rois_path, refined_mask)
              if final_seg_path: np.save(final_seg_path, merged_roi_array)
 
              # --- Add visualization ---
              self._add_layer_safely(viewer, cell_bodies, "Cell bodies")
-             self._add_layer_safely(viewer, refined_mask, "Refined ROIs")
              self._add_layer_safely(viewer, merged_roi_array, "Final segmentation")
 
              print(f"Saved 2D cell bodies, refined ROIs, and final segmentation.")
