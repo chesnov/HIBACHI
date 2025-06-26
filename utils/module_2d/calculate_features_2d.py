@@ -1,3 +1,5 @@
+# --- START OF FILE calculate_features_2d.py ---
+
 # --- START OF FILE utils/ramified_module_2d/calculate_features_2d.py ---
 
 import numpy as np
@@ -99,6 +101,9 @@ def calculate_pair_distances_worker_2d(args):
          return i, j, np.inf, np.full(4, np.nan)
 
     distances, indices = tree2.query(scaled_points1, k=1)
+    
+    if distances.size == 0: # Handle empty distances array if scaled_points1 was empty after all
+        return i, j, np.inf, np.full(4, np.nan)
 
     min_idx = np.argmin(distances)
     min_distance = distances[min_idx]
@@ -149,9 +154,11 @@ def shortest_distance_2d(segmented_array, spacing_yx=(1.0, 1.0),
     # --- Boundary Point Extraction (2D Optimized) ---
     print("DEBUG [shortest_distance_2d] Finding 2D object bounding boxes...")
     locations = ndi.find_objects(segmented_array, max_label=labels.max())
-    print(f"DEBUG [shortest_distance_2d] Found {len(locations)} potential 2D bounding boxes.")
+    print(f"DEBUG [shortest_distance_2d] Found {len(locations if locations is not None else [])} potential 2D bounding boxes.")
 
     extract_args = []; labels_found_in_locations = []
+    if locations is None: locations = [] # Ensure locations is iterable
+
     for i, label in enumerate(labels):
         if label -1 < len(locations) and locations[label-1] is not None:
             slices = locations[label - 1]
@@ -170,8 +177,9 @@ def shortest_distance_2d(segmented_array, spacing_yx=(1.0, 1.0),
              boundary_file = os.path.join(temp_dir, f"boundary_{label}.npy"); np.save(boundary_file, np.empty((0, 2), dtype=int))
 
     print(f"DEBUG [shortest_distance_2d] Prepared {len(extract_args)} tasks for boundary extraction.")
-    with mp.Pool(processes=n_jobs) as pool:
-         list(tqdm(pool.imap_unordered(extract_boundary_points_worker_2d, extract_args), total=len(extract_args), desc="Extracting Boundaries"))
+    if extract_args:
+        with mp.Pool(processes=n_jobs) as pool:
+             list(tqdm(pool.imap_unordered(extract_boundary_points_worker_2d, extract_args), total=len(extract_args), desc="Extracting Boundaries"))
 
     # --- Pairwise Distance Calculation (2D) ---
     labels_to_process_distance = labels_found_in_locations; n_labels_processed = len(labels_to_process_distance)
@@ -192,13 +200,14 @@ def shortest_distance_2d(segmented_array, spacing_yx=(1.0, 1.0),
     all_pairs = [(i, j) for i in range(n_labels_processed) for j in range(i + 1, n_labels_processed)]
     calc_args = [(i, j, labels_to_process_distance, temp_dir, spacing_yx, distances_matrix, points_matrix) for i, j in all_pairs]
 
-    with mp.Pool(processes=n_jobs) as pool:
-        results = list(tqdm(pool.imap_unordered(calculate_pair_distances_worker_2d, calc_args), total=len(all_pairs), desc="Calculating Distances (2D)"))
+    if calc_args:
+        with mp.Pool(processes=n_jobs) as pool:
+            results = list(tqdm(pool.imap_unordered(calculate_pair_distances_worker_2d, calc_args), total=len(all_pairs), desc="Calculating Distances (2D)"))
 
-    for i, j, distance, points in results:
-        distances_matrix[i, j] = distances_matrix[j, i] = distance
-        points_matrix[i, j, :] = points
-        if not np.any(np.isnan(points)): points_matrix[j, i, :] = np.array([points[2], points[3], points[0], points[1]]) # Swap Y2,X2,Y1,X1
+        for i_res, j_res, distance, points_res in results: # Renamed loop variables
+            distances_matrix[i_res, j_res] = distances_matrix[j_res, i_res] = distance
+            points_matrix[i_res, j_res, :] = points_res
+            if not np.any(np.isnan(points_res)): points_matrix[j_res, i_res, :] = np.array([points_res[2], points_res[3], points_res[0], points_res[1]]) # Swap Y2,X2,Y1,X1
 
     # --- Convert to DataFrames (2D) ---
     distance_matrix_processed_df = pd.DataFrame(distances_matrix, index=labels_to_process_distance, columns=labels_to_process_distance)
@@ -216,14 +225,15 @@ def shortest_distance_2d(segmented_array, spacing_yx=(1.0, 1.0),
     # Expand distance matrix to original full label set
     final_distance_df = pd.DataFrame(np.inf, index=labels, columns=labels, dtype=np.float32)
     np.fill_diagonal(final_distance_df.values, 0)
-    final_distance_df.loc[labels_to_process_distance, labels_to_process_distance] = distance_matrix_processed_df
+    if not distance_matrix_processed_df.empty:
+        final_distance_df.loc[labels_to_process_distance, labels_to_process_distance] = distance_matrix_processed_df
 
     final_points_df = points_processed_df # Return only calculated pairs
 
     # --- DEBUG ---
     print(f"DEBUG [shortest_distance_2d] Finished. Distance matrix shape {final_distance_df.shape}. Points DF shape {final_points_df.shape}")
     if DEBUG_TARGET_LABEL is not None and DEBUG_TARGET_LABEL in final_points_df['mask1'].values: debug_print(f"Points DF sample for label {DEBUG_TARGET_LABEL}:\n{final_points_df[final_points_df['mask1'] == DEBUG_TARGET_LABEL].head()}", label=DEBUG_TARGET_LABEL)
-    elif DEBUG_TARGET_LABEL is None: print(f"DEBUG [shortest_distance_2d] Points DF head:\n{final_points_df.head()}")
+    elif DEBUG_TARGET_LABEL is None and not final_points_df.empty : print(f"DEBUG [shortest_distance_2d] Points DF head:\n{final_points_df.head()}")
 
     # --- Cleanup ---
     if temp_dir_managed and os.path.exists(temp_dir): 
@@ -248,9 +258,10 @@ def calculate_area_and_shape_2d(segmented_array, spacing_yx=(1.0, 1.0)):
     try:
         # Calculate props for all labeled regions at once
         # Provide spacing for accurate physical measurements
-        props = regionprops(segmented_array, spacing=spacing_yx)
+        props = regionprops(segmented_array.astype(np.int32), spacing=spacing_yx, intensity_image=None) # Ensure int for labels
     except Exception as e:
         print(f"Error calculating regionprops: {e}")
+        traceback.print_exc()
         return pd.DataFrame()
 
     print(f"DEBUG [calculate_area_shape_2d] Found {len(props)} regions.")
@@ -313,65 +324,105 @@ def calculate_area_and_shape_2d(segmented_array, spacing_yx=(1.0, 1.0)):
 
 def analyze_skeleton_with_skan_2d(label_region, offset_yx, spacing_yx, label):
     """
-    Analyzes a single 2D binary mask using skan.
+    Analyzes a single 2D binary mask using skan. (CORRECTED based on 3D logic)
     Returns DataFrame, skeleton image (local coords), and stats.
-    Offset is the (y,x) start of label_region in the original array.
+    Offset_yx is the (y,x) start of label_region in the original array.
     """
     is_target = (label == DEBUG_TARGET_LABEL)
-    # if is_target: debug_print(f"Label {label}: Analyzing 2D skeleton. Region shape {label_region.shape}, Offset {offset_yx}. Spacing {spacing_yx}", label=label)
-
-    mask = None; skeleton_img = None; skel_pixel_count = 0
+    
+    mask_local = None; skeleton_img_to_return_local = None; skel_pixel_count = 0
     branch_data = pd.DataFrame(); graph_obj = None
     n_junctions = 0; n_endpoints = 0; total_nodes = 0
 
     try:
-        mask = (label_region == label)
-        if not np.any(mask): return pd.DataFrame(), np.zeros_like(label_region, dtype=np.uint8), 0, 0, 0, None
+        mask_local = (label_region == label)
 
-        # Skeletonize 2D mask
-        skeleton_img = skeletonize(mask).astype(np.uint8)
-        skel_pixel_count = np.count_nonzero(skeleton_img)
+        if not np.any(mask_local):
+            return pd.DataFrame(), np.zeros_like(label_region, dtype=np.uint8), 0, 0, 0, None
 
-        # if is_target: debug_print(f"Label {label}: Skeletonized 2D region. Skel pixels {skel_pixel_count}.", label=label)
-        if skel_pixel_count == 0: return pd.DataFrame(), skeleton_img, 0, 0, 0, None
+        skeleton_binary_local = skeletonize(mask_local)
+        skel_pixel_count = np.count_nonzero(skeleton_binary_local)
+        
+        # This is the binary (0/1) skeleton image that will be RETURNED. It has local coordinates.
+        skeleton_img_to_return_local = skeleton_binary_local.astype(np.uint8)
 
-        # --- Run Skan (2D) ---
-        # Pass 2D spacing, 2D offset (Y,X)
-        graph_obj = Skeleton(skeleton_img, spacing=spacing_yx, source_image=mask, offset=offset_yx)
+        if skel_pixel_count == 0:
+            return pd.DataFrame(), skeleton_img_to_return_local, 0, 0, 0, None
+
+        # --- START OF SKAN COMPATIBILITY FIX (mirroring 3D logic) ---
+        skeleton_global_coords = np.argwhere(skeleton_binary_local) + offset_yx # offset_yx is (y_offset, x_offset)
+        source_mask_global_coords = np.argwhere(mask_local) + offset_yx
+
+        if skeleton_global_coords.size == 0 or source_mask_global_coords.size == 0: # Should not happen if skel_pixel_count > 0
+            return pd.DataFrame(), skeleton_img_to_return_local, 0, 0, 0, None
+
+        max_skel_coords = np.max(skeleton_global_coords, axis=0) if skeleton_global_coords.size > 0 else np.array([0,0])
+        max_mask_coords = np.max(source_mask_global_coords, axis=0) if source_mask_global_coords.size > 0 else np.array([0,0])
+        
+        required_shape_2d = np.maximum(max_skel_coords, max_mask_coords) + 1 # (max_y+1, max_x+1)
+        
+        skeleton_for_skan_analysis_2d = np.zeros(required_shape_2d, dtype=np.min_scalar_type(label))
+        source_for_skan_2d = np.zeros(required_shape_2d, dtype=bool)
+
+        skeleton_for_skan_analysis_2d[tuple(skeleton_global_coords.T)] = label
+        source_for_skan_2d[tuple(source_mask_global_coords.T)] = True
+        
+        # Call Skan without the 'offset' parameter, using the reconstructed arrays
+        graph_obj = Skeleton(skeleton_for_skan_analysis_2d, spacing=spacing_yx, source_image=source_for_skan_2d)
+        # --- END OF SKAN COMPATIBILITY FIX ---
+
         branch_data = summarize(graph_obj)
 
-        # if is_target: debug_print(f"Label {label}: skan summarize complete. Branches found: {len(branch_data)}.", label=label)
-        # if is_target and not branch_data.empty: debug_print(f"Label {label}: Branch columns: {branch_data.columns}", label=label)
-
-        # --- Graph Analysis (2D) ---
         nx_graph = None
-        if hasattr(graph_obj, 'graph'):
+        if hasattr(graph_obj, 'graph') and isinstance(graph_obj.graph, (csr_matrix, nx.Graph)):
             if isinstance(graph_obj.graph, csr_matrix):
-                 try: nx_graph = nx.from_scipy_sparse_array(graph_obj.graph)
-                 except Exception as nx_err: print(f"Warn: Label {label} NX convert fail: {nx_err}")
-            elif isinstance(graph_obj.graph, nx.Graph): nx_graph = graph_obj.graph
+                try: nx_graph = nx.from_scipy_sparse_array(graph_obj.graph)
+                except Exception as nx_err: print(f"Warning: Label {label}: Failed to convert skan sparse graph to NetworkX: {nx_err}"); nx_graph = None
+            else: nx_graph = graph_obj.graph
 
             if nx_graph is not None:
                 total_nodes = nx_graph.number_of_nodes()
                 if total_nodes > 0:
-                    degrees = pd.Series(dict(nx_graph.degree())); n_endpoints = (degrees == 1).sum()
+                    degrees = pd.Series(dict(nx_graph.degree()))
+                    n_endpoints = (degrees == 1).sum()
                     if hasattr(graph_obj, 'n_junctions'): n_junctions = graph_obj.n_junctions
-                    elif hasattr(graph_obj, 'n_junction'): n_junctions = graph_obj.n_junction
+                    elif hasattr(graph_obj, 'n_junction'): n_junctions = graph_obj.n_junction # Older skan
                     else: n_junctions = (degrees > 2).sum()
-                # if is_target: debug_print(f"Label {label}: Graph analysis: Nodes={total_nodes}, Endpoints={n_endpoints}, Junctions={n_junctions}", label=label)
+    
+    except ValueError as ve:
+        print(f"Label {label}: Skan ValueError (possibly trivial skeleton): {ve}")
+        if skeleton_img_to_return_local is None: skeleton_img_to_return_local = np.zeros_like(label_region, dtype=np.uint8)
+        # Try to estimate some basic properties if skan fails but skeleton exists
+        if skel_pixel_count > 0 and branch_data.empty:
+            total_nodes = skel_pixel_count
+            if skel_pixel_count == 1: n_endpoints = 1
+            elif skel_pixel_count == 2: n_endpoints = 2 # Simple line
+    except MemoryError as me:
+        print(f"CRITICAL: MemoryError during 2D skeleton analysis for label {label}: {me}")
+        if skeleton_img_to_return_local is None: skeleton_img_to_return_local = np.zeros_like(label_region, dtype=np.uint8)
+        branch_data = pd.DataFrame(); n_junctions=0; n_endpoints=0; total_nodes=0; graph_obj=None
+    except AttributeError as ae: # Catch issues like 'Skeleton' object has no attribute 'graph'
+        print(f"Label {label}: Skan AttributeError during analysis: {ae}")
+        if skeleton_img_to_return_local is None: skeleton_img_to_return_local = np.zeros_like(label_region, dtype=np.uint8)
+        return pd.DataFrame(), skeleton_img_to_return_local, 0, 0, 0, None # Return empty/zero
+    except Exception as e:
+        print(f"Label {label}: Skan analysis failed unexpectedly: {e}"); traceback.print_exc()
+        if skeleton_img_to_return_local is None: skeleton_img_to_return_local = np.zeros_like(label_region, dtype=np.uint8)
+        return pd.DataFrame(), skeleton_img_to_return_local, 0, 0, 0, None # Return empty/zero
+    finally:
+        # Clean up temporary large arrays
+        if 'skeleton_for_skan_analysis_2d' in locals(): del skeleton_for_skan_analysis_2d
+        if 'source_for_skan_2d' in locals(): del source_for_skan_2d
+        if 'graph_obj' in locals() and graph_obj is not None: del graph_obj
+        if 'mask_local' in locals() and mask_local is not None: del mask_local
 
-    except ValueError as ve: print(f"Label {label}: Skan ValueError (trivial skel?): {ve}")
-    except MemoryError as me: print(f"CRITICAL: MemoryError skan label {label}: {me}")
-    except Exception as e: print(f"Label {label}: Skan analysis failed: {e}"); traceback.print_exc()
-    finally: del mask, graph_obj
-
-    if skeleton_img is None: skeleton_img = np.zeros_like(label_region, dtype=np.uint8)
-    return branch_data, skeleton_img, n_junctions, n_endpoints, total_nodes, None
+    if skeleton_img_to_return_local is None: skeleton_img_to_return_local = np.zeros_like(label_region, dtype=np.uint8)
+    return branch_data, skeleton_img_to_return_local, n_junctions, n_endpoints, total_nodes, None
 
 
 def calculate_ramification_with_skan_2d(segmented_array, spacing_yx=(1.0, 1.0), labels=None, skeleton_export_path=None):
     """
-    Calculate 2D ramification statistics using skan.
+    Calculate 2D ramification statistics using skan. (CORRECTED)
     """
     print("DEBUG [calculate_ramification_2d] Starting 2D skeleton analysis...")
     if segmented_array.ndim != 2: raise ValueError("Input must be 2D")
@@ -384,20 +435,28 @@ def calculate_ramification_with_skan_2d(segmented_array, spacing_yx=(1.0, 1.0), 
     if not labels_to_process: return pd.DataFrame(), pd.DataFrame(), np.zeros_like(segmented_array, dtype=np.uint8)
 
     print("DEBUG [calculate_ramification_2d] Finding 2D object bounding boxes...")
-    locations = ndi.find_objects(segmented_array, max_label=max(labels_to_process))
-    if locations is None: return pd.DataFrame(), pd.DataFrame(), np.zeros_like(segmented_array, dtype=np.uint8)
+    locations = ndi.find_objects(segmented_array.astype(np.int32), max_label=max(labels_to_process) if labels_to_process else 0)
+    if locations is None: locations = [] # Ensure iterable
     print(f"DEBUG [calculate_ramification_2d] Found {len(locations)} potential 2D boxes.")
 
     # --- Prepare skeleton array (2D) ---
     use_memmap = bool(skeleton_export_path)
-    max_label_skel = max(labels_to_process); skeleton_dtype = np.uint32 # Default to uint32 for typical label counts
-    if max_label_skel < 2**8: skeleton_dtype = np.uint8
+    
+    # Robust dtype selection for skeleton_array (mirroring 3D)
+    max_label_skel = max(labels_to_process) if labels_to_process else 0
+    if max_label_skel == 0: skeleton_dtype = np.uint8 # Should not happen if labels_to_process is not empty
+    elif max_label_skel < 2**8: skeleton_dtype = np.uint8
     elif max_label_skel < 2**16: skeleton_dtype = np.uint16
-    print(f"DEBUG [calculate_ramification_2d] Using dtype {skeleton_dtype} for 2D skeleton array.")
+    elif max_label_skel < 2**32: skeleton_dtype = np.uint32 # Default for 2D was uint32
+    else: skeleton_dtype = np.uint64 # Should be very rare for 2D label counts
+    print(f"DEBUG [calculate_ramification_2d] Using dtype {skeleton_dtype} for 2D skeleton array based on max label {max_label_skel}.")
+
 
     skeleton_array = None
     try:
-        if use_memmap: skeleton_array = np.memmap(skeleton_export_path, dtype=skeleton_dtype, mode='w+', shape=segmented_array.shape)
+        if use_memmap:
+            if os.path.exists(skeleton_export_path): os.remove(skeleton_export_path) # Ensure clean start
+            skeleton_array = np.memmap(skeleton_export_path, dtype=skeleton_dtype, mode='w+', shape=segmented_array.shape)
         else: skeleton_array = np.zeros(segmented_array.shape, dtype=skeleton_dtype)
         skeleton_array[:] = 0;
         if use_memmap: skeleton_array.flush()
@@ -405,48 +464,51 @@ def calculate_ramification_with_skan_2d(segmented_array, spacing_yx=(1.0, 1.0), 
 
     all_branch_data_dfs = []; summary_stats_list = []
 
-    for label in tqdm(labels_to_process, desc="Analyzing Skeletons (2D skan)"):
-        loc_index = label - 1
-        if loc_index < 0 or loc_index >= len(locations) or locations[loc_index] is None: continue
+    for label_val in tqdm(labels_to_process, desc="Analyzing Skeletons (2D skan)"): # Renamed label to label_val
+        loc_index = label_val - 1
+        if loc_index < 0 or loc_index >= len(locations) or locations[loc_index] is None: 
+            summary_stats_list.append({'label': label_val, 'skan_num_branches': 0, 'skan_total_length_um': 0.0, 'skan_avg_branch_length_um': np.nan, 'skan_num_junctions': 0, 'skan_num_endpoints': 0, 'skan_num_skeleton_pixels': 0})
+            continue
+        
         slices = locations[loc_index]; label_region = None; offset_yx = None
         try:
             label_region = segmented_array[slices]
             offset_yx = np.array([s.start for s in slices]) # 2D offset (Y, X)
-        except Exception as e: print(f"Warning: Error slicing for skel label {label}: {e}"); continue
+        except Exception as e: print(f"Warning: Error slicing for skel label {label_val}: {e}"); continue
 
-        # Analyze 2D sub-region
+        # Analyze 2D sub-region with the corrected helper
         branch_data, label_skeleton_img_local, n_junctions, n_endpoints, total_nodes, _ = \
-            analyze_skeleton_with_skan_2d(label_region, offset_yx, spacing_yx, label)
+            analyze_skeleton_with_skan_2d(label_region, offset_yx, spacing_yx, label_val)
 
-        # Store skeleton in GLOBAL 2D array
         num_skel_pixels = 0
         if label_skeleton_img_local is not None and label_skeleton_img_local.ndim == 2 :
             try:
-                local_coords = np.argwhere(label_skeleton_img_local > 0)
+                local_coords = np.argwhere(label_skeleton_img_local > 0) # This is binary
                 if local_coords.size > 0:
                      global_coords = local_coords + offset_yx
                      idx_y, idx_x = global_coords[:, 0], global_coords[:, 1]
-                     valid_idx = ((idx_y >= 0) & (idx_y < skeleton_array.shape[0]) & (idx_x >= 0) & (idx_x < skeleton_array.shape[1]))
+                     valid_idx = ((idx_y >= 0) & (idx_y < skeleton_array.shape[0]) & 
+                                  (idx_x >= 0) & (idx_x < skeleton_array.shape[1]))
                      idx_y, idx_x = idx_y[valid_idx], idx_x[valid_idx]
-                     skeleton_array[idx_y, idx_x] = label # Assign label ID
+                     skeleton_array[idx_y, idx_x] = label_val # Assign label ID
                      num_skel_pixels = len(idx_y)
                      if use_memmap: skeleton_array.flush()
                      del local_coords, global_coords, idx_y, idx_x, valid_idx
-            except Exception as map_err: print(f"Warning: Error mapping 2D skeleton for label {label}: {map_err}"); num_skel_pixels = -1
+            except Exception as map_err: print(f"Warning: Error mapping 2D skeleton for label {label_val}: {map_err}"); num_skel_pixels = -1
 
-        # Aggregate Stats
         total_length = 0.0; num_branches = 0; avg_branch_length = np.nan
         if not branch_data.empty:
             try:
-                branch_data['label'] = label; all_branch_data_dfs.append(branch_data.copy())
+                branch_data['label'] = label_val; all_branch_data_dfs.append(branch_data.copy())
                 total_length = branch_data['branch-distance'].sum(); num_branches = len(branch_data)
-                if 'branch-distance' in branch_data.columns and branch_data['branch-distance'].notna().any(): avg_branch_length = branch_data['branch-distance'].mean()
-            except Exception as agg_err: print(f"Warning: Error aggregating 2D branch stats label {label}: {agg_err}")
+                if 'branch-distance' in branch_data.columns and branch_data['branch-distance'].notna().any(): 
+                    avg_branch_length = branch_data['branch-distance'].mean()
+            except Exception as agg_err: print(f"Warning: Error aggregating 2D branch stats label {label_val}: {agg_err}")
 
         summary_stats_list.append({
-            'label': label, 'skan_num_branches': num_branches, 'skan_total_length_um': total_length,
+            'label': label_val, 'skan_num_branches': num_branches, 'skan_total_length_um': total_length,
             'skan_avg_branch_length_um': avg_branch_length, 'skan_num_junctions': n_junctions,
-            'skan_num_endpoints': n_endpoints, 'skan_num_skeleton_pixels': num_skel_pixels, # Renamed voxels->pixels
+            'skan_num_endpoints': n_endpoints, 'skan_num_skeleton_pixels': num_skel_pixels,
         })
         del label_region, offset_yx, branch_data, label_skeleton_img_local
         # if i % 50 == 0: gc.collect()
@@ -493,7 +555,7 @@ def analyze_segmentation_2d(segmented_array, spacing_yx=(1.0, 1.0),
     print("\nDEBUG [analyze_segmentation_2d] [1/3] Calculating Area & Shape Metrics...")
     area_shape_df = calculate_area_and_shape_2d(segmented_array, spacing_yx=spacing_yx)
     metrics_df = area_shape_df # Start with these metrics
-    print(f"DEBUG [analyze_segmentation_2d] Initial metrics_df shape after area/shape: {metrics_df.shape}")
+    print(f"DEBUG [analyze_segmentation_2d] Initial metrics_df shape after area/shape: {metrics_df.shape if not metrics_df.empty else 'Empty'}")
 
     detailed_outputs = {}
 
@@ -508,35 +570,65 @@ def analyze_segmentation_2d(segmented_array, spacing_yx=(1.0, 1.0),
             point_self_y, point_self_x = [], []
             point_neigh_y, point_neigh_x = [], []
 
-            distance_matrix_df = distance_matrix_df.reindex(index=labels, columns=labels); dist_values = distance_matrix_df.values
+            if not distance_matrix_df.empty:
+                distance_matrix_df = distance_matrix_df.reindex(index=labels, columns=labels).fillna(np.inf) # Ensure all labels present
+                dist_values = distance_matrix_df.values
 
-            for i, label in enumerate(labels):
-                row_dists = dist_values[i, :].copy(); row_dists[i] = np.inf
-                if np.all(np.isinf(row_dists)): min_idx=-1; shortest_dist=np.inf; closest_neighbor=None
-                else: min_idx=np.nanargmin(row_dists); shortest_dist=row_dists[min_idx]; closest_neighbor=labels[min_idx]
-                closest_neighbor_labels.append(closest_neighbor); shortest_distances.append(shortest_dist)
+                for i, label_val in enumerate(labels): # Renamed label
+                    # Find index of label_val in distance_matrix_df.index, as labels might not be contiguous or sorted same way
+                    try:
+                        label_idx_in_matrix = distance_matrix_df.index.get_loc(label_val)
+                    except KeyError: # Label not in matrix (e.g., if it had no boundary points)
+                        closest_neighbor_labels.append(None)
+                        shortest_distances.append(np.inf)
+                        point_self_y.append(np.nan); point_self_x.append(np.nan)
+                        point_neigh_y.append(np.nan); point_neigh_x.append(np.nan)
+                        continue
 
-                psy, psx, pny, pnx = np.nan, np.nan, np.nan, np.nan # Init with NaN
-                if closest_neighbor is not None:
-                    pair_row = all_pairs_points_df[ (all_pairs_points_df['mask1'] == label) & (all_pairs_points_df['mask2'] == closest_neighbor) ]
-                    if not pair_row.empty:
-                        psy=pair_row.iloc[0]['mask1_y']; psx=pair_row.iloc[0]['mask1_x']
-                        pny=pair_row.iloc[0]['mask2_y']; pnx=pair_row.iloc[0]['mask2_x']
-                point_self_y.append(psy); point_self_x.append(psx); point_neigh_y.append(pny); point_neigh_x.append(pnx)
+                    row_dists = dist_values[label_idx_in_matrix, :].copy()
+                    
+                    # Ensure self-distance is Inf for min finding
+                    try:
+                        self_col_idx = distance_matrix_df.columns.get_loc(label_val)
+                        row_dists[self_col_idx] = np.inf
+                    except KeyError: pass # Should not happen if reindexed correctly
 
-                # if label == DEBUG_TARGET_LABEL or (DEBUG_TARGET_LABEL is None and i < 3): debug_print(f"Label {label}: Closest neigh={closest_neighbor}, dist={shortest_dist:.2f}. PointSelf(YX)=({psy},{psx}), PointNeigh(YX)=({pny},{pnx})", label=label)
+                    if np.all(np.isinf(row_dists)): 
+                        min_col_idx_in_matrix=-1; shortest_dist=np.inf; closest_neighbor=None
+                    else: 
+                        min_col_idx_in_matrix=np.nanargmin(row_dists)
+                        shortest_dist=row_dists[min_col_idx_in_matrix]
+                        closest_neighbor=distance_matrix_df.columns[min_col_idx_in_matrix] # Get label from matrix columns
+                    
+                    closest_neighbor_labels.append(closest_neighbor); shortest_distances.append(shortest_dist)
+
+                    psy, psx, pny, pnx = np.nan, np.nan, np.nan, np.nan 
+                    if closest_neighbor is not None and not all_pairs_points_df.empty:
+                        pair_row = all_pairs_points_df[ (all_pairs_points_df['mask1'] == label_val) & (all_pairs_points_df['mask2'] == closest_neighbor) ]
+                        if not pair_row.empty:
+                            psy=pair_row.iloc[0]['mask1_y']; psx=pair_row.iloc[0]['mask1_x']
+                            pny=pair_row.iloc[0]['mask2_y']; pnx=pair_row.iloc[0]['mask2_x']
+                    point_self_y.append(psy); point_self_x.append(psx); point_neigh_y.append(pny); point_neigh_x.append(pnx)
+            else: # distance_matrix_df is empty
+                 for _ in labels:
+                    closest_neighbor_labels.append(None); shortest_distances.append(np.inf)
+                    point_self_y.append(np.nan); point_self_x.append(np.nan); point_neigh_y.append(np.nan); point_neigh_x.append(np.nan)
+
 
             dist_info_df = pd.DataFrame({
                 'label': labels, 'closest_neighbor_label': closest_neighbor_labels, 'shortest_distance_um': shortest_distances,
-                'point_on_self_y': point_self_y, 'point_on_self_x': point_self_x, # Corrected column names
-                'point_on_neighbor_y': point_neigh_y, 'point_on_neighbor_x': point_neigh_x # Corrected column names
+                'point_on_self_y': point_self_y, 'point_on_self_x': point_self_x, 
+                'point_on_neighbor_y': point_neigh_y, 'point_on_neighbor_x': point_neigh_x 
             })
-            metrics_df = pd.merge(metrics_df, dist_info_df, on='label', how='left')
-            print(f"DEBUG [analyze_segmentation_2d] metrics_df shape after distance merge: {metrics_df.shape}")
+            if not metrics_df.empty:
+                metrics_df = pd.merge(metrics_df, dist_info_df, on='label', how='left')
+            else: # If metrics_df was empty (e.g. area_shape failed)
+                metrics_df = dist_info_df
+
+            print(f"DEBUG [analyze_segmentation_2d] metrics_df shape after distance merge: {metrics_df.shape if not metrics_df.empty else 'Empty'}")
 
             if return_detailed: detailed_outputs['distance_matrix'] = distance_matrix_df; detailed_outputs['all_pairs_points'] = all_pairs_points_df
         else: print("DEBUG [analyze_segmentation_2d] Skipping 2D distance calculation (<= 1 label).")
-            # Add empty columns if needed
     else: print("DEBUG [analyze_segmentation_2d] Skipping distance calculation as requested.")
 
     # --- 3. Skeleton Metrics (2D skan) ---
@@ -544,15 +636,25 @@ def analyze_segmentation_2d(segmented_array, spacing_yx=(1.0, 1.0),
 
     if calculate_skeletons:
         print("\nDEBUG [analyze_segmentation_2d] [3/3] Calculating Skeleton Metrics (2D skan)...")
-        labels_for_skeleton = list(metrics_df['label'].unique())
+        labels_for_skeleton = list(metrics_df['label'].unique()) if not metrics_df.empty else list(labels)
+        
         ramification_summary_df, detailed_branch_df, skeleton_array = calculate_ramification_with_skan_2d(
             segmented_array, spacing_yx=spacing_yx, labels=labels_for_skeleton, skeleton_export_path=skeleton_export_path
         )
-        if not ramification_summary_df.empty: metrics_df = pd.merge(metrics_df, ramification_summary_df, on='label', how='left')
-        else: # Add empty columns
+        if not ramification_summary_df.empty: 
+            if not metrics_df.empty:
+                metrics_df = pd.merge(metrics_df, ramification_summary_df, on='label', how='left')
+            else: # If metrics_df was empty
+                metrics_df = ramification_summary_df
+        else: # Add empty columns if ram_summary is empty
             skel_cols_2d = ['skan_num_branches', 'skan_total_length_um', 'skan_avg_branch_length_um', 'skan_num_junctions', 'skan_num_endpoints', 'skan_num_skeleton_pixels']
-            for col in skel_cols_2d:
-                if col not in metrics_df.columns: metrics_df[col] = np.nan
+            if not metrics_df.empty:
+                for col in skel_cols_2d:
+                    if col not in metrics_df.columns: metrics_df[col] = np.nan
+            else: # If metrics_df is still empty, create it with labels and these NaN cols
+                metrics_df = pd.DataFrame({'label': labels_for_skeleton})
+                for col in skel_cols_2d: metrics_df[col] = np.nan
+
 
         if return_detailed:
             detailed_outputs['detailed_branches'] = detailed_branch_df; detailed_outputs['skeleton_array'] = skeleton_array
@@ -560,10 +662,14 @@ def analyze_segmentation_2d(segmented_array, spacing_yx=(1.0, 1.0),
             else: print("DEBUG [analyze_segmentation_2d] Final 2D skeleton_array is None.")
     else: print("DEBUG [analyze_segmentation_2d] Skipping skeleton calculation as requested.")
 
-    # Reorder columns
-    cols = ['label'] + [col for col in metrics_df if col != 'label']
-    metrics_df = metrics_df[cols]
-    metrics_df = metrics_df.fillna(value=np.nan)
+    # Reorder columns and fill NaNs
+    if not metrics_df.empty:
+        cols = ['label'] + [col for col in metrics_df if col != 'label']
+        metrics_df = metrics_df[cols]
+        metrics_df = metrics_df.fillna(value=np.nan)
+    else: # If all calculations failed or were skipped, return empty DF with a label column
+        metrics_df = pd.DataFrame({'label': labels})
+
 
     print("-" * 30); print(f"DEBUG [analyze_segmentation_2d] Final metrics_df head:"); print(metrics_df.head()); print("-" * 30)
     print(f"DEBUG [analyze_segmentation_2d] Analysis completed in {time.time() - overall_start_time:.2f} seconds.")
