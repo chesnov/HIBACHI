@@ -20,7 +20,7 @@ from PyQt5.QtWidgets import ( # type: ignore
 
 # Corrected path for BatchProcessor import
 try:
-    from ..module_3d.batch_processor import BatchProcessor
+    from .batch_processor import BatchProcessor
 except ImportError as e:
     print(f"WARNING: Failed to import BatchProcessor in helper_funcs.py: {e}. Batch processing button will be disabled.")
     BatchProcessor = None
@@ -304,7 +304,7 @@ class ProjectViewWindow(QMainWindow):
 
     def initUI(self):
         self.setWindowTitle("Image Segmentation Project")
-        self.setGeometry(100, 100, 700, 450)
+        self.setGeometry(100, 100, 700, 450) # Adjusted width for one batch button
         central_widget = QWidget(); layout = QVBoxLayout()
         self.project_path_label = QLabel("Project Path: Not Selected"); layout.addWidget(self.project_path_label)
         self.image_list = QListWidget(); self.image_list.itemDoubleClicked.connect(self.open_image_view); layout.addWidget(self.image_list)
@@ -312,41 +312,52 @@ class ProjectViewWindow(QMainWindow):
         button_layout = QHBoxLayout()
         select_project_btn = QPushButton("Select/Load Project Folder"); select_project_btn.clicked.connect(self.load_project); button_layout.addWidget(select_project_btn)
 
-        self.batch_process_ramified_btn = QPushButton("Process All (Ramified Mode)")
-        self.batch_process_ramified_btn.clicked.connect(self.run_batch_processing_ramified)
-        self.batch_process_ramified_btn.setEnabled(False) # Initially disabled
+        # --- SINGLE BATCH PROCESS BUTTON ---
+        self.batch_process_all_btn = QPushButton("Process All Compatible Folders")
+        self.batch_process_all_btn.clicked.connect(self.run_batch_processing_all_compatible)
+        self.batch_process_all_btn.setEnabled(False) # Initially disabled
         if BatchProcessor is None:
-            self.batch_process_ramified_btn.setToolTip("BatchProcessor module not available. Check console for import errors.")
+            self.batch_process_all_btn.setToolTip("BatchProcessor module not available. Check console for import errors.")
         else:
-            self.batch_process_ramified_btn.setToolTip("Load a project with 'ramified' mode folders to enable.")
+            self.batch_process_all_btn.setToolTip("Load a project with compatible folders (e.g., 'ramified', 'ramified_2d') to enable.")
+        button_layout.addWidget(self.batch_process_all_btn)
+        # --- END SINGLE BATCH PROCESS BUTTON ---
 
-        button_layout.addWidget(self.batch_process_ramified_btn)
         layout.addLayout(button_layout); central_widget.setLayout(layout); self.setCentralWidget(central_widget)
 
     def _update_batch_button_state(self):
-        """Updates the enabled state of the batch processing button."""
+        """Updates the enabled state of the single batch processing button."""
         if BatchProcessor is None:
-            self.batch_process_ramified_btn.setEnabled(False)
-            self.batch_process_ramified_btn.setToolTip("BatchProcessor module not available.")
+            self.batch_process_all_btn.setEnabled(False)
+            self.batch_process_all_btn.setToolTip("BatchProcessor module not available.")
             return
 
         if not self.project_manager or not self.project_manager.project_path or not self.project_manager.image_folders:
-            self.batch_process_ramified_btn.setEnabled(False)
-            self.batch_process_ramified_btn.setToolTip("Load a project to enable.")
+            self.batch_process_all_btn.setEnabled(False)
+            self.batch_process_all_btn.setToolTip("Load a project to enable.")
             return
 
-        # Check if any loaded folder is 'ramified'
-        has_ramified_folders = any(
-            self.project_manager.get_image_details(fp).get('mode') == 'ramified'
+        # Check if any loaded folder has a mode supported by BatchProcessor
+        # Assuming BatchProcessor instance is not needed just to check its supported_strategies keys
+        # If BatchProcessor class is available, we can access its class variable or a temp instance.
+        # For simplicity, let's assume we know the keys or can get them from a dummy instance.
+        # More robustly, BatchProcessor could have a static method for supported keys.
+        # For now, let's create a temporary instance just for this check if BatchProcessor is not None
+        temp_processor = BatchProcessor(self.project_manager) # Minimal impact
+        supported_modes = temp_processor.supported_strategies.keys()
+        del temp_processor # Clean up
+
+        has_compatible_folders = any(
+            self.project_manager.get_image_details(fp).get('mode') in supported_modes
             for fp in self.project_manager.image_folders
         )
 
-        if has_ramified_folders:
-            self.batch_process_ramified_btn.setEnabled(True)
-            self.batch_process_ramified_btn.setToolTip("Process all 'ramified' mode folders in the current project.")
+        if has_compatible_folders:
+            self.batch_process_all_btn.setEnabled(True)
+            self.batch_process_all_btn.setToolTip(f"Process all folders with supported modes: {', '.join(supported_modes)}.")
         else:
-            self.batch_process_ramified_btn.setEnabled(False)
-            self.batch_process_ramified_btn.setToolTip("No 'ramified' mode folders found in the current project.")
+            self.batch_process_all_btn.setEnabled(False)
+            self.batch_process_all_btn.setToolTip(f"No folders found with supported modes ({', '.join(supported_modes)}).")
 
 
     def load_project(self):
@@ -410,54 +421,162 @@ class ProjectViewWindow(QMainWindow):
         except Exception as e: error_msg = f"Error opening image view:\n{str(e)}\n{traceback.format_exc()}"; QMessageBox.critical(self, "Error", error_msg); print(error_msg); self.show()
 
 
-    def run_batch_processing_ramified(self):
-        # Button should already be enabled only if BatchProcessor and ramified folders exist
-        if not self.batch_process_ramified_btn.isEnabled(): # Defensive check
-            QMessageBox.warning(self, "Batch Processing Unavailable", "Batch processing for ramified mode is currently not available. Ensure a project with ramified folders is loaded."); return
+    def run_batch_processing_all_compatible(self):
+        """Handles the click of the 'Process All Compatible Folders' button."""
+        if not self.batch_process_all_btn.isEnabled():
+            QMessageBox.warning(self, "Batch Processing Unavailable",
+                                "Batch processing is currently not available. "
+                                "Ensure BatchProcessor module is loaded and a project with compatible folders is open.");
+            return
 
-        # Re-confirm ramified folders just before processing
-        ramified_folders_to_process = [fp for fp in self.project_manager.image_folders if self.project_manager.get_image_details(fp).get('mode') == 'ramified']
-        if not ramified_folders_to_process:
-            QMessageBox.information(self, "No Ramified Images", "No folders configured for 'ramified' mode found. The 'Process All' button should have been disabled.");
+        # Determine compatible folders again, just to be sure
+        temp_processor = BatchProcessor(self.project_manager)
+        supported_modes = temp_processor.supported_strategies.keys()
+        del temp_processor
+
+        compatible_folders_info = [] # Store (folder_path, mode)
+        for fp in self.project_manager.image_folders:
+            details = self.project_manager.get_image_details(fp)
+            mode = details.get('mode')
+            if mode in supported_modes:
+                compatible_folders_info.append((fp, mode))
+
+        if not compatible_folders_info:
+            QMessageBox.information(self, "No Compatible Folders",
+                                    f"No folders configured for supported modes ({', '.join(supported_modes)}) found. "
+                                    "The button should have been disabled.");
             self._update_batch_button_state() # Correct button state
             return
 
-        num_folders = len(ramified_folders_to_process)
+        num_folders = len(compatible_folders_info)
+        # Create a more informative list for the confirmation dialog
+        folder_summary_list = [f"  - {os.path.basename(fp_info[0])} (Mode: {fp_info[1]})" for fp_info in compatible_folders_info[:5]] # Show first 5
+        if num_folders > 5: folder_summary_list.append("  - ... and more.")
+        folder_summary_str = "\n".join(folder_summary_list)
+
+
         force_restart_processing = False
-        reply_force = QMessageBox.question(self, "Force Restart Option",
-                                     "Do you want to force reprocessing of ALL steps for ALL selected folders, even if previously completed?",
+        reply_force = QMessageBox.question(self, f"Force Restart Option (All Compatible)",
+                                     f"For the {num_folders} compatible folder(s):\n{folder_summary_str}\n\n"
+                                     "Do you want to force reprocessing of ALL steps, even if previously completed?",
                                      QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
         if reply_force == QMessageBox.Yes:
             force_restart_processing = True
-            print("User chose to FORCE RESTART all processing.")
+            print(f"User chose to FORCE RESTART all processing for compatible folders.")
 
-        reply = QMessageBox.question(self, "Confirm Ramified Batch Processing",
-                                     f"Process {num_folders} 'ramified' mode folder(s)?\n"
+        reply_confirm = QMessageBox.question(self, f"Confirm Batch Processing (All Compatible)",
+                                     f"Process {num_folders} compatible folder(s)?\n{folder_summary_str}\n\n"
                                      f"{'ALL STEPS WILL BE REPROCESSED.' if force_restart_processing else 'Processing will attempt to resume incomplete folders.'}\n"
-                                     f"Existing processed data for {'all steps (if forcing restart)' if force_restart_processing else 'steps to be run'} will be overwritten.\n"
-                                     "This can take time.",
+                                     f"Existing processed data will be affected.\nThis can take time.",
                                      QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes)
-        if reply == QMessageBox.No: return
+        if reply_confirm == QMessageBox.No: return
 
-        print(f"Starting batch processing for {num_folders} ramified folders...");
-        # Disable the button during processing
-        original_tooltip = self.batch_process_ramified_btn.toolTip()
-        self.batch_process_ramified_btn.setEnabled(False);
-        self.batch_process_ramified_btn.setToolTip("Processing... Please wait.")
+        print(f"Starting batch processing for {num_folders} compatible folders...");
+        original_tooltip = self.batch_process_all_btn.toolTip()
+        self.batch_process_all_btn.setEnabled(False);
+        self.batch_process_all_btn.setToolTip("Processing... Please wait.")
         QApplication.processEvents()
 
         processor = BatchProcessor(self.project_manager)
         try:
-            successful_count, failed_count = processor.process_all_folders(target_strategy_key="ramified")
-            summary_msg = f"Ramified batch processing finished.\nSuccess: {successful_count}\nFailed/Skipped: {failed_count}\nCheck console for details."
+            # Call the modified process_all_folders which infers mode per folder
+            successful_count, failed_count, skipped_count = processor.process_all_folders(
+                force_restart_all=force_restart_processing
+            )
+            summary_msg = f"Batch processing for all compatible folders finished.\n\n" \
+                          f"Successfully processed/resumed/completed: {successful_count} folder(s)\n" \
+                          f"Failed during processing: {failed_count} folder(s)\n" \
+                          f"Skipped (unsupported mode/error before start): {skipped_count} folder(s)\n\n" \
+                          f"Check console output for detailed logs and errors."
             if failed_count > 0: QMessageBox.warning(self, "Batch Processing Complete (with issues)", summary_msg)
             else: QMessageBox.information(self, "Batch Processing Complete", summary_msg)
-        except Exception as e: print(f"Critical error during batch processing: {e}"); traceback.print_exc(); QMessageBox.critical(self, "Batch Processing Error", f"Error: {e}\nCheck console.")
+        except Exception as e:
+            print(f"Critical error during 'Process All Compatible Folders': {e}"); traceback.print_exc();
+            QMessageBox.critical(self, "Batch Processing Error", f"Error: {e}\nCheck console.")
         finally:
-            # Re-enable the button and restore original tooltip or update based on new state
-            self.batch_process_ramified_btn.setToolTip(original_tooltip) # Restore previous before update
-            self._update_batch_button_state() # This will set correct enabled state and tooltip
-            print("Batch processing GUI action finished.")
+            self.batch_process_all_btn.setToolTip(original_tooltip)
+            self._update_batch_button_state()
+            print(f"Batch processing GUI action for 'All Compatible Folders' finished.")
+
+    # Generic batch processing runner
+    def run_batch_processing_for_mode(self, mode_key: str):
+        """Handles the click of a 'Process All' button for a specific mode."""
+        
+        target_button = None
+        mode_display_name = ""
+        if mode_key == "ramified":
+            target_button = self.batch_process_ramified_btn
+            mode_display_name = "Ramified 3D"
+        elif mode_key == "ramified_2d":
+            target_button = self.batch_process_ramified_2d_btn
+            mode_display_name = "Ramified 2D"
+        else:
+            QMessageBox.critical(self, "Internal Error", f"Unknown mode key '{mode_key}' for batch processing.")
+            return
+
+        if target_button is None or not target_button.isEnabled():
+            QMessageBox.warning(self, f"Batch Processing ({mode_display_name}) Unavailable",
+                                f"Batch processing for {mode_display_name} mode is currently not available. "
+                                f"Ensure a project with '{mode_key}' folders is loaded.");
+            return
+
+        # Confirm folders for the specific mode
+        folders_to_process = [
+            fp for fp in self.project_manager.image_folders
+            if self.project_manager.get_image_details(fp).get('mode') == mode_key
+        ]
+        if not folders_to_process:
+            QMessageBox.information(self, f"No {mode_display_name} Images",
+                                    f"No folders configured for '{mode_key}' mode found. "
+                                    f"The 'Process All ({mode_display_name})' button should have been disabled.");
+            self._update_batch_buttons_state()
+            return
+
+        num_folders = len(folders_to_process)
+
+        force_restart_processing = False
+        reply_force = QMessageBox.question(self, f"Force Restart Option ({mode_display_name})",
+                                     f"For the {num_folders} '{mode_key}' folder(s):\n"
+                                     "Do you want to force reprocessing of ALL steps, even if previously completed?",
+                                     QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if reply_force == QMessageBox.Yes:
+            force_restart_processing = True
+            print(f"User chose to FORCE RESTART all processing for '{mode_key}' mode.")
+
+
+        reply_confirm = QMessageBox.question(self, f"Confirm Batch Processing ({mode_display_name})",
+                                     f"Process {num_folders} '{mode_key}' mode folder(s)?\n"
+                                     f"{'ALL STEPS WILL BE REPROCESSED.' if force_restart_processing else 'Processing will attempt to resume incomplete folders.'}\n"
+                                     f"Existing processed data for {'all steps (if forcing restart)' if force_restart_processing else 'steps to be run'} will be overwritten.\n"
+                                     "This can take time.",
+                                     QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes)
+        if reply_confirm == QMessageBox.No: return
+
+        print(f"Starting batch processing for {num_folders} '{mode_key}' folders...");
+        original_tooltip = target_button.toolTip()
+        target_button.setEnabled(False);
+        target_button.setToolTip("Processing... Please wait.")
+        QApplication.processEvents()
+
+        processor = BatchProcessor(self.project_manager) # ProjectManager already has all folders
+        try:
+            successful_count, failed_count = processor.process_all_folders(
+                target_strategy_key=mode_key, # Pass the specific mode key
+                force_restart_all=force_restart_processing
+            )
+            summary_msg = f"Batch processing for '{mode_display_name}' finished.\n\n" \
+                          f"Successfully processed/resumed/completed: {successful_count} folder(s)\n" \
+                          f"Failed during processing: {failed_count} folder(s)\n\n" \
+                          f"Check console output for detailed logs and errors."
+            if failed_count > 0: QMessageBox.warning(self, f"Batch Processing ({mode_display_name}) Complete (with issues)", summary_msg)
+            else: QMessageBox.information(self, f"Batch Processing ({mode_display_name}) Complete", summary_msg)
+        except Exception as e:
+            print(f"Critical error during batch processing for mode '{mode_key}': {e}"); traceback.print_exc();
+            QMessageBox.critical(self, f"Batch Processing ({mode_display_name}) Error", f"Error: {e}\nCheck console.")
+        finally:
+            target_button.setToolTip(original_tooltip)
+            self._update_batch_buttons_state() # Update all buttons based on current project state
+            print(f"Batch processing GUI action for mode '{mode_key}' finished.")
 
 
     def closeEvent(self, event: QCloseEvent):
