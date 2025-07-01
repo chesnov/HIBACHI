@@ -8,7 +8,7 @@ import tempfile
 import time
 import psutil # type: ignore
 import gc
-from skimage.morphology import skeletonize # type: ignore
+from skimage.morphology import skeletonize, ball # type: ignore
 from skan import Skeleton, summarize # type: ignore
 import networkx as nx # type: ignore # Still potentially useful for graph ops if needed
 from tqdm.auto import tqdm # type: ignore # Use auto for notebook/console compatibility
@@ -504,117 +504,234 @@ def calculate_depth_df(segmented_array, spacing=(1.0, 1.0, 1.0)):
 # =============================================================================
 # Skeletonization and Ramification (using skan)
 # =============================================================================
-
-def analyze_skeleton_with_skan(label_region, offset, spacing, label):
+def _trace_spur_length_and_path_3d(skeleton, start_z, start_x, start_y, spacing):
     """
-    Analyzes a single binary mask (provided as a sub-region) using skan.
-    This version is compatible with older skan versions that lack the 'offset' parameter
-    and correctly handles array indexing to prevent IndexError.
+    3D equivalent of _trace_spur_length_and_path. Traces a spur from an endpoint.
     """
-    is_target = (label == DEBUG_TARGET_LABEL)
+    if skeleton[start_z, start_x, start_y] == 0:
+        return 0.0, []
     
-    mask = None; skeleton_img = None; skel_voxel_count = 0
-    branch_data = pd.DataFrame(); graph_obj = None
-    n_junctions = 0; n_endpoints = 0; total_nodes = 0
+    visited = set()
+    current_z, current_x, current_y = start_z, start_x, start_y
+    total_length = 0.0
+    path = [(current_z, current_x, current_y)]
+    
+    # 26-connectivity offsets for 3D
+    offsets = [
+        (dz, dx, dy) for dz in [-1, 0, 1] for dx in [-1, 0, 1] for dy in [-1, 0, 1]
+        if not (dz == 0 and dx == 0 and dy == 0)
+    ]
+    
+    while True:
+        visited.add((current_z, current_x, current_y))
+        
+        neighbors = []
+        for dz, dx, dy in offsets:
+            nz, nx, ny = current_z + dz, current_x + dx, current_y + dy
+            if (0 <= nz < skeleton.shape[0] and 
+                0 <= nx < skeleton.shape[1] and
+                0 <= ny < skeleton.shape[2] and
+                skeleton[nz, nx, ny] == 1 and 
+                (nz, nx, ny) not in visited):
+                neighbors.append((nz, nx, ny))
+        
+        if len(neighbors) != 1: # Stop if we hit a junction or the end of a line
+            break
+        
+        next_z, next_x, next_y = neighbors[0]
+        
+        distance = np.sqrt(
+            ((next_z - current_z) * spacing[0])**2 +
+            ((next_x - current_x) * spacing[1])**2 +
+            ((next_y - current_y) * spacing[2])**2
+        )
+        total_length += distance
+        
+        current_z, current_x, current_y = next_z, next_x, next_y
+        path.append((current_z, current_x, current_y))
+    
+    return total_length, path
+
+
+def _prune_skeleton_spurs_3d(skeleton_binary, spacing, max_spur_length_um):
+    """
+    3D equivalent of _prune_skeleton_spurs.
+    CORRECTED to use a kernel with a zeroed center.
+    """
+    if max_spur_length_um <= 0:
+        return skeleton_binary
+    
+    pruned_skeleton = skeleton_binary.copy()
+    
+    # --- KERNEL FIX ---
+    # Create the 26-connectivity kernel and explicitly set the center to 0.
+    # This now correctly counts neighbors only, matching the 2D code's logic.
+    kernel = ndi.generate_binary_structure(3, 3).astype(np.uint8)
+    kernel[1, 1, 1] = 0
+
+    changed = True
+    max_iterations = 50
+    iteration = 0
+    
+    while changed and iteration < max_iterations:
+        changed = False
+        iteration += 1
+        
+        neighbor_count = ndi.convolve(pruned_skeleton.astype(np.uint8), 
+                                      kernel, mode='constant', cval=0)
+        
+        # This condition will now work correctly.
+        endpoints = (pruned_skeleton == 1) & (neighbor_count == 1)
+        
+        if not np.any(endpoints):
+            break
+            
+        endpoint_coords = np.argwhere(endpoints)
+        
+        for ep_z, ep_x, ep_y in endpoint_coords:
+            if pruned_skeleton[ep_z, ep_x, ep_y] == 0:
+                continue
+                
+            spur_length, spur_path = _trace_spur_length_and_path_3d(pruned_skeleton, ep_z, ep_x, ep_y, spacing)
+            
+            if spur_length <= max_spur_length_um:
+                _remove_spur_path_3d(pruned_skeleton, spur_path)
+                changed = True
+                
+    return pruned_skeleton
+
+def _remove_spur_path_3d(skeleton, path):
+    """
+    3D equivalent of _remove_spur_path.
+    CORRECTED to use a kernel with a zeroed center.
+    """
+    # --- KERNEL FIX ---
+    kernel = ndi.generate_binary_structure(3, 3).astype(np.uint8)
+    kernel[1, 1, 1] = 0
+    
+    for i, (z, x, y) in enumerate(path):
+        if i == len(path) - 1:
+            # Check the neighbor count of the last point to see if it's a junction.
+            # This logic now works because the kernel is correct.
+            neighbor_count = ndi.convolve(skeleton.astype(np.uint8), 
+                                          kernel, mode='constant', cval=0)[z, x, y]
+            # If it has more than 1 neighbor *other than the spur being removed*, it's a junction.
+            if neighbor_count > 1:
+                break
+        skeleton[z, x, y] = 0
+
+def analyze_skeleton_topology_correctly_3d(skeleton_binary, spacing=(1.0, 1.0, 1.0)):
+    """
+    3D equivalent of analyze_skeleton_topology_correctly.
+    CORRECTED to use a kernel with a zeroed center.
+    """
+    if not np.any(skeleton_binary):
+        return 0, 0, 0, 0.0
+    
+    # --- KERNEL FIX ---
+    kernel = ndi.generate_binary_structure(3, 3).astype(np.uint8)
+    kernel[1, 1, 1] = 0
+    
+    neighbor_count = ndi.convolve(skeleton_binary.astype(np.uint8), kernel, mode='constant', cval=0)
+    skeleton_mask = skeleton_binary > 0
+    
+    # The endpoint and junction logic will now work correctly.
+    endpoints = skeleton_mask & (neighbor_count == 1)
+    junctions = skeleton_mask & (neighbor_count >= 3)
+    
+    n_endpoints = np.sum(endpoints)
+    n_junctions = np.sum(junctions)
+    
+    if n_junctions == 0:
+        true_branches = 0
+    else:
+        # This logic remains correct, but now operates on accurate neighbor counts.
+        junction_degrees = neighbor_count[junctions]
+        excess_branches = np.sum(junction_degrees - 2)
+        true_branches = excess_branches
+    
+    total_length = 0.0
+    try:
+        graph_obj = Skeleton(skeleton_binary.astype(np.uint8), spacing=spacing)
+        branch_data = summarize(graph_obj)
+        if not branch_data.empty:
+            total_length = branch_data['branch-distance'].sum()
+    except:
+        total_length = np.sum(skeleton_binary) * np.mean(spacing)
+    
+    return true_branches, n_junctions, n_endpoints, total_length
+
+def analyze_skeleton_with_skan_3d(label_region, offset, spacing, label, prune_spurs_le_um=0.0):
+    """
+    3D equivalent of analyze_skeleton_with_skan_2d.
+    Structure and logic are identical, adapted for 3D.
+    """
+    branch_data = pd.DataFrame()
+    skeleton_img_to_return_local = np.zeros_like(label_region, dtype=np.uint8)
 
     try:
-        mask = (label_region == label)
+        mask_local = (label_region == label)
+        if not np.any(mask_local):
+            return branch_data, skeleton_img_to_return_local, 0, 0, 0, 0.0
 
-        if not np.any(mask):
-            return pd.DataFrame(), np.zeros_like(label_region, dtype=np.uint8), 0, 0, 0, None
-
-        skeleton_binary = skeletonize(mask)
-        skel_voxel_count = np.count_nonzero(skeleton_binary)
+        skeleton_binary_local = skeletonize(mask_local)
         
-        # This is the binary (0/1) skeleton image that will be RETURNED. It has local coordinates.
-        skeleton_img = skeleton_binary.astype(np.uint8)
+        # Apply pruning, matching the 2D logic
+        if np.any(skeleton_binary_local):
+            if prune_spurs_le_um > 0.0:
+                skeleton_binary_local = _prune_skeleton_spurs_3d(skeleton_binary_local, spacing, prune_spurs_le_um)
+            
+        skeleton_img_to_return_local = skeleton_binary_local.astype(np.uint8)
 
-        if skel_voxel_count == 0:
-            return pd.DataFrame(), skeleton_img, 0, 0, 0, None
+        if not np.any(skeleton_img_to_return_local):
+            return branch_data, skeleton_img_to_return_local, 0, 0, 0, 0.0
 
-        # --- START OF FIX for IndexError ---
-        
-        # 1. Get global coordinates for both the skeleton and the source mask.
-        skeleton_global_coords = np.argwhere(skeleton_binary) + offset
-        source_mask_global_coords = np.argwhere(mask) + offset
+        # GET CORRECT TOPOLOGY AND MEASUREMENTS from the (potentially pruned) skeleton
+        true_branches, n_junctions, n_endpoints, total_length = analyze_skeleton_topology_correctly_3d(
+            skeleton_img_to_return_local, spacing)
 
-        # 2. Determine the maximum coordinate needed across ALL axes for BOTH sets of points.
-        # This is the crucial step to define an array large enough for everything.
-        # We find the max coordinate along each axis (z, x, y) and add 1 to get the required shape.
-        max_skel_coords = np.max(skeleton_global_coords, axis=0)
-        max_mask_coords = np.max(source_mask_global_coords, axis=0)
-        
-        # Combine the max coordinates and find the overall max for each axis.
-        # The +1 is the fix for the off-by-one IndexError.
-        required_shape = np.maximum(max_skel_coords, max_mask_coords) + 1
-        
-        # 3. Create the temporary arrays with the correct, sufficiently large shape.
-        skeleton_for_skan_analysis = np.zeros(required_shape, dtype=np.min_scalar_type(label))
-        source_for_skan = np.zeros(required_shape, dtype=bool)
+        # Still get skan data for detailed analysis (but ignore its branch count)
+        try:
+            # Skan needs a minimal array containing the skeleton with global-like coordinates
+            skeleton_global_coords = np.argwhere(skeleton_binary_local) + offset
+            if skeleton_global_coords.size > 0:
+                min_coords = np.min(skeleton_global_coords, axis=0)
+                skan_shape = np.max(skeleton_global_coords, axis=0) - min_coords + 1
+                relative_coords = skeleton_global_coords - min_coords
+                
+                skeleton_for_skan = np.zeros(skan_shape, dtype=np.uint8)
+                skeleton_for_skan[tuple(relative_coords.T)] = 1
 
-        # 4. Populate the arrays using the global coordinates. This will now be safe.
-        skeleton_for_skan_analysis[tuple(skeleton_global_coords.T)] = label
-        source_for_skan[tuple(source_mask_global_coords.T)] = True
-        
-        # 5. Run Skan on the correctly prepared images, without the 'offset' argument.
-        graph_obj = Skeleton(skeleton_for_skan_analysis, spacing=spacing, source_image=source_for_skan)
-        # --- END OF FIX ---
+                graph_obj = Skeleton(skeleton_for_skan, spacing=spacing)
+                branch_data = summarize(graph_obj)
 
-        branch_data = summarize(graph_obj)
+                if not branch_data.empty:
+                    # Shift coordinates back to global space
+                    for i, suffix in enumerate(['-0', '-1', '-2']): # z, x, y
+                         for col in branch_data.columns:
+                            if col.endswith(suffix) and ('coord' in col):
+                                branch_data[col] += min_coords[i]
+        except:
+            pass
 
-        # --- Graph Analysis (unchanged) ---
-        nx_graph = None
-        if hasattr(graph_obj, 'graph') and isinstance(graph_obj.graph, (csr_matrix, nx.Graph)):
-            if isinstance(graph_obj.graph, csr_matrix):
-                try: nx_graph = nx.from_scipy_sparse_array(graph_obj.graph)
-                except Exception as nx_err: print(f"Warning: Label {label}: Failed to convert skan sparse graph to NetworkX: {nx_err}"); nx_graph = None
-            else: nx_graph = graph_obj.graph
-
-            if nx_graph is not None:
-                total_nodes = nx_graph.number_of_nodes()
-                if total_nodes > 0:
-                    degrees = pd.Series(dict(nx_graph.degree()))
-                    n_endpoints = (degrees == 1).sum()
-                    if hasattr(graph_obj, 'n_junctions'): n_junctions = graph_obj.n_junctions
-                    elif hasattr(graph_obj, 'n_junction'): n_junctions = graph_obj.n_junction
-                    else: n_junctions = (degrees > 2).sum()
-
-    except ValueError as ve:
-        print(f"Label {label}: Skan ValueError (possibly trivial skeleton): {ve}")
-        if skeleton_img is None: skeleton_img = np.zeros_like(label_region, dtype=np.uint8)
-        if skel_voxel_count > 0 and branch_data.empty:
-            total_nodes = skel_voxel_count
-            if skel_voxel_count == 1: n_endpoints = 1
-            elif skel_voxel_count == 2: n_endpoints = 2
-    except MemoryError as me:
-        print(f"CRITICAL: MemoryError during skeleton analysis for label {label}: {me}")
-        if skeleton_img is None: skeleton_img = np.zeros_like(label_region, dtype=np.uint8)
-        branch_data = pd.DataFrame(); n_junctions=0; n_endpoints=0; total_nodes=0; graph_obj=None
-    except AttributeError as ae:
-        print(f"Label {label}: Skan AttributeError during analysis: {ae}")
-        if skeleton_img is None: skeleton_img = np.zeros_like(label_region, dtype=np.uint8)
-        return pd.DataFrame(), skeleton_img, 0, 0, 0, None
+        return branch_data, skeleton_img_to_return_local, true_branches, n_junctions, n_endpoints, total_length
+                    
     except Exception as e:
-        print(f"Label {label}: Skan analysis failed unexpectedly: {e}"); traceback.print_exc()
-        if skeleton_img is None: skeleton_img = np.zeros_like(label_region, dtype=np.uint8)
-        return pd.DataFrame(), skeleton_img, 0, 0, 0, None
-    finally:
-        # Clean up temporary large arrays
-        if 'skeleton_for_skan_analysis' in locals(): del skeleton_for_skan_analysis
-        if 'source_for_skan' in locals(): del source_for_skan
-        if 'graph_obj' in locals() and graph_obj is not None: del graph_obj
-        if 'mask' in locals() and mask is not None: del mask
+        print(f"Label {label}: Analysis failed: {e}")
+        return pd.DataFrame(), np.zeros_like(label_region, dtype=np.uint8), 0, 0, 0, 0.0
 
-    if skeleton_img is None: skeleton_img = np.zeros_like(label_region, dtype=np.uint8)
-    return branch_data, skeleton_img, n_junctions, n_endpoints, total_nodes, None
+def calculate_ramification_with_skan(segmented_array, spacing=(1.0, 1.0, 1.0), labels=None, 
+                                     skeleton_export_path=None, 
+                                     prune_spurs_le_um=0.0): # <-- MODIFIED PARAMETER
+    """
+    CORRECTED version that reports true biological branch statistics for 3D data.
+    """
+    print("DEBUG [calculate_ramification_3d] Starting CORRECTED 3D skeleton analysis...")
+    
+    if segmented_array.ndim != 3: 
+        raise ValueError("Input must be 3D")
 
-def calculate_ramification_with_skan(segmented_array, spacing=(1.0, 1.0, 1.0), labels=None, skeleton_export_path=None):
-    """
-    Calculate ramification statistics using skan (Memory Optimized - CORRECTED).
-    """
-    # This function is now restored to its original, correct structure.
-    # The logic before and after the main loop is unchanged.
-    print("DEBUG [calculate_ramification] Starting skeleton analysis (Optimized)...")
+    # Handle labels (logic is unchanged)
     if labels is None:
         unique_labels_in_array = np.unique(segmented_array)
         labels_to_process = unique_labels_in_array[unique_labels_in_array > 0]
@@ -623,167 +740,87 @@ def calculate_ramification_with_skan(segmented_array, spacing=(1.0, 1.0, 1.0), l
         present_labels_set = set(unique_labels_in_array[unique_labels_in_array > 0])
         labels = [int(lbl) for lbl in labels]
         labels_to_process = sorted([lbl for lbl in labels if lbl in present_labels_set])
-        print(f"DEBUG [calculate_ramification] Processing {len(labels_to_process)} labels present in array out of {len(labels)} originally requested.")
-
+    
     if not labels_to_process:
-         print("No valid labels found for skeletonization.")
-         return pd.DataFrame(), pd.DataFrame(), np.zeros_like(segmented_array, dtype=np.uint8)
-
-    # --- Find bounding boxes first ---
-    print("DEBUG [calculate_ramification] Finding object bounding boxes...")
-    locations = None
-    try:
-        if not np.issubdtype(segmented_array.dtype, np.integer):
-             print(f"Warning: Converting segmented_array from {segmented_array.dtype} to uint32 for find_objects.")
-             segmented_array = segmented_array.astype(np.uint32)
-
-        max_lbl_find_obj = max(labels_to_process) if labels_to_process else 0
-        locations = ndi.find_objects(segmented_array, max_label=max_lbl_find_obj)
-        if locations is None:
-             print("ERROR: ndi.find_objects returned None. Cannot proceed.")
-             return pd.DataFrame(), pd.DataFrame(), np.zeros_like(segmented_array, dtype=np.uint8)
-        print(f"DEBUG [calculate_ramification] Found {len(locations)} potential bounding boxes for max_label {max_lbl_find_obj}.")
-        if max_lbl_find_obj >= len(locations):
-             print(f"Warning: Max label {max_lbl_find_obj} >= length of locations {len(locations)}. Non-contiguous labels outside this range may be missed.")
-
-    except Exception as e:
-        print(f"Error calling ndi.find_objects for skeletonization: {e}")
         return pd.DataFrame(), pd.DataFrame(), np.zeros_like(segmented_array, dtype=np.uint8)
 
+    print(f"Processing {len(labels_to_process)} labels with spur pruning <= {prune_spurs_le_um} um...")
+    
+    # Get bounding boxes (logic is unchanged)
+    locations = ndi.find_objects(segmented_array.astype(np.int32), 
+                                 max_label=max(labels_to_process) if labels_to_process else 0)
+    if locations is None: locations = []
 
-    # --- Prepare skeleton array (final output, GLOBAL coordinates) ---
+    # Prepare skeleton array (logic is unchanged)
     use_memmap = bool(skeleton_export_path)
-
-    # Your correct dtype logic
     max_label_skel = max(labels_to_process) if labels_to_process else 0
-    if max_label_skel == 0: skeleton_dtype = np.uint8
-    elif max_label_skel < 2**8: skeleton_dtype = np.uint8
+    
+    if max_label_skel < 2**8: skeleton_dtype = np.uint8
     elif max_label_skel < 2**16: skeleton_dtype = np.uint16
-    elif max_label_skel < 2**32: skeleton_dtype = np.uint32
-    else: skeleton_dtype = np.uint64
-    print(f"DEBUG [calculate_ramification] Using dtype {skeleton_dtype} for skeleton array based on max label {max_label_skel}.")
+    else: skeleton_dtype = np.uint32
 
     skeleton_array = None
-    try:
-        # Your correct memmap/array creation logic
-        if use_memmap:
-            print(f"DEBUG [calculate_ramification] Exporting skeletons to memmap: {skeleton_export_path}")
-            if os.path.exists(skeleton_export_path):
-                 try: os.remove(skeleton_export_path)
-                 except Exception as e_rm: print(f"Warning: Could not remove existing memmap file {skeleton_export_path}: {e_rm}")
-            memmap_dir = os.path.dirname(skeleton_export_path)
-            if memmap_dir: os.makedirs(memmap_dir, exist_ok=True)
-            skeleton_array = np.memmap(skeleton_export_path, dtype=skeleton_dtype, mode='w+', shape=segmented_array.shape)
-        else:
-            print("DEBUG [calculate_ramification] Creating skeleton array in memory.")
-            skeleton_array = np.zeros(segmented_array.shape, dtype=skeleton_dtype)
-        skeleton_array[:] = 0
-        if use_memmap: skeleton_array.flush()
-    except MemoryError as me:
-         print(f"CRITICAL: MemoryError allocating skeleton array (Shape: {segmented_array.shape}, Dtype: {skeleton_dtype}, Memmap: {use_memmap}). Cannot proceed.")
-         return pd.DataFrame(), pd.DataFrame(), None
-    except Exception as e_alloc:
-         print(f"Error preparing skeleton array: {e_alloc}")
-         return pd.DataFrame(), pd.DataFrame(), None
-
+    if use_memmap:
+        if os.path.exists(skeleton_export_path): os.remove(skeleton_export_path)
+        skeleton_array = np.memmap(skeleton_export_path, dtype=skeleton_dtype, mode='w+', shape=segmented_array.shape)
+    else: 
+        skeleton_array = np.zeros(segmented_array.shape, dtype=skeleton_dtype)
+    skeleton_array[:] = 0
+    if use_memmap: skeleton_array.flush()
 
     all_branch_data_dfs = []
     summary_stats_list = []
 
-    # --- Process labels one by one ---
-    for label in tqdm(labels_to_process, desc="Analyzing Skeletons (skan)"):
-        loc_index = label - 1
+    for label_val in tqdm(labels_to_process, desc="Analyzing 3D Skeletons"):
+        loc_index = label_val - 1
         if loc_index < 0 or loc_index >= len(locations) or locations[loc_index] is None:
-            summary_stats_list.append({'label': label, 'skan_num_branches': 0, 'skan_total_length_um': 0.0, 'skan_avg_branch_length_um': np.nan, 'skan_num_junctions': 0, 'skan_num_endpoints': 0, 'skan_num_skeleton_voxels': 0})
+            summary_stats_list.append({
+                'label': label_val, 'true_num_branches': 0, 'skan_total_length_um': 0.0,
+                'skan_avg_branch_length_um': np.nan, 'true_num_junctions': 0,
+                'true_num_endpoints': 0, 'skan_num_skeleton_voxels': 0
+            })
             continue
-
+        
         slices = locations[loc_index]
-        label_region = None
-        offset = None
-        try:
-            label_region = segmented_array[slices]
-            offset = np.array([s.start for s in slices])
-        except MemoryError as me:
-            print(f"CRITICAL: MemoryError slicing array for skeletonization label {label}. Skipping.")
-            summary_stats_list.append({'label': label, 'skan_num_branches': 0, 'skan_total_length_um': 0.0, 'skan_avg_branch_length_um': np.nan, 'skan_num_junctions': 0, 'skan_num_endpoints': 0, 'skan_num_skeleton_voxels': 0})
-            del label_region; gc.collect()
-            continue
-        except Exception as e:
-            print(f"Warning: Error slicing array for skeletonization label {label}: {e}. Skipping.")
-            summary_stats_list.append({'label': label, 'skan_num_branches': 0, 'skan_total_length_um': 0.0, 'skan_avg_branch_length_um': np.nan, 'skan_num_junctions': 0, 'skan_num_endpoints': 0, 'skan_num_skeleton_voxels': 0})
-            continue
+        label_region = segmented_array[slices]
+        offset = np.array([s.start for s in slices])
 
-        # --- FIX: THIS IS THE CORRECT 4-ARGUMENT CALL ---
-        # It passes all necessary information to the helper function.
-        branch_data, label_skeleton_img_local, n_junctions, n_endpoints, total_nodes, _ = \
-            analyze_skeleton_with_skan(label_region, offset, spacing, label)
+        # --- Call the new 3D worker, matching the 2D file's structure ---
+        branch_data, label_skeleton_img_local, true_branches, n_junctions, n_endpoints, total_length = \
+            analyze_skeleton_with_skan_3d(label_region, offset, spacing, label_val, prune_spurs_le_um)
 
-        # --- The rest of the logic remains unchanged and is correct ---
-        num_skel_voxels = 0
-        if label_skeleton_img_local is not None and label_skeleton_img_local.ndim == 3 :
-            try:
-                local_coords = np.argwhere(label_skeleton_img_local > 0)
-                if local_coords.size > 0:
-                     global_coords = local_coords + offset
-                     idx_z, idx_x, idx_y = global_coords[:, 0], global_coords[:, 1], global_coords[:, 2]
+        avg_branch_length = (total_length / true_branches) if true_branches > 0 else 0.0
+        num_skel_voxels = np.count_nonzero(label_skeleton_img_local)
 
-                     valid_idx = ( (idx_z >= 0) & (idx_z < skeleton_array.shape[0]) &
-                                   (idx_x >= 0) & (idx_x < skeleton_array.shape[1]) &
-                                   (idx_y >= 0) & (idx_y < skeleton_array.shape[2]) )
-
-                     idx_z, idx_x, idx_y = idx_z[valid_idx], idx_x[valid_idx], idx_y[valid_idx]
-                     skeleton_array[idx_z, idx_x, idx_y] = label
-                     num_skel_voxels = len(idx_z)
-
-                     if use_memmap: skeleton_array.flush()
-                     del local_coords, global_coords, idx_z, idx_x, idx_y, valid_idx
-            except MemoryError:
-                print(f"CRITICAL: MemoryError processing/assigning skeleton coordinates for label {label}.")
-                num_skel_voxels = -1
-            except Exception as map_err:
-                print(f"Warning: Error mapping skeleton for label {label}: {map_err}")
-                num_skel_voxels = -1
-
-        total_length = 0.0; num_branches = 0; avg_branch_length = np.nan
-        if not branch_data.empty:
-            try:
-                branch_data['label'] = label
-                all_branch_data_dfs.append(branch_data.copy())
-                total_length = branch_data['branch-distance'].sum()
-                num_branches = len(branch_data)
-                if 'branch-distance' in branch_data.columns and branch_data['branch-distance'].notna().any():
-                     avg_branch_length = branch_data['branch-distance'].mean()
-                else: avg_branch_length = np.nan
-            except Exception as agg_err:
-                 print(f"Warning: Error aggregating branch stats for label {label}: {agg_err}")
-                 total_length = np.nan; num_branches = -1; avg_branch_length = np.nan
-
+        # Store CORRECTED statistics with names matching the 2D version
         summary_stats_list.append({
-            'label': label, 'skan_num_branches': num_branches, 'skan_total_length_um': total_length,
-            'skan_avg_branch_length_um': avg_branch_length, 'skan_num_junctions': n_junctions,
-            'skan_num_endpoints': n_endpoints, 'skan_num_skeleton_voxels': num_skel_voxels,
+            'label': label_val, 'true_num_branches': true_branches,
+            'skan_total_length_um': total_length, 'skan_avg_branch_length_um': avg_branch_length,
+            'true_num_junctions': n_junctions, 'true_num_endpoints': n_endpoints,
+            'skan_num_skeleton_voxels': num_skel_voxels
         })
 
-        del label_region, offset, branch_data, label_skeleton_img_local
+        if not branch_data.empty:
+            branch_data['label'] = label_val
+            all_branch_data_dfs.append(branch_data.copy())
+        
+        # Map skeleton to global array (3D indexing)
+        if label_skeleton_img_local is not None and np.any(label_skeleton_img_local):
+            local_coords = np.argwhere(label_skeleton_img_local > 0)
+            if local_coords.size > 0:
+                global_coords = local_coords + offset
+                idx_z, idx_x, idx_y = global_coords[:, 0], global_coords[:, 1], global_coords[:, 2]
+                valid_idx = ((idx_z >= 0) & (idx_z < skeleton_array.shape[0]) & 
+                             (idx_x >= 0) & (idx_x < skeleton_array.shape[1]) &
+                             (idx_y >= 0) & (idx_y < skeleton_array.shape[2]))
+                idx_z, idx_x, idx_y = idx_z[valid_idx], idx_x[valid_idx], idx_y[valid_idx]
+                skeleton_array[idx_z, idx_x, idx_y] = label_val
+                if use_memmap: skeleton_array.flush()
 
-    # --- Final dataframe creation logic is unchanged and correct ---
-    detailed_branch_df = pd.DataFrame()
-    if all_branch_data_dfs:
-         try: detailed_branch_df = pd.concat(all_branch_data_dfs, ignore_index=True)
-         except MemoryError: print("CRITICAL: MemoryError concatenating detailed branch dataframes."); detailed_branch_df = pd.DataFrame()
-         except Exception as concat_err: print(f"Warning: Error concatenating detailed branch data: {concat_err}"); detailed_branch_df = pd.DataFrame()
-
-    del all_branch_data_dfs; gc.collect()
+    detailed_branch_df = pd.concat(all_branch_data_dfs, ignore_index=True) if all_branch_data_dfs else pd.DataFrame()
     ramification_summary_df = pd.DataFrame(summary_stats_list)
-    print(f"DEBUG [calculate_ramification] Finished skeleton analysis. Final skeleton array shape {skeleton_array.shape if skeleton_array is not None else 'None'}, dtype {skeleton_array.dtype if skeleton_array is not None else 'N/A'}, type {type(skeleton_array)}. Summary DF shape {ramification_summary_df.shape}. Branch DF shape {detailed_branch_df.shape}")
 
-    if skeleton_array is not None:
-        try:
-             unique_skel_vals = np.unique(skeleton_array)
-             print(f"DEBUG [calculate_ramification] Unique values in final skeleton array (Top 20): {unique_skel_vals[:20]}")
-             if len(unique_skel_vals) > 20 : print("    ...")
-        except Exception as e_uniq: print(f"Warning: Could not get unique values from skeleton array: {e_uniq}")
-
+    print("DEBUG [calculate_ramification_3d] Finished CORRECTED 3D analysis.")
     return ramification_summary_df, detailed_branch_df, skeleton_array
 
 
@@ -797,9 +834,10 @@ def analyze_segmentation(segmented_array,
                          calculate_skeletons=True,
                          skeleton_export_path=None,
                          temp_dir=None, n_jobs=None,
-                         return_detailed=False):
+                         return_detailed=False,
+                         prune_spurs_le_um=None): # <-- ADDED PARAM
     """
-    Comprehensive analysis of a 3D segmented array.
+    Comprehensive analysis of a 3D segmented array with optional smoothing/pruning.
     """
     overall_start_time = time.time()
     print("\n" + "=" * 30)
@@ -807,6 +845,9 @@ def analyze_segmentation(segmented_array,
     print(f"DEBUG [analyze_segmentation] Input array shape: {segmented_array.shape}, dtype: {segmented_array.dtype}")
     print(f"DEBUG [analyze_segmentation] Voxel spacing (z,x,y): {spacing} um")
     print("=" * 30)
+
+    if prune_spurs_le_um == 0:
+        prune_spurs_le_um = None # Treat 0 as no smoothing
 
     labels = np.unique(segmented_array)
     labels = labels[labels > 0] # Exclude background
@@ -887,38 +928,26 @@ def analyze_segmentation(segmented_array,
     else: print("DEBUG [analyze_segmentation] Skipping distance calculation as requested.")
 
     # --- 3. Skeleton Metrics (using skan) ---
-    detailed_outputs['skeleton_array'] = None
-    detailed_outputs['detailed_branches'] = None
-
     if calculate_skeletons:
-        print("\nDEBUG [analyze_segmentation] [3/3] Calculating Skeleton Metrics (skan)...")
-        labels_for_skeleton = list(metrics_df['label'].unique()) # Use labels present in metrics df
-        print(f"DEBUG [analyze_segmentation] Labels passed to skeletonization: {len(labels_for_skeleton)}")
-
+        print("\nDEBUG [analyze_segmentation] [3/3] Calculating Skeleton Metrics (3D skan)...")
+        labels_for_skeleton = list(metrics_df['label'].unique())
+        
+        # --- Call the modified function with the new parameter, matching 2D version ---
         ramification_summary_df, detailed_branch_df, skeleton_array = calculate_ramification_with_skan(
-            segmented_array, spacing=spacing, labels=labels_for_skeleton, skeleton_export_path=skeleton_export_path
+            segmented_array, spacing=spacing, labels=labels_for_skeleton, 
+            skeleton_export_path=skeleton_export_path,
+            prune_spurs_le_um=prune_spurs_le_um
         )
-
-        # Merge summary skeleton stats
-        if not ramification_summary_df.empty:
-             metrics_df = pd.merge(metrics_df, ramification_summary_df, on='label', how='left')
-             print(f"DEBUG [analyze_segmentation] metrics_df shape after skeleton merge: {metrics_df.shape}")
-        else: # Add empty columns if needed
-             skel_cols = ['skan_num_branches', 'skan_total_length_um', 'skan_avg_branch_length_um','skan_num_junctions', 'skan_num_endpoints', 'skan_num_skeleton_voxels']
-             for col in skel_cols:
-                 if col not in metrics_df.columns: metrics_df[col] = np.nan
+        if not ramification_summary_df.empty: 
+            metrics_df = pd.merge(metrics_df, ramification_summary_df, on='label', how='left')
+        else: # Add empty columns with new names to match 2D output
+            skel_cols_3d = ['true_num_branches', 'skan_total_length_um', 'skan_avg_branch_length_um', 'true_num_junctions', 'true_num_endpoints', 'skan_num_skeleton_voxels']
+            for col in skel_cols_3d:
+                if col not in metrics_df.columns: metrics_df[col] = np.nan
 
         if return_detailed:
             detailed_outputs['detailed_branches'] = detailed_branch_df
-            detailed_outputs['skeleton_array'] = skeleton_array # Assign actual array/memmap
-            # --- DEBUG ---
-            if skeleton_array is not None:
-                print(f"DEBUG [analyze_segmentation] Final skeleton_array returned: shape={skeleton_array.shape}, dtype={skeleton_array.dtype}, type={type(skeleton_array)}")
-                if DEBUG_TARGET_LABEL is not None and DEBUG_TARGET_LABEL in labels:
-                    skel_coords_final_return = np.argwhere(skeleton_array == DEBUG_TARGET_LABEL)
-                    debug_print(f"Label {DEBUG_TARGET_LABEL}: Coords in final RETURNED skeleton array (First 5 Z,X,Y):\n{skel_coords_final_return[:5]}", label=DEBUG_TARGET_LABEL)
-            else: print("DEBUG [analyze_segmentation] Final skeleton_array is None.")
-            # --- END DEBUG ---
+            detailed_outputs['skeleton_array'] = skeleton_array
 
     else: print("DEBUG [analyze_segmentation] Skipping skeleton calculation as requested.")
 

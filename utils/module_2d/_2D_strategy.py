@@ -412,6 +412,8 @@ class Ramified2DStrategy(ProcessingStrategy):
         except Exception as e: print(f"Error loading final 2D segmentation {final_seg_path}: {e}"); return False
 
         try:
+            prune_spurs_le_um = params.get("prune_spurs_le_um", 0)
+
             print("Running analyze_segmentation_2d...")
             metrics_df, detailed_outputs = analyze_segmentation_2d(
                 segmented_array=merged_roi_array,
@@ -419,7 +421,9 @@ class Ramified2DStrategy(ProcessingStrategy):
                 calculate_distances=params.get("calculate_distances", True),
                 calculate_skeletons=params.get("calculate_skeletons", True), # Ensure analyze_segmentation_2d supports this
                 skeleton_export_path=None, # Or specific path if needed by backend
-                return_detailed=True)
+                return_detailed=True,
+                prune_spurs_le_um=prune_spurs_le_um
+            )
             print("analyze_segmentation_2d finished.")
             skeleton_array_result = detailed_outputs.get('skeleton_array') # Capture for display/save
         except Exception as e: print(f"Error during 2D feature calculation (analyze_segmentation_2d): {e}"); traceback.print_exc(); return False

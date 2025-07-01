@@ -467,12 +467,15 @@ class RamifiedStrategy(ProcessingStrategy):
         detailed_outputs = {}
         try:
             if not hasattr(self, 'spacing') or not self.spacing: raise ValueError("Strategy instance is missing 'spacing'.")
+            
+            prune_spurs_le_um = params.get("prune_spurs_le_um", 0)
+            
             print("Running analyze_segmentation...")
             metrics_df, detailed_outputs = analyze_segmentation(
                 segmented_array=merged_roi_array, spacing=self.spacing,
                 calculate_distances=True, calculate_skeletons=True,
                 skeleton_export_path=None, return_detailed=True,
-                n_jobs=params.get('n_jobs', None)
+                prune_spurs_le_um=prune_spurs_le_um
             )
             print("analyze_segmentation finished.")
         except Exception as e:

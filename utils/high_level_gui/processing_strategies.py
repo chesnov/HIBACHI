@@ -207,7 +207,7 @@ class ProcessingStrategy(abc.ABC):
         #    Include known top-level keys explicitly if needed.
         print("DEBUG save_config: Processing current_config keys...")
         for step_key, step_data in current_config.items():
-            if step_key == 'voxel_dimensions' and isinstance(step_data, dict):
+            if (step_key == 'voxel_dimensions' or step_key == 'pixel_dimensions') and isinstance(step_data, dict):
                  config_to_save[step_key] = step_data
                  print(f"  Included key: {step_key}")
             # Include step configurations (assuming they start with 'execute_')
