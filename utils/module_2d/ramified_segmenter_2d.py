@@ -570,7 +570,9 @@ def separate_multi_soma_cells_2d(
     spacing: Optional[Tuple[float, float]], min_size_threshold: int = 50, # Adjusted for 2D
     intensity_weight: float = 0.0, max_seed_centroid_dist: float = 30, # Adjusted for 2D
     min_path_intensity_ratio: float = 0.8, 
-    min_local_intensity_difference: float = 0.05, local_analysis_radius: int = 5 # Adjusted for 2D
+    min_local_intensity_difference: float = 0.05, 
+    local_analysis_radius: int = 5, # Adjusted for 2D
+    max_hole_size: int = 0, # Adjusted for 2D
 ) -> np.ndarray:
     
     log_main_prefix = "[SepMultiSomaSerialV7_2D]"
@@ -852,11 +854,7 @@ def separate_multi_soma_cells_2d(
 
     phase3_start_time = time.time()
     print(f"\n{log_main_prefix} Phase 3: Finalizing mask.")
-    try:
-        final_mask_filled = fill_internal_voids_2d(final_output_mask) 
-    except NameError: # Should not happen if fill_internal_voids_2d is defined
-        print(f"{log_main_prefix} Warning: fill_internal_voids_2d not defined. Skipping this step.")
-        final_mask_filled = final_output_mask.copy()
+    final_mask_filled = fill_internal_voids_2d(final_output_mask, max_hole_size=max_hole_size) 
 
     if np.any(final_mask_filled):
         print(f"{log_main_prefix} Relabeling final mask sequentially...")
@@ -877,69 +875,116 @@ def separate_multi_soma_cells_2d(
     return output_to_return
 
 # --- fill_internal_voids (2D) ---
-def fill_internal_voids_2d(segmentation_mask_input: np.ndarray) -> np.ndarray: # Input is 2D
+def fill_internal_voids_2d(
+    segmentation_mask_input: np.ndarray, 
+    max_hole_size: int
+) -> np.ndarray:
+    """
+    Fills internal holes in a 2D integer-labeled segmentation mask, with a size constraint.
+
+    This function iterates through each labeled object in the mask, identifies any
+    internal holes (voids), and fills them if their size in pixels is less than or
+    equal to the specified `max_hole_size`.
+
+    Args:
+        segmentation_mask_input (np.ndarray): A 2D NumPy array where each integer
+            value represents a unique object label. Background is 0.
+        max_hole_size (int): The maximum size of a hole (in pixels) to be filled.
+            Holes larger than this will be ignored.
+
+    Returns:
+        np.ndarray: A new 2D mask with the specified internal voids filled.
+    """
     log_fill_prefix = "[FillVoids_2D]"
-    print(f"{log_fill_prefix} Starting Internal Void Filling (2D)...")
+    print(f"{log_fill_prefix} Starting Internal Void Filling (2D) with max_hole_size={max_hole_size}...")
     t_start_fill = time.time()
+    
+    # Make a copy to avoid modifying the original array
     filled_mask_output = segmentation_mask_input.copy()
     
+    # find_objects requires an integer array
     input_for_find_objects = segmentation_mask_input.astype(np.int32)
-    if np.max(input_for_find_objects) == 0 :
+    if np.max(input_for_find_objects) == 0:
         print(f"{log_fill_prefix} Input mask is empty or all zeros. No voids to fill.")
         print(f"{log_fill_prefix} Void Filling Complete. Time: {time.time()-t_start_fill:.2f}s")
         return filled_mask_output
 
-    bboxes = find_objects(input_for_find_objects) # bboxes will be tuples of 2 slices
+    # Get bounding boxes for each labeled object
+    bboxes = find_objects(input_for_find_objects)
     
-    voids_filled_count = 0
-    pixels_added_total = 0 # Renamed from voxels
-
-    if bboxes is None:
+    if bboxes is None or all(b is None for b in bboxes):
         print(f"{log_fill_prefix} No objects found by find_objects. No voids to fill.")
         print(f"{log_fill_prefix} Void Filling Complete. Time: {time.time()-t_start_fill:.2f}s")
         return filled_mask_output
+        
+    holes_filled_count = 0
+    pixels_added_total = 0
 
+    # Iterate through each object's bounding box
     for i, bbox_slices in enumerate(bboxes):
         label_val_fill = i + 1
         
-        if bbox_slices is None: continue
-
-        if not (isinstance(bbox_slices, tuple) and len(bbox_slices) == segmentation_mask_input.ndim and \
-                all(isinstance(s, slice) for s in bbox_slices) and segmentation_mask_input.ndim == 2): # Check for 2D
-            print(f"{log_fill_prefix}   Skipping label {label_val_fill} due to invalid bbox or non-2D mask: {bbox_slices}")
+        if bbox_slices is None:
             continue
 
-        original_roi_fill = segmentation_mask_input[bbox_slices]
-        cell_mask_roi_fill = (original_roi_fill == label_val_fill)
+        # Extract the Region of Interest (ROI) for the current object
+        cell_mask_roi_fill = (segmentation_mask_input[bbox_slices] == label_val_fill)
         
         if not np.any(cell_mask_roi_fill):
-            print(f"{log_fill_prefix}   ROI for label {label_val_fill} is empty for this label. Skipping fill.")
+            print(f"{log_fill_prefix}   ROI for label {label_val_fill} is empty. Skipping fill.")
             continue
 
-        original_pixels_fill = np.sum(cell_mask_roi_fill) # Renamed
+        # --- CORE MODIFICATION STARTS HERE ---
+
+        # 1. Fill all holes to identify them.
         try:
-            # binary_fill_holes works for 2D
             filled_cell_roi_fill = binary_fill_holes(cell_mask_roi_fill)
         except Exception as e_fill:
-            print(f"{log_fill_prefix}   Error filling holes for label {label_val_fill} in ROI: {e_fill}. Skipping.")
+            print(f"{log_fill_prefix}   Error during initial fill for label {label_val_fill}: {e_fill}. Skipping.")
+            continue
+            
+        # 2. Create a mask of the holes by finding the difference.
+        #    A pixel is part of a hole if it's True in the filled version but False in the original.
+        holes_mask = filled_cell_roi_fill & ~cell_mask_roi_fill
+        
+        if not np.any(holes_mask):
+            # No holes were found in this object
             continue
 
-        filled_pixels_fill = np.sum(filled_cell_roi_fill) # Renamed
-        if filled_pixels_fill > original_pixels_fill:
-            pixels_added_fill = filled_pixels_fill - original_pixels_fill # Renamed
-            pixels_added_total += pixels_added_fill
-            voids_filled_count += 1
-            print(f"{log_fill_prefix}   Filled void in label {label_val_fill}: added {pixels_added_fill} pixels.")
+        # 3. Label each separate hole with a unique integer.
+        labeled_holes, num_holes = label(holes_mask)
+        
+        if num_holes == 0:
+            continue
+
+        print(f"{log_fill_prefix}   Found {num_holes} potential hole(s) in label {label_val_fill}.")
+
+        # 4. Iterate through each labeled hole, check its size, and fill if it meets the criteria.
+        result_roi_view_fill = filled_mask_output[bbox_slices]
+        
+        for hole_label in range(1, num_holes + 1):
+            current_hole_mask = (labeled_holes == hole_label)
+            hole_size = np.sum(current_hole_mask)
             
-            result_roi_view_fill = filled_mask_output[bbox_slices]
-            result_roi_view_fill[filled_cell_roi_fill] = label_val_fill
-    
+            # 5. The crucial size check
+            if hole_size <= max_hole_size:
+                print(f"{log_fill_prefix}     - Filling hole of size {hole_size} (<= {max_hole_size}).")
+                # Apply the fill to the output mask for this specific hole
+                result_roi_view_fill[current_hole_mask] = label_val_fill
+                
+                pixels_added_total += hole_size
+                holes_filled_count += 1
+            else:
+                print(f"{log_fill_prefix}     - Skipping hole of size {hole_size} (> {max_hole_size}).")
+
+        # --- CORE MODIFICATION ENDS HERE ---
+
     print(f"{log_fill_prefix} --- Void Filling Summary ---")
-    if voids_filled_count > 0:
-        print(f"{log_fill_prefix}   Filled voids in {voids_filled_count} objects.")
+    if holes_filled_count > 0:
+        print(f"{log_fill_prefix}   Filled {holes_filled_count} holes across all objects.")
         print(f"{log_fill_prefix}   Total pixels added: {pixels_added_total}")
     else:
-        print(f"{log_fill_prefix}   No internal voids were found to fill.")
+        print(f"{log_fill_prefix}   No internal voids meeting the size criteria were found to fill.")
     print(f"{log_fill_prefix} Void Filling Complete. Time: {time.time()-t_start_fill:.2f}s")
     return filled_mask_output
 

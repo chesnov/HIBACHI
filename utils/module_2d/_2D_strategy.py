@@ -327,6 +327,7 @@ class Ramified2DStrategy(ProcessingStrategy):
             min_path_intensity_ratio = float(params.get("min_path_intensity_ratio", 0.8))
             min_local_intensity_difference = float(params.get("min_local_intensity_difference", 0.05))
             local_analysis_radius = float(params.get("local_analysis_radius", 2.0))
+            max_hole_size = int(params.get("max_hole_size", 0)) # 0 means not filling any holes
 
             print("  Calling extract_soma_masks_2d...")
             cell_bodies = extract_soma_masks_2d(
@@ -354,7 +355,8 @@ class Ramified2DStrategy(ProcessingStrategy):
                 max_seed_centroid_dist=max_seed_centroid_dist,
                 min_path_intensity_ratio=min_path_intensity_ratio,
                 min_local_intensity_difference=min_local_intensity_difference,
-                local_analysis_radius=local_analysis_radius
+                local_analysis_radius=local_analysis_radius,
+                max_hole_size=max_hole_size
             )
         except NotImplementedError:
             print("ERROR: 2D Refinement functions (extract_soma_masks_2d, etc.) not implemented yet.")

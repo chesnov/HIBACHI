@@ -583,7 +583,7 @@ def separate_multi_soma_cells(
     min_local_intensity_difference: float = 0.05, local_analysis_radius: int = 10, #If the local intensity difference between two segments is less than this, they are merged
     # --- MODIFIED parameters for memory optimization ---
     memmap_dir: Optional[str] = "ramiseg_temp_memmap",
-    memmap_voxel_threshold: int = 50_000_000 # ~50 million voxels
+    memmap_voxel_threshold: int = 25_000_000 # ~25 million voxels
 ) -> np.ndarray:
     """
     Separates multi-soma cells using a hybrid watershed and graph-based merging approach.

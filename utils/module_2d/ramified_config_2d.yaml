@@ -239,6 +239,13 @@ execute_refine_rois_ramified_2d:
       min: 1
       max: 1000
       step: 1
+    max_hole_size:
+      label: Max Hole Size (Separate cells; um^2)
+      type: int
+      value: 0
+      min: 0
+      max: 1000000
+      step: 1
 execute_calculate_features_ramified_2d:
   name: Execute Feature Calculation (2D)
   parameters:
