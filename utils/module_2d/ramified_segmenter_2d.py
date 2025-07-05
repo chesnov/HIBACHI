@@ -952,7 +952,7 @@ def fill_internal_voids_2d(
             continue
 
         # 3. Label each separate hole with a unique integer.
-        labeled_holes, num_holes = label(holes_mask)
+        labeled_holes, num_holes = label(holes_mask, return_num=True)
         
         if num_holes == 0:
             continue
