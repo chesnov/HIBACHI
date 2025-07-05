@@ -13,7 +13,7 @@ import time
 import psutil
 import gc
 from skimage.morphology import skeletonize, binary_erosion, binary_dilation, disk # type: ignore
-from skimage.measure import regionprops # type: ignore # Use regionprops for 2D metrics
+from skimage.measure import regionprops, find_contours # type: ignore
 from skan import Skeleton, summarize # type: ignore
 import networkx as nx # type: ignore
 from tqdm.auto import tqdm
@@ -254,16 +254,19 @@ def shortest_distance_2d(segmented_array, spacing_yx=(1.0, 1.0),
 # =============================================================================
 
 def calculate_area_and_shape_2d(segmented_array, spacing_yx=(1.0, 1.0)):
-    """Calculate area and basic 2D shape metrics for each mask using regionprops."""
+    """
+    Calculate area and basic 2D shape metrics for each mask using regionprops.
+    CORRECTED to handle anisotropic spacing for perimeter calculation.
+    """
     print("DEBUG [calculate_area_shape_2d] Starting area/shape calculations...")
     if segmented_array.ndim != 2: raise ValueError("Input must be 2D")
 
     results = []
     print("DEBUG [calculate_area_shape_2d] Calculating regionprops...")
     try:
-        # Calculate props for all labeled regions at once
-        # Provide spacing for accurate physical measurements
-        props = regionprops(segmented_array.astype(np.int32), spacing=spacing_yx, intensity_image=None) # Ensure int for labels
+        # We still use regionprops for all other metrics, as they work correctly.
+        # Spacing is passed so that props like major_axis_length are in physical units.
+        props = regionprops(segmented_array.astype(np.int32), spacing=spacing_yx, intensity_image=None)
     except Exception as e:
         print(f"Error calculating regionprops: {e}")
         traceback.print_exc()
@@ -272,45 +275,59 @@ def calculate_area_and_shape_2d(segmented_array, spacing_yx=(1.0, 1.0)):
     print(f"DEBUG [calculate_area_shape_2d] Found {len(props)} regions.")
 
     pixel_area_um2 = spacing_yx[0] * spacing_yx[1]
-    avg_spacing_um = np.mean(spacing_yx)
+    # No longer need avg_spacing_um
 
     for prop in tqdm(props, desc="Processing Regions"):
         label = prop.label
-        # Area
-        pixel_count = prop.area # Number of pixels
+        
+        # These properties are calculated correctly by regionprops even with anisotropy
+        pixel_count = prop.area
         area_um2 = pixel_count * pixel_area_um2
-
-        # Bounding Box
         min_r, min_c, max_r, max_c = prop.bbox
         bbox_height_px = max_r - min_r
         bbox_width_px = max_c - min_c
         bbox_area_um2 = (bbox_height_px * spacing_yx[0]) * (bbox_width_px * spacing_yx[1])
+        eccentricity = prop.eccentricity
+        solidity = prop.solidity
+        major_axis_um = prop.major_axis_length
+        minor_axis_um = prop.minor_axis_length
 
-        # Perimeter (Note: regionprops perimeter is pixel count on border)
-        # Convert to physical length approximately
-        perimeter_px = prop.perimeter
-        perimeter_um = perimeter_px * avg_spacing_um # Approximate physical perimeter
+        # --- CORRECTED PERIMETER CALCULATION ---
+        perimeter_um = 0.0
+        try:
+            # prop.image is the mask in its bounding box. Pad it to ensure contours are closed.
+            padded_mask = np.pad(prop.image, pad_width=1, mode='constant', constant_values=0)
+            
+            # Find contours of the object. The level must be between 0 and 1.
+            contours = find_contours(padded_mask, level=0.5)
+            
+            # A single object can have multiple contours (e.g., if it has holes)
+            for contour in contours:
+                # Calculate the difference between consecutive contour points
+                delta = np.diff(contour, axis=0)
+                # Scale these differences by the physical spacing
+                delta_scaled = delta * np.array(spacing_yx)
+                # Calculate the hypotenuse of each segment and sum them
+                perimeter_um += np.sum(np.sqrt(np.sum(delta_scaled**2, axis=1)))
+        except Exception as e_contour:
+            print(f"Warning: Could not calculate perimeter for label {label}: {e_contour}")
+            perimeter_um = np.nan
+        # --- END OF CORRECTION ---
 
-        # Circularity (Compactness) = 4 * pi * Area / Perimeter^2
-        # Use physical units for calculation
+        # Circularity calculation now uses the new, more accurate perimeter
         circularity = np.nan
         if perimeter_um > 1e-6:
             circularity = (4 * math.pi * area_um2) / (perimeter_um**2)
-            circularity = min(1.0, max(0.0, circularity)) # Clamp to [0, 1]
-
-        # Other potentially useful props (already in physical units if spacing provided)
-        eccentricity = prop.eccentricity
-        solidity = prop.solidity # Ratio of pixels in region to convex hull
-        major_axis_um = prop.major_axis_length # Physical length
-        minor_axis_um = prop.minor_axis_length # Physical length
+            # Clamp to a realistic range [0, 1]
+            circularity = min(1.0, max(0.0, circularity))
 
         results.append({
             'label': label,
             'area_um2': area_um2,
-            'perimeter_um': perimeter_um,
+            'perimeter_um': perimeter_um, # Now correctly calculated
             'pixel_count': pixel_count,
             'bounding_box_area_um2': bbox_area_um2,
-            'circularity': circularity,
+            'circularity': circularity, # Now correctly calculated
             'eccentricity': eccentricity,
             'solidity': solidity,
             'major_axis_length_um': major_axis_um,
