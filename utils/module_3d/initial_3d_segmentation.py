@@ -3,7 +3,7 @@
 import numpy as np
 from scipy import ndimage
 # Make sure all necessary ndimage functions are imported
-from scipy.ndimage import (gaussian_filter, generate_binary_structure)
+from scipy.ndimage import (generate_binary_structure)
 from skimage.filters import frangi, sato # type: ignore
 from skimage.morphology import remove_small_objects # type: ignore
 import tempfile
@@ -14,16 +14,20 @@ import time
 import psutil
 from shutil import rmtree
 import gc
-# import os # duplicate
-# import tempfile # duplicate
-# import gc # duplicate
-# import numpy as np # duplicate
-# from tqdm import tqdm # duplicate
 from functools import partial
 import math
+import traceback
+import zarr # Ensure zarr is imported
+
+# Dask and dask-image are now essential
+import dask.array as da
+from dask.diagnostics import ProgressBar
+import dask_image.ndmorph
+import dask_image.ndmeasure
+import dask_image.ndfilters
+
 seed = 42
 np.random.seed(seed)         # For NumPy
-import traceback
 
 from .remove_artifacts import * # Assuming this exists and is needed by other parts not shown
 
@@ -45,25 +49,49 @@ def create_memmap(data=None, dtype=None, shape=None, prefix='temp', directory=No
         result = np.memmap(path, dtype=dtype, mode='w+', shape=shape)
     return result, path, directory
 
+
+# +++ START: NEW Dask-based 3D Smoothing Function (Internal Helper) +++
+def _smooth_volume_dask_internal(volume, spacing, smoothing_sigma_phys):
+    """
+    Internal helper to apply 3D Gaussian smoothing using Dask.
+    Returns a memmap of the smoothed volume and its temp directory.
+    """
+    print("Applying initial 3D smoothing using Dask for memory safety...")
+    dask_chunk_size = (64, 256, 256)
+    dask_volume = da.from_array(volume, chunks=dask_chunk_size)
+    
+    sigma_voxel_3d = tuple(smoothing_sigma_phys / s if s > 0 else 0 for s in spacing)
+    print(f"  Using 3D voxel sigma for smoothing: {sigma_voxel_3d}")
+
+    smoothed_dask_array = dask_image.ndfilters.gaussian_filter(
+        dask_volume, sigma=sigma_voxel_3d, mode='reflect'
+    ).astype(np.float32)
+
+    temp_dir = tempfile.mkdtemp(prefix="dask_smooth_output_")
+    output_path = os.path.join(temp_dir, 'smoothed_volume.dat')
+    output_memmap = np.memmap(output_path, dtype=np.float32, mode='w+', shape=volume.shape)
+
+    print("  Executing Dask smoothing and storing to memmap...")
+    # Corrected ProgressBar call without the 'label' argument
+    with ProgressBar():
+        da.store(smoothed_dask_array, output_memmap)
+    
+    print("  Dask 3D smoothing complete.")
+    return output_memmap, temp_dir
+# +++ END: NEW Dask-based 3D Smoothing Function +++
+
+
 def _process_slice_worker(z, input_memmap_info, output_memmap_info,
                           sigmas_voxel_2d, black_ridges,
                           frangi_alpha, frangi_beta, frangi_gamma):
-    """Worker function to process a single slice."""
+    """Worker function to process a single slice. (Unchanged)"""
     try:
         input_path, input_shape, input_dtype = input_memmap_info
         output_path, output_shape, output_dtype = output_memmap_info
-        # Ensure input_dtype for memmap is float32 as expected by frangi/sato after smoothing
-        if input_dtype != np.float32:
-             # This should not happen if previous steps ensure float32 input to this worker
-            print(f"Warning: _process_slice_worker received input_dtype {input_dtype}, expected np.float32. Path: {input_path}")
-
         input_memmap = np.memmap(input_path, dtype=input_dtype, mode='r', shape=input_shape)
         output_memmap = np.memmap(output_path, dtype=output_dtype, mode='r+', shape=output_shape)
         
-        slice_data = input_memmap[z, :, :].copy() # Copy to ensure it's in memory
-        # Convert to float32 if not already, frangi/sato expect float
-        if not np.issubdtype(slice_data.dtype, np.floating): slice_data = slice_data.astype(np.float32)
-        elif slice_data.dtype != np.float32: slice_data = slice_data.astype(np.float32)
+        slice_data = input_memmap[z, :, :].copy().astype(np.float32)
 
         frangi_result_2d = frangi(slice_data, sigmas=sigmas_voxel_2d, alpha=frangi_alpha, beta=frangi_beta, gamma=frangi_gamma, black_ridges=black_ridges, mode='reflect')
         sato_result_2d = sato(slice_data, sigmas=sigmas_voxel_2d, black_ridges=black_ridges, mode='reflect')
@@ -75,188 +103,147 @@ def _process_slice_worker(z, input_memmap_info, output_memmap_info,
         return None
     except Exception as e:
         print(f"ERROR in worker processing slice {z}: {e}")
-        import traceback; traceback.print_exc(); return f"Error_slice_{z}"
+        traceback.print_exc(); return f"Error_slice_{z}"
 
+# +++ START: REFACTORED ENHANCEMENT FUNCTION WITH ORIGINAL SIGNATURE +++
 def enhance_tubular_structures_slice_by_slice(
     volume, scales, spacing, black_ridges=False,
     frangi_alpha=0.5, frangi_beta=0.5, frangi_gamma=15,
     apply_3d_smoothing=True, smoothing_sigma_phys=0.5,
     ram_safety_factor=0.8, mem_factor_per_slice=8.0,
-    skip_tubular_enhancement=False # New parameter
+    skip_tubular_enhancement=False
 ):
     """
-    Enhance tubular structures slice-by-slice in parallel, or skip if requested.
-    Returns a MEMMAP object, its path, and the directory containing it.
-    The output memmap will always be float32.
+    Enhance tubular structures slice-by-slice, now with memory-safe Dask smoothing.
+    The function signature is identical to the original script.
     """
-    if skip_tubular_enhancement:
-        print(f"Skipping tubular structure enhancement as per request.")
-    # Initial message for enhancement moved to the 'else' block for skip_tubular_enhancement
-
     print(f"  Volume shape: {volume.shape}, Spacing: {spacing}")
-    print(f"  Initial memory usage: {psutil.Process().memory_info().rss / (1024 * 1024):.2f} MB")
-    spacing = tuple(float(s) for s in spacing); volume_shape = volume.shape
-    slice_shape = volume_shape[1:]; num_slices = volume_shape[0]; xy_spacing = spacing[1:]
+    volume_shape = volume.shape
+    num_slices = volume_shape[0]
     
-    input_volume_memmap = None # This will point to the data to be processed (or copied)
-    input_memmap_path = None   # Path to input_volume_memmap's data file
-    input_memmap_dir_local = None # Directory if input_volume_memmap is a local temp copy/smooth
-    temp_dirs_created_internally = [] # Tracks dirs made by this func for internal data
-
-    # --- Step 1: Prepare input_volume_memmap (ensuring it's float32 and a memmap) ---
+    # This list tracks temporary directories created inside this function
+    internal_temp_dirs = []
+    
+    # --- Step 1: Prepare input volume (Smoothing or Copying) ---
+    # This will be the input for the enhancement step.
+    enhancement_input_memmap = None
+    
     if apply_3d_smoothing and smoothing_sigma_phys > 0:
-        print(f"Applying initial 3D smoothing (output to float32 memmap)...")
-        sigma_voxel_3d = tuple(smoothing_sigma_phys / s if s > 0 else 0 for s in spacing) # Avoid div by zero
-        input_memmap_dir_local = tempfile.mkdtemp(prefix="pre_smooth_")
-        temp_dirs_created_internally.append(input_memmap_dir_local)
-        smooth_path = os.path.join(input_memmap_dir_local, 'smoothed_3d.dat')
-        smoothed_dtype = np.float32
-        input_volume_memmap = np.memmap(smooth_path, dtype=smoothed_dtype, mode='w+', shape=volume_shape)
-        input_memmap_path = smooth_path
-
-        chunk_size_z_smooth = min(50, volume_shape[0]) if volume_shape[0] > 0 else 1
-        overlap_z_smooth = math.ceil(3 * sigma_voxel_3d[0]) if sigma_voxel_3d[0] > 0 else 0
-
-        for i in tqdm(range(0, volume_shape[0], chunk_size_z_smooth), desc="3D Pre-Smoothing"):
-            start_read = max(0, i - overlap_z_smooth)
-            end_read = min(volume_shape[0], i + chunk_size_z_smooth + overlap_z_smooth)
-            start_write = i; end_write = min(volume_shape[0], i + chunk_size_z_smooth)
-            local_write_start = start_write - start_read; local_write_end = end_write - start_read
-            
-            if start_read >= end_read or local_write_start >= local_write_end : continue
-            
-            chunk = volume[start_read:end_read].astype(smoothed_dtype).copy()
-            smoothed_chunk = gaussian_filter(chunk, sigma=sigma_voxel_3d, mode='reflect')
-            input_volume_memmap[start_write:end_write, :, :] = smoothed_chunk[local_write_start:local_write_end, :, :]
-            del chunk, smoothed_chunk; gc.collect()
-        input_volume_memmap.flush()
-        print(f"  3D pre-smoothing to float32 memmap done.")
+        # Use the new Dask-based smoothing function
+        smoothed_memmap, temp_dir = _smooth_volume_dask_internal(volume, spacing, smoothing_sigma_phys)
+        enhancement_input_memmap = smoothed_memmap
+        internal_temp_dirs.append(temp_dir)
     else:
-        print("  Skipping initial 3D smoothing.")
-        if isinstance(volume, np.memmap) and volume.dtype == np.float32:
-            print("  Input is already a float32 memmap. Using it directly.")
-            input_volume_memmap = volume
-            input_memmap_path = volume.filename
-            # input_memmap_dir_local remains None
-        else:
-            dtype_msg = f"memmap of dtype {volume.dtype}" if isinstance(volume, np.memmap) else f"numpy array of dtype {volume.dtype}"
-            print(f"  Input is {dtype_msg}. Converting to a new temporary float32 memmap...")
-            input_memmap_dir_local = tempfile.mkdtemp(prefix="input_float32_copy_")
-            temp_dirs_created_internally.append(input_memmap_dir_local)
-            _temp_input_path = os.path.join(input_memmap_dir_local, 'input_float32.dat')
-            input_volume_memmap = np.memmap(_temp_input_path, dtype=np.float32, mode='w+', shape=volume.shape)
-            input_memmap_path = _temp_input_path
+        print("  Skipping initial 3D smoothing. Creating a float32 memmap copy.")
+        # Create a float32 copy if no smoothing is done, as subsequent steps expect it.
+        temp_dir = tempfile.mkdtemp(prefix="input_copy_")
+        path = os.path.join(temp_dir, 'input_copy.dat')
+        memmap_copy = np.memmap(path, dtype=np.float32, mode='w+', shape=volume.shape)
+        # Copy chunk by chunk to be safe
+        for i in tqdm(range(0, volume.shape[0], 100), desc="Copying to float32 memmap"):
+            end = min(i + 100, volume.shape[0])
+            memmap_copy[i:end] = volume[i:end].astype(np.float32)
+        memmap_copy.flush()
+        enhancement_input_memmap = memmap_copy
+        internal_temp_dirs.append(temp_dir)
 
-            chunk_size_copy = min(100, volume.shape[0]) if volume.shape[0] > 0 else 1
-            for i_chunk in tqdm(range(0, volume.shape[0], chunk_size_copy), desc="Copying input to float32 memmap"):
-                end_chunk = min(i_chunk + chunk_size_copy, volume.shape[0])
-                input_volume_memmap[i_chunk:end_chunk] = volume[i_chunk:end_chunk].astype(np.float32)
-            input_volume_memmap.flush()
-            print("  Input copied to float32 memmap.")
-
-    # --- Step 2: Prepare Output Memmap ---
+    # --- Step 2: Perform Enhancement or just copy the smoothed/prepared data ---
     output_temp_dir = tempfile.mkdtemp(prefix='tubular_output_')
     output_path = os.path.join(output_temp_dir, 'processed_volume.dat')
-    output_dtype = np.float32
-    output_memmap = np.memmap(output_path, dtype=output_dtype, mode='w+', shape=volume_shape)
-    print(f"  Output memmap created: {output_path}")
+    output_memmap = np.memmap(output_path, dtype=np.float32, mode='w+', shape=volume_shape)
 
-    # --- Step 3: Perform Enhancement or Copy ---
     if skip_tubular_enhancement:
-        print("  Copying (potentially smoothed) input to output memmap as enhancement is skipped.")
-        chunk_size_copy = min(100, volume_shape[0]) if volume_shape[0] > 0 else 1
-        for i in tqdm(range(0, volume_shape[0], chunk_size_copy), desc="Copying to output (skip enhancement)"):
-            start_idx = i; end_idx = min(i + chunk_size_copy, volume_shape[0])
-            chunk_data = input_volume_memmap[start_idx:end_idx] # Already float32
-            output_memmap[start_idx:end_idx] = chunk_data
-            del chunk_data; gc.collect()
+        print("  Skipping tubular structure enhancement as requested.")
+        for i in tqdm(range(0, volume_shape[0], 100), desc="Copying (enhancement skipped)"):
+            end = min(i + 100, volume_shape[0])
+            output_memmap[i:end] = enhancement_input_memmap[i:end]
         output_memmap.flush()
-        print("  Copying finished.")
     else:
-        print(f"Starting slice-by-slice (2.5D) tubular enhancement with PARALLEL processing...")
-        print(f"  xy spacing is: {xy_spacing}, scales: {scales}")
-        avg_xy_spacing = np.mean(xy_spacing); sigmas_voxel_2d = sorted([s / avg_xy_spacing for s in scales])
+        print(f"Starting slice-by-slice (2.5D) tubular enhancement...")
+        xy_spacing = tuple(float(s) for s in spacing)[1:]
+        avg_xy_spacing = np.mean(xy_spacing)
+        sigmas_voxel_2d = sorted([s / avg_xy_spacing for s in scales])
         print(f"  Using 2D voxel sigmas: {sigmas_voxel_2d}")
         
         try:
             total_cores = os.cpu_count()
-            # Try to leave at least 1 or 2 cores free for system stability
-            max_cpu_workers = max(1, total_cores - 2 if total_cores > 2 else (total_cores - 1 if total_cores > 1 else 1))
-            available_ram = psutil.virtual_memory().available; usable_ram = available_ram * ram_safety_factor
-            input_dtype_bytes = np.dtype(input_volume_memmap.dtype).itemsize # Should be float32
-            slice_mem_bytes = slice_shape[0] * slice_shape[1] * input_dtype_bytes
-            estimated_worker_ram = slice_mem_bytes * mem_factor_per_slice
-            if estimated_worker_ram <= 0: estimated_worker_ram = 1024 * 1024 # Min 1MB safeguard
-            max_mem_workers = max(1, int(usable_ram // estimated_worker_ram)) if estimated_worker_ram > 0 else 1
-            num_workers = min(max_cpu_workers, max_mem_workers, num_slices)
-            print(f"  Resource Check: Total Cores={total_cores} (using {num_workers}), Avail RAM={available_ram / (1024**3):.2f}GB, Usable RAM={usable_ram / (1024**3):.2f}GB")
-            print(f"  Est. RAM/worker={estimated_worker_ram / (1024**2):.2f}MB -> Max RAM Workers={max_mem_workers}")
-        except Exception as e:
-            print(f"  Warning: Could not determine resources automatically ({e}). Defaulting to 1 worker."); num_workers = 1
+            num_workers = max(1, total_cores - 2 if total_cores > 2 else 1)
+        except Exception:
+            num_workers = 1
 
         start_time = time.time()
         try:
-            input_info = (input_memmap_path, input_volume_memmap.shape, input_volume_memmap.dtype)
-            output_info = (output_path, output_memmap.shape, output_dtype)
-            worker_func_partial = partial(_process_slice_worker, input_memmap_info=input_info, output_memmap_info=output_info, sigmas_voxel_2d=sigmas_voxel_2d, black_ridges=black_ridges, frangi_alpha=frangi_alpha, frangi_beta=frangi_beta, frangi_gamma=frangi_gamma)
-            print(f"Processing {num_slices} slices using {num_workers} workers...")
+            input_info = (enhancement_input_memmap.filename, enhancement_input_memmap.shape, enhancement_input_memmap.dtype)
+            output_info = (output_path, output_memmap.shape, output_memmap.dtype)
+            worker_func = partial(_process_slice_worker, input_memmap_info=input_info, output_memmap_info=output_info, sigmas_voxel_2d=sigmas_voxel_2d, black_ridges=black_ridges, frangi_alpha=frangi_alpha, frangi_beta=frangi_beta, frangi_gamma=frangi_gamma)
+            
             with Pool(processes=num_workers) as pool:
-                results = list(tqdm(pool.imap_unordered(worker_func_partial, range(num_slices)), total=num_slices, desc="Applying 2D Filters (Parallel)"))
-            errors = [r for r in results if isinstance(r, str) and r.startswith("Error_slice_")]
-            if errors: print(f"\n!!! Encountered {len(errors)} errors during parallel processing: {errors[:5]}"); raise RuntimeError(f"Parallel slice processing failed: {errors}")
+                results = list(tqdm(pool.imap_unordered(worker_func, range(num_slices)), total=num_slices, desc="Applying 2D Filters (Parallel)"))
+            
+            errors = [r for r in results if r is not None]
+            if errors:
+                raise RuntimeError(f"Parallel slice processing failed: {errors}")
             print(f"Parallel processing finished in {time.time() - start_time:.2f} seconds.")
         except Exception as e:
-            print(f"An error occurred during parallel processing: {e}"); import traceback; traceback.print_exc(); raise
+            print(f"An error occurred during parallel processing: {e}"); traceback.print_exc(); raise
 
-    # --- Step 4: Cleanup and Return ---
-    if input_volume_memmap is not None:
-        if hasattr(input_volume_memmap, '_mmap') and input_volume_memmap._mmap is not None:
-            input_volume_memmap.flush()
-            if input_memmap_dir_local is not None: # It's a temp memmap created here, del Python object
-                 del input_volume_memmap
-            # else: input_volume_memmap was the original 'volume' passed in, don't del its Python object.
-        gc.collect()
-
-    for d_path in temp_dirs_created_internally:
+    # --- Step 3: Cleanup and Return ---
+    # Clean up the intermediate smoothed/copied data
+    del enhancement_input_memmap; gc.collect()
+    for d_path in internal_temp_dirs:
         if d_path and os.path.exists(d_path):
-            print(f"Cleaning up temporary internal directory: {d_path}")
-            try: rmtree(d_path, ignore_errors=True)
-            except Exception as e: print(f"Warning: Could not delete temp internal directory {d_path}: {e}")
-    temp_dirs_created_internally.clear()
+            rmtree(d_path, ignore_errors=True)
 
-    if skip_tubular_enhancement:
-        print(f"Skipped enhancement. Output memmap (copy of input/smoothed): {output_path}")
-    else:
-        print(f"Enhanced volume generated as memmap: {output_path}")
-    print(f"Memory usage after enhance function (before returning memmap): {psutil.Process().memory_info().rss / (1024 * 1024):.2f} MB")
+    print(f"Enhanced volume generated as memmap: {output_path}")
     return output_memmap, output_path, output_temp_dir
+# +++ END: REFACTORED ENHANCEMENT FUNCTION +++
 
-# Connection function (remains the same with minor robustness improvement)
-def connect_fragmented_processes(binary_mask, spacing, max_gap_physical=1.0):
-    """Connect fragmented processes using anisotropic morphological closing."""
-    print(f"Connecting fragmented processes with max physical gap: {max_gap_physical}")
-    print(f"  Input mask shape: {binary_mask.shape}, Spacing: {spacing}")
-    radius_vox = [math.ceil((max_gap_physical / 2) / s) if s > 1e-9 else 0 for s in spacing] # Avoid div by zero/small
+
+def connect_fragmented_processes_dask(binary_dask_array, spacing, max_gap_physical=1.0):
+    """Connect fragmented processes using Dask for memory-efficient morphological closing."""
+    print(f"Connecting fragmented processes with max physical gap: {max_gap_physical} using Dask.")
+    radius_vox = [math.ceil((max_gap_physical / 2) / s) if s > 1e-9 else 0 for s in spacing]
     structure_shape = tuple(max(1, 2 * r + 1) for r in radius_vox)
-    print(f"  Calculated anisotropic structure shape (voxels): {structure_shape}")
-    
     if all(s == 1 for s in structure_shape):
-        print("  Warning: Structure shape is all ones. Binary closing will likely have no effect. Check max_gap_physical and spacing.")
-
+        print("  Warning: Structure shape is all ones. Binary closing will have no effect.")
+        return binary_dask_array
     structure = np.ones(structure_shape, dtype=bool)
-    temp_dir = tempfile.mkdtemp(prefix="connect_frag_")
-    result_path = os.path.join(temp_dir, 'connected_mask.dat')
-    connected_mask = np.memmap(result_path, dtype=np.bool_, mode='w+', shape=binary_mask.shape)
-    print("  Applying anisotropic binary closing...")
-    start_time = time.time()
-    try:
-        ndimage.binary_closing(binary_mask, structure=structure, output=connected_mask, border_value=0)
-        connected_mask.flush(); print(f"  Binary closing completed in {time.time() - start_time:.2f} seconds.")
-    except MemoryError: print("  MemoryError during binary closing."); del connected_mask; gc.collect(); rmtree(temp_dir); raise MemoryError("Failed binary closing.") from None
-    except Exception as e: print(f"  Error during binary closing: {e}"); del connected_mask; gc.collect(); rmtree(temp_dir); raise e
-    return connected_mask, temp_dir
+    print("  Applying Dask anisotropic binary closing...")
+    return dask_image.ndmorph.binary_closing(binary_dask_array, structure=structure)
 
-# === Function for Raw Segmentation (Steps 1-6) Modified ===
+def remove_small_objects_dask(binary_dask_array, min_size_voxels):
+    """Remove small objects from a binary Dask array in a memory-efficient way."""
+    if min_size_voxels <= 1:
+        return binary_dask_array
+    print(f"  Removing objects smaller than {min_size_voxels} voxels using Dask.")
+    s = generate_binary_structure(binary_dask_array.ndim, 1)
+    labeled_array, num_features = dask_image.ndmeasure.label(binary_dask_array, structure=s)
+    
+    print("  Calculating number of features...")
+    # Corrected ProgressBar call
+    with ProgressBar():
+        num_features = num_features.compute()
+    print(f"  Found {num_features} initial objects.")
+    if num_features == 0:
+        return binary_dask_array
+
+    print("  Calculating sizes of all objects...")
+    # Corrected ProgressBar call
+    with ProgressBar():
+        bins = np.arange(num_features + 2)
+        object_sizes, _ = da.histogram(labeled_array, bins=bins)
+        object_sizes = object_sizes.compute()
+    
+    small_objects_labels = np.where(object_sizes[1:] < min_size_voxels)[0] + 1
+    if small_objects_labels.size == 0:
+        print("  No small objects to remove.")
+        return binary_dask_array
+    print(f"  Found {len(small_objects_labels)} small objects to remove.")
+    small_objects_mask = da.isin(labeled_array, small_objects_labels)
+    return da.where(small_objects_mask, False, binary_dask_array)
+
+
+# === Main Function for Raw Segmentation (Unchanged Call Signature) ===
 def segment_cells_first_pass_raw(
     volume, # Original intensity volume
     spacing,
@@ -266,28 +253,11 @@ def segment_cells_first_pass_raw(
     min_size_voxels=50,
     low_threshold_percentile=25.0,
     high_threshold_percentile=95.0,
-    skip_tubular_enhancement=False # New parameter
+    skip_tubular_enhancement=False
     ):
-    """
-    Performs initial segmentation steps 1-6 (Enhance or Skip, Normalize, Threshold,
-    Connect, Clean, Label) without edge trimming. Uses memmaps.
-
-    Returns:
-    --------
-    labels_path : str
-        Path to the final labeled segmentation memmap file.
-    labels_temp_dir : str
-        Path to the temporary directory containing the labels memmap.
-    segmentation_threshold : float
-        The calculated absolute threshold used for segmentation.
-    first_pass_params : dict
-        Dictionary containing parameters used.
-    """
-    low_threshold_percentile = max(0.0, min(100.0, low_threshold_percentile))
-    high_threshold_percentile = max(0.0, min(100.0, high_threshold_percentile))
 
     original_shape = volume.shape
-    spacing_float = tuple(float(s) for s in spacing) # Ensure spacing is float tuple
+    spacing_float = tuple(float(s) for s in spacing)
     first_pass_params = {
         'spacing': spacing_float, 'tubular_scales': tubular_scales, 'smooth_sigma': smooth_sigma,
         'connect_max_gap_physical': connect_max_gap_physical, 'min_size_voxels': min_size_voxels,
@@ -295,10 +265,9 @@ def segment_cells_first_pass_raw(
         'high_threshold_percentile': high_threshold_percentile,
         'original_shape': original_shape,
         'skip_tubular_enhancement': skip_tubular_enhancement
-        }
+    }
+    
     print(f"\n--- Starting Raw First Pass Segmentation ---")
-    if skip_tubular_enhancement:
-        print("NOTE: Tubular enhancement step will be SKIPPED.")
     initial_mem = psutil.Process().memory_info().rss / (1024 * 1024)
     print(f"Initial memory usage: {initial_mem:.2f} MB")
 
@@ -307,192 +276,154 @@ def segment_cells_first_pass_raw(
 
     try:
         # --- Step 1: Enhance (or skip) ---
-        step1_input_description = "(potentially smoothed) input" if skip_tubular_enhancement else "enhanced structures"
-        print(f"\nStep 1: Preparing {step1_input_description}...")
-
+        print(f"\nStep 1: Preparing processed input volume...")
         processed_input_memmap, processed_input_path, processed_input_temp_dir = enhance_tubular_structures_slice_by_slice(
-            volume, scales=tubular_scales, spacing=spacing_float, # Use spacing_float
+            volume, scales=tubular_scales, spacing=spacing_float,
             apply_3d_smoothing=(smooth_sigma > 0), smoothing_sigma_phys=smooth_sigma,
             skip_tubular_enhancement=skip_tubular_enhancement
         )
         memmap_registry['processed_input'] = (processed_input_memmap, processed_input_path, processed_input_temp_dir)
-        print(f"Step 1 output ('{step1_input_description}') memmap created: {processed_input_path}")
+        print(f"Step 1 output memmap created: {processed_input_path}")
         gc.collect()
 
         # --- Step 2: Normalize ---
-        current_processed_input_memmap = memmap_registry['processed_input'][0]
         print("\nStep 2: Normalizing signal...")
         normalized_temp_dir = tempfile.mkdtemp(prefix="normalize_")
         normalized_path = os.path.join(normalized_temp_dir, 'normalized.dat')
-        normalized_memmap = np.memmap(normalized_path, dtype=np.float32, mode='w+', shape=current_processed_input_memmap.shape)
+        normalized_memmap = np.memmap(normalized_path, dtype=np.float32, mode='w+', shape=original_shape)
         memmap_registry['normalized'] = (normalized_memmap, normalized_path, normalized_temp_dir)
         
+        # This normalization logic is already chunked and safe.
         z_high_percentile_values = []
         target_intensity = 1.0
-        chunk_size_norm_read = min(50, current_processed_input_memmap.shape[0]) if current_processed_input_memmap.shape[0] > 0 else 1
-        for z_start in tqdm(range(0, current_processed_input_memmap.shape[0], chunk_size_norm_read), desc="  Calc z-stats"):
-            z_end = min(z_start + chunk_size_norm_read, current_processed_input_memmap.shape[0])
-            if z_start >= z_end: continue
-            
-            current_chunk = current_processed_input_memmap[z_start:z_end]
-            finite_chunk_values = current_chunk[np.isfinite(current_chunk)] # For overall check
-            
-            if finite_chunk_values.size == 0: # All values in chunk are NaN/inf
-                 for z_idx in range(z_start, z_end): z_high_percentile_values.append((z_idx, 0.0))
-                 del current_chunk; gc.collect()
-                 continue
-            
-            for i_slice, z_val in enumerate(range(z_start, z_end)):
-                plane = current_chunk[i_slice]
+        for z_start in tqdm(range(0, original_shape[0], 50), desc="  Calc z-stats"):
+            chunk = processed_input_memmap[z_start:z_start+50]
+            for i_slice, z_val in enumerate(range(z_start, z_start + chunk.shape[0])):
+                plane = chunk[i_slice]
                 finite_plane_values = plane[np.isfinite(plane)].ravel()
                 if finite_plane_values.size == 0:
                     z_high_percentile_values.append((z_val, 0.0))
                     continue
-                
                 samples_count = min(100000, finite_plane_values.size)
-                # Ensure random.choice gets a non-empty array if samples_count is 0
                 samples = np.random.choice(finite_plane_values, samples_count, replace=False) if samples_count > 0 else np.array([])
-                
-                try:
-                    high_perc_value = np.percentile(samples, high_threshold_percentile) if samples.size > 0 else 0.0
-                except IndexError: # Should be rare if samples.size check is done
-                    high_perc_value = 0.0
-                
+                high_perc_value = np.percentile(samples, high_threshold_percentile) if samples.size > 0 else 0.0
                 if not np.isfinite(high_perc_value): high_perc_value = 0.0
                 z_high_percentile_values.append((z_val, float(high_perc_value)))
-            del current_chunk, finite_chunk_values; gc.collect()
-
         z_stats_dict = dict(z_high_percentile_values)
-        chunk_size_norm_write = min(50, current_processed_input_memmap.shape[0]) if current_processed_input_memmap.shape[0] > 0 else 1
-        for z_start in tqdm(range(0, current_processed_input_memmap.shape[0], chunk_size_norm_write), desc="  Normalize z-planes"):
-             z_end = min(z_start + chunk_size_norm_write, current_processed_input_memmap.shape[0])
-             if z_start >= z_end: continue
-
-             current_chunk_to_normalize = current_processed_input_memmap[z_start:z_end]
-             normalized_chunk_data = np.zeros_like(current_chunk_to_normalize, dtype=np.float32)
-             for i_slice, z_val in enumerate(range(z_start, z_end)):
-                 current_slice_data = current_chunk_to_normalize[i_slice]
-                 high_perc_value = z_stats_dict.get(z_val, 0.0)
-                 
-                 if not np.any(np.isfinite(current_slice_data)): # If slice is all NaN/inf
-                     normalized_chunk_data[i_slice] = 0.0
-                     continue
-                 
-                 if high_perc_value > 1e-9: # Use a small epsilon for division
-                     scale_factor = target_intensity / high_perc_value
-                     normalized_chunk_data[i_slice] = (current_slice_data * scale_factor).astype(np.float32)
+        for z_start in tqdm(range(0, original_shape[0], 50), desc="  Normalize z-planes"):
+             chunk_to_normalize = processed_input_memmap[z_start:z_start+50]
+             normalized_chunk = np.zeros_like(chunk_to_normalize, dtype=np.float32)
+             for i, z_val in enumerate(range(z_start, z_start + chunk_to_normalize.shape[0])):
+                 high_perc = z_stats_dict.get(z_val, 0.0)
+                 if high_perc > 1e-9:
+                     normalized_chunk[i] = (chunk_to_normalize[i] * (target_intensity / high_perc)).astype(np.float32)
                  else:
-                     normalized_chunk_data[i_slice] = current_slice_data.astype(np.float32) # Already float32
-             normalized_memmap[z_start:z_end] = normalized_chunk_data
-             del current_chunk_to_normalize, normalized_chunk_data; gc.collect()
-        normalized_memmap.flush(); print("Normalization finished.")
-        name = 'processed_input'; mm, p, d = memmap_registry.pop(name); del mm; gc.collect(); os.unlink(p); rmtree(d, ignore_errors=True)
+                     normalized_chunk[i] = chunk_to_normalize[i]
+             normalized_memmap[z_start:z_start+50] = normalized_chunk
+        normalized_memmap.flush()
+        del memmap_registry['processed_input']; gc.collect(); rmtree(processed_input_temp_dir, ignore_errors=True)
 
-        # --- Step 3: Thresholding & Calc Thresholds ---
-        print("\nStep 3: Thresholding and Calculating Thresholds...")
+        # --- Step 3: Thresholding ---
+        print("\nStep 3: Thresholding...")
         binary_temp_dir = tempfile.mkdtemp(prefix="binary_")
         binary_path = os.path.join(binary_temp_dir, 'b.dat')
         binary_memmap = np.memmap(binary_path, dtype=bool, mode='w+', shape=original_shape)
         memmap_registry['binary'] = (binary_memmap, binary_path, binary_temp_dir)
         
-        sample_size = min(5_000_000, normalized_memmap.size)
-        collected_count = 0;
-        chunk_size_thresh_sample = min(200, normalized_memmap.shape[0]) if normalized_memmap.shape[0] > 0 else 1
-        indices_z = np.arange(normalized_memmap.shape[0]); np.random.shuffle(indices_z)
+        # +++ START: REVERTED TO ROBUST, MEMORY-SAFE MANUAL SAMPLING +++
+        print("  Sampling for threshold using memory-safe manual chunks...")
+        sample_size_target = 5_000_000
         all_samples_list = []
-
-        for z_start_idx_loop in tqdm(range(0, len(indices_z), chunk_size_thresh_sample), desc="  Sampling Norm. Vol."):
-            if collected_count >= sample_size: break
-            z_indices_chunk = indices_z[z_start_idx_loop : z_start_idx_loop + chunk_size_thresh_sample]
-            if not z_indices_chunk.size: continue
-
-            slices_data = normalized_memmap[z_indices_chunk, :, :]
-            finite_samples_in_chunk = slices_data[np.isfinite(slices_data)].ravel()
+        collected_count = 0
+        
+        # Get a random order of slices to read
+        z_indices = np.arange(original_shape[0])
+        np.random.shuffle(z_indices)
+        
+        # Read a small number of random slices at a time
+        slices_per_chunk = 20 
+        
+        for i in tqdm(range(0, len(z_indices), slices_per_chunk), desc="  Sampling Norm. Vol."):
+            if collected_count >= sample_size_target:
+                break
+            
+            # Get the indices for this chunk of random slices
+            z_chunk_indices = z_indices[i:i + slices_per_chunk]
+            
+            # Load only these slices into memory
+            slices_data = normalized_memmap[z_chunk_indices, :, :]
+            
+            # Take only finite values
+            finite_values = slices_data[np.isfinite(slices_data)].ravel()
             del slices_data; gc.collect()
 
-            samples_to_take_this_round = min(len(finite_samples_in_chunk), sample_size - collected_count)
-            if samples_to_take_this_round > 0:
-                chosen_samples = np.random.choice(finite_samples_in_chunk, samples_to_take_this_round, replace=False)
+            if finite_values.size > 0:
+                samples_to_take = min(len(finite_values), sample_size_target - collected_count)
+                chosen_samples = np.random.choice(finite_values, samples_to_take, replace=False)
                 all_samples_list.append(chosen_samples)
-                collected_count += samples_to_take_this_round
-            del finite_samples_in_chunk; gc.collect()
-        
+                collected_count += len(chosen_samples)
+            
+            del finite_values; gc.collect()
+
         if all_samples_list:
-            all_samples_np = np.concatenate(all_samples_list); del all_samples_list; gc.collect()
+            all_samples_np = np.concatenate(all_samples_list)
+            del all_samples_list; gc.collect()
             if all_samples_np.size > 0:
-                 try: segmentation_threshold = float(np.percentile(all_samples_np, low_threshold_percentile))
-                 except IndexError:
-                    print(" Warn: No valid samples for threshold calculation (IndexError). Defaulting to 0.0."); segmentation_threshold = 0.0
-            else: print(" Warn: No samples for threshold after concatenation. Defaulting to 0.0."); segmentation_threshold = 0.0
-            if 'all_samples_np' in locals(): del all_samples_np; gc.collect()
-        else: print(" Warn: No samples collected for thresholding. Defaulting to 0.0."); segmentation_threshold = 0.0
-        print(f"  Segmentation threshold ({low_threshold_percentile:.1f} perc): {segmentation_threshold:.4f}")
-
-        chunk_size_thresh_apply = min(100, original_shape[0]) if original_shape[0] > 0 else 1
-        for i_thresh in tqdm(range(0, original_shape[0], chunk_size_thresh_apply), desc="  Applying Threshold"):
-             end_idx_thresh = min(i_thresh + chunk_size_thresh_apply, original_shape[0])
-             if i_thresh >= end_idx_thresh: continue
-             if hasattr(normalized_memmap, '_mmap') and normalized_memmap._mmap is not None:
-                  norm_chunk = normalized_memmap[i_thresh:end_idx_thresh]
-                  binary_memmap[i_thresh:end_idx_thresh] = norm_chunk > segmentation_threshold
-                  del norm_chunk; gc.collect()
-             else:
-                  print(f"Error: 'normalized' memmap closed or invalid during thresholding chunk {i_thresh}. Filling with False.");
-                  binary_memmap[i_thresh:end_idx_thresh] = False
-        binary_memmap.flush(); print("Thresholding done.")
-        name = 'normalized'; mm, p, d = memmap_registry.pop(name); del mm; gc.collect(); os.unlink(p); rmtree(d, ignore_errors=True)
-
-        # --- Step 4: Connect ---
-        print("\nStep 4: Connecting fragments...")
-        connected_binary_memmap, connected_temp_dir = connect_fragmented_processes(
-            binary_memmap, spacing=spacing_float, max_gap_physical=connect_max_gap_physical # Use spacing_float
-        )
-        memmap_registry['connected'] = (connected_binary_memmap, connected_binary_memmap.filename, connected_temp_dir)
-        print("Connection memmap created.")
-        name = 'binary'; mm, p, d = memmap_registry.pop(name); del mm; gc.collect(); os.unlink(p); rmtree(d, ignore_errors=True)
-
-        # --- Step 5: Clean Small Objects ---
-        print(f"\nStep 5: Cleaning objects < {min_size_voxels} voxels...")
-        cleaned_binary_dir=tempfile.mkdtemp(prefix="cleaned_")
-        cleaned_binary_path=os.path.join(cleaned_binary_dir, 'c.dat')
-        cleaned_binary_memmap=np.memmap(cleaned_binary_path, dtype=bool, mode='w+', shape=original_shape)
-        memmap_registry['cleaned'] = (cleaned_binary_memmap, cleaned_binary_path, cleaned_binary_dir)
+                segmentation_threshold = float(np.percentile(all_samples_np, low_threshold_percentile))
+            else:
+                segmentation_threshold = 0.0
+            del all_samples_np; gc.collect()
+        else:
+            segmentation_threshold = 0.0
         
-        connected_memmap_obj = memmap_registry['connected'][0]
-        try:
-            print("  Attempting to load connected mask into memory for small object removal.")
-            connected_in_memory = np.array(connected_memmap_obj)
-            print(f"  Connected mask loaded ({connected_in_memory.nbytes / 1024**2:.2f} MB). Removing small objects.")
-            remove_small_objects(connected_in_memory, min_size=min_size_voxels, connectivity=1, out=cleaned_binary_memmap)
-            del connected_in_memory; gc.collect()
-            print("  Small object removal from in-memory array complete, written to memmap.")
-        except MemoryError:
-            print("  MemoryError loading full connected mask. Fallback: Copying connected mask (small object removal skipped).")
-            chunk_size_copy_clean = min(100, original_shape[0]) if original_shape[0] > 0 else 1
-            for i_clean in tqdm(range(0, original_shape[0], chunk_size_copy_clean), desc="  Copying Connected (MemFallback)"):
-                start_idx_clean = i_clean; end_idx_clean = min(i_clean + chunk_size_copy_clean, original_shape[0])
-                if start_idx_clean >= end_idx_clean: continue
-                cleaned_binary_memmap[start_idx_clean:end_idx_clean] = connected_memmap_obj[start_idx_clean:end_idx_clean]
-        cleaned_binary_memmap.flush(); print("Cleaning step done.")
-        name = 'connected'; mm, p, d = memmap_registry.pop(name); del mm; gc.collect(); os.unlink(p); rmtree(d, ignore_errors=True)
+        print(f"  Segmentation threshold ({low_threshold_percentile:.1f} perc): {segmentation_threshold:.4f}")
+        # +++ END: REVERTED SAMPLING LOGIC +++
+        
+        # Memory-safe thresholding loop
+        for i_thresh in tqdm(range(0, original_shape[0], 100), desc="  Applying Threshold"):
+             end_idx_thresh = min(i_thresh + 100, original_shape[0])
+             norm_chunk = normalized_memmap[i_thresh:end_idx_thresh]
+             for i in range(norm_chunk.shape[0]):
+                 binary_memmap[i_thresh + i, :, :] = norm_chunk[i, :, :] > segmentation_threshold
+        binary_memmap.flush()
+        del memmap_registry['normalized']; gc.collect(); rmtree(normalized_temp_dir, ignore_errors=True)
 
-        # --- Step 6: Label ---
-        print("\nStep 6: Labeling components...")
+        # --- Steps 4, 5, 6 with Dask/Zarr (Unchanged) ---
+        dask_chunk_size = (64, 256, 256)
+        binary_dask_array = da.from_array(binary_memmap, chunks=dask_chunk_size)
+        
+        print("\nStep 4: Connecting fragments (Dask)...")
+        connected_dask_array = connect_fragmented_processes_dask(binary_dask_array, spacing_float, connect_max_gap_physical)
+        
+        print(f"\nStep 5: Cleaning objects < {min_size_voxels} voxels (Dask)...")
+        cleaned_dask_array = remove_small_objects_dask(connected_dask_array, min_size_voxels)
+        
+        print("\nStep 6: Labeling components (Dask)...")
+        s = generate_binary_structure(cleaned_dask_array.ndim, 1)
+        labeled_dask_array, num_features_dask = dask_image.ndmeasure.label(cleaned_dask_array, structure=s)
+        
         labels_temp_dir = tempfile.mkdtemp(prefix="labels_")
         labels_path = os.path.join(labels_temp_dir, 'l.dat')
-        first_pass_segmentation_memmap=np.memmap(labels_path, dtype=np.int32, mode='w+', shape=original_shape)
+        temp_zarr_path = os.path.join(labels_temp_dir, 'temp_labels.zarr')
         
-        cleaned_memmap_obj = memmap_registry['cleaned'][0]
-        print("  Applying ndimage.label directly to memmap...")
-        num_features = ndimage.label(cleaned_memmap_obj, structure=generate_binary_structure(3, 1), output=first_pass_segmentation_memmap)
-        first_pass_segmentation_memmap.flush()
-        print(f"Labeling done ({num_features} features found). Output memmap: {labels_path}")
-        del first_pass_segmentation_memmap; gc.collect()
-        name = 'cleaned'; mm, p, d = memmap_registry.pop(name); del mm; gc.collect(); os.unlink(p); rmtree(d, ignore_errors=True)
+        print(f"  Computing and storing result to temporary Zarr store: {temp_zarr_path}")
+        with ProgressBar():
+            labeled_dask_array.to_zarr(temp_zarr_path, overwrite=True)
+        
+        print("  Copying Zarr to final memmap file.")
+        final_labels_memmap = np.memmap(labels_path, dtype=np.int32, mode='w+', shape=original_shape)
+        zarr_array = zarr.open(temp_zarr_path, mode='r')
+        for i in tqdm(range(0, original_shape[0], 50), desc="  Copying Zarr to Memmap"):
+            start, end = i, min(i + 50, original_shape[0])
+            final_labels_memmap[start:end, :, :] = zarr_array[start:end, :, :]
+        final_labels_memmap.flush()
+        
+        rmtree(temp_zarr_path)
+        with ProgressBar():
+            num_features = num_features_dask.compute()
+        print(f"Labeling done ({num_features} features found).")
 
         print(f"\n--- Raw First Pass Segmentation Finished ---")
-        final_mem = psutil.Process().memory_info().rss / (1024 * 1024)
-        print(f"Final memory usage: {final_mem:.2f} MB")
         return labels_path, labels_temp_dir, segmentation_threshold, first_pass_params
 
     except Exception as e:
@@ -500,18 +431,14 @@ def segment_cells_first_pass_raw(
         traceback.print_exc()
         raise
     finally:
-        print("\nFinal cleanup check for raw pass...")
+        print("\nFinal cleanup check...")
         registry_keys = list(memmap_registry.keys())
         for name_key in registry_keys:
-             mm_obj, p_path, d_dir = memmap_registry.pop(name_key)
-             print(f"  Cleaning up leftover {name_key} (Path: {p_path})...")
-             if hasattr(mm_obj, '_mmap') and mm_obj._mmap is not None: del mm_obj; gc.collect()
-             if p_path and os.path.exists(p_path):
-                 try: os.unlink(p_path)
-                 except Exception as e_unlink: print(f"    Error unlinking {p_path}: {e_unlink}")
+             items = memmap_registry.pop(name_key)
+             mm_obj, d_dir = items[0], items[-1]
+             print(f"  Cleaning up leftover {name_key}...")
+             if hasattr(mm_obj, '_mmap') and mm_obj._mmap is not None: del mm_obj
              if d_dir and os.path.exists(d_dir):
                  try: rmtree(d_dir, ignore_errors=True)
                  except Exception as e_rmtree: print(f"    Error removing dir {d_dir}: {e_rmtree}")
         gc.collect()
-
-# --- END OF FILE initial_3d_segmentation.py ---
