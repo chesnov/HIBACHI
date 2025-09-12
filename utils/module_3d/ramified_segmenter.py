@@ -19,13 +19,232 @@ from skimage.measure import label, regionprops # type: ignore
 from collections import deque
 from scipy.ndimage import binary_fill_holes, find_objects # type: ignore
 from skimage.morphology import binary_dilation, ball, footprint_rectangle # type: ignore
-from scipy.ndimage import binary_fill_holes, find_objects, gaussian_filter, distance_transform_edt # type: ignore
+from scipy.ndimage import binary_fill_holes, find_objects, gaussian_filter, _ni_support, _nd_image # type: ignore
 import os
 from shutil import rmtree
+import sys # Make sure sys is imported
+import SimpleITK as sitk
 
 seed = 42
 np.random.seed(seed)         # For NumPy
 
+# Add this import at the top of your file
+import SimpleITK as sitk
+
+def _watershed_with_simpleitk(
+    landscape: np.ndarray,
+    markers: np.ndarray,
+    log_prefix: str = ""
+) -> np.ndarray:
+    """
+    Performs the watershed algorithm using SimpleITK, which is generally more
+    memory-efficient for large 3D volumes than scikit-image. This version includes
+    detailed profiling and data sanitization to ensure compatibility with the
+    strict ITK backend.
+
+    Args:
+        landscape (np.ndarray): The watershed landscape.
+        markers (np.ndarray): The labeled markers for the watershed.
+        log_prefix (str): A prefix for logging messages.
+
+    Returns:
+        np.ndarray: The resulting labeled segmentation mask.
+    """
+    flush_print(f"{log_prefix} Executing watershed using SimpleITK...")
+    ws_start_time = time.time()
+    
+    try:
+        # --- [STEP 1: PROFILING & SANITIZING] ---
+        flush_print(f"{log_prefix}   - Input landscape (numpy): shape={landscape.shape}, dtype={landscape.dtype}")
+        flush_print(f"{log_prefix}   - Input markers (numpy):   shape={markers.shape}, dtype={markers.dtype}")
+
+        if not np.all(np.isfinite(landscape)):
+            flush_print(f"{log_prefix}   - WARNING: Non-finite values (inf/nan) found in landscape. Sanitizing...")
+            max_finite_val = np.max(landscape[np.isfinite(landscape)]) if np.any(np.isfinite(landscape)) else 0
+            landscape = np.nan_to_num(landscape, nan=max_finite_val + 1, posinf=max_finite_val + 1, neginf=max_finite_val - 1)
+            flush_print(f"{log_prefix}   - Sanitization complete.")
+        
+        # --- [STEP 2: CONVERT TO SITK IMAGES] ---
+        # We use standard dtypes that are widely supported.
+        landscape_sitk = sitk.GetImageFromArray(landscape.astype(np.float64))
+        markers_sitk = sitk.GetImageFromArray(markers.astype(np.uint32))
+
+        flush_print(f"{log_prefix}   - Landscape (sitk):    size={landscape_sitk.GetSize()}, pixel_type={landscape_sitk.GetPixelIDTypeAsString()}")
+        flush_print(f"{log_prefix}   - Markers (sitk):      size={markers_sitk.GetSize()}, pixel_type={markers_sitk.GetPixelIDTypeAsString()}")
+        
+        flush_print(f"{log_prefix}   - Calling sitk.MorphologicalWatershedFromMarkers...")
+        
+        # --- [THE DEFINITIVE FIX] ---
+        # The correct argument order is (landscapeImage, markerImage).
+        result_sitk = sitk.MorphologicalWatershedFromMarkers(
+            landscape_sitk,
+            markers_sitk,
+            markWatershedLine=True,
+            fullyConnected=False
+        )
+
+        # --- [STEP 3: CONVERT RESULT BACK TO NUMPY] ---
+        result_np = sitk.GetArrayFromImage(result_sitk)
+        result_np = result_np.astype(markers.dtype, copy=False)
+
+        flush_print(f"{log_prefix} SimpleITK watershed finished. Time: {time.time() - ws_start_time:.2f}s")
+        return result_np
+
+    except Exception as e:
+        flush_print(f"{log_prefix} CRITICAL: SimpleITK watershed failed: {e}")
+        import traceback
+        traceback.print_exc()
+        
+        # Fallback
+        if isinstance(markers, np.memmap):
+            return np.array(markers)
+        return markers.copy()
+
+def flush_print(*args, **kwargs):
+    """A wrapper for flush_print() that forces an immediate flush of the output buffer."""
+    print(*args, **kwargs)
+    sys.stdout.flush()
+
+def _distance_tranform_arg_check(distances_out, indices_out,
+                                 return_distances, return_indices):
+    """Raise a RuntimeError if the arguments are invalid"""
+    error_msgs = []
+    if (not return_distances) and (not return_indices):
+        error_msgs.append(
+            'at least one of return_distances/return_indices must be True')
+    if distances_out and not return_distances:
+        error_msgs.append(
+            'return_distances must be True if distances is supplied'
+        )
+    if indices_out and not return_indices:
+        error_msgs.append('return_indices must be True if indices is supplied')
+    if error_msgs:
+        raise RuntimeError(', '.join(error_msgs))
+
+def distance_transform_edt(input, sampling=None, return_distances=True,
+                           return_indices=False, distances=None, indices=None,
+                           output=None):
+    """
+    Exact Euclidean distance transform.
+
+    This function is a modified version of scipy.ndimage.distance_transform_edt
+    with an added 'output' parameter for memory-mapped computation.
+
+    Parameters
+    ----------
+    input : array_like
+        Input data to transform. Can be any type but will be converted
+        into binary: 1 wherever input equates to True, 0 elsewhere.
+    sampling : float, or sequence of float, optional
+        Spacing of elements along each dimension. If a sequence, must be of
+        length equal to the input rank; if a single number, this is used for
+        all axes. If not specified, a grid spacing of unity is implied.
+    return_distances : bool, optional
+        Whether to calculate the distance transform.
+        Default is True.
+    return_indices : bool, optional
+        Whether to calculate the feature transform.
+        Default is False.
+    distances : float64 ndarray, optional
+        An output array to store the calculated distance transform, instead of
+        returning it.
+        `return_distances` must be True.
+        It must be the same shape as `input`.
+    indices : int32 ndarray, optional
+        An output array to store the calculated feature transform, instead of
+        returning it.
+        `return_indices` must be True.
+        Its shape must be ``(input.ndim,) + input.shape``.
+    output : numpy.memmap, optional
+        A memory-mapped array to use for offloading intermediate,
+        RAM-intensive computations. If provided, it must have a shape of
+        ``(input.ndim,) + input.shape`` and a dtype of `numpy.float64`.
+
+    Returns
+    -------
+    distances : float64 ndarray, optional
+        The calculated distance transform. Returned only when
+        `return_distances` is True and `distances` is not supplied.
+        It will have the same shape as the input array.
+    indices : int32 ndarray, optional
+        The calculated feature transform. It has an input-shaped array for each
+        dimension of the input. See example below.
+        Returned only when `return_indices` is True and `indices` is not
+        supplied.
+    """
+    ft_inplace = isinstance(indices, np.ndarray)
+    dt_inplace = isinstance(distances, np.ndarray)
+
+    # This is a private function in SciPy for argument validation.
+    _distance_tranform_arg_check(
+        dt_inplace, ft_inplace, return_distances, return_indices
+    )
+
+    input = np.atleast_1d(np.where(input, 1, 0).astype(np.int8))
+    if sampling is not None:
+        sampling = _ni_support._normalize_sequence(sampling, input.ndim)
+        sampling = np.asarray(sampling, dtype=np.float64)
+        if not sampling.flags.contiguous:
+            sampling = sampling.copy()
+
+    if ft_inplace:
+        ft = indices
+        if ft.shape != (input.ndim,) + input.shape:
+            raise RuntimeError('indices array has wrong shape')
+        if ft.dtype.type != np.int32:
+            raise RuntimeError('indices array must be int32')
+    else:
+        ft = np.zeros((input.ndim,) + input.shape, dtype=np.int32)
+
+    _nd_image.euclidean_feature_transform(input, sampling, ft)
+
+    if return_distances:
+        if output is not None:
+            # Validate the provided output memmap array
+            expected_shape = (input.ndim,) + input.shape
+            if output.shape != expected_shape:
+                raise ValueError(f"The 'output' memmap must have shape {expected_shape}, but has {output.shape}")
+            if output.dtype != np.float64:
+                raise TypeError(f"The 'output' memmap must have dtype {np.float64}, but has {output.dtype}")
+
+            dt = output
+            # Use the memmap as the output buffer to perform the calculation, saving RAM
+            np.subtract(ft, np.indices(input.shape, dtype=ft.dtype), out=dt)
+        else:
+            # Original behavior: create a new array in memory
+            dt = ft - np.indices(input.shape, dtype=ft.dtype)
+            dt = dt.astype(np.float64)
+
+        if sampling is not None:
+            for ii in range(len(sampling)):
+                dt[ii, ...] *= sampling[ii]
+        np.multiply(dt, dt, dt)
+
+        if dt_inplace:
+            # This reduction creates a smaller temporary array in memory
+            reduced_dt = np.add.reduce(dt, axis=0)
+            if distances.shape != reduced_dt.shape:
+                raise RuntimeError('distances array has wrong shape')
+            if distances.dtype.type != np.float64:
+                raise RuntimeError('distances array must be float64')
+            np.sqrt(reduced_dt, distances)
+        else:
+            dt = np.add.reduce(dt, axis=0)
+            dt = np.sqrt(dt)
+
+    # Construct and return the result
+    result = []
+    if return_distances and not dt_inplace:
+        result.append(dt)
+    if return_indices and not ft_inplace:
+        result.append(ft)
+
+    if len(result) == 2:
+        return tuple(result)
+    elif len(result) == 1:
+        return result[0]
+    else:
+        return None
 
 # Helper function for physical size based min_distance (keep as is)
 def get_min_distance_pixels(spacing, physical_distance):
@@ -103,7 +322,7 @@ def _filter_candidate_fragment_3d(
             return 'fallback', reason, fragment_mask_copy, fragment_volume, duration
             
     except Exception as e_filt:
-        print(f"Warn: Unexpected error during 3D fragment filtering: {e_filt}")
+        flush_print(f"Warn: Unexpected error during 3D fragment filtering: {e_filt}")
         return 'discard', 'error', None, None, time.time() - t_start
 
 
@@ -130,11 +349,11 @@ def extract_soma_masks(
     Generates candidate seed mask using a memory-efficient strategy by storing
     candidate coordinates and provides detailed performance and rejection profiling.
     """
-    print("--- Starting 3D Soma Extraction (Coordinate Storage Strategy with Rejection Profiling) ---")
+    flush_print("--- Starting 3D Soma Extraction (Coordinate Storage Strategy with Rejection Profiling) ---")
 
-    print(f"DT ratios: {ratios_to_process}")
+    flush_print(f"DT ratios: {ratios_to_process}")
     intensity_percentiles_to_process = sorted([p for p in intensity_percentiles_to_process if 0 < p < 100], reverse=True)
-    print(f"Intensity Percentiles: {intensity_percentiles_to_process}")
+    flush_print(f"Intensity Percentiles: {intensity_percentiles_to_process}")
 
     # --- Internal Parameters & Setup ---
     if min_fragment_size is None or min_fragment_size < 1:
@@ -142,14 +361,14 @@ def extract_soma_masks(
     else:
         min_seed_fragment_volume = min_fragment_size
     MAX_CORE_VOXELS_FOR_WS = 500_000 # SAFETY VALVE
-    print(f"Watershed safety valve: cores > {MAX_CORE_VOXELS_FOR_WS} voxels will not be split.")
+    flush_print(f"Watershed safety valve: cores > {MAX_CORE_VOXELS_FOR_WS} voxels will not be split.")
 
     # --- Setup block ---
     if spacing is None: spacing = (1.0, 1.0, 1.0)
     else:
         try: spacing = tuple(float(s) for s in spacing); assert len(spacing) == 3
         except: spacing = (1.0, 1.0, 1.0)
-    print(f"Using 3D spacing (z,y,x): {spacing}")
+    flush_print(f"Using 3D spacing (z,y,x): {spacing}")
     unique_labels_all, counts = np.unique(segmentation_mask[segmentation_mask > 0], return_counts=True)
     if len(unique_labels_all) == 0: return np.zeros_like(segmentation_mask, dtype=np.int32)
     initial_volumes = dict(zip(unique_labels_all, counts))
@@ -172,7 +391,7 @@ def extract_soma_masks(
     target_soma_volume = np.median([v for l,v in volumes.items() if l in smallest_object_labels_set] or all_volumes_list)
     min_accepted_core_volume = max(min_seed_fragment_volume, target_soma_volume * core_volume_target_factor_lower)
     max_accepted_core_volume = target_soma_volume * core_volume_target_factor_upper
-    print(f"Core Volume filter range: [{min_accepted_core_volume:.2f} - {max_accepted_core_volume:.2f}] voxels")
+    flush_print(f"Core Volume filter range: [{min_accepted_core_volume:.2f} - {max_accepted_core_volume:.2f}] voxels")
     vol_thresh_lower, vol_thresh_upper = np.percentile(all_volumes_list, ref_vol_percentile_lower), np.percentile(all_volumes_list, ref_vol_percentile_upper)
     reference_object_labels = [l for l in unique_labels if vol_thresh_lower < volumes[l] <= vol_thresh_upper]
     if len(reference_object_labels) < 5: reference_object_labels = list(unique_labels)
@@ -186,25 +405,25 @@ def extract_soma_masks(
                 max_thicknesses_um.append(np.max(dt))
     min_accepted_thickness_um = max(absolute_min_thickness_um, np.percentile(max_thicknesses_um, ref_thickness_percentile_lower)) if max_thicknesses_um else absolute_min_thickness_um
     min_accepted_thickness_um = min(min_accepted_thickness_um, absolute_max_thickness_um - 1e-6)
-    print(f"Final Core Thickness filter range: [{min_accepted_thickness_um:.2f} - {absolute_max_thickness_um:.2f}] um")
+    flush_print(f"Final Core Thickness filter range: [{min_accepted_thickness_um:.2f} - {absolute_max_thickness_um:.2f}] um")
     min_peak_sep_pixels = get_min_distance_pixels(spacing, min_physical_peak_separation)
     gc.collect()
 
     # --- 2. Process Small Cells & Initialize Final Mask ---
     final_seed_mask = np.zeros_like(segmentation_mask, dtype=np.int32); next_final_label = 1; added_small_labels: Set[int] = set()
     small_cell_labels = [l for l in unique_labels if l in smallest_object_labels_set]
-    print(f"\nProcessing {len(small_cell_labels)} small objects (3D)...")
+    flush_print(f"\nProcessing {len(small_cell_labels)} small objects (3D)...")
     for label in tqdm(small_cell_labels, desc="Small Cells", disable=len(small_cell_labels) < 10):
         if volumes.get(label, 0) >= min_seed_fragment_volume:
             coords = np.argwhere(segmentation_mask == label)
             if coords.size > 0:
                 final_seed_mask[coords[:, 0], coords[:, 1], coords[:, 2]] = next_final_label
                 next_final_label += 1; added_small_labels.add(label)
-    print(f"Added {len(added_small_labels)} initial seeds from small cells."); gc.collect()
+    flush_print(f"Added {len(added_small_labels)} initial seeds from small cells."); gc.collect()
 
     # --- 3. Generate Candidates from Large Cells ---
     large_cell_labels = [l for l in unique_labels if l not in added_small_labels]
-    print(f"Generating and placing candidates from {len(large_cell_labels)} large objects (3D)...")
+    flush_print(f"Generating and placing candidates from {len(large_cell_labels)} large objects (3D)...")
     struct_el_erosion = ndimage.generate_binary_structure(3, 3) if erosion_iterations > 0 else None
 
     for label in tqdm(large_cell_labels, desc="Large Cell Candidates"):
@@ -286,7 +505,7 @@ def extract_soma_masks(
                         num_found, num_kept, stats = process_core_mask(eroded_core, time_log)
                         total_time = time.time() - t_iter_start
                         rejection_str = ", ".join([f"rej {k}: {v}" for k, v in stats.items() if v > 0])
-                        print(f"    L{label} DT R{ratio:.1f}: Found {num_found} cores, kept {num_kept} frags. "
+                        flush_print(f"    L{label} DT R{ratio:.1f}: Found {num_found} cores, kept {num_kept} frags. "
                               f"{rejection_str}. Total time: {total_time:.2f}s "
                               f"[label:{time_log['labeling']:.2f}s, sum:{time_log['summing']:.2f}s, "
                               f"ws:{time_log['mini_ws']:.2f}s, filter:{time_log['filtering']:.2f}s]")
@@ -305,7 +524,7 @@ def extract_soma_masks(
                         num_found, num_kept, stats = process_core_mask(eroded_core, time_log)
                         total_time = time.time() - t_iter_start
                         rejection_str = ", ".join([f"rej {k}: {v}" for k, v in stats.items() if v > 0])
-                        print(f"    L{label} INT P{perc:02d}: Found {num_found} cores, kept {num_kept} frags. "
+                        flush_print(f"    L{label} INT P{perc:02d}: Found {num_found} cores, kept {num_kept} frags. "
                               f"{rejection_str}. Total time: {total_time:.2f}s "
                               f"[label:{time_log['labeling']:.2f}s, sum:{time_log['summing']:.2f}s, "
                               f"ws:{time_log['mini_ws']:.2f}s, filter:{time_log['filtering']:.2f}s]")
@@ -326,8 +545,8 @@ def extract_soma_masks(
                         final_seed_mask[vg] = next_final_label
                         next_final_label += 1
 
-        except MemoryError: print(f"CRITICAL: MemoryError processing L{label}. Skipping this cell."); gc.collect()
-        except Exception as e: print(f"Warn: Uncaught Error L{label}: {e}"); traceback.print_exc()
+        except MemoryError: flush_print(f"CRITICAL: MemoryError processing L{label}. Skipping this cell."); gc.collect()
+        except Exception as e: flush_print(f"Warn: Uncaught Error L{label}: {e}"); traceback.print_exc()
         finally:
             del valid_candidates_for_this_label, fallback_candidates_for_this_label
             if seg_sub is not None: del seg_sub
@@ -337,54 +556,56 @@ def extract_soma_masks(
             gc.collect()
 
     total_final_seeds = next_final_label - 1
-    print(f"\nGenerated {total_final_seeds} final aggregated seeds (3D)."); print("--- Finished 3D Intermediate Seed Extraction ---")
+    flush_print(f"\nGenerated {total_final_seeds} final aggregated seeds (3D)."); flush_print("--- Finished 3D Intermediate Seed Extraction ---")
     return final_seed_mask
 
 # --- Helper: Analyze local intensity difference ---
-def _analyze_local_intensity_difference_hybrid(
-    region1_mask: np.ndarray, region2_mask: np.ndarray, parent_cell_mask: np.ndarray,
+def _analyze_local_intensity_difference_optimized(
+    interface_mask: np.ndarray, # The pre-computed interface between segments
+    region1_mask: np.ndarray, region2_mask: np.ndarray,
     intensity_vol_local: np.ndarray, local_analysis_radius: int,
     min_local_intensity_difference_threshold: float, log_prefix: str = "    [LID]"
 ) -> bool:
+    """
+    Optimized version of LID analysis that works by dilating only the small
+    interface mask, avoiding large intermediate array allocations.
+    """
     t_start_lid = time.time()
-    print(f"{log_prefix} Start LID. R1:{np.sum(region1_mask)}, R2:{np.sum(region2_mask)}, Parent:{np.sum(parent_cell_mask)}, Radius:{local_analysis_radius}, Thresh:{min_local_intensity_difference_threshold:.3f}")
+    
+    # --- The key optimization is here ---
+    # Instead of dilating the entire region masks (which are large), we only
+    # dilate the much smaller interface_mask. This creates a narrow "analysis zone"
+    # around the boundary, which is all we need.
     footprint_elem = ball(local_analysis_radius) if local_analysis_radius > 1 else footprint_rectangle((3,3,3))
+    analysis_zone = binary_dilation(interface_mask, footprint=footprint_elem)
 
-    r1m, r2m, pcm = region1_mask.astype(bool), region2_mask.astype(bool), parent_cell_mask.astype(bool)
-    
-    dr1 = binary_dilation(r1m, footprint=footprint_elem)
-    dr2 = binary_dilation(r2m, footprint=footprint_elem)
-
-    # Define the zone where dilated regions overlap within the parent mask
-    interface_overlap_zone = dr1 & dr2 & pcm
-    
-    # Local region 1: Part of the overlap zone, but strictly outside r1 itself.
-    # These are voxels effectively "on r2's side" of the r1/r2 interface.
-    la_r1 = interface_overlap_zone & ~r1m 
-    
-    # Local region 2: Part of the overlap zone, but strictly outside r2 itself.
-    # These are voxels "on r1's side" of the r1/r2 interface.
-    la_r2 = interface_overlap_zone & ~r2m
-    la_r1 = dr1 & dr2 & pcm & ~r1m & dr2 # Voxels near r1's boundary but in r2's dilation, within parent, outside r1
-    la_r2 = dr1 & dr2 & pcm & ~r2m & dr1 # Voxels near r2's boundary but in r1's dilation, within parent, outside r2
+    # The local adjacent regions are simply the parts of this analysis zone
+    # that fall within each original segment. This is extremely fast and memory-efficient.
+    la_r1 = analysis_zone & region1_mask
+    la_r2 = analysis_zone & region2_mask
 
     sa1, sa2 = np.sum(la_r1), np.sum(la_r2)
-    print(f"{log_prefix} Adj. region sizes: LA_R1={sa1}, LA_R2={sa2}")
+    flush_print(f"{log_prefix} Adj. region sizes: LA_R1={sa1}, LA_R2={sa2}")
+    
     MIN_ADJ_SIZE = 20
     if sa1 < MIN_ADJ_SIZE or sa2 < MIN_ADJ_SIZE:
-        print(f"{log_prefix} Small adj. regions. LID returns False. Time:{time.time()-t_start_lid:.3f}s")
-        return False
+        flush_print(f"{log_prefix} Small adj. regions. LID returns False. Time:{time.time()-t_start_lid:.3f}s")
+        # In this case, the regions are distinct enough because the interface is thin/sparse
+        return True # Returning True means "don't merge"
+
     i1, i2 = intensity_vol_local[la_r1], intensity_vol_local[la_r2]
     m1, m2 = (np.mean(i1) if i1.size > 0 else 0), (np.mean(i2) if i2.size > 0 else 0)
-    print(f"{log_prefix} Adj. means: M1={m1:.2f}, M2={m2:.2f}")
+    flush_print(f"{log_prefix} Adj. means: M1={m1:.2f}, M2={m2:.2f}")
+    
     ref_i = max(m1, m2)
     if ref_i < 1e-6: 
-        print(f"{log_prefix} Ref intensity near zero. LID True. Time:{time.time()-t_start_lid:.3f}s"); 
-        return True
+        flush_print(f"{log_prefix} Ref intensity near zero. LID True. Time:{time.time()-t_start_lid:.3f}s"); 
+        return True # Distinct enough
+        
     rel_d = abs(m1 - m2) / ref_i
-    is_valid = rel_d >= min_local_intensity_difference_threshold
-    print(f"{log_prefix} Rel.Diff={rel_d:.3f} (Thresh {min_local_intensity_difference_threshold:.3f}). Valid={is_valid}. Time:{time.time()-t_start_lid:.3f}s")
-    return is_valid
+    is_distinct_enough = rel_d >= min_local_intensity_difference_threshold
+    flush_print(f"{log_prefix} Rel.Diff={rel_d:.3f} (Thresh {min_local_intensity_difference_threshold:.3f}). Distinct={is_distinct_enough}. Time:{time.time()-t_start_lid:.3f}s")
+    return is_distinct_enough
 
 def _calculate_interface_metrics(
     mask_A_local: np.ndarray, # Boolean mask of segment A in its local crop
@@ -411,7 +632,7 @@ def _calculate_interface_metrics(
         'should_merge_decision': False # Final decision based on heuristics
     }
     if not np.any(mask_A_local) or not np.any(mask_B_local):
-        print(f"{log_prefix} One or both masks empty, cannot calculate metrics.")
+        flush_print(f"{log_prefix} One or both masks empty, cannot calculate metrics.")
         return metrics
 
     footprint_dilation = footprint_rectangle((3,3,3))
@@ -424,7 +645,7 @@ def _calculate_interface_metrics(
 
     combined_interface_mask = (interface_A_B | interface_B_A) & parent_mask_local
     metrics['interface_voxel_count'] = np.sum(combined_interface_mask)
-    print(f"{log_prefix} Interface Voxel Count: {metrics['interface_voxel_count']}")
+    flush_print(f"{log_prefix} Interface Voxel Count: {metrics['interface_voxel_count']}")
 
     if metrics['interface_voxel_count'] > 0:
         interface_intensity_values = intensity_local[combined_interface_mask]
@@ -438,37 +659,38 @@ def _calculate_interface_metrics(
         # A "good" separation has a LOW ratio (dark interface compared to somas)
         metrics['ratio_threshold_passed'] = metrics['interface_intensity_ratio'] < min_path_intensity_ratio_heuristic
         
-        print(f"{log_prefix} Mean Interface Intensity: {metrics['mean_interface_intensity']:.2f}")
-        print(f"{log_prefix} Avg Soma Intensity Ref: {avg_soma_intensity_for_interface:.2f}")
-        print(f"{log_prefix} Interface/Soma Intensity Ratio: {metrics['interface_intensity_ratio']:.3f} (Threshold for merge if >= {min_path_intensity_ratio_heuristic:.3f})")
+        flush_print(f"{log_prefix} Mean Interface Intensity: {metrics['mean_interface_intensity']:.2f}")
+        flush_print(f"{log_prefix} Avg Soma Intensity Ref: {avg_soma_intensity_for_interface:.2f}")
+        flush_print(f"{log_prefix} Interface/Soma Intensity Ratio: {metrics['interface_intensity_ratio']:.3f} (Threshold for merge if >= {min_path_intensity_ratio_heuristic:.3f})")
         if metrics['ratio_threshold_passed']:
-            print(f"{log_prefix} --> Path Ratio Check: PASSED (interface is dark enough relative to somas)")
+            flush_print(f"{log_prefix} --> Path Ratio Check: PASSED (interface is dark enough relative to somas)")
         else:
-            print(f"{log_prefix} --> Path Ratio Check: FAILED (interface is too bright, suggests merge)")
+            flush_print(f"{log_prefix} --> Path Ratio Check: FAILED (interface is too bright, suggests merge)")
 
 
-        metrics['lid_passed_separation'] = _analyze_local_intensity_difference_hybrid(
-            mask_A_local, mask_B_local, parent_mask_local, intensity_local,
+        metrics['lid_passed_separation'] = _analyze_local_intensity_difference_optimized(
+            combined_interface_mask, # Pass the pre-computed interface mask
+            mask_A_local, mask_B_local, intensity_local,
             local_analysis_radius, min_local_intensity_difference,
             log_prefix=log_prefix + " LID"
         )
         if metrics['lid_passed_separation']:
-            print(f"{log_prefix} --> LID Check: PASSED (segments are locally distinct)")
+            flush_print(f"{log_prefix} --> LID Check: PASSED (segments are locally distinct)")
         else:
-            print(f"{log_prefix} --> LID Check: FAILED (segments are too similar locally, suggests merge)")
+            flush_print(f"{log_prefix} --> LID Check: FAILED (segments are too similar locally, suggests merge)")
         
         # Decision to merge:
         # Merge if EITHER the interface is too bright (FAILS ratio_threshold_passed)
         # OR if the local regions are too similar (FAILS lid_passed_separation)
         if not metrics['ratio_threshold_passed'] or not metrics['lid_passed_separation']:
             metrics['should_merge_decision'] = True
-            print(f"{log_prefix} ===> Merge Decision: YES (RatioFail: {not metrics['ratio_threshold_passed']}, LIDFail: {not metrics['lid_passed_separation']})")
+            flush_print(f"{log_prefix} ===> Merge Decision: YES (RatioFail: {not metrics['ratio_threshold_passed']}, LIDFail: {not metrics['lid_passed_separation']})")
         else:
             metrics['should_merge_decision'] = False
-            print(f"{log_prefix} ===> Merge Decision: NO (Separation seems valid by both heuristics)")
+            flush_print(f"{log_prefix} ===> Merge Decision: NO (Separation seems valid by both heuristics)")
 
     else: # No direct interface voxels found
-        print(f"{log_prefix} No interface voxels found between segments. Defaulting to NO MERGE.")
+        flush_print(f"{log_prefix} No interface voxels found between segments. Defaulting to NO MERGE.")
         metrics['ratio_threshold_passed'] = True # No interface to be "too bright"
         metrics['lid_passed_separation'] = True  # No interface for LID to fail on
         metrics['should_merge_decision'] = False
@@ -487,11 +709,11 @@ def _build_adjacency_graph_for_cell(
     min_path_intensity_ratio_heuristic: float, # Pass this for comparison printout in metrics
     log_prefix: str = "    [GraphBuild]"
 ) -> Tuple[Dict[int, Dict[str, Any]], Dict[Tuple[int, int], Dict[str, Any]]]:
-    print(f"{log_prefix} Building graph. SegMaskShape:{current_cell_segments_mask_local.shape}")
+    flush_print(f"{log_prefix} Building graph. SegMaskShape:{current_cell_segments_mask_local.shape}")
     nodes: Dict[int, Dict[str, Any]] = {}
     edges: Dict[Tuple[int, int], Dict[str, Any]] = {}
     seg_lbls = np.unique(current_cell_segments_mask_local[current_cell_segments_mask_local > 0])
-    print(f"{log_prefix} Found {len(seg_lbls)} P1 segments: {seg_lbls}")
+    flush_print(f"{log_prefix} Found {len(seg_lbls)} P1 segments: {seg_lbls}")
 
     if len(seg_lbls) <= 1:
         # ... (single node creation logic - same as before) ...
@@ -504,7 +726,7 @@ def _build_adjacency_graph_for_cell(
             obj_sl = find_objects(m_node.astype(np.int32))
             nodes[lbl] = {'mask_bbox_local': obj_sl[0] if obj_sl and obj_sl[0] else None, 
                           'orig_somas': s_in_node, 'volume': np.sum(m_node)}
-        print(f"{log_prefix} <=1 segment. Graph: {len(nodes)} nodes, {len(edges)} edges.")
+        flush_print(f"{log_prefix} <=1 segment. Graph: {len(nodes)} nodes, {len(edges)} edges.")
         return nodes, edges
     
     footprint_d_graph = footprint_rectangle((3,3,3)) # Renamed
@@ -524,7 +746,7 @@ def _build_adjacency_graph_for_cell(
             'orig_somas': orig_somas_list_build, 
             'volume': np.sum(m_node_build)
         }
-        print(f"{log_prefix}   Node {lbl_node}: Vol={nodes[lbl_node]['volume']}, OrigSomas={nodes[lbl_node]['orig_somas']}")
+        flush_print(f"{log_prefix}   Node {lbl_node}: Vol={nodes[lbl_node]['volume']}, OrigSomas={nodes[lbl_node]['orig_somas']}")
 
     for i_idx_graph in range(len(seg_lbls)): # Renamed i_idx
         lbl_A_graph = seg_lbls[i_idx_graph] # Renamed
@@ -547,7 +769,7 @@ def _build_adjacency_graph_for_cell(
             edge_key_graph = tuple(sorted((lbl_A_graph, lbl_B_graph))) # Renamed
             if edge_key_graph in edges: continue
 
-            print(f"{log_prefix}   Checking interface: {edge_key_graph}")
+            flush_print(f"{log_prefix}   Checking interface: {edge_key_graph}")
             
             # Calculate avg_soma_intensity for this specific interface
             somas_A = nodes[lbl_A_graph].get('orig_somas', [])
@@ -561,7 +783,7 @@ def _build_adjacency_graph_for_cell(
             avg_soma_intensity_for_this_interface = np.mean(interface_soma_intensities) if interface_soma_intensities else 1.0 # Default to 1.0 to avoid div by zero
             if avg_soma_intensity_for_this_interface < 1e-6 : avg_soma_intensity_for_this_interface = 1.0
             
-            print(f"{log_prefix}     Edge{edge_key_graph}: OrigSomasA={somas_A}, OrigSomasB={somas_B}, AvgSomaIntensityForIface={avg_soma_intensity_for_this_interface:.2f}")
+            flush_print(f"{log_prefix}     Edge{edge_key_graph}: OrigSomasA={somas_A}, OrigSomasB={somas_B}, AvgSomaIntensityForIface={avg_soma_intensity_for_this_interface:.2f}")
 
             if_metrics_graph = _calculate_interface_metrics( # Renamed
                 mask_A_graph, mask_B_graph, original_cell_mask_local, intensity_local, 
@@ -571,7 +793,7 @@ def _build_adjacency_graph_for_cell(
                 log_prefix=f"{log_prefix}     Edge{edge_key_graph}")
             edges[edge_key_graph] = if_metrics_graph
             
-    print(f"{log_prefix} Graph built: {len(nodes)} nodes, {len(edges)} edges.")
+    flush_print(f"{log_prefix} Graph built: {len(nodes)} nodes, {len(edges)} edges.")
     return nodes, edges
 
 
@@ -603,19 +825,19 @@ def separate_multi_soma_cells(
     
     log_main_prefix = "[SepMultiSomaSerialV7_MemOpt_V2]"
     overall_start_time = time.time()
-    print(f"{log_main_prefix} Starting Serialized Hybrid Separation (Voxel Threshold Trigger)")
+    flush_print(f"{log_main_prefix} Starting Serialized Hybrid Separation (Voxel Threshold Trigger)")
     
     # --- Setup for Memory-Mapping ---
     use_memmap_feature = memmap_dir is not None
     if use_memmap_feature:
         if os.path.exists(memmap_dir):
-            print(f"{log_main_prefix} INFO: Cleaning pre-existing memmap directory: {memmap_dir}")
+            flush_print(f"{log_main_prefix} INFO: Cleaning pre-existing memmap directory: {memmap_dir}")
             try:
                 rmtree(memmap_dir)
             except OSError as e:
-                print(f"{log_main_prefix} WARNING: Could not remove memmap directory: {e}. Files may be locked.")
+                flush_print(f"{log_main_prefix} WARNING: Could not remove memmap directory: {e}. Files may be locked.")
         os.makedirs(memmap_dir, exist_ok=True)
-        print(f"{log_main_prefix} INFO: Using temporary directory for large arrays: {memmap_dir}")
+        flush_print(f"{log_main_prefix} INFO: Using temporary directory for large arrays: {memmap_dir}")
 
     try:
         # --- Initial parameter prints, spacing setup, type checks - same as before) ...
@@ -623,19 +845,19 @@ def separate_multi_soma_cells(
         else:
             try: spacing_tuple = tuple(float(s) for s in spacing); assert len(spacing_tuple) == 3; spacing_arr = np.array(spacing_tuple)
             except: spacing_tuple = (1.0,1.0,1.0); spacing_arr = np.array([1.0,1.0,1.0])
-        print(f"{log_main_prefix} Using 3D spacing (z,y,x): {spacing_tuple}")
+        flush_print(f"{log_main_prefix} Using 3D spacing (z,y,x): {spacing_tuple}")
         if not np.issubdtype(intensity_volume.dtype, np.floating): intensity_volume = intensity_volume.astype(np.float32, copy=False)
         if not np.issubdtype(segmentation_mask.dtype, np.integer): segmentation_mask = segmentation_mask.astype(np.int32)
         if not np.issubdtype(soma_mask.dtype, np.integer): soma_mask = soma_mask.astype(np.int32)
 
         final_output_mask = np.zeros_like(segmentation_mask, dtype=np.int32)
         unique_initial_labels = np.unique(segmentation_mask[segmentation_mask > 0])
-        if unique_initial_labels.size == 0: print(f"{log_main_prefix} Seg mask empty."); return final_output_mask
+        if unique_initial_labels.size == 0: flush_print(f"{log_main_prefix} Seg mask empty."); return final_output_mask
         
         cell_to_somas_orig: Dict[int, Set[int]] = {lbl: set() for lbl in unique_initial_labels}
         present_soma_labels_orig = np.unique(soma_mask[soma_mask > 0])
         if present_soma_labels_orig.size == 0: 
-            print(f"{log_main_prefix} Soma mask empty. Returning original seg (relabelled).")
+            flush_print(f"{log_main_prefix} Soma mask empty. Returning original seg (relabelled).")
             final_output_mask = segmentation_mask.copy()
             if np.any(final_output_mask): return relabel_sequential(final_output_mask.astype(np.int32), offset=1)[0]
             return final_output_mask
@@ -654,30 +876,30 @@ def separate_multi_soma_cells(
                 final_output_mask[segmentation_mask == lbl_init] = lbl_init
         
         if not multi_soma_cell_labels_list:
-            print(f"{log_main_prefix} No multi-soma cells. Relabeling initial output. Time:{time.time()-overall_start_time:.2f}s")
+            flush_print(f"{log_main_prefix} No multi-soma cells. Relabeling initial output. Time:{time.time()-overall_start_time:.2f}s")
             if np.any(final_output_mask): return relabel_sequential(final_output_mask.astype(np.int32), offset=1)[0]
             return final_output_mask
         
-        print(f"{log_main_prefix} Found {len(multi_soma_cell_labels_list)} multi-soma cells to process.")
+        flush_print(f"{log_main_prefix} Found {len(multi_soma_cell_labels_list)} multi-soma cells to process.")
         current_max_overall_label_val = np.max(final_output_mask) if np.any(final_output_mask) else 0
         if present_soma_labels_orig.size > 0 : current_max_overall_label_val = max(current_max_overall_label_val, np.max(present_soma_labels_orig))
         next_global_label_offset_val = current_max_overall_label_val + 1
-        print(f"{log_main_prefix} Initial next_global_label_offset: {next_global_label_offset_val}")
+        flush_print(f"{log_main_prefix} Initial next_global_label_offset: {next_global_label_offset_val}")
 
         phase1_combined_time = time.time()
-        print(f"\n{log_main_prefix} Phase 1 (GWS + Graph-Merge per cell).")
+        flush_print(f"\n{log_main_prefix} Phase 1 (GWS + Graph-Merge per cell).")
         footprint_p1_dilation_val = footprint_rectangle((3,3,3)) 
 
         for cell_idx_p1, cell_label_p1 in enumerate(tqdm(multi_soma_cell_labels_list, desc=f"{log_main_prefix} P1:CellProc")):
             # --- More aggressive garbage collection ---
             gc.collect()
 
-            print(f"\n{log_main_prefix}   P1 Processing cell L{cell_label_p1} ({cell_idx_p1+1}/{len(multi_soma_cell_labels_list)})")
+            flush_print(f"\n{log_main_prefix}   P1 Processing cell L{cell_label_p1} ({cell_idx_p1+1}/{len(multi_soma_cell_labels_list)})")
             
             # --- GWS LOGIC FOR ONE CELL ---
             original_cell_mask_full_p1gws = (segmentation_mask == cell_label_p1)
             obj_slices_p1gws = find_objects(original_cell_mask_full_p1gws)
-            if not obj_slices_p1gws or obj_slices_p1gws[0] is None: print(f"{log_main_prefix}     L{cell_label_p1} No object slices. Skip."); continue
+            if not obj_slices_p1gws or obj_slices_p1gws[0] is None: flush_print(f"{log_main_prefix}     L{cell_label_p1} No object slices. Skip."); continue
             bbox_p1gws = obj_slices_p1gws[0]
             pad_p1gws = 3 
             local_bbox_slices_p1gws = tuple(slice(max(0, s.start - pad_p1gws), min(dim_size, s.stop + pad_p1gws))
@@ -689,12 +911,12 @@ def separate_multi_soma_cells(
             use_memmap_for_this_cell = use_memmap_feature and (num_voxels > memmap_voxel_threshold)
 
             if use_memmap_for_this_cell:
-                print(f"{log_main_prefix}     L{cell_label_p1} is large ({num_voxels:,} voxels > {memmap_voxel_threshold:,}). SWITCHING TO MEMORY-MAPPED ARRAYS.")
+                flush_print(f"{log_main_prefix}     L{cell_label_p1} is large ({num_voxels:,} voxels > {memmap_voxel_threshold:,}). SWITCHING TO MEMORY-MAPPED ARRAYS.")
             else:
-                print(f"{log_main_prefix}     L{cell_label_p1} processing in RAM ({num_voxels:,} voxels).")
+                flush_print(f"{log_main_prefix}     L{cell_label_p1} processing in RAM ({num_voxels:,} voxels).")
 
             original_cell_mask_local_for_gws_p1gws = original_cell_mask_full_p1gws[local_bbox_slices_p1gws]
-            if not np.any(original_cell_mask_local_for_gws_p1gws): print(f"{log_main_prefix}     L{cell_label_p1} Empty local cell mask. Skip."); continue
+            if not np.any(original_cell_mask_local_for_gws_p1gws): flush_print(f"{log_main_prefix}     L{cell_label_p1} Empty local cell mask. Skip."); continue
             soma_mask_local_orig_labels_gws_p1gws = soma_mask[local_bbox_slices_p1gws]
             intensity_local_gws_p1gws = intensity_volume[local_bbox_slices_p1gws]
             active_soma_labels_in_cell_gws_p1gws = sorted(list(cell_to_somas_orig[cell_label_p1]))
@@ -710,7 +932,7 @@ def separate_multi_soma_cells(
                         if p_item_gws_p1gws.area > 0 : 
                              soma_props_local_gws_p1gws[p_item_gws_p1gws.label] = {'centroid': p_item_gws_p1gws.centroid, 'area': p_item_gws_p1gws.area, 'mean_intensity': p_item_gws_p1gws.mean_intensity if hasattr(p_item_gws_p1gws, 'mean_intensity') and p_item_gws_p1gws.mean_intensity is not None else 0.0}
                 except Exception as e_rp_gws:
-                    print(f"{log_main_prefix}     L{cell_label_p1} regionprops error: {e_rp_gws}. Fallback.")
+                    flush_print(f"{log_main_prefix}     L{cell_label_p1} regionprops error: {e_rp_gws}. Fallback.")
                     for sl_orig_gws_p1gws in active_soma_labels_in_cell_gws_p1gws:
                         coords_gws_p1gws = np.argwhere((soma_mask_local_orig_labels_gws_p1gws == sl_orig_gws_p1gws) & original_cell_mask_local_for_gws_p1gws)
                         if coords_gws_p1gws.shape[0] > 0:
@@ -718,12 +940,12 @@ def separate_multi_soma_cells(
                             soma_props_local_gws_p1gws[sl_orig_gws_p1gws] = {'centroid': np.mean(coords_gws_p1gws, axis=0), 'area': coords_gws_p1gws.shape[0], 'mean_intensity': soma_mean_int}
             
             valid_soma_labels_for_ws_gws_p1gws = [lbl for lbl in active_soma_labels_in_cell_gws_p1gws if lbl in soma_props_local_gws_p1gws and soma_props_local_gws_p1gws[lbl]['area'] > 0]
-            if len(valid_soma_labels_for_ws_gws_p1gws) <= 1: print(f"{log_main_prefix}     L{cell_label_p1} <=1 valid GWS soma. Skip GWS."); continue
+            if len(valid_soma_labels_for_ws_gws_p1gws) <= 1: flush_print(f"{log_main_prefix}     L{cell_label_p1} <=1 valid GWS soma. Skip GWS."); continue
             
             num_seeds_gws_p1gws = len(valid_soma_labels_for_ws_gws_p1gws); soma_idx_map_gws_p1gws = {lbl: i for i, lbl in enumerate(valid_soma_labels_for_ws_gws_p1gws)}; adj_matrix_gws_p1gws = np.zeros((num_seeds_gws_p1gws, num_seeds_gws_p1gws), dtype=bool)
             max_intensity_val_local_gws_p1gws = np.max(intensity_local_gws_p1gws[original_cell_mask_local_for_gws_p1gws]) if np.any(original_cell_mask_local_for_gws_p1gws) else 1.0
             
-            print(f"{log_main_prefix}     L{cell_label_p1} Creating cost array ({'memmap' if use_memmap_for_this_cell else 'RAM'})...")
+            flush_print(f"{log_main_prefix}     L{cell_label_p1} Creating cost array ({'memmap' if use_memmap_for_this_cell else 'RAM'})...")
             if use_memmap_for_this_cell:
                 cost_array_path = os.path.join(memmap_dir, f"cell_{cell_label_p1}_cost.mmp")
                 cost_array_local_gws_p1gws = np.memmap(cost_array_path, dtype=np.float32, mode='w+', shape=local_shape)
@@ -753,7 +975,7 @@ def separate_multi_soma_cells(
                     if ratio_val_gws_p1gws >= min_path_intensity_ratio:
                         adj_matrix_gws_p1gws[soma_idx_map_gws_p1gws[lbl1_gws_p1gws], soma_idx_map_gws_p1gws[lbl2_gws_p1gws]] = adj_matrix_gws_p1gws[soma_idx_map_gws_p1gws[lbl2_gws_p1gws], soma_idx_map_gws_p1gws[lbl1_gws_p1gws]] = True
             
-            print(f"{log_main_prefix}     L{cell_label_p1} Creating watershed markers ({'memmap' if use_memmap_for_this_cell else 'RAM'})...")
+            flush_print(f"{log_main_prefix}     L{cell_label_p1} Creating watershed markers ({'memmap' if use_memmap_for_this_cell else 'RAM'})...")
             if use_memmap_for_this_cell:
                 markers_path = os.path.join(memmap_dir, f"cell_{cell_label_p1}_markers.mmp")
                 ws_markers_local_gws_p1gws = np.memmap(markers_path, dtype=np.int32, mode='w+', shape=local_shape)
@@ -783,26 +1005,49 @@ def separate_multi_soma_cells(
                     orig_soma_to_ws_marker_gws_p1gws[sl_orig_gws] = group_marker_id_gws
                     ws_marker_to_orig_somas_gws_p1gws[group_marker_id_gws] = [sl_orig_gws]; current_ws_marker_id_gws_p1gws +=1
             num_final_ws_markers_gws_p1gws = current_ws_marker_id_gws_p1gws - 1
-            if num_final_ws_markers_gws_p1gws <= 1: print(f"{log_main_prefix}     L{cell_label_p1} <=1 final WS marker. Skip WS."); continue
+            if num_final_ws_markers_gws_p1gws <= 1: flush_print(f"{log_main_prefix}     L{cell_label_p1} <=1 final WS marker. Skip WS."); continue
             
-            print(f"{log_main_prefix}     L{cell_label_p1} Calculating distance transform ({'memmap' if use_memmap_for_this_cell else 'RAM'})...")
+            flush_print(f"{log_main_prefix}     L{cell_label_p1} Calculating distance transform and landscape ({'memmap' if use_memmap_for_this_cell else 'RAM'})...")
+
             if use_memmap_for_this_cell:
-                dt_path = os.path.join(memmap_dir, f"cell_{cell_label_p1}_dt.mmp")
-                dt_local_gws = np.memmap(dt_path, dtype=np.float32, mode='w+', shape=local_shape)
-                distance_transform_edt(original_cell_mask_local_for_gws_p1gws, sampling=spacing_tuple, output=dt_local_gws)
-            else:
-                dt_local_gws = distance_transform_edt(original_cell_mask_local_for_gws_p1gws, sampling=spacing_tuple)
-            
-            print(f"{log_main_prefix}     L{cell_label_p1} Creating watershed landscape ({'memmap' if use_memmap_for_this_cell else 'RAM'})...")
-            if use_memmap_for_this_cell:
+                # --- Step 1: Use a memmap for the large, intermediate distance calculation ---
+                # This memmap stores the squared, scaled coordinate differences, shape: (3, z, y, x)
+                dt_intermediate_path = os.path.join(memmap_dir, f"cell_{cell_label_p1}_dt_intermediate.mmp")
+                intermediate_shape = (len(local_shape),) + tuple(local_shape)
+                dt_intermediate_memmap = np.memmap(dt_intermediate_path, dtype=np.float64, mode='w+', shape=intermediate_shape)
+                
+                # Our modified function populates this memmap. Note that the values inside are already squared.
+                distance_transform_edt(original_cell_mask_local_for_gws_p1gws, sampling=spacing_tuple, output=dt_intermediate_memmap)
+
+                # --- Step 2: Create the final watershed landscape memmap with the CORRECT shape ---
+                # The landscape must have the same shape as the cell mask: (z, y, x)
                 ws_landscape_path = os.path.join(memmap_dir, f"cell_{cell_label_p1}_landscape.mmp")
                 ws_landscape_gws = np.memmap(ws_landscape_path, dtype=np.float32, mode='w+', shape=local_shape)
-                np.negative(dt_local_gws, out=ws_landscape_gws)
+
+                # --- Step 3: Perform the final steps of the Euclidean distance calculation ---
+                # Sum the squared differences along the first axis. This creates a temporary (z,y,x) array in RAM.
+                final_dt_squared = np.add.reduce(dt_intermediate_memmap, axis=0)
+                
+                # Take the square root to get the final Euclidean distance. This is done in-place on the temporary array.
+                np.sqrt(final_dt_squared, out=final_dt_squared)
+                
+                # Now, negate the final distance and store it in the landscape memmap.
+                np.negative(final_dt_squared, out=ws_landscape_gws)
+                
+                # We need the final (non-negative) distance transform for the intensity weighting step later.
+                # We can reuse the temporary array for this.
+                dt_local_gws = final_dt_squared
+                
+                # Explicitly close and delete the large intermediate memmap to free up file handles.
+                del dt_intermediate_memmap
+
             else:
+                # This branch was already correct. It computes the final DT in one go and holds it in RAM.
+                dt_local_gws = distance_transform_edt(original_cell_mask_local_for_gws_p1gws, sampling=spacing_tuple)
                 ws_landscape_gws = -dt_local_gws.astype(np.float32)
 
             if intensity_weight > 1e-6:
-                print(f"{log_main_prefix}     L{cell_label_p1} Adding intensity term to landscape...")
+                flush_print(f"{log_main_prefix}     L{cell_label_p1} Adding intensity term to landscape...")
                 icell_gws = intensity_local_gws_p1gws[original_cell_mask_local_for_gws_p1gws]
                 if icell_gws.size > 0:
                     min_ic_gws, max_ic_gws = np.min(icell_gws), np.max(icell_gws)
@@ -813,43 +1058,68 @@ def separate_multi_soma_cells(
             ws_markers_local_gws_p1gws[~original_cell_mask_local_for_gws_p1gws] = 0
             
             # --- Enhanced Pre-Watershed Diagnostics ---
-            print(f"{log_main_prefix}     L{cell_label_p1} PRE-WATERSHED DIAGNOSTICS:")
-            print(f"{log_main_prefix}       - Landscape shape: {ws_landscape_gws.shape}, dtype: {ws_landscape_gws.dtype}, is_memmap: {isinstance(ws_landscape_gws, np.memmap)}")
-            print(f"{log_main_prefix}       - Markers shape:   {ws_markers_local_gws_p1gws.shape}, dtype: {ws_markers_local_gws_p1gws.dtype}, is_memmap: {isinstance(ws_markers_local_gws_p1gws, np.memmap)}")
-            print(f"{log_main_prefix}       - Mask shape:      {original_cell_mask_local_for_gws_p1gws.shape}, dtype: {original_cell_mask_local_for_gws_p1gws.dtype}")
+            flush_print(f"{log_main_prefix}     L{cell_label_p1} PRE-WATERSHED DIAGNOSTICS:")
+            flush_print(f"{log_main_prefix}       - Landscape shape: {ws_landscape_gws.shape}, dtype: {ws_landscape_gws.dtype}, is_memmap: {isinstance(ws_landscape_gws, np.memmap)}")
+            flush_print(f"{log_main_prefix}       - Markers shape:   {ws_markers_local_gws_p1gws.shape}, dtype: {ws_markers_local_gws_p1gws.dtype}, is_memmap: {isinstance(ws_markers_local_gws_p1gws, np.memmap)}")
+            flush_print(f"{log_main_prefix}       - Mask shape:      {original_cell_mask_local_for_gws_p1gws.shape}, dtype: {original_cell_mask_local_for_gws_p1gws.dtype}")
             unique_markers, counts = np.unique(ws_markers_local_gws_p1gws, return_counts=True)
-            print(f"{log_main_prefix}       - Unique markers ({len(unique_markers)}): {unique_markers}")
-            if np.any(np.isinf(ws_landscape_gws)): print(f"{log_main_prefix}       - WARNING: Landscape contains Inf values!")
-            if np.any(np.isnan(ws_landscape_gws)): print(f"{log_main_prefix}       - WARNING: Landscape contains NaN values!")
+            flush_print(f"{log_main_prefix}       - Unique markers ({len(unique_markers)}): {unique_markers}")
+            if np.any(np.isinf(ws_landscape_gws)): flush_print(f"{log_main_prefix}       - WARNING: Landscape contains Inf values!")
+            if np.any(np.isnan(ws_landscape_gws)): flush_print(f"{log_main_prefix}       - WARNING: Landscape contains NaN values!")
             
-            print(f"{log_main_prefix}     L{cell_label_p1} EXECUTING WATERSHED (this step will use RAM for its result)...")
+            flush_print(f"{log_main_prefix}     L{cell_label_p1} EXECUTING WATERSHED (this step will use RAM for its result)...")
             ws_start_time = time.time()
-            global_ws_result_local_p1gws = watershed(ws_landscape_gws, ws_markers_local_gws_p1gws, mask=original_cell_mask_local_for_gws_p1gws, watershed_line=True)
-            print(f"{log_main_prefix}     L{cell_label_p1} Watershed finished. Time: {time.time() - ws_start_time:.2f}s. Result is in RAM.")
+            global_ws_result_local_p1gws = _watershed_with_simpleitk(
+                landscape=ws_landscape_gws,
+                markers=ws_markers_local_gws_p1gws,
+                log_prefix=f"{log_main_prefix}     L{cell_label_p1}"
+            )
+            flush_print(f"{log_main_prefix}     L{cell_label_p1} Watershed finished. Time: {time.time() - ws_start_time:.2f}s. Result is in RAM.")
 
-            print(f"{log_main_prefix}     L{cell_label_p1} Creating temp mask for post-processing ({'memmap' if use_memmap_for_this_cell else 'RAM'})...")
-            if use_memmap_for_this_cell:
-                temp_gws_path = os.path.join(memmap_dir, f"cell_{cell_label_p1}_temp_gws.mmp")
-                temp_gws_mask_local_p1gws = np.memmap(temp_gws_path, dtype=np.int32, mode='w+', shape=local_shape)
-                temp_gws_mask_local_p1gws[:] = 0
-            else:
-                temp_gws_mask_local_p1gws = np.zeros_like(global_ws_result_local_p1gws, dtype=np.int32)
+            # --- [START] CORRECTED CODE BLOCK ---
+            # This block replaces the original post-watershed processing to prevent a memory spike.
+            # We modify the watershed result array directly in-place.
+            flush_print(f"{log_main_prefix}     L{cell_label_p1} Relabeling watershed result in-place...")
             
             largest_soma_lbl_gws, max_area_s_gws = -1, -1
             for sl_prop_gws in valid_soma_labels_for_ws_gws_p1gws:
-                if soma_props_local_gws_p1gws[sl_prop_gws]['area'] > max_area_s_gws: max_area_s_gws = soma_props_local_gws_p1gws[sl_prop_gws]['area']; largest_soma_lbl_gws = sl_prop_gws
+                if soma_props_local_gws_p1gws[sl_prop_gws]['area'] > max_area_s_gws:
+                    max_area_s_gws = soma_props_local_gws_p1gws[sl_prop_gws]['area']
+                    largest_soma_lbl_gws = sl_prop_gws
             main_marker_id_gws = orig_soma_to_ws_marker_gws_p1gws.get(largest_soma_lbl_gws, -1)
+
+            # Create a mapping from the old watershed labels to the new final labels first.
             unique_ws_res_lbls_gws = np.unique(global_ws_result_local_p1gws[global_ws_result_local_p1gws > 0])
             current_next_lbl_cell_gws = next_global_label_offset_val
+            label_map = {}
             for res_lbl_gws in unique_ws_res_lbls_gws:
                 final_lbl_gws = cell_label_p1 if res_lbl_gws == main_marker_id_gws else current_next_lbl_cell_gws
-                if res_lbl_gws != main_marker_id_gws: current_next_lbl_cell_gws +=1
-                temp_gws_mask_local_p1gws[global_ws_result_local_p1gws == res_lbl_gws] = final_lbl_gws
+                label_map[res_lbl_gws] = final_lbl_gws
+                if res_lbl_gws != main_marker_id_gws:
+                    current_next_lbl_cell_gws += 1
+
+            # Apply the mapping. This loop modifies the array in-place.
+            for old_label, new_label in label_map.items():
+                global_ws_result_local_p1gws[global_ws_result_local_p1gws == old_label] = new_label
+
             next_global_label_offset_val = max(next_global_label_offset_val, current_next_lbl_cell_gws)
 
-            print(f"{log_main_prefix}     L{cell_label_p1} Freeing in-memory watershed result and intermediate arrays...")
-            del global_ws_result_local_p1gws, cost_array_local_gws_p1gws, dt_local_gws, ws_landscape_gws, ws_markers_local_gws_p1gws
+            # Now that the result is relabeled, decide where to store it for post-processing.
+            # This logic prevents creating a second large in-memory array.
+            if use_memmap_for_this_cell:
+                flush_print(f"{log_main_prefix}     L{cell_label_p1} Storing relabeled mask to memmap...")
+                temp_gws_path = os.path.join(memmap_dir, f"cell_{cell_label_p1}_temp_gws.mmp")
+                temp_gws_mask_local_p1gws = np.memmap(temp_gws_path, dtype=np.int32, mode='w+', shape=local_shape)
+                temp_gws_mask_local_p1gws[:] = global_ws_result_local_p1gws
+                del global_ws_result_local_p1gws # Free the RAM version
+            else:
+                flush_print(f"{log_main_prefix}     L{cell_label_p1} Using in-memory relabeled mask...")
+                temp_gws_mask_local_p1gws = global_ws_result_local_p1gws # Just rename the pointer, no new memory used
+
+            flush_print(f"{log_main_prefix}     L{cell_label_p1} Freeing intermediate arrays...")
+            del cost_array_local_gws_p1gws, dt_local_gws, ws_landscape_gws, ws_markers_local_gws_p1gws
             gc.collect()
+            # --- [END] CORRECTED CODE BLOCK ---
 
             ws_lines_gws = (temp_gws_mask_local_p1gws == 0) & original_cell_mask_local_for_gws_p1gws
             if np.any(ws_lines_gws):
@@ -859,7 +1129,7 @@ def separate_multi_soma_cells(
                     nh_vals_gws = temp_gws_mask_local_p1gws[nh_slice_gws]; un_nh_gws,cts_nh_gws=np.unique(nh_vals_gws[nh_vals_gws>0],return_counts=True)
                     if un_nh_gws.size > 0: temp_gws_mask_local_p1gws[zlg,ylg,xlg] = un_nh_gws[np.argmax(cts_nh_gws)]
             
-            print(f"{log_main_prefix}     L{cell_label_p1} Merging small fragments...")
+            flush_print(f"{log_main_prefix}     L{cell_label_p1} Merging small fragments...")
             frag_merged_gws,sfm_iters_gws=True,0
             while frag_merged_gws and sfm_iters_gws < 10:
                 sfm_iters_gws+=1; frag_merged_gws=False
@@ -877,7 +1147,7 @@ def separate_multi_soma_cells(
                         frag_merged_gws=True;break
 
             # --- Phase 1.5: Build Local Graph & Merge Weak Interfaces for THIS CELL ---
-            print(f"{log_main_prefix}     P1 L{cell_label_p1}: Building local graph for P1.5 merges on {np.sum(np.unique(temp_gws_mask_local_p1gws)>0)} GWS segments.")
+            flush_print(f"{log_main_prefix}     P1 L{cell_label_p1}: Building local graph for P1.5 merges on {np.sum(np.unique(temp_gws_mask_local_p1gws)>0)} GWS segments.")
             local_nodes_p15, local_edges_p15 = _build_adjacency_graph_for_cell(
                 temp_gws_mask_local_p1gws,
                 original_cell_mask_local_for_gws_p1gws,
@@ -891,15 +1161,15 @@ def separate_multi_soma_cells(
             )
 
             if local_edges_p15: 
-                print(f"{log_main_prefix}     P1 L{cell_label_p1}: P1.5 - Checking {len(local_edges_p15)} interfaces for merging.")
+                flush_print(f"{log_main_prefix}     P1 L{cell_label_p1}: P1.5 - Checking {len(local_edges_p15)} interfaces for merging.")
                 p1_5_local_merge_passes = 0; MAX_P1_5_LOCAL_PASSES = 5
                 p1_5_merged_in_pass_loc = True
                 while p1_5_merged_in_pass_loc and p1_5_local_merge_passes < MAX_P1_5_LOCAL_PASSES:
                     p1_5_local_merge_passes += 1; p1_5_merged_in_pass_loc = False
-                    print(f"{log_main_prefix}       P1.5 L{cell_label_p1} Merge Pass {p1_5_local_merge_passes}")
+                    flush_print(f"{log_main_prefix}       P1.5 L{cell_label_p1} Merge Pass {p1_5_local_merge_passes}")
                     
                     current_local_labels_in_temp_gws = np.unique(temp_gws_mask_local_p1gws[temp_gws_mask_local_p1gws > 0])
-                    if len(current_local_labels_in_temp_gws) <=1: print(f"{log_main_prefix}         P1.5 L{cell_label_p1}: Only {len(current_local_labels_in_temp_gws)} segment(s) left. No more P1.5 merges."); break
+                    if len(current_local_labels_in_temp_gws) <=1: flush_print(f"{log_main_prefix}         P1.5 L{cell_label_p1}: Only {len(current_local_labels_in_temp_gws)} segment(s) left. No more P1.5 merges."); break
 
                     sorted_local_edges_to_check_p15 = sorted(list(local_edges_p15.keys()))
 
@@ -918,7 +1188,7 @@ def separate_multi_soma_cells(
                         should_merge_local_p1_5_val = edge_metrics_local_p1_5_val.get('should_merge_decision', False)
                         
                         if should_merge_local_p1_5_val:
-                            print(f"{log_main_prefix}       P1.5 L{cell_label_p1} Edge ({lbl_A_loc_p15},{lbl_B_loc_p15}): Metrics indicate MERGE.")
+                            flush_print(f"{log_main_prefix}       P1.5 L{cell_label_p1} Edge ({lbl_A_loc_p15},{lbl_B_loc_p15}): Metrics indicate MERGE.")
                             label_to_keep_loc_p15 = lbl_A_loc_p15; label_to_remove_loc_p15 = lbl_B_loc_p15
                             vol_A_loc_p15 = local_nodes_p15.get(lbl_A_loc_p15,{}).get('volume',0)
                             vol_B_loc_p15 = local_nodes_p15.get(lbl_B_loc_p15,{}).get('volume',0)
@@ -930,7 +1200,7 @@ def separate_multi_soma_cells(
                             elif vol_A_loc_p15 < vol_B_loc_p15:
                                 label_to_keep_loc_p15, label_to_remove_loc_p15 = lbl_B_loc_p15, lbl_A_loc_p15
                             
-                            print(f"{log_main_prefix}         Merging L{label_to_remove_loc_p15} into L{label_to_keep_loc_p15} in temp_gws_mask_local_p1gws.")
+                            flush_print(f"{log_main_prefix}         Merging L{label_to_remove_loc_p15} into L{label_to_keep_loc_p15} in temp_gws_mask_local_p1gws.")
                             temp_gws_mask_local_p1gws[temp_gws_mask_local_p1gws == label_to_remove_loc_p15] = label_to_keep_loc_p15
                             p1_5_merged_in_pass_loc = True
                             
@@ -946,9 +1216,9 @@ def separate_multi_soma_cells(
                     if p1_5_merged_in_pass_loc: continue 
                     if not p1_5_merged_in_pass_loc: break 
             else:
-                print(f"{log_main_prefix}     P1 L{cell_label_p1}: P1.5 - No interfaces or no merges needed based on graph.")
+                flush_print(f"{log_main_prefix}     P1 L{cell_label_p1}: P1.5 - No interfaces or no merges needed based on graph.")
             
-            print(f"{log_main_prefix}     P1 L{cell_label_p1} Writing final segments to global mask...")
+            flush_print(f"{log_main_prefix}     P1 L{cell_label_p1} Writing final segments to global mask...")
             output_mask_local_view_final_p1_val = final_output_mask[local_bbox_slices_p1gws]
             output_mask_local_view_final_p1_val[original_cell_mask_local_for_gws_p1gws] = \
                 temp_gws_mask_local_p1gws[original_cell_mask_local_for_gws_p1gws]
@@ -958,24 +1228,24 @@ def separate_multi_soma_cells(
             if max_lbl_in_cell_after_p15_val >= cell_label_p1 : 
                  next_global_label_offset_val = max(next_global_label_offset_val, max_lbl_in_cell_after_p15_val + 1)
             
-            print(f"{log_main_prefix}     P1 L{cell_label_p1}: Finished P1 & P1.5. Max label in cell: {max_lbl_in_cell_after_p15_val}. Next global offset: {next_global_label_offset_val}.")
+            flush_print(f"{log_main_prefix}     P1 L{cell_label_p1}: Finished P1 & P1.5. Max label in cell: {max_lbl_in_cell_after_p15_val}. Next global offset: {next_global_label_offset_val}.")
             del temp_gws_mask_local_p1gws, local_nodes_p15, local_edges_p15
             
-        print(f"{log_main_prefix} Phase 1 & 1.5 (GWS + Per-Cell Graph Merging) completed. Time: {time.time()-phase1_combined_time:.2f}s. Final next_global_label_offset after P1.5: {next_global_label_offset_val}")
+        flush_print(f"{log_main_prefix} Phase 1 & 1.5 (GWS + Per-Cell Graph Merging) completed. Time: {time.time()-phase1_combined_time:.2f}s. Final next_global_label_offset after P1.5: {next_global_label_offset_val}")
 
-        print(f"\n{log_main_prefix} Phase 2 (Local Splitting) has been REMOVED as per request.")
+        flush_print(f"\n{log_main_prefix} Phase 2 (Local Splitting) has been REMOVED as per request.")
 
         phase3_start_time = time.time()
-        print(f"\n{log_main_prefix} Phase 3: Finalizing mask.")
+        flush_print(f"\n{log_main_prefix} Phase 3: Finalizing mask.")
         try:
-            print(f"{log_main_prefix} Filling internal voids...")
+            flush_print(f"{log_main_prefix} Filling internal voids...")
             final_mask_filled = fill_internal_voids(final_output_mask) 
         except NameError:
-            print(f"{log_main_prefix} Warning: fill_internal_voids not defined. Skipping this step.")
+            flush_print(f"{log_main_prefix} Warning: fill_internal_voids not defined. Skipping this step.")
             final_mask_filled = final_output_mask.copy()
 
         if np.any(final_mask_filled):
-            print(f"{log_main_prefix} Relabeling final mask sequentially...")
+            flush_print(f"{log_main_prefix} Relabeling final mask sequentially...")
             relabeled_array, forward_map, inverse_map = relabel_sequential(
                 final_mask_filled.astype(np.int32), offset=1 
             )
@@ -983,21 +1253,21 @@ def separate_multi_soma_cells(
             num_objects_final = len(unique_labels_in_relabeled[unique_labels_in_relabeled > 0])
             max_label_val = num_objects_final if num_objects_final > 0 else 0
             
-            print(f"{log_main_prefix} Relabeled final mask contains {num_objects_final} objects (max label: {max_label_val}).")
+            flush_print(f"{log_main_prefix} Relabeled final mask contains {num_objects_final} objects (max label: {max_label_val}).")
             output_to_return = relabeled_array.astype(np.int32)
         else:
-            print(f"{log_main_prefix} Final mask is empty.")
+            flush_print(f"{log_main_prefix} Final mask is empty.")
             output_to_return = final_mask_filled.astype(np.int32)
 
-        print(f"{log_main_prefix} Phase 3 (Finalization) completed. Time: {time.time()-phase3_start_time:.2f}s")
-        print(f"{log_main_prefix} Total processing time: {time.time()-overall_start_time:.2f}s")
+        flush_print(f"{log_main_prefix} Phase 3 (Finalization) completed. Time: {time.time()-phase3_start_time:.2f}s")
+        flush_print(f"{log_main_prefix} Total processing time: {time.time()-overall_start_time:.2f}s")
         
         return output_to_return
 
     finally:
         # --- Final Cleanup of Memory-Mapped Files ---
         if use_memmap_feature and memmap_dir and os.path.exists(memmap_dir):
-            print(f"{log_main_prefix} Final cleanup of memmap directory: {memmap_dir}")
+            flush_print(f"{log_main_prefix} Final cleanup of memmap directory: {memmap_dir}")
             # Force garbage collection to release file handles before attempting to delete
             gc.collect()
             rmtree(memmap_dir, ignore_errors=True)
@@ -1005,7 +1275,7 @@ def separate_multi_soma_cells(
 # --- fill_internal_voids (ensure it's defined as before) ---
 def fill_internal_voids(segmentation_mask_input: np.ndarray) -> np.ndarray:
     log_fill_prefix = "[FillVoids]"
-    print(f"{log_fill_prefix} Starting Internal Void Filling...")
+    flush_print(f"{log_fill_prefix} Starting Internal Void Filling...")
     t_start_fill = time.time()
     filled_mask_output = segmentation_mask_input.copy()
     
@@ -1014,8 +1284,8 @@ def fill_internal_voids(segmentation_mask_input: np.ndarray) -> np.ndarray:
     # It returns a list where index i corresponds to label i+1.
     input_for_find_objects = segmentation_mask_input.astype(np.int32)
     if np.max(input_for_find_objects) == 0 : # All zeros or empty
-        print(f"{log_fill_prefix} Input mask is empty or all zeros. No voids to fill.")
-        print(f"{log_fill_prefix} Void Filling Complete. Time: {time.time()-t_start_fill:.2f}s")
+        flush_print(f"{log_fill_prefix} Input mask is empty or all zeros. No voids to fill.")
+        flush_print(f"{log_fill_prefix} Void Filling Complete. Time: {time.time()-t_start_fill:.2f}s")
         return filled_mask_output
 
     bboxes = find_objects(input_for_find_objects)
@@ -1024,8 +1294,8 @@ def fill_internal_voids(segmentation_mask_input: np.ndarray) -> np.ndarray:
     voxels_added_total = 0
 
     if bboxes is None: # Should not happen if max > 0, but defensive.
-        print(f"{log_fill_prefix} No objects found by find_objects. No voids to fill.")
-        print(f"{log_fill_prefix} Void Filling Complete. Time: {time.time()-t_start_fill:.2f}s")
+        flush_print(f"{log_fill_prefix} No objects found by find_objects. No voids to fill.")
+        flush_print(f"{log_fill_prefix} Void Filling Complete. Time: {time.time()-t_start_fill:.2f}s")
         return filled_mask_output
 
     for i, bbox_slices in enumerate(bboxes):
@@ -1035,14 +1305,14 @@ def fill_internal_voids(segmentation_mask_input: np.ndarray) -> np.ndarray:
 
         if not (isinstance(bbox_slices, tuple) and len(bbox_slices) == segmentation_mask_input.ndim and \
                 all(isinstance(s, slice) for s in bbox_slices)):
-            print(f"{log_fill_prefix}   Skipping label {label_val_fill} due to invalid bbox: {bbox_slices}")
+            flush_print(f"{log_fill_prefix}   Skipping label {label_val_fill} due to invalid bbox: {bbox_slices}")
             continue
 
         original_roi_fill = segmentation_mask_input[bbox_slices] # Use original mask for ROI
         cell_mask_roi_fill = (original_roi_fill == label_val_fill) # Create binary mask for current label in ROI
         
         if not np.any(cell_mask_roi_fill):
-            print(f"{log_fill_prefix}   ROI for label {label_val_fill} is empty for this label. Skipping fill.")
+            flush_print(f"{log_fill_prefix}   ROI for label {label_val_fill} is empty for this label. Skipping fill.")
             continue
 
         original_voxels_fill = np.sum(cell_mask_roi_fill)
@@ -1050,7 +1320,7 @@ def fill_internal_voids(segmentation_mask_input: np.ndarray) -> np.ndarray:
             # binary_fill_holes expects a 2D or 3D binary image.
             filled_cell_roi_fill = binary_fill_holes(cell_mask_roi_fill)
         except Exception as e_fill:
-            print(f"{log_fill_prefix}   Error filling holes for label {label_val_fill} in ROI: {e_fill}. Skipping.")
+            flush_print(f"{log_fill_prefix}   Error filling holes for label {label_val_fill} in ROI: {e_fill}. Skipping.")
             continue
 
         filled_voxels_fill = np.sum(filled_cell_roi_fill)
@@ -1058,7 +1328,7 @@ def fill_internal_voids(segmentation_mask_input: np.ndarray) -> np.ndarray:
             voxels_added_fill = filled_voxels_fill - original_voxels_fill
             voxels_added_total += voxels_added_fill
             voids_filled_count += 1
-            print(f"{log_fill_prefix}   Filled void in label {label_val_fill}: added {voxels_added_fill} voxels.")
+            flush_print(f"{log_fill_prefix}   Filled void in label {label_val_fill}: added {voxels_added_fill} voxels.")
             
             # Update the corresponding ROI in our result mask (filled_mask_output)
             # We use the filled_cell_roi_fill (a boolean mask) to specify which
@@ -1066,11 +1336,11 @@ def fill_internal_voids(segmentation_mask_input: np.ndarray) -> np.ndarray:
             result_roi_view_fill = filled_mask_output[bbox_slices] # Get a view of the output mask's ROI
             result_roi_view_fill[filled_cell_roi_fill] = label_val_fill # Modify the view (updates filled_mask_output)
     
-    print(f"{log_fill_prefix} --- Void Filling Summary ---")
+    flush_print(f"{log_fill_prefix} --- Void Filling Summary ---")
     if voids_filled_count > 0:
-        print(f"{log_fill_prefix}   Filled voids in {voids_filled_count} objects.")
-        print(f"{log_fill_prefix}   Total voxels added: {voxels_added_total}")
+        flush_print(f"{log_fill_prefix}   Filled voids in {voids_filled_count} objects.")
+        flush_print(f"{log_fill_prefix}   Total voxels added: {voxels_added_total}")
     else:
-        print(f"{log_fill_prefix}   No internal voids were found to fill.")
-    print(f"{log_fill_prefix} Void Filling Complete. Time: {time.time()-t_start_fill:.2f}s")
+        flush_print(f"{log_fill_prefix}   No internal voids were found to fill.")
+    flush_print(f"{log_fill_prefix} Void Filling Complete. Time: {time.time()-t_start_fill:.2f}s")
     return filled_mask_output
