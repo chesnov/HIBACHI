@@ -325,6 +325,7 @@ def _filter_candidate_fragment_3d(
         flush_print(f"Warn: Unexpected error during 3D fragment filtering: {e_filt}")
         return 'discard', 'error', None, None, time.time() - t_start
 
+# (Ensure the flush_print helper and other necessary imports are at the top of your file)
 
 def extract_soma_masks(
     segmentation_mask: np.ndarray, # 3D mask
@@ -343,7 +344,10 @@ def extract_soma_masks(
     ref_vol_percentile_upper: int = 70,
     ref_thickness_percentile_lower: int = 1,
     absolute_min_thickness_um: float = 1.5,
-    absolute_max_thickness_um: float = 10.0
+    absolute_max_thickness_um: float = 10.0,
+    # --- NEW parameters for memory optimization ---
+    memmap_dir: Optional[str] = "ramiseg_temp_memmap",
+    memmap_voxel_threshold: int = 25_000_000 # ~25 million voxels
 ) -> np.ndarray:
     """
     Generates candidate seed mask using a memory-efficient strategy by storing
@@ -354,8 +358,12 @@ def extract_soma_masks(
     flush_print(f"DT ratios: {ratios_to_process}")
     intensity_percentiles_to_process = sorted([p for p in intensity_percentiles_to_process if 0 < p < 100], reverse=True)
     flush_print(f"Intensity Percentiles: {intensity_percentiles_to_process}")
+    
+    use_memmap_feature = memmap_dir is not None
+    if use_memmap_feature:
+        os.makedirs(memmap_dir, exist_ok=True)
+        flush_print(f"INFO: Using temporary directory for large arrays: {memmap_dir}")
 
-    # --- Internal Parameters & Setup ---
     if min_fragment_size is None or min_fragment_size < 1:
         min_seed_fragment_volume = 30
     else:
@@ -363,7 +371,6 @@ def extract_soma_masks(
     MAX_CORE_VOXELS_FOR_WS = 500_000 # SAFETY VALVE
     flush_print(f"Watershed safety valve: cores > {MAX_CORE_VOXELS_FOR_WS} voxels will not be split.")
 
-    # --- Setup block ---
     if spacing is None: spacing = (1.0, 1.0, 1.0)
     else:
         try: spacing = tuple(float(s) for s in spacing); assert len(spacing) == 3
@@ -409,7 +416,6 @@ def extract_soma_masks(
     min_peak_sep_pixels = get_min_distance_pixels(spacing, min_physical_peak_separation)
     gc.collect()
 
-    # --- 2. Process Small Cells & Initialize Final Mask ---
     final_seed_mask = np.zeros_like(segmentation_mask, dtype=np.int32); next_final_label = 1; added_small_labels: Set[int] = set()
     small_cell_labels = [l for l in unique_labels if l in smallest_object_labels_set]
     flush_print(f"\nProcessing {len(small_cell_labels)} small objects (3D)...")
@@ -421,30 +427,43 @@ def extract_soma_masks(
                 next_final_label += 1; added_small_labels.add(label)
     flush_print(f"Added {len(added_small_labels)} initial seeds from small cells."); gc.collect()
 
-    # --- 3. Generate Candidates from Large Cells ---
     large_cell_labels = [l for l in unique_labels if l not in added_small_labels]
     flush_print(f"Generating and placing candidates from {len(large_cell_labels)} large objects (3D)...")
     struct_el_erosion = ndimage.generate_binary_structure(3, 3) if erosion_iterations > 0 else None
 
     for label in tqdm(large_cell_labels, desc="Large Cell Candidates"):
+        flush_print(f"\n--- [START] Processing Large Cell L{label} ---")
         bbox_slice = label_to_slice.get(label)
-        if not bbox_slice: continue
+        if not bbox_slice:
+            flush_print(f"L{label}: No bbox slice found. Skipping.")
+            continue
         
         valid_candidates_for_this_label: List[Dict[str, Any]] = []
         fallback_candidates_for_this_label: List[Dict[str, Any]] = []
         seg_sub, mask_sub, int_sub, dist_transform_obj = None, None, None, None
+        dt_intermediate_path = None
 
         try:
             pad = 1
             slice_obj_tuple = (slice(max(0, s.start-pad), min(sh, s.stop+pad)) for s, sh in zip(bbox_slice, segmentation_mask.shape))
             slice_obj = tuple(slice_obj_tuple)
             offset = (slice_obj[0].start, slice_obj[1].start, slice_obj[2].start)
+            local_shape = tuple(s.stop - s.start for s in slice_obj)
+            num_voxels = np.prod(local_shape)
+            flush_print(f"L{label}: Local bbox shape is {local_shape} ({num_voxels:,} voxels)")
 
             seg_sub = segmentation_mask[slice_obj]
             mask_sub = (seg_sub == label)
-            if not np.any(mask_sub): continue
             
-            def process_core_mask(core_mask_for_labeling: np.ndarray, time_log: Dict[str, float]) -> Tuple[int, int, Dict[str, int]]:
+            if not np.any(mask_sub):
+                flush_print(f"L{label}: Empty local mask after cropping. Skipping.")
+                continue
+            
+            def process_core_mask(
+                core_mask_for_labeling: np.ndarray,
+                parent_dt: np.ndarray,
+                time_log: Dict[str, float]
+            ) -> Tuple[int, int, Dict[str, int]]:
                 rejection_stats = {'too_small': 0, 'thickness': 0, 'volume': 0, 'aspect': 0, 'error': 0}
                 t_start = time.time(); labeled_cores, num_cores = ndimage.label(core_mask_for_labeling); time_log['labeling'] += time.time() - t_start
                 if num_cores == 0: return 0, 0, rejection_stats
@@ -458,23 +477,40 @@ def extract_soma_masks(
                     core_volume = core_volumes[core_idx]
                     
                     t_ws_start = time.time()
-                    frags_masks, dt_core = [], None
+                    
+                    ws_core_full_size = np.zeros_like(parent_dt, dtype=np.int32)
                     if core_volume > MAX_CORE_VOXELS_FOR_WS:
-                        frags_masks.append(core_component_mask)
-                        dt_core = ndimage.distance_transform_edt(core_component_mask, sampling=spacing)
+                        ws_core_full_size[core_component_mask] = 1
                     else:
-                        dt_core = ndimage.distance_transform_edt(core_component_mask, sampling=spacing)
-                        peaks = peak_local_max(dt_core, min_distance=min_peak_sep_pixels, labels=core_component_mask, exclude_border=False)
+                        core_slices = find_objects(core_component_mask)
+                        if not core_slices: continue
+                        core_bbox = core_slices[0]
+
+                        mask_cropped = core_component_mask[core_bbox]
+                        dt_cropped = parent_dt[core_bbox]
+
+                        peaks = peak_local_max(dt_cropped, min_distance=min_peak_sep_pixels, labels=mask_cropped, exclude_border=False)
+                        
                         if peaks.shape[0] > 1:
-                            markers = np.zeros(dt_core.shape, dtype=np.int32); markers[tuple(peaks.T)] = np.arange(1, peaks.shape[0] + 1)
-                            ws_core = watershed(-dt_core, markers, mask=core_component_mask, watershed_line=False)
-                            for l in np.unique(ws_core):
-                                if l > 0: frags_masks.append(ws_core == l)
-                        else: frags_masks.append(core_component_mask)
+                            markers_cropped = np.zeros(dt_cropped.shape, dtype=np.int32)
+                            markers_cropped[tuple(peaks.T)] = np.arange(1, peaks.shape[0] + 1)
+                            
+                            ws_core_cropped = watershed(-dt_cropped, markers_cropped, mask=mask_cropped, watershed_line=False)
+                            
+                            ws_core_full_size[core_bbox][mask_cropped] = ws_core_cropped[mask_cropped]
+                        else:
+                            ws_core_full_size[core_component_mask] = 1
+                            
                     time_log['mini_ws'] += time.time() - t_ws_start
                     
-                    for f_mask in frags_masks:
-                        status, reason, m_copy, vol, dur = _filter_candidate_fragment_3d(f_mask, dt_core, spacing, min_seed_fragment_volume, min_accepted_core_volume, max_accepted_core_volume, min_accepted_thickness_um, absolute_max_thickness_um, max_allowed_core_aspect_ratio)
+                    unique_labels = np.unique(ws_core_full_size)
+                    unique_labels = unique_labels[unique_labels > 0]
+
+                    flush_print(f"    (process_core_mask): Filtering {len(unique_labels)} fragments from core {core_lbl} one-by-one...")
+                    for fragment_label in unique_labels:
+                        f_mask = (ws_core_full_size == fragment_label)
+                        
+                        status, reason, m_copy, vol, dur = _filter_candidate_fragment_3d(f_mask, parent_dt, spacing, min_seed_fragment_volume, min_accepted_core_volume, max_accepted_core_volume, min_accepted_thickness_um, absolute_max_thickness_um, max_allowed_core_aspect_ratio)
                         time_log['filtering'] += dur
                         
                         if status == 'valid':
@@ -492,8 +528,19 @@ def extract_soma_masks(
 
                 return num_cores, kept_fragments, rejection_stats
             
-            # --- A) DT Path ---
-            dist_transform_obj = ndimage.distance_transform_edt(mask_sub, sampling=spacing)
+            use_memmap_for_this_cell = use_memmap_feature and (num_voxels > memmap_voxel_threshold)
+
+            if use_memmap_for_this_cell:
+                dt_intermediate_path = os.path.join(memmap_dir, f"cell_{label}_dt_intermediate.mmp")
+                intermediate_shape = (mask_sub.ndim,) + mask_sub.shape
+                dt_intermediate_memmap = np.memmap(dt_intermediate_path, dtype=np.float64, mode='w+', shape=intermediate_shape)
+                distance_transform_edt(mask_sub, sampling=spacing, output=dt_intermediate_memmap)
+                final_dt_squared = np.add.reduce(dt_intermediate_memmap, axis=0)
+                dist_transform_obj = np.sqrt(final_dt_squared)
+                del dt_intermediate_memmap
+            else:
+                dist_transform_obj = ndimage.distance_transform_edt(mask_sub, sampling=spacing)
+
             max_dist = np.max(dist_transform_obj)
             if max_dist > 1e-9:
                 for ratio in ratios_to_process:
@@ -502,41 +549,50 @@ def extract_soma_masks(
                     if not np.any(initial_core): continue
                     eroded_core = ndimage.binary_erosion(initial_core, footprint=struct_el_erosion, iterations=erosion_iterations) if erosion_iterations > 0 else initial_core
                     if np.any(eroded_core):
-                        num_found, num_kept, stats = process_core_mask(eroded_core, time_log)
+                        num_found, num_kept, stats = process_core_mask(eroded_core, dist_transform_obj, time_log)
                         total_time = time.time() - t_iter_start
                         rejection_str = ", ".join([f"rej {k}: {v}" for k, v in stats.items() if v > 0])
-                        flush_print(f"    L{label} DT R{ratio:.1f}: Found {num_found} cores, kept {num_kept} frags. "
-                              f"{rejection_str}. Total time: {total_time:.2f}s "
-                              f"[label:{time_log['labeling']:.2f}s, sum:{time_log['summing']:.2f}s, "
-                              f"ws:{time_log['mini_ws']:.2f}s, filter:{time_log['filtering']:.2f}s]")
+                        flush_print(f"    L{label} DT R{ratio:.1f}: Found {num_found} cores, kept {num_kept} frags. Total time: {total_time:.2f}s")
 
-            # --- B) Intensity Path ---
             int_sub = intensity_image[slice_obj]
             ints_obj_vals = int_sub[mask_sub]
             if ints_obj_vals.size > 0:
                 for perc in intensity_percentiles_to_process:
+                    flush_print(f"  L{label}: Processing Intensity percentile {perc}...")
                     t_iter_start = time.time(); time_log = {'labeling': 0, 'summing': 0, 'mini_ws': 0, 'filtering': 0}
                     thresh = np.percentile(ints_obj_vals, perc)
                     initial_core = (int_sub >= thresh) & mask_sub
                     if not np.any(initial_core): continue
                     eroded_core = ndimage.binary_erosion(initial_core, footprint=struct_el_erosion, iterations=erosion_iterations) if erosion_iterations > 0 else initial_core
                     if np.any(eroded_core):
-                        num_found, num_kept, stats = process_core_mask(eroded_core, time_log)
+                        temp_dt_for_intensity_path = None
+                        if use_memmap_for_this_cell:
+                            dt_int_path = os.path.join(memmap_dir, f"cell_{label}_dt_int_p{perc}.mmp")
+                            int_intermediate_shape = (eroded_core.ndim,) + eroded_core.shape
+                            dt_int_memmap = np.memmap(dt_int_path, dtype=np.float64, mode='w+', shape=int_intermediate_shape)
+                            distance_transform_edt(eroded_core, sampling=spacing, output=dt_int_memmap)
+                            final_dt_sq = np.add.reduce(dt_int_memmap, axis=0)
+                            temp_dt_for_intensity_path = np.sqrt(final_dt_sq)
+                            del dt_int_memmap
+                        else:
+                            temp_dt_for_intensity_path = ndimage.distance_transform_edt(eroded_core, sampling=spacing)
+                        
+                        num_found, num_kept, stats = process_core_mask(eroded_core, temp_dt_for_intensity_path, time_log)
+                        del temp_dt_for_intensity_path
+                        
                         total_time = time.time() - t_iter_start
                         rejection_str = ", ".join([f"rej {k}: {v}" for k, v in stats.items() if v > 0])
-                        flush_print(f"    L{label} INT P{perc:02d}: Found {num_found} cores, kept {num_kept} frags. "
-                              f"{rejection_str}. Total time: {total_time:.2f}s "
-                              f"[label:{time_log['labeling']:.2f}s, sum:{time_log['summing']:.2f}s, "
-                              f"ws:{time_log['mini_ws']:.2f}s, filter:{time_log['filtering']:.2f}s]")
+                        flush_print(f"    L{label} INT P{perc:02d}: Found {num_found} cores, kept {num_kept} frags. Total time: {total_time:.2f}s")
 
-            # --- Placement logic (run once per parent cell) ---
             candidates_to_place = []
-            if valid_candidates_for_this_label: candidates_to_place.extend(valid_candidates_for_this_label)
-            elif fallback_candidates_for_this_label: candidates_to_place.append(max(fallback_candidates_for_this_label, key=lambda x: x['volume']))
+            if valid_candidates_for_this_label:
+                candidates_to_place.extend(valid_candidates_for_this_label)
+            elif fallback_candidates_for_this_label:
+                candidates_to_place.append(max(fallback_candidates_for_this_label, key=lambda x: x['volume']))
             
             if candidates_to_place:
                 candidates_to_place.sort(key=lambda x: x['volume'])
-                for cand in candidates_to_place:
+                for i, cand in enumerate(candidates_to_place):
                     coords_sub, offset_cand = cand['coords'], cand['offset']
                     if coords_sub.size == 0: continue
                     gz, gy, gx = coords_sub[:, 0] + offset_cand[0], coords_sub[:, 1] + offset_cand[1], coords_sub[:, 2] + offset_cand[2]
@@ -545,18 +601,35 @@ def extract_soma_masks(
                         final_seed_mask[vg] = next_final_label
                         next_final_label += 1
 
-        except MemoryError: flush_print(f"CRITICAL: MemoryError processing L{label}. Skipping this cell."); gc.collect()
-        except Exception as e: flush_print(f"Warn: Uncaught Error L{label}: {e}"); traceback.print_exc()
+        except MemoryError:
+            flush_print(f"CRITICAL: MemoryError processing L{label}. Skipping this cell.");
+            gc.collect()
+        except Exception as e:
+            flush_print(f"Warn: Uncaught Error L{label}: {e}");
+            traceback.print_exc()
         finally:
+            flush_print(f"L{label}: Entering 'finally' block for cleanup...")
+            if dt_intermediate_path and os.path.exists(dt_intermediate_path):
+                try: os.remove(dt_intermediate_path)
+                except OSError as e: flush_print(f"L{label}: WARNING - Could not remove intermediate memmap file: {e}")
+
             del valid_candidates_for_this_label, fallback_candidates_for_this_label
             if seg_sub is not None: del seg_sub
             if mask_sub is not None: del mask_sub
             if int_sub is not None: del int_sub
             if dist_transform_obj is not None: del dist_transform_obj
             gc.collect()
+            flush_print(f"--- [END] Processing Large Cell L{label} ---")
 
     total_final_seeds = next_final_label - 1
-    flush_print(f"\nGenerated {total_final_seeds} final aggregated seeds (3D)."); flush_print("--- Finished 3D Intermediate Seed Extraction ---")
+    flush_print(f"\nGenerated {total_final_seeds} final aggregated seeds (3D).");
+    flush_print("--- Finished 3D Intermediate Seed Extraction ---")
+    
+    if use_memmap_feature and memmap_dir and os.path.exists(memmap_dir):
+        flush_print(f"Final cleanup of memmap directory: {memmap_dir}")
+        try: rmtree(memmap_dir)
+        except OSError as e: flush_print(f"WARNING: Could not remove memmap directory during final cleanup: {e}")
+
     return final_seed_mask
 
 # --- Helper: Analyze local intensity difference ---
