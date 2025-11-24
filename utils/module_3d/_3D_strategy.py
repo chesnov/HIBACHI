@@ -172,9 +172,11 @@ class RamifiedStrategy(ProcessingStrategy):
         if not os.path.exists(trimmed_seg_path): return False
         
         try:
+            # Open inputs as read-only memmaps
             trimmed_labels_memmap = np.memmap(trimmed_seg_path, dtype=np.int32, mode='r', shape=self.image_shape)
+            # NOTE: For this to be fully effective, 'image_stack' should also be a memmap object
+            # when passed into this function.
 
-            # +++ CRITICAL FIX: Create separate, explicit parameter dictionaries +++
             soma_extraction_params = {
                 "smallest_quantile": float(params.get("smallest_quantile", 25)),
                 "min_fragment_size": int(params.get("min_fragment_size", 30)),
@@ -189,7 +191,8 @@ class RamifiedStrategy(ProcessingStrategy):
                 "ref_vol_percentile_upper": int(params.get("ref_vol_percentile_upper", 70)),
                 "ref_thickness_percentile_lower": int(params.get("ref_thickness_percentile_lower", 1)),
                 "absolute_min_thickness_um": float(params.get("absolute_min_thickness_um", 1.5)),
-                "absolute_max_thickness_um": float(params.get("absolute_max_thickness_um", 10.0))
+                "absolute_max_thickness_um": float(params.get("absolute_max_thickness_um", 10.0)),
+                "memmap_final_mask": True # Ensure extract_soma_masks uses a memmap for its output
             }
 
             separation_params = {
@@ -198,22 +201,46 @@ class RamifiedStrategy(ProcessingStrategy):
                 "max_seed_centroid_dist": float(params.get("max_seed_centroid_dist", 40.0)),
                 "min_path_intensity_ratio": float(params.get("min_path_intensity_ratio", 0.8)),
                 "min_local_intensity_difference": float(params.get("min_local_intensity_difference", 0.05)),
-                "local_analysis_radius": int(params.get("local_analysis_radius", 10))
+                "local_analysis_radius": int(params.get("local_analysis_radius", 10)),
+                # Pass memmap control params to the chunked wrapper
+                "memmap_dir": os.path.join(self.processed_dir, "sep_multi_soma_temp"),
+                "memmap_voxel_threshold": int(params.get("memmap_voxel_threshold", 25_000_000))
             }
             
+            # This function now returns EITHER a memmap object OR a numpy array
             cell_bodies = extract_soma_masks(trimmed_labels_memmap, image_stack, self.spacing, **soma_extraction_params)
+            
+            # Pass the object directly (whether memmap or array).
             final_separated_cells = separate_multi_soma_cells(trimmed_labels_memmap, image_stack, cell_bodies, self.spacing, **separation_params)
             
             cell_bodies_path = files.get("cell_bodies")
-            cb_memmap = np.memmap(cell_bodies_path, dtype=cell_bodies.dtype, mode='w+', shape=cell_bodies.shape)
-            cb_memmap[:] = cell_bodies[:]; cb_memmap.flush()
+            
+            # --- [START] ROBUST, CORRECTED SAVING LOGIC ---
+            # Check the type to handle saving correctly
+            if isinstance(cell_bodies, np.memmap):
+                print("Cell bodies is a memmap object. Copying file to persistent location.")
+                temp_cb_path = cell_bodies.filename
+                # Ensure the object is deleted to release the file lock before copying
+                del cell_bodies
+                gc.collect()
+                copyfile(temp_cb_path, cell_bodies_path)
+            else:
+                print("Cell bodies is a NumPy array. Saving to persistent memmap location.")
+                # Save the in-memory array to the persistent memmap file
+                cb_memmap = np.memmap(cell_bodies_path, dtype=cell_bodies.dtype, mode='w+', shape=cell_bodies.shape)
+                cb_memmap[:] = cell_bodies[:]
+                cb_memmap.flush()
+                del cb_memmap # Release the handle to the new persistent file
+            # --- [END] ROBUST, CORRECTED SAVING LOGIC ---
             
             final_seg_path = files.get("final_segmentation")
             final_memmap = np.memmap(final_seg_path, dtype=np.int32, mode='w+', shape=self.image_shape)
             final_memmap[:] = final_separated_cells[:]; final_memmap.flush()
             
             if viewer is not None:
-                self._add_layer_safely(viewer, cb_memmap, "Cell bodies")
+                # Open the persistent file for viewing
+                cb_display = np.memmap(cell_bodies_path, dtype=np.int32, mode='r', shape=self.image_shape)
+                self._add_layer_safely(viewer, cb_display, "Cell bodies")
                 self._add_layer_safely(viewer, final_memmap, "Final segmentation")
             
             return True

@@ -24,6 +24,8 @@ import os
 from shutil import rmtree
 import sys # Make sure sys is imported
 import SimpleITK as sitk
+import graph_tool.all as gt
+from scipy.sparse import csr_matrix
 
 seed = 42
 np.random.seed(seed)         # For NumPy
@@ -325,7 +327,17 @@ def _filter_candidate_fragment_3d(
         flush_print(f"Warn: Unexpected error during 3D fragment filtering: {e_filt}")
         return 'discard', 'error', None, None, time.time() - t_start
 
-# (Ensure the flush_print helper and other necessary imports are at the top of your file)
+import psutil # Add this import
+
+def log_memory_usage(label=""):
+    """Logs the current RAM usage of the process."""
+    process = psutil.Process(os.getpid())
+    # RSS: Resident Set Size - the non-swapped physical memory a process has used.
+    mem_info = process.memory_info()
+    mem_gb = mem_info.rss / (1024 ** 3)
+    flush_print(f"    [MEM_PROFILE] {label}: {mem_gb:.3f} GB")
+
+# (Ensure flush_print, time, os, gc, rmtree, psutil, and other necessary imports are at the top of your file)
 
 def extract_soma_masks(
     segmentation_mask: np.ndarray, # 3D mask
@@ -345,37 +357,28 @@ def extract_soma_masks(
     ref_thickness_percentile_lower: int = 1,
     absolute_min_thickness_um: float = 1.5,
     absolute_max_thickness_um: float = 10.0,
-    # --- NEW parameters for memory optimization ---
+    # --- Parameters for memory optimization ---
     memmap_dir: Optional[str] = "ramiseg_temp_memmap",
-    memmap_voxel_threshold: int = 25_000_000 # ~25 million voxels
+    memmap_voxel_threshold: int = 25_000_000,
+    memmap_final_mask: bool = True
 ) -> np.ndarray:
     """
-    Generates candidate seed mask using a memory-efficient strategy by storing
-    candidate coordinates and provides detailed performance and rejection profiling.
+    Generates candidate seed mask with optimizations for baseline and peak RAM usage.
     """
-    flush_print("--- Starting 3D Soma Extraction (Coordinate Storage Strategy with Rejection Profiling) ---")
-
-    flush_print(f"DT ratios: {ratios_to_process}")
-    intensity_percentiles_to_process = sorted([p for p in intensity_percentiles_to_process if 0 < p < 100], reverse=True)
-    flush_print(f"Intensity Percentiles: {intensity_percentiles_to_process}")
+    flush_print("--- Starting 3D Soma Extraction (Optimized for Baseline RAM) ---")
     
     use_memmap_feature = memmap_dir is not None
     if use_memmap_feature:
         os.makedirs(memmap_dir, exist_ok=True)
         flush_print(f"INFO: Using temporary directory for large arrays: {memmap_dir}")
 
-    if min_fragment_size is None or min_fragment_size < 1:
-        min_seed_fragment_volume = 30
-    else:
-        min_seed_fragment_volume = min_fragment_size
-    MAX_CORE_VOXELS_FOR_WS = 500_000 # SAFETY VALVE
-    flush_print(f"Watershed safety valve: cores > {MAX_CORE_VOXELS_FOR_WS} voxels will not be split.")
-
+    if min_fragment_size is None or min_fragment_size < 1: min_seed_fragment_volume = 30
+    else: min_seed_fragment_volume = min_fragment_size
+    MAX_CORE_VOXELS_FOR_WS = 500_000
     if spacing is None: spacing = (1.0, 1.0, 1.0)
     else:
         try: spacing = tuple(float(s) for s in spacing); assert len(spacing) == 3
         except: spacing = (1.0, 1.0, 1.0)
-    flush_print(f"Using 3D spacing (z,y,x): {spacing}")
     unique_labels_all, counts = np.unique(segmentation_mask[segmentation_mask > 0], return_counts=True)
     if len(unique_labels_all) == 0: return np.zeros_like(segmentation_mask, dtype=np.int32)
     initial_volumes = dict(zip(unique_labels_all, counts))
@@ -398,7 +401,6 @@ def extract_soma_masks(
     target_soma_volume = np.median([v for l,v in volumes.items() if l in smallest_object_labels_set] or all_volumes_list)
     min_accepted_core_volume = max(min_seed_fragment_volume, target_soma_volume * core_volume_target_factor_lower)
     max_accepted_core_volume = target_soma_volume * core_volume_target_factor_upper
-    flush_print(f"Core Volume filter range: [{min_accepted_core_volume:.2f} - {max_accepted_core_volume:.2f}] voxels")
     vol_thresh_lower, vol_thresh_upper = np.percentile(all_volumes_list, ref_vol_percentile_lower), np.percentile(all_volumes_list, ref_vol_percentile_upper)
     reference_object_labels = [l for l in unique_labels if vol_thresh_lower < volumes[l] <= vol_thresh_upper]
     if len(reference_object_labels) < 5: reference_object_labels = list(unique_labels)
@@ -412,225 +414,312 @@ def extract_soma_masks(
                 max_thicknesses_um.append(np.max(dt))
     min_accepted_thickness_um = max(absolute_min_thickness_um, np.percentile(max_thicknesses_um, ref_thickness_percentile_lower)) if max_thicknesses_um else absolute_min_thickness_um
     min_accepted_thickness_um = min(min_accepted_thickness_um, absolute_max_thickness_um - 1e-6)
-    flush_print(f"Final Core Thickness filter range: [{min_accepted_thickness_um:.2f} - {absolute_max_thickness_um:.2f}] um")
     min_peak_sep_pixels = get_min_distance_pixels(spacing, min_physical_peak_separation)
     gc.collect()
 
-    final_seed_mask = np.zeros_like(segmentation_mask, dtype=np.int32); next_final_label = 1; added_small_labels: Set[int] = set()
-    small_cell_labels = [l for l in unique_labels if l in smallest_object_labels_set]
-    flush_print(f"\nProcessing {len(small_cell_labels)} small objects (3D)...")
-    for label in tqdm(small_cell_labels, desc="Small Cells", disable=len(small_cell_labels) < 10):
-        if volumes.get(label, 0) >= min_seed_fragment_volume:
-            coords = np.argwhere(segmentation_mask == label)
-            if coords.size > 0:
-                final_seed_mask[coords[:, 0], coords[:, 1], coords[:, 2]] = next_final_label
-                next_final_label += 1; added_small_labels.add(label)
-    flush_print(f"Added {len(added_small_labels)} initial seeds from small cells."); gc.collect()
-
-    large_cell_labels = [l for l in unique_labels if l not in added_small_labels]
-    flush_print(f"Generating and placing candidates from {len(large_cell_labels)} large objects (3D)...")
-    struct_el_erosion = ndimage.generate_binary_structure(3, 3) if erosion_iterations > 0 else None
-
-    for label in tqdm(large_cell_labels, desc="Large Cell Candidates"):
-        flush_print(f"\n--- [START] Processing Large Cell L{label} ---")
-        bbox_slice = label_to_slice.get(label)
-        if not bbox_slice:
-            flush_print(f"L{label}: No bbox slice found. Skipping.")
-            continue
-        
-        valid_candidates_for_this_label: List[Dict[str, Any]] = []
-        fallback_candidates_for_this_label: List[Dict[str, Any]] = []
-        seg_sub, mask_sub, int_sub, dist_transform_obj = None, None, None, None
-        dt_intermediate_path = None
-
-        try:
-            pad = 1
-            slice_obj_tuple = (slice(max(0, s.start-pad), min(sh, s.stop+pad)) for s, sh in zip(bbox_slice, segmentation_mask.shape))
-            slice_obj = tuple(slice_obj_tuple)
-            offset = (slice_obj[0].start, slice_obj[1].start, slice_obj[2].start)
-            local_shape = tuple(s.stop - s.start for s in slice_obj)
-            num_voxels = np.prod(local_shape)
-            flush_print(f"L{label}: Local bbox shape is {local_shape} ({num_voxels:,} voxels)")
-
-            seg_sub = segmentation_mask[slice_obj]
-            mask_sub = (seg_sub == label)
+    final_seed_mask_path = None
+    final_seed_mask = None
+    
+    try:
+        if use_memmap_feature and memmap_final_mask:
+            flush_print(f"Creating final_seed_mask as a memory-mapped file to reduce baseline RAM.")
+            final_seed_mask_path = os.path.join(memmap_dir, 'final_seed_mask.mmp')
+            final_seed_mask = np.memmap(final_seed_mask_path, dtype=np.int32, mode='w+', shape=segmentation_mask.shape)
+        else:
+            flush_print(f"Creating final_seed_mask as an in-memory NumPy array.")
+            final_seed_mask = np.zeros_like(segmentation_mask, dtype=np.int32)
             
-            if not np.any(mask_sub):
-                flush_print(f"L{label}: Empty local mask after cropping. Skipping.")
+        next_final_label = 1
+        added_small_labels: Set[int] = set()
+        small_cell_labels = [l for l in unique_labels if l in smallest_object_labels_set]
+        flush_print(f"\nProcessing {len(small_cell_labels)} small objects (3D)...")
+        for label in tqdm(small_cell_labels, desc="Small Cells", disable=len(small_cell_labels) < 10):
+            if volumes.get(label, 0) >= min_seed_fragment_volume:
+                coords = np.argwhere(segmentation_mask == label)
+                if coords.size > 0:
+                    final_seed_mask[coords[:, 0], coords[:, 1], coords[:, 2]] = next_final_label
+                    next_final_label += 1; added_small_labels.add(label)
+        flush_print(f"Added {len(added_small_labels)} initial seeds from small cells."); gc.collect()
+
+        large_cell_labels = [l for l in unique_labels if l not in added_small_labels]
+        flush_print(f"Generating and placing candidates from {len(large_cell_labels)} large objects (3D)...")
+        struct_el_erosion = ndimage.generate_binary_structure(3, 3) if erosion_iterations > 0 else None
+
+        for label in tqdm(large_cell_labels, desc="Large Cell Candidates"):
+            flush_print(f"\n--- [START] Processing Large Cell L{label} ---")
+            bbox_slice = label_to_slice.get(label)
+            if not bbox_slice:
+                flush_print(f"L{label}: No bbox slice found. Skipping.")
                 continue
             
-            def process_core_mask(
-                core_mask_for_labeling: np.ndarray,
-                parent_dt: np.ndarray,
-                time_log: Dict[str, float]
-            ) -> Tuple[int, int, Dict[str, int]]:
-                rejection_stats = {'too_small': 0, 'thickness': 0, 'volume': 0, 'aspect': 0, 'error': 0}
-                t_start = time.time(); labeled_cores, num_cores = ndimage.label(core_mask_for_labeling); time_log['labeling'] += time.time() - t_start
-                if num_cores == 0: return 0, 0, rejection_stats
+            valid_candidate_paths: List[Dict[str, Any]] = []
+            fallback_candidate_paths: List[Dict[str, Any]] = []
+            
+            seg_sub, mask_sub, int_sub, dist_transform_obj = None, None, None, None
+            dt_intermediate_path = None
+            int_sub_path = None
 
-                t_start = time.time(); core_volumes = ndimage.sum_labels(core_mask_for_labeling, labeled_cores, range(1, num_cores + 1)); time_log['summing'] += time.time() - t_start
+            try:
+                pad = 1
+                slice_obj_tuple = (slice(max(0, s.start-pad), min(sh, s.stop+pad)) for s, sh in zip(bbox_slice, segmentation_mask.shape))
+                slice_obj = tuple(slice_obj_tuple)
+                offset = (slice_obj[0].start, slice_obj[1].start, slice_obj[2].start)
+                local_shape = tuple(s.stop - s.start for s in slice_obj)
+                num_voxels = np.prod(local_shape)
+                flush_print(f"L{label}: Local bbox shape is {local_shape} ({num_voxels:,} voxels)")
                 
-                kept_fragments = 0
-                for core_idx in np.where(core_volumes >= min_seed_fragment_volume)[0]:
-                    core_lbl = core_idx + 1
-                    core_component_mask = (labeled_cores == core_lbl)
-                    core_volume = core_volumes[core_idx]
+                seg_sub = segmentation_mask[slice_obj]
+                mask_sub = (seg_sub == label)
+                if not np.any(mask_sub): continue
+                
+                def process_core_mask(core_mask_for_labeling: np.ndarray, parent_dt: np.ndarray, time_log: Dict[str, float]) -> Tuple[int, int, Dict[str, int]]:
+                    flush_print(f"  (process_core_mask): Starting.")
+                    rejection_stats = {'too_small': 0, 'thickness': 0, 'volume': 0, 'aspect': 0, 'error': 0}
+                    labeled_cores, num_cores = ndimage.label(core_mask_for_labeling)
+                    if num_cores == 0: return 0, 0, rejection_stats
+                    core_volumes = ndimage.sum_labels(core_mask_for_labeling, labeled_cores, range(1, num_cores + 1))
                     
-                    t_ws_start = time.time()
-                    
-                    ws_core_full_size = np.zeros_like(parent_dt, dtype=np.int32)
-                    if core_volume > MAX_CORE_VOXELS_FOR_WS:
-                        ws_core_full_size[core_component_mask] = 1
-                    else:
-                        core_slices = find_objects(core_component_mask)
-                        if not core_slices: continue
-                        core_bbox = core_slices[0]
-
-                        mask_cropped = core_component_mask[core_bbox]
-                        dt_cropped = parent_dt[core_bbox]
-
-                        peaks = peak_local_max(dt_cropped, min_distance=min_peak_sep_pixels, labels=mask_cropped, exclude_border=False)
+                    kept_fragments = 0
+                    for core_idx in np.where(core_volumes >= min_seed_fragment_volume)[0]:
+                        core_lbl = core_idx + 1
+                        core_component_mask = (labeled_cores == core_lbl)
+                        core_volume = core_volumes[core_idx]
                         
-                        if peaks.shape[0] > 1:
-                            markers_cropped = np.zeros(dt_cropped.shape, dtype=np.int32)
-                            markers_cropped[tuple(peaks.T)] = np.arange(1, peaks.shape[0] + 1)
-                            
-                            ws_core_cropped = watershed(-dt_cropped, markers_cropped, mask=mask_cropped, watershed_line=False)
-                            
-                            ws_core_full_size[core_bbox][mask_cropped] = ws_core_cropped[mask_cropped]
-                        else:
+                        t_ws_start = time.time()
+                        ws_core_full_size = np.zeros_like(parent_dt, dtype=np.int32)
+                        if core_volume > MAX_CORE_VOXELS_FOR_WS:
                             ws_core_full_size[core_component_mask] = 1
-                            
-                    time_log['mini_ws'] += time.time() - t_ws_start
-                    
-                    unique_labels = np.unique(ws_core_full_size)
-                    unique_labels = unique_labels[unique_labels > 0]
-
-                    flush_print(f"    (process_core_mask): Filtering {len(unique_labels)} fragments from core {core_lbl} one-by-one...")
-                    for fragment_label in unique_labels:
-                        f_mask = (ws_core_full_size == fragment_label)
-                        
-                        status, reason, m_copy, vol, dur = _filter_candidate_fragment_3d(f_mask, parent_dt, spacing, min_seed_fragment_volume, min_accepted_core_volume, max_accepted_core_volume, min_accepted_thickness_um, absolute_max_thickness_um, max_allowed_core_aspect_ratio)
-                        time_log['filtering'] += dur
-                        
-                        if status == 'valid':
-                            coords = np.argwhere(m_copy)
-                            valid_candidates_for_this_label.append({'coords': coords, 'volume': vol, 'offset': offset})
-                            kept_fragments += 1
-                        elif status == 'fallback':
-                            coords = np.argwhere(m_copy)
-                            fallback_candidates_for_this_label.append({'coords': coords, 'volume': vol, 'offset': offset})
-                            if reason: rejection_stats[reason] += 1
-                        elif status == 'discard' and reason:
-                            rejection_stats[reason] += 1
-                        
-                        if m_copy is not None: del m_copy
-
-                return num_cores, kept_fragments, rejection_stats
-            
-            use_memmap_for_this_cell = use_memmap_feature and (num_voxels > memmap_voxel_threshold)
-
-            if use_memmap_for_this_cell:
-                dt_intermediate_path = os.path.join(memmap_dir, f"cell_{label}_dt_intermediate.mmp")
-                intermediate_shape = (mask_sub.ndim,) + mask_sub.shape
-                dt_intermediate_memmap = np.memmap(dt_intermediate_path, dtype=np.float64, mode='w+', shape=intermediate_shape)
-                distance_transform_edt(mask_sub, sampling=spacing, output=dt_intermediate_memmap)
-                final_dt_squared = np.add.reduce(dt_intermediate_memmap, axis=0)
-                dist_transform_obj = np.sqrt(final_dt_squared)
-                del dt_intermediate_memmap
-            else:
-                dist_transform_obj = ndimage.distance_transform_edt(mask_sub, sampling=spacing)
-
-            max_dist = np.max(dist_transform_obj)
-            if max_dist > 1e-9:
-                for ratio in ratios_to_process:
-                    t_iter_start = time.time(); time_log = {'labeling': 0, 'summing': 0, 'mini_ws': 0, 'filtering': 0}
-                    initial_core = (dist_transform_obj >= max_dist * ratio) & mask_sub
-                    if not np.any(initial_core): continue
-                    eroded_core = ndimage.binary_erosion(initial_core, footprint=struct_el_erosion, iterations=erosion_iterations) if erosion_iterations > 0 else initial_core
-                    if np.any(eroded_core):
-                        num_found, num_kept, stats = process_core_mask(eroded_core, dist_transform_obj, time_log)
-                        total_time = time.time() - t_iter_start
-                        rejection_str = ", ".join([f"rej {k}: {v}" for k, v in stats.items() if v > 0])
-                        flush_print(f"    L{label} DT R{ratio:.1f}: Found {num_found} cores, kept {num_kept} frags. Total time: {total_time:.2f}s")
-
-            int_sub = intensity_image[slice_obj]
-            ints_obj_vals = int_sub[mask_sub]
-            if ints_obj_vals.size > 0:
-                for perc in intensity_percentiles_to_process:
-                    flush_print(f"  L{label}: Processing Intensity percentile {perc}...")
-                    t_iter_start = time.time(); time_log = {'labeling': 0, 'summing': 0, 'mini_ws': 0, 'filtering': 0}
-                    thresh = np.percentile(ints_obj_vals, perc)
-                    initial_core = (int_sub >= thresh) & mask_sub
-                    if not np.any(initial_core): continue
-                    eroded_core = ndimage.binary_erosion(initial_core, footprint=struct_el_erosion, iterations=erosion_iterations) if erosion_iterations > 0 else initial_core
-                    if np.any(eroded_core):
-                        temp_dt_for_intensity_path = None
-                        if use_memmap_for_this_cell:
-                            dt_int_path = os.path.join(memmap_dir, f"cell_{label}_dt_int_p{perc}.mmp")
-                            int_intermediate_shape = (eroded_core.ndim,) + eroded_core.shape
-                            dt_int_memmap = np.memmap(dt_int_path, dtype=np.float64, mode='w+', shape=int_intermediate_shape)
-                            distance_transform_edt(eroded_core, sampling=spacing, output=dt_int_memmap)
-                            final_dt_sq = np.add.reduce(dt_int_memmap, axis=0)
-                            temp_dt_for_intensity_path = np.sqrt(final_dt_sq)
-                            del dt_int_memmap
                         else:
-                            temp_dt_for_intensity_path = ndimage.distance_transform_edt(eroded_core, sampling=spacing)
+                            core_slices = find_objects(core_component_mask)
+                            if not core_slices: continue
+                            core_bbox = core_slices[0]
+                            mask_cropped = core_component_mask[core_bbox]
+                            dt_cropped = parent_dt[core_bbox]
+                            peaks = peak_local_max(dt_cropped, min_distance=min_peak_sep_pixels, labels=mask_cropped, exclude_border=False)
+                            if peaks.shape[0] > 1:
+                                markers_cropped = np.zeros(dt_cropped.shape, dtype=np.int32)
+                                markers_cropped[tuple(peaks.T)] = np.arange(1, peaks.shape[0] + 1)
+                                ws_core_cropped = watershed(-dt_cropped, markers_cropped, mask=mask_cropped, watershed_line=False)
+                                ws_core_full_size[core_bbox][mask_cropped] = ws_core_cropped[mask_cropped]
+                            else:
+                                ws_core_full_size[core_component_mask] = 1
+                        time_log['mini_ws'] += time.time() - t_ws_start
                         
-                        num_found, num_kept, stats = process_core_mask(eroded_core, temp_dt_for_intensity_path, time_log)
-                        del temp_dt_for_intensity_path
+                        unique_labels_ws = np.unique(ws_core_full_size)
+                        unique_labels_ws = unique_labels_ws[unique_labels_ws > 0]
+
+                        flush_print(f"    (process_core_mask): Filtering {len(unique_labels_ws)} fragments from core {core_lbl} one-by-one...")
+                        for fragment_label in unique_labels_ws:
+                            f_mask = (ws_core_full_size == fragment_label)
+                            status, reason, m_copy, vol, dur = _filter_candidate_fragment_3d(f_mask, parent_dt, spacing, min_seed_fragment_volume, min_accepted_core_volume, max_accepted_core_volume, min_accepted_thickness_um, absolute_max_thickness_um, max_allowed_core_aspect_ratio)
+                            time_log['filtering'] += dur
+                            
+                            if status in ['valid', 'fallback']:
+                                coords = np.argwhere(m_copy)
+                                if coords.size == 0:
+                                    if m_copy is not None: del m_copy
+                                    continue
+                                timestamp = int(time.time() * 1_000_000)
+                                cand_path = os.path.join(memmap_dir, f"cell_{label}_cand_{timestamp}.mmp")
+                                cand_memmap = np.memmap(cand_path, dtype=coords.dtype, mode='w+', shape=coords.shape)
+                                cand_memmap[:] = coords[:]
+                                cand_memmap.flush()
+                                del cand_memmap
+                                candidate_info = {'path': cand_path, 'volume': vol, 'offset': offset, 'dtype': coords.dtype, 'shape': coords.shape}
+                                if status == 'valid':
+                                    valid_candidate_paths.append(candidate_info)
+                                    kept_fragments += 1
+                                else:
+                                    fallback_candidate_paths.append(candidate_info)
+                                    if reason: rejection_stats[reason] += 1
+                            elif status == 'discard' and reason:
+                                rejection_stats[reason] += 1
+                            if m_copy is not None: del m_copy
+                    return num_cores, kept_fragments, rejection_stats
+                
+                use_memmap_for_this_cell = use_memmap_feature and (num_voxels > memmap_voxel_threshold)
+                if use_memmap_for_this_cell:
+                    dt_intermediate_path = os.path.join(memmap_dir, f"cell_{label}_dt_intermediate.mmp")
+                    intermediate_shape = (mask_sub.ndim,) + mask_sub.shape
+                    dt_intermediate_memmap = np.memmap(dt_intermediate_path, dtype=np.float64, mode='w+', shape=intermediate_shape)
+                    distance_transform_edt(mask_sub, sampling=spacing, output=dt_intermediate_memmap)
+                    final_dt_squared = np.add.reduce(dt_intermediate_memmap, axis=0)
+                    dist_transform_obj = np.sqrt(final_dt_squared)
+                    del dt_intermediate_memmap
+                else:
+                    dist_transform_obj = ndimage.distance_transform_edt(mask_sub, sampling=spacing)
+                
+                max_dist = np.max(dist_transform_obj)
+                if max_dist > 1e-9:
+                    for ratio in ratios_to_process:
+                        flush_print(f"  L{label}: Processing DT ratio {ratio:.1f}...")
+                        t_iter_start = time.time(); time_log = {'labeling': 0, 'summing': 0, 'mini_ws': 0, 'filtering': 0}
+                        initial_core = (dist_transform_obj >= max_dist * ratio) & mask_sub
+                        if not np.any(initial_core): continue
+                        eroded_core = ndimage.binary_erosion(initial_core, footprint=struct_el_erosion, iterations=erosion_iterations) if erosion_iterations > 0 else initial_core
+                        if np.any(eroded_core):
+                            num_found, num_kept, stats = process_core_mask(eroded_core, dist_transform_obj, time_log)
+                            total_time = time.time() - t_iter_start
+                            flush_print(f"    L{label} DT R{ratio:.1f}: Found {num_found} cores, kept {num_kept} frags. Total time: {total_time:.2f}s")
+
+                flush_print(f"L{label}: Starting Intensity Path...")
+                if use_memmap_for_this_cell:
+                    flush_print(f"L{label}: Cell is large. Creating intensity crop (int_sub) as a memmap file.")
+                    int_sub_path = os.path.join(memmap_dir, f"cell_{label}_int_sub.mmp")
+                    int_sub = np.memmap(int_sub_path, dtype=intensity_image.dtype, mode='w+', shape=local_shape)
+                    int_sub[:] = intensity_image[slice_obj]
+                    int_sub.flush()
+                else:
+                    flush_print(f"L{label}: Cell is small. Creating intensity crop (int_sub) in RAM.")
+                    int_sub = intensity_image[slice_obj]
+                flush_print(f"L{label}: int_sub created. shape={int_sub.shape}, dtype={int_sub.dtype}, is_memmap={isinstance(int_sub, np.memmap)}")
+                
+                ints_obj_vals = int_sub[mask_sub]
+                if ints_obj_vals.size > 0:
+                    candidates_have_been_reset = False
+                    dt_int_path_reusable = os.path.join(memmap_dir, f"cell_{label}_dt_intensity_REUSABLE.mmp")
+                    
+                    for perc in intensity_percentiles_to_process:
+                        log_memory_usage(f"L{label} P{perc}: Start of loop")
+                        flush_print(f"  L{label}: Processing Intensity percentile {perc}...")
+                        t_iter_start = time.time(); time_log = {'labeling': 0, 'summing': 0, 'mini_ws': 0, 'filtering': 0}
                         
-                        total_time = time.time() - t_iter_start
-                        rejection_str = ", ".join([f"rej {k}: {v}" for k, v in stats.items() if v > 0])
-                        flush_print(f"    L{label} INT P{perc:02d}: Found {num_found} cores, kept {num_kept} frags. Total time: {total_time:.2f}s")
+                        thresh = np.percentile(ints_obj_vals, perc)
+                        initial_core = (int_sub >= thresh) & mask_sub
+                        log_memory_usage(f"L{label} P{perc}: After 'initial_core' creation")
+                        
+                        if not np.any(initial_core): continue
+                        
+                        eroded_core = ndimage.binary_erosion(initial_core, footprint=struct_el_erosion, iterations=erosion_iterations) if erosion_iterations > 0 else initial_core
+                        log_memory_usage(f"L{label} P{perc}: After 'eroded_core' creation")
+                        del initial_core
+                        
+                        if np.any(eroded_core):
+                            if not candidates_have_been_reset:
+                                flush_print(f"    L{label} P{perc}: Found valid intensity core. Clearing previous DT-based candidate files.")
+                                for cand_info in valid_candidate_paths:
+                                    if os.path.exists(cand_info['path']): os.remove(cand_info['path'])
+                                for cand_info in fallback_candidate_paths:
+                                    if os.path.exists(cand_info['path']): os.remove(cand_info['path'])
+                                valid_candidate_paths.clear()
+                                fallback_candidate_paths.clear()
+                                candidates_have_been_reset = True
+                            
+                            temp_dt_for_intensity_path = np.zeros_like(eroded_core, dtype=np.float64)
+                            log_memory_usage(f"L{label} P{perc}: After creating 'temp_dt_for_intensity_path'")
+                            
+                            core_slices = find_objects(eroded_core)
+                            if not core_slices:
+                                flush_print(f"    L{label} P{perc}: Core became empty after erosion, skipping.")
+                                del eroded_core
+                                continue
+                            
+                            core_bbox = core_slices[0]
+                            cropped_core = eroded_core[core_bbox]
+                            log_memory_usage(f"L{label} P{perc}: After 'cropped_core' creation")
+                            
+                            cropped_core_voxels = cropped_core.size
+                            use_memmap_for_cropped_core = use_memmap_feature and (cropped_core_voxels > memmap_voxel_threshold)
 
-            candidates_to_place = []
-            if valid_candidates_for_this_label:
-                candidates_to_place.extend(valid_candidates_for_this_label)
-            elif fallback_candidates_for_this_label:
-                candidates_to_place.append(max(fallback_candidates_for_this_label, key=lambda x: x['volume']))
-            
-            if candidates_to_place:
-                candidates_to_place.sort(key=lambda x: x['volume'])
-                for i, cand in enumerate(candidates_to_place):
-                    coords_sub, offset_cand = cand['coords'], cand['offset']
-                    if coords_sub.size == 0: continue
-                    gz, gy, gx = coords_sub[:, 0] + offset_cand[0], coords_sub[:, 1] + offset_cand[1], coords_sub[:, 2] + offset_cand[2]
-                    vg = (gz, gy, gx)
-                    if np.all(final_seed_mask[vg] == 0):
-                        final_seed_mask[vg] = next_final_label
-                        next_final_label += 1
+                            cropped_dt = None
+                            if use_memmap_for_cropped_core:
+                                flush_print(f"    L{label} P{perc}: Cropped intensity core is large ({cropped_core_voxels:,} voxels). Using REUSABLE MEMMAP for DT.")
+                                int_intermediate_shape = (cropped_core.ndim,) + cropped_core.shape
+                                dt_int_memmap = np.memmap(dt_int_path_reusable, dtype=np.float64, mode='w+', shape=int_intermediate_shape)
+                                log_memory_usage(f"L{label} P{perc}: After creating reusable memmap")
+                                distance_transform_edt(cropped_core, sampling=spacing, output=dt_int_memmap)
+                                log_memory_usage(f"L{label} P{perc}: After running custom EDT")
+                                final_dt_sq = np.add.reduce(dt_int_memmap, axis=0)
+                                cropped_dt = np.sqrt(final_dt_sq)
+                                log_memory_usage(f"L{label} P{perc}: After calculating final cropped_dt from memmap")
+                                del dt_int_memmap, final_dt_sq
+                            else:
+                                flush_print(f"    L{label} P{perc}: Cropped intensity core is small ({cropped_core_voxels:,} voxels). Using RAM for DT.")
+                                cropped_dt = ndimage.distance_transform_edt(cropped_core, sampling=spacing)
+                                log_memory_usage(f"L{label} P{perc}: After calculating cropped_dt in RAM")
 
-        except MemoryError:
-            flush_print(f"CRITICAL: MemoryError processing L{label}. Skipping this cell.");
+                            temp_dt_for_intensity_path[core_bbox] = cropped_dt
+                            log_memory_usage(f"L{label} P{perc}: After placing cropped_dt into full-size array")
+                            del cropped_dt, cropped_core # UNLIKE BEFORE, WE KEEP eroded_core for process_core_mask
+                            
+                            num_found, num_kept, stats = process_core_mask(eroded_core, temp_dt_for_intensity_path, time_log)
+                            del temp_dt_for_intensity_path, eroded_core # Cleanup after use
+                            log_memory_usage(f"L{label} P{perc}: After process_core_mask and cleanup")
+                            
+                            total_time = time.time() - t_iter_start
+                            flush_print(f"    L{label} INT P{int(perc):02d}: Found {num_found} cores, kept {num_kept} frags. Total time: {total_time:.2f}s")
+                    
+                    if os.path.exists(dt_int_path_reusable):
+                        try: os.remove(dt_int_path_reusable)
+                        except OSError as e: flush_print(f"L{label}: WARNING - Could not remove reusable intensity memmap: {e}")
+                
+                flush_print(f"L{label}: Starting placement logic...")
+                candidates_to_process = []
+                if valid_candidate_paths: candidates_to_process.extend(valid_candidate_paths)
+                elif fallback_candidate_paths: candidates_to_process.append(max(fallback_candidate_paths, key=lambda x: x['volume']))
+                if candidates_to_process:
+                    candidates_to_process.sort(key=lambda x: x['volume'])
+                    flush_print(f"L{label}: Placing {len(candidates_to_process)} candidates from disk...")
+                    for i, cand_info in enumerate(candidates_to_process):
+                        coords_sub = np.memmap(cand_info['path'], dtype=cand_info['dtype'], mode='r', shape=cand_info['shape'])
+                        offset_cand = cand_info['offset']
+                        if coords_sub.size > 0:
+                            gz, gy, gx = coords_sub[:, 0] + offset_cand[0], coords_sub[:, 1] + offset_cand[1], coords_sub[:, 2] + offset_cand[2]
+                            vg = (gz, gy, gx)
+                            if np.all(final_seed_mask[vg] == 0):
+                                final_seed_mask[vg] = next_final_label
+                                next_final_label += 1
+                        del coords_sub
+                        try:
+                            os.remove(cand_info['path'])
+                        except OSError as e:
+                            flush_print(f"  L{label}: WARNING - could not remove candidate file {cand_info['path']}: {e}")
+            except MemoryError:
+                flush_print(f"CRITICAL: MemoryError processing L{label}. Skipping this cell."); gc.collect()
+            except Exception as e:
+                flush_print(f"Warn: Uncaught Error L{label}: {e}"); traceback.print_exc()
+            finally:
+                flush_print(f"L{label}: Entering 'finally' block for cleanup...")
+                if dt_intermediate_path and os.path.exists(dt_intermediate_path):
+                    try: os.remove(dt_intermediate_path)
+                    except OSError as e: flush_print(f"L{label}: WARNING - Could not remove intermediate memmap file: {e}")
+                if int_sub_path and os.path.exists(int_sub_path):
+                    try:
+                        os.remove(int_sub_path)
+                        flush_print(f"L{label}: Successfully removed int_sub memmap file.")
+                    except OSError as e:
+                        flush_print(f"L{label}: WARNING - Could not remove int_sub memmap file: {e}")
+                del valid_candidate_paths, fallback_candidate_paths
+                if seg_sub is not None: del seg_sub
+                if mask_sub is not None: del mask_sub
+                if int_sub is not None: del int_sub
+                if dist_transform_obj is not None: del dist_transform_obj
+                gc.collect()
+                flush_print(f"--- [END] Processing Large Cell L{label} ---")
+
+        if isinstance(final_seed_mask, np.memmap):
+            flush_print("Loading final memory-mapped seed mask into RAM before returning...")
+            in_memory_final_mask = np.array(final_seed_mask)
+            return in_memory_final_mask
+        else:
+            return final_seed_mask
+    finally:
+        flush_print("--- Entering final cleanup block ---")
+        if 'final_seed_mask' in locals() and isinstance(final_seed_mask, np.memmap):
+            del final_seed_mask
             gc.collect()
-        except Exception as e:
-            flush_print(f"Warn: Uncaught Error L{label}: {e}");
-            traceback.print_exc()
-        finally:
-            flush_print(f"L{label}: Entering 'finally' block for cleanup...")
-            if dt_intermediate_path and os.path.exists(dt_intermediate_path):
-                try: os.remove(dt_intermediate_path)
-                except OSError as e: flush_print(f"L{label}: WARNING - Could not remove intermediate memmap file: {e}")
-
-            del valid_candidates_for_this_label, fallback_candidates_for_this_label
-            if seg_sub is not None: del seg_sub
-            if mask_sub is not None: del mask_sub
-            if int_sub is not None: del int_sub
-            if dist_transform_obj is not None: del dist_transform_obj
-            gc.collect()
-            flush_print(f"--- [END] Processing Large Cell L{label} ---")
-
-    total_final_seeds = next_final_label - 1
-    flush_print(f"\nGenerated {total_final_seeds} final aggregated seeds (3D).");
-    flush_print("--- Finished 3D Intermediate Seed Extraction ---")
-    
-    if use_memmap_feature and memmap_dir and os.path.exists(memmap_dir):
-        flush_print(f"Final cleanup of memmap directory: {memmap_dir}")
-        try: rmtree(memmap_dir)
-        except OSError as e: flush_print(f"WARNING: Could not remove memmap directory during final cleanup: {e}")
-
-    return final_seed_mask
+        if final_seed_mask_path and os.path.exists(final_seed_mask_path):
+            try:
+                os.remove(final_seed_mask_path)
+                flush_print(f"Successfully removed final_seed_mask memmap file: {final_seed_mask_path}")
+            except OSError as e:
+                flush_print(f"WARNING: Could not remove final_seed_mask memmap file: {e}")
+        if use_memmap_feature and memmap_dir and os.path.exists(memmap_dir):
+            flush_print(f"Final cleanup of memmap directory: {memmap_dir}")
+            try:
+                rmtree(memmap_dir)
+            except OSError as e:
+                flush_print(f"WARNING: Could not remove memmap directory during final cleanup: {e}")
 
 # --- Helper: Analyze local intensity difference ---
 def _analyze_local_intensity_difference_optimized(
@@ -869,71 +958,305 @@ def _build_adjacency_graph_for_cell(
     flush_print(f"{log_prefix} Graph built: {len(nodes)} nodes, {len(edges)} edges.")
     return nodes, edges
 
-
 def separate_multi_soma_cells(
     segmentation_mask: np.ndarray, intensity_volume: np.ndarray, soma_mask: np.ndarray,
-    spacing: Optional[Tuple[float, float, float]], min_size_threshold: int = 100,
-    intensity_weight: float = 0.0, max_seed_centroid_dist: float = 40,
-    min_path_intensity_ratio: float = 0.8, # If the metric for two tentative segments is >= this, they are considered "too bright" and merged
-    min_local_intensity_difference: float = 0.05, local_analysis_radius: int = 10, #If the local intensity difference between two segments is less than this, they are merged
-    # --- MODIFIED parameters for memory optimization ---
-    memmap_dir: Optional[str] = "ramiseg_temp_memmap",
-    memmap_voxel_threshold: int = 25_000_000 # ~25 million voxels
+    spacing: Optional[Tuple[float, float, float]], 
+    chunk_shape: Tuple[int, int, int] = (128, 512, 512),
+    overlap: int = 32,
+    **kwargs 
 ) -> np.ndarray:
     """
-    Separates multi-soma cells using a hybrid watershed and graph-based merging approach.
+    A wrapper function that processes a large volume in manageable, overlapping chunks,
+    performs a pixel-perfect stitch, and then runs a final global re-merging phase.
+    """
+    log_wrapper_prefix = "[SepMultiSoma_WRAPPER]"
+    flush_print(f"{log_wrapper_prefix} Starting chunked processing...")
     
-    This version includes memory optimization for processing extremely large cells. If a
-    cell's bounding box voxel count exceeds `memmap_voxel_threshold`, its large 
-    intermediate arrays (like distance transforms, cost arrays, etc.) are created
-    on disk as memory-mapped files in the `memmap_dir` to prevent RAM overload.
+    memmap_dir = kwargs.get("memmap_dir", "ramiseg_temp_memmap")
+    if memmap_dir and not os.path.exists(memmap_dir):
+        os.makedirs(memmap_dir)
 
-    Args:
-        ... (existing args) ...
-        memmap_dir (Optional[str]): Directory to store temporary memory-mapped files. 
-            If None, this feature is disabled. The directory is created and cleaned up automatically.
-        memmap_voxel_threshold (int): If the number of voxels in a cell's local bounding box
-            exceeds this, memory-mapping is triggered to avoid RAM overload.
+    # --- Initial analysis on the full volume to get multi-soma list ---
+    unique_initial_labels = np.unique(segmentation_mask[segmentation_mask > 0])
+    if unique_initial_labels.size == 0: return np.zeros_like(segmentation_mask, dtype=np.int32)
+    
+    cell_to_somas_orig: Dict[int, Set[int]] = {lbl: set() for lbl in unique_initial_labels}
+    present_soma_labels_orig = np.unique(soma_mask[soma_mask > 0])
+    if present_soma_labels_orig.size == 0: 
+        if np.any(segmentation_mask): return relabel_sequential(segmentation_mask.astype(np.int32), offset=1)[0]
+        return segmentation_mask.astype(np.int32)
+
+    for soma_lbl_init in present_soma_labels_orig:
+        soma_loc_mask_init = (soma_mask == soma_lbl_init)
+        cell_lbls_under_soma_init = np.unique(segmentation_mask[soma_loc_mask_init])
+        for cell_lbl_init in cell_lbls_under_soma_init:
+            if cell_lbl_init > 0 and cell_lbl_init in cell_to_somas_orig:
+                cell_to_somas_orig[cell_lbl_init].add(soma_lbl_init)
+    multi_soma_cell_labels_list = [lbl for lbl, somas in cell_to_somas_orig.items() if len(somas) > 1]
+    
+    if not multi_soma_cell_labels_list:
+        if np.any(segmentation_mask): return relabel_sequential(segmentation_mask.astype(np.int32), offset=1)[0]
+        return segmentation_mask.astype(np.int32)
+
+    # --- Phase 1: Process Chunks and save individual results ---
+    next_label_offset = (np.max(unique_initial_labels) if unique_initial_labels.size > 0 else 0) + 1
+    global_provenance_map = {}
+    chunk_slices = list(_get_chunk_slices(segmentation_mask.shape, chunk_shape, overlap))
+    chunk_result_paths = {}
+    print(f'Splitting in {len(chunk_slices)} chunks')
+
+    for i, chunk_slice in enumerate(tqdm(chunk_slices, desc=f"{log_wrapper_prefix} Processing Chunks")):
+        seg_chunk = np.array(segmentation_mask[chunk_slice])
+        intensity_chunk = np.array(intensity_volume[chunk_slice])
+        soma_chunk = np.array(soma_mask[chunk_slice])
+        
+        chunk_result, chunk_provenance = _separate_multi_soma_cells_chunk(
+            segmentation_mask=seg_chunk, intensity_volume=intensity_chunk, soma_mask=soma_chunk,
+            spacing=spacing, label_offset=next_label_offset,
+            multi_soma_cell_labels_list=multi_soma_cell_labels_list,
+            **kwargs
+        )
+        
+        global_provenance_map.update(chunk_provenance)
+        max_label_in_chunk = np.max(chunk_result)
+        if max_label_in_chunk >= next_label_offset:
+            next_label_offset = max_label_in_chunk + 1
+        
+        chunk_path = os.path.join(memmap_dir, f"chunk_{i}_result.mmp")
+        chunk_memmap = np.memmap(chunk_path, dtype=np.int32, mode='w+', shape=seg_chunk.shape)
+        chunk_memmap[:] = chunk_result[:]
+        chunk_memmap.flush()
+        chunk_result_paths[i] = (chunk_path, seg_chunk.shape)
+        del chunk_memmap, chunk_result, seg_chunk, intensity_chunk, soma_chunk
+        gc.collect()
+
+    # --- Phase 2: Pixel-Perfect Stitching ---
+    flush_print(f"\n{log_wrapper_prefix} All chunks processed. Starting Stitching Phase 1 (Pixel Correspondence)...")
+    label_map = {}
+    shape_in_chunks = [
+        len(range(0, segmentation_mask.shape[0], chunk_shape[0] - overlap)),
+        len(range(0, segmentation_mask.shape[1], chunk_shape[1] - overlap)),
+        len(range(0, segmentation_mask.shape[2], chunk_shape[2] - overlap))
+    ]
+    for i, chunk_slice1 in enumerate(tqdm(chunk_slices, desc=f"{log_wrapper_prefix} Analyzing Overlaps")):
+        # (Neighbor finding logic is correct and remains)
+        cz, cy, cx = np.unravel_index(i, shape_in_chunks)
+        neighbors_indices = []
+        if cz + 1 < shape_in_chunks[0]: neighbors_indices.append(np.ravel_multi_index((cz + 1, cy, cx), shape_in_chunks))
+        if cy + 1 < shape_in_chunks[1]: neighbors_indices.append(np.ravel_multi_index((cz, cy + 1, cx), shape_in_chunks))
+        if cx + 1 < shape_in_chunks[2]: neighbors_indices.append(np.ravel_multi_index((cz, cy, cx + 1), shape_in_chunks))
+
+        for j in neighbors_indices:
+            if j >= len(chunk_slices): continue
+            chunk_slice2 = chunk_slices[j]
+            overlap_slice = tuple(slice(max(s1.start, s2.start), min(s1.stop, s2.stop)) for s1, s2 in zip(chunk_slice1, chunk_slice2))
+            if any(s.start >= s.stop for s in overlap_slice): continue
+            
+            relative_overlap1 = tuple(slice(s.start - cs.start, s.stop - cs.start) for s, cs in zip(overlap_slice, chunk_slice1))
+            relative_overlap2 = tuple(slice(s.start - cs.start, s.stop - cs.start) for s, cs in zip(overlap_slice, chunk_slice2))
+
+            path1, shape1 = chunk_result_paths[i]
+            res1 = np.memmap(path1, dtype=np.int32, mode='r', shape=shape1)
+            overlap1 = res1[relative_overlap1]
+            path2, shape2 = chunk_result_paths[j]
+            res2 = np.memmap(path2, dtype=np.int32, mode='r', shape=shape2)
+            overlap2 = res2[relative_overlap2]
+            
+            correspondence_mask = (overlap1 > 0) & (overlap2 > 0)
+            if not np.any(correspondence_mask): continue
+            
+            labels1 = overlap1[correspondence_mask]
+            labels2 = overlap2[correspondence_mask]
+            unique_pairs = np.unique(np.vstack([labels1, labels2]), axis=1).T
+            
+            for l1, l2 in unique_pairs:
+                root1 = label_map.get(l1, l1)
+                root2 = label_map.get(l2, l2)
+                if root1 != root2:
+                    unified_label = min(root1, root2)
+                    for k, v in label_map.items():
+                        if v == max(root1, root2): label_map[k] = unified_label
+                    label_map[max(root1, root2)] = unified_label
+                    label_map[min(root1, root2)] = unified_label
+
+    # --- Phase 3: Assembling the Provisionally Stitched Mask ---
+    flush_print(f"\n{log_wrapper_prefix} Stitching Phase 1 complete. Assembling provisional mask...")
+    prov_stitched_path = os.path.join(memmap_dir, "prov_stitched.mmp")
+    prov_stitched_mask = np.memmap(prov_stitched_path, dtype=np.int32, mode='w+', shape=segmentation_mask.shape)
+    
+    untouched_mask = ~np.isin(segmentation_mask, multi_soma_cell_labels_list)
+    prov_stitched_mask[untouched_mask] = segmentation_mask[untouched_mask]
+    
+    for i, chunk_slice in enumerate(tqdm(chunk_slices, desc=f"{log_wrapper_prefix} Assembling Mask")):
+        path, shape = chunk_result_paths[i]
+        chunk_result = np.memmap(path, dtype=np.int32, mode='r+', shape=shape)
+        unique_labels_in_chunk = np.unique(chunk_result)
+        for old_label in unique_labels_in_chunk:
+            if old_label == 0: continue
+            root_label = label_map.get(old_label, old_label)
+            if root_label != old_label:
+                chunk_result[chunk_result == old_label] = root_label
+        
+        paste_mask = np.isin(segmentation_mask[chunk_slice], multi_soma_cell_labels_list)
+        prov_stitched_mask[chunk_slice][paste_mask] = chunk_result[paste_mask]
+
+    prov_stitched_mask.flush()
+
+    # --- Phase 4: Global Re-merging of Stitched Siblings (YOUR CORRECT LOGIC) ---
+    flush_print(f"\n{log_wrapper_prefix} Starting Stitching Phase 3 (Global Re-merging)...")
+    
+    parent_to_children = {}
+    for child, parent in global_provenance_map.items():
+        stitched_child = label_map.get(child, child)
+        if parent not in parent_to_children:
+            parent_to_children[parent] = set()
+        parent_to_children[parent].add(stitched_child)
+
+    final_remerge_map = {} 
+    footprint = footprint_rectangle((3,3,3))
+
+    for parent_label, child_labels_set in tqdm(parent_to_children.items(), desc=f"{log_wrapper_prefix} Re-merging Siblings"):
+        child_labels = list(child_labels_set)
+        if len(child_labels) <= 1: continue
+
+        for i in range(len(child_labels)):
+            for j in range(i + 1, len(child_labels)):
+                label_a = child_labels[i]
+                label_b = child_labels[j]
+                
+                root_a = final_remerge_map.get(label_a, label_a)
+                root_b = final_remerge_map.get(label_b, label_b)
+                if root_a == root_b: continue
+
+                mask_a_full = (prov_stitched_mask == label_a)
+                dilated_a = binary_dilation(mask_a_full, footprint=footprint)
+                interface = dilated_a & (prov_stitched_mask == label_b)
+                if not np.any(interface): continue
+                
+                interface_slices = find_objects(interface)
+                if not interface_slices: continue
+                bbox = interface_slices[0]
+                
+                mask_a_local = mask_a_full[bbox]
+                mask_b_local = (prov_stitched_mask[bbox] == label_b)
+                intensity_local = np.array(intensity_volume[bbox])
+                parent_mask_local = mask_a_local | mask_b_local
+                
+                # We do not have easy access to the specific soma intensities here.
+                # The _calculate_interface_metrics function is robust enough to work
+                # with a placeholder and rely more on the LID heuristic.
+                avg_soma_intensity = 15000 
+
+                metrics = _calculate_interface_metrics(
+                    mask_A_local=mask_a_local, mask_B_local=mask_b_local,
+                    parent_mask_local=parent_mask_local, intensity_local=intensity_local,
+                    avg_soma_intensity_for_interface=avg_soma_intensity,
+                    spacing_tuple=spacing,
+                    local_analysis_radius=kwargs.get("local_analysis_radius", 10),
+                    min_local_intensity_difference=kwargs.get("min_local_intensity_difference", 0.05),
+                    min_path_intensity_ratio_heuristic=kwargs.get("min_path_intensity_ratio", 0.8),
+                    log_prefix=f"{log_wrapper_prefix}   - Sibling Edge ({label_a},{label_b})"
+                )
+
+                if metrics.get('should_merge_decision', False):
+                    flush_print(f"{log_wrapper_prefix}     Decision: MERGE siblings {label_a} and {label_b}.")
+                    root1 = final_remerge_map.get(label_a, label_a)
+                    root2 = final_remerge_map.get(label_b, label_b)
+                    if root1 != root2:
+                        unified = min(root1, root2)
+                        # Ensure transitive merges point to the single smallest root
+                        for k, v in final_remerge_map.items():
+                           if v == max(root1, root2): final_remerge_map[k] = unified
+                        final_remerge_map[max(root1, root2)] = unified
+                        final_remerge_map[label_a] = unified
+                        final_remerge_map[label_b] = unified
+
+    flush_print(f"{log_wrapper_prefix} Global re-merging analysis complete. Resolving {len(final_remerge_map)} merge rules...")
+
+    # Create a final, clean map that resolves all chains (e.g., C->B, B->A becomes C->A)
+    # This is a robust way to handle the merges and prevents any possibility of an infinite loop.
+    final_clean_map = {}
+    for old_label in list(final_remerge_map.keys()) + list(final_remerge_map.values()):
+        root = final_remerge_map.get(old_label, old_label)
+        # Follow the chain to the ultimate root
+        visited_path = [root]
+        while root in final_remerge_map:
+            root = final_remerge_map[root]
+            # Cycle detection
+            if root in visited_path:
+                # This case should ideally not happen with the min() logic, but this is a safeguard.
+                # We break the cycle by choosing the smallest label in the cycle as the root.
+                cycle_root = min(visited_path[visited_path.index(root):])
+                root = cycle_root
+                break
+            visited_path.append(root)
+
+        final_clean_map[old_label] = root
+    
+    flush_print(f"{log_wrapper_prefix} Applying {len(final_clean_map)} final merges to mask...")
+    # Apply the clean, resolved map to the provisionally stitched mask
+    for old_label, new_label in tqdm(final_clean_map.items(), desc=f"{log_wrapper_prefix} Finalizing Merges"):
+        if old_label != new_label:
+            prov_stitched_mask[prov_stitched_mask == old_label] = new_label
+
+    # --- Final Cleanup and Relabeling ---
+    final_result, _, _ = relabel_sequential(np.array(prov_stitched_mask), offset=1)
+    
+    del prov_stitched_mask
+    gc.collect()
+    if os.path.exists(prov_stitched_path): os.remove(prov_stitched_path)
+    for path, _ in chunk_result_paths.values():
+        if os.path.exists(path): os.remove(path)
+    
+    return final_result
+
+def _get_chunk_slices(volume_shape, chunk_shape, overlap):
+    """Generator that yields slices for overlapping chunks."""
+    for z in range(0, volume_shape[0], chunk_shape[0] - overlap):
+        for y in range(0, volume_shape[1], chunk_shape[1] - overlap):
+            for x in range(0, volume_shape[2], chunk_shape[2] - overlap):
+                yield (
+                    slice(z, min(z + chunk_shape[0], volume_shape[0])),
+                    slice(y, min(y + chunk_shape[1], volume_shape[1])),
+                    slice(x, min(x + chunk_shape[2], volume_shape[2])),
+                )
+
+def _separate_multi_soma_cells_chunk(
+    segmentation_mask: np.ndarray, intensity_volume: np.ndarray, soma_mask: np.ndarray,
+    spacing: Optional[Tuple[float, float, float]], min_size_threshold: int,
+    intensity_weight: float, max_seed_centroid_dist: float,
+    min_path_intensity_ratio: float, min_local_intensity_difference: float, 
+    local_analysis_radius: int, label_offset: int,
+    memmap_dir: Optional[str], memmap_voxel_threshold: int,
+    multi_soma_cell_labels_list: List[int]
+) -> Tuple[np.ndarray, Dict[int, int]]:
+    """
+    Worker function. Processes only the multi-soma cells present in its chunk and
+    returns a mask of ONLY the new fragments, plus a provenance map.
     """
     
-    log_main_prefix = "[SepMultiSomaSerialV7_MemOpt_V2]"
-    overall_start_time = time.time()
-    flush_print(f"{log_main_prefix} Starting Serialized Hybrid Separation (Voxel Threshold Trigger)")
-    
-    # --- Setup for Memory-Mapping ---
-    use_memmap_feature = memmap_dir is not None
-    if use_memmap_feature:
-        if os.path.exists(memmap_dir):
-            flush_print(f"{log_main_prefix} INFO: Cleaning pre-existing memmap directory: {memmap_dir}")
-            try:
-                rmtree(memmap_dir)
-            except OSError as e:
-                flush_print(f"{log_main_prefix} WARNING: Could not remove memmap directory: {e}. Files may be locked.")
-        os.makedirs(memmap_dir, exist_ok=True)
-        flush_print(f"{log_main_prefix} INFO: Using temporary directory for large arrays: {memmap_dir}")
+    log_main_prefix = "[SepMultiSoma_CHUNK]"
+    provenance_map = {}
 
     try:
-        # --- Initial parameter prints, spacing setup, type checks - same as before) ...
         if spacing is None: spacing_arr = np.array([1.0, 1.0, 1.0]); spacing_tuple = (1.0,1.0,1.0)
         else:
             try: spacing_tuple = tuple(float(s) for s in spacing); assert len(spacing_tuple) == 3; spacing_arr = np.array(spacing_tuple)
             except: spacing_tuple = (1.0,1.0,1.0); spacing_arr = np.array([1.0,1.0,1.0])
         flush_print(f"{log_main_prefix} Using 3D spacing (z,y,x): {spacing_tuple}")
-        if not np.issubdtype(intensity_volume.dtype, np.floating): intensity_volume = intensity_volume.astype(np.float32, copy=False)
-        if not np.issubdtype(segmentation_mask.dtype, np.integer): segmentation_mask = segmentation_mask.astype(np.int32)
-        if not np.issubdtype(soma_mask.dtype, np.integer): soma_mask = soma_mask.astype(np.int32)
-
+        
+        # This mask will ONLY contain the new fragments we create and untouched cells.
         final_output_mask = np.zeros_like(segmentation_mask, dtype=np.int32)
         unique_initial_labels = np.unique(segmentation_mask[segmentation_mask > 0])
-        if unique_initial_labels.size == 0: flush_print(f"{log_main_prefix} Seg mask empty."); return final_output_mask
+        if unique_initial_labels.size == 0: 
+            flush_print(f"{log_main_prefix} Seg mask empty in chunk."); 
+            return final_output_mask, {}
         
         cell_to_somas_orig: Dict[int, Set[int]] = {lbl: set() for lbl in unique_initial_labels}
         present_soma_labels_orig = np.unique(soma_mask[soma_mask > 0])
         if present_soma_labels_orig.size == 0: 
-            flush_print(f"{log_main_prefix} Soma mask empty. Returning original seg (relabelled).")
-            final_output_mask = segmentation_mask.copy()
-            if np.any(final_output_mask): return relabel_sequential(final_output_mask.astype(np.int32), offset=1)[0]
-            return final_output_mask
+            flush_print(f"{log_main_prefix} Soma mask empty in chunk. Returning original seg.")
+            return segmentation_mask.copy(), {}
 
         for soma_lbl_init in present_soma_labels_orig:
             soma_loc_mask_init = (soma_mask == soma_lbl_init)
@@ -942,54 +1265,40 @@ def separate_multi_soma_cells(
                 if cell_lbl_init > 0 and cell_lbl_init in cell_to_somas_orig:
                     cell_to_somas_orig[cell_lbl_init].add(soma_lbl_init)
 
-        multi_soma_cell_labels_list = [lbl for lbl, somas in cell_to_somas_orig.items() if len(somas) > 1]
+        # Determine which of the GLOBAL multi-soma cells are present in THIS chunk's segmentation mask
+        chunk_multi_soma_labels = [lbl for lbl in multi_soma_cell_labels_list if lbl in unique_initial_labels and len(cell_to_somas_orig.get(lbl, [])) > 1]
         
+        # Copy the single-soma cells (or non-multi-soma cells) to the output directly
         for lbl_init in unique_initial_labels:
-            if lbl_init not in multi_soma_cell_labels_list:
+            if lbl_init not in chunk_multi_soma_labels:
                 final_output_mask[segmentation_mask == lbl_init] = lbl_init
-        
-        if not multi_soma_cell_labels_list:
-            flush_print(f"{log_main_prefix} No multi-soma cells. Relabeling initial output. Time:{time.time()-overall_start_time:.2f}s")
-            if np.any(final_output_mask): return relabel_sequential(final_output_mask.astype(np.int32), offset=1)[0]
-            return final_output_mask
-        
-        flush_print(f"{log_main_prefix} Found {len(multi_soma_cell_labels_list)} multi-soma cells to process.")
-        current_max_overall_label_val = np.max(final_output_mask) if np.any(final_output_mask) else 0
-        if present_soma_labels_orig.size > 0 : current_max_overall_label_val = max(current_max_overall_label_val, np.max(present_soma_labels_orig))
-        next_global_label_offset_val = current_max_overall_label_val + 1
-        flush_print(f"{log_main_prefix} Initial next_global_label_offset: {next_global_label_offset_val}")
 
-        phase1_combined_time = time.time()
-        flush_print(f"\n{log_main_prefix} Phase 1 (GWS + Graph-Merge per cell).")
+        if not chunk_multi_soma_labels:
+            flush_print(f"{log_main_prefix} No multi-soma cells from the global list were found in this chunk.")
+            return final_output_mask, {}
+        
+        flush_print(f"{log_main_prefix} Found {len(chunk_multi_soma_labels)} multi-soma cells to process in this chunk.")
+        next_global_label_offset_val = label_offset
+        flush_print(f"{log_main_prefix} Initial next_global_label_offset for chunk: {next_global_label_offset_val}")
+
         footprint_p1_dilation_val = footprint_rectangle((3,3,3)) 
 
-        for cell_idx_p1, cell_label_p1 in enumerate(tqdm(multi_soma_cell_labels_list, desc=f"{log_main_prefix} P1:CellProc")):
-            # --- More aggressive garbage collection ---
+        for cell_idx_p1, cell_label_p1 in enumerate(tqdm(chunk_multi_soma_labels, desc=f"{log_main_prefix} P1:CellProc")):
             gc.collect()
-
-            flush_print(f"\n{log_main_prefix}   P1 Processing cell L{cell_label_p1} ({cell_idx_p1+1}/{len(multi_soma_cell_labels_list)})")
+            flush_print(f"\n{log_main_prefix}   P1 Processing cell L{cell_label_p1} ({cell_idx_p1+1}/{len(chunk_multi_soma_labels)})")
             
-            # --- GWS LOGIC FOR ONE CELL ---
             original_cell_mask_full_p1gws = (segmentation_mask == cell_label_p1)
             obj_slices_p1gws = find_objects(original_cell_mask_full_p1gws)
-            if not obj_slices_p1gws or obj_slices_p1gws[0] is None: flush_print(f"{log_main_prefix}     L{cell_label_p1} No object slices. Skip."); continue
+            if not obj_slices_p1gws or obj_slices_p1gws[0] is None: continue
             bbox_p1gws = obj_slices_p1gws[0]
             pad_p1gws = 3 
-            local_bbox_slices_p1gws = tuple(slice(max(0, s.start - pad_p1gws), min(dim_size, s.stop + pad_p1gws))
-                               for s, dim_size in zip(bbox_p1gws, segmentation_mask.shape))
-
-            # --- Voxel-based Memory Activation ---
+            local_bbox_slices_p1gws = tuple(slice(max(0, s.start - pad_p1gws), min(dim_size, s.stop + pad_p1gws)) for s, dim_size in zip(bbox_p1gws, segmentation_mask.shape))
             local_shape = tuple(s.stop - s.start for s in local_bbox_slices_p1gws)
             num_voxels = np.prod(local_shape)
-            use_memmap_for_this_cell = use_memmap_feature and (num_voxels > memmap_voxel_threshold)
-
-            if use_memmap_for_this_cell:
-                flush_print(f"{log_main_prefix}     L{cell_label_p1} is large ({num_voxels:,} voxels > {memmap_voxel_threshold:,}). SWITCHING TO MEMORY-MAPPED ARRAYS.")
-            else:
-                flush_print(f"{log_main_prefix}     L{cell_label_p1} processing in RAM ({num_voxels:,} voxels).")
+            use_memmap_for_this_cell = memmap_dir is not None and (num_voxels > memmap_voxel_threshold)
 
             original_cell_mask_local_for_gws_p1gws = original_cell_mask_full_p1gws[local_bbox_slices_p1gws]
-            if not np.any(original_cell_mask_local_for_gws_p1gws): flush_print(f"{log_main_prefix}     L{cell_label_p1} Empty local cell mask. Skip."); continue
+            if not np.any(original_cell_mask_local_for_gws_p1gws): continue
             soma_mask_local_orig_labels_gws_p1gws = soma_mask[local_bbox_slices_p1gws]
             intensity_local_gws_p1gws = intensity_volume[local_bbox_slices_p1gws]
             active_soma_labels_in_cell_gws_p1gws = sorted(list(cell_to_somas_orig[cell_label_p1]))
@@ -1003,59 +1312,80 @@ def separate_multi_soma_cells(
                     props_gws_p1gws = regionprops(temp_soma_labeled_for_props_gws_p1gws, intensity_image=intensity_local_gws_p1gws)
                     for p_item_gws_p1gws in props_gws_p1gws:
                         if p_item_gws_p1gws.area > 0 : 
-                             soma_props_local_gws_p1gws[p_item_gws_p1gws.label] = {'centroid': p_item_gws_p1gws.centroid, 'area': p_item_gws_p1gws.area, 'mean_intensity': p_item_gws_p1gws.mean_intensity if hasattr(p_item_gws_p1gws, 'mean_intensity') and p_item_gws_p1gws.mean_intensity is not None else 0.0}
-                except Exception as e_rp_gws:
-                    flush_print(f"{log_main_prefix}     L{cell_label_p1} regionprops error: {e_rp_gws}. Fallback.")
+                             soma_props_local_gws_p1gws[p_item_gws_p1gws.label] = {'centroid': p_item_gws_p1gws.centroid, 'area': p_item_gws_p1gws.area, 'mean_intensity': p_item_gws_p1gws.mean_intensity if hasattr(p_item_gws_p1gws, 'mean_intensity') else 0.0}
+                except Exception:
                     for sl_orig_gws_p1gws in active_soma_labels_in_cell_gws_p1gws:
                         coords_gws_p1gws = np.argwhere((soma_mask_local_orig_labels_gws_p1gws == sl_orig_gws_p1gws) & original_cell_mask_local_for_gws_p1gws)
                         if coords_gws_p1gws.shape[0] > 0:
-                            soma_mean_int = np.mean(intensity_local_gws_p1gws[coords_gws_p1gws[:,0], coords_gws_p1gws[:,1], coords_gws_p1gws[:,2]]) if coords_gws_p1gws.size > 0 else 0.0
+                            soma_mean_int = np.mean(intensity_local_gws_p1gws[tuple(coords_gws_p1gws.T)])
                             soma_props_local_gws_p1gws[sl_orig_gws_p1gws] = {'centroid': np.mean(coords_gws_p1gws, axis=0), 'area': coords_gws_p1gws.shape[0], 'mean_intensity': soma_mean_int}
-            
+
             valid_soma_labels_for_ws_gws_p1gws = [lbl for lbl in active_soma_labels_in_cell_gws_p1gws if lbl in soma_props_local_gws_p1gws and soma_props_local_gws_p1gws[lbl]['area'] > 0]
-            if len(valid_soma_labels_for_ws_gws_p1gws) <= 1: flush_print(f"{log_main_prefix}     L{cell_label_p1} <=1 valid GWS soma. Skip GWS."); continue
+            if len(valid_soma_labels_for_ws_gws_p1gws) <= 1: continue
             
             num_seeds_gws_p1gws = len(valid_soma_labels_for_ws_gws_p1gws); soma_idx_map_gws_p1gws = {lbl: i for i, lbl in enumerate(valid_soma_labels_for_ws_gws_p1gws)}; adj_matrix_gws_p1gws = np.zeros((num_seeds_gws_p1gws, num_seeds_gws_p1gws), dtype=bool)
-            max_intensity_val_local_gws_p1gws = np.max(intensity_local_gws_p1gws[original_cell_mask_local_for_gws_p1gws]) if np.any(original_cell_mask_local_for_gws_p1gws) else 1.0
             
-            flush_print(f"{log_main_prefix}     L{cell_label_p1} Creating cost array ({'memmap' if use_memmap_for_this_cell else 'RAM'})...")
             if use_memmap_for_this_cell:
-                cost_array_path = os.path.join(memmap_dir, f"cell_{cell_label_p1}_cost.mmp")
+                cost_array_path = os.path.join(memmap_dir, f"chunk_cell_{cell_label_p1}_cost.mmp")
                 cost_array_local_gws_p1gws = np.memmap(cost_array_path, dtype=np.float32, mode='w+', shape=local_shape)
-                cost_array_local_gws_p1gws[:] = np.inf
             else:
-                cost_array_local_gws_p1gws = np.full(local_shape, np.inf, dtype=np.float32)
+                cost_array_local_gws_p1gws = np.empty(local_shape, dtype=np.float32)
+            cost_array_local_gws_p1gws[:] = np.inf
 
-            if np.any(original_cell_mask_local_for_gws_p1gws): cost_array_local_gws_p1gws[original_cell_mask_local_for_gws_p1gws] = np.maximum(1e-6, max_intensity_val_local_gws_p1gws - intensity_local_gws_p1gws[original_cell_mask_local_for_gws_p1gws])
-            
+            if np.any(original_cell_mask_local_for_gws_p1gws):
+                max_intensity_val_local_gws_p1gws = np.max(intensity_local_gws_p1gws[original_cell_mask_local_for_gws_p1gws])
+                coords = np.argwhere(original_cell_mask_local_for_gws_p1gws)
+                chunk_size = 5_000_000
+                num_chunks = (len(coords) + chunk_size - 1) // chunk_size
+                for i in range(num_chunks):
+                    start_idx = i * chunk_size
+                    end_idx = start_idx + chunk_size
+                    chunk_coords = coords[start_idx:end_idx]
+                    z, y, x = chunk_coords[:, 0], chunk_coords[:, 1], chunk_coords[:, 2]
+                    intensities_chunk = intensity_local_gws_p1gws[z, y, x]
+                    cost_values = np.maximum(1e-6, max_intensity_val_local_gws_p1gws - intensities_chunk)
+                    cost_array_local_gws_p1gws[z, y, x] = cost_values
+                if isinstance(cost_array_local_gws_p1gws, np.memmap): cost_array_local_gws_p1gws.flush()
+                del coords
+
             for i_gws_p1gws in range(num_seeds_gws_p1gws):
                 for j_gws_p1gws in range(i_gws_p1gws + 1, num_seeds_gws_p1gws):
-                    lbl1_gws_p1gws, lbl2_gws_p1gws = valid_soma_labels_for_ws_gws_p1gws[i_gws_p1gws], valid_soma_labels_for_ws_gws_p1gws[j_gws_p1gws]; prop1_gws_p1gws, prop2_gws_p1gws = soma_props_local_gws_p1gws[lbl1_gws_p1gws], soma_props_local_gws_p1gws[lbl2_gws_p1gws]
-                    c1_phys_gws_p1gws, c2_phys_gws_p1gws = np.array(prop1_gws_p1gws['centroid']) * spacing_arr, np.array(prop2_gws_p1gws['centroid']) * spacing_arr; dist_um_gws_p1gws = np.linalg.norm(c1_phys_gws_p1gws - c2_phys_gws_p1gws)
+                    lbl1_gws_p1gws, lbl2_gws_p1gws = valid_soma_labels_for_ws_gws_p1gws[i_gws_p1gws], valid_soma_labels_for_ws_gws_p1gws[j_gws_p1gws]
+                    prop1_gws_p1gws, prop2_gws_p1gws = soma_props_local_gws_p1gws[lbl1_gws_p1gws], soma_props_local_gws_p1gws[lbl2_gws_p1gws]
+                    c1_phys_gws_p1gws = np.array(prop1_gws_p1gws['centroid']) * spacing_arr
+                    c2_phys_gws_p1gws = np.array(prop2_gws_p1gws['centroid']) * spacing_arr
+                    dist_um_gws_p1gws = np.linalg.norm(c1_phys_gws_p1gws - c2_phys_gws_p1gws)
                     if dist_um_gws_p1gws > max_seed_centroid_dist: continue
-                    c1_vox_gws_p1gws, c2_vox_gws_p1gws = tuple(np.round(prop1_gws_p1gws['centroid']).astype(int)), tuple(np.round(prop2_gws_p1gws['centroid']).astype(int))
-                    c1_vox_c_gws_p1gws, c2_vox_c_gws_p1gws = tuple(np.clip(c1_vox_gws_p1gws[d_idx],0,s-1)for d_idx,s in enumerate(cost_array_local_gws_p1gws.shape)), tuple(np.clip(c2_vox_gws_p1gws[d_idx],0,s-1)for d_idx,s in enumerate(cost_array_local_gws_p1gws.shape))
+                    
+                    c1_vox_gws_p1gws = tuple(np.round(prop1_gws_p1gws['centroid']).astype(int))
+                    c2_vox_gws_p1gws = tuple(np.round(prop2_gws_p1gws['centroid']).astype(int))
+                    c1_vox_c_gws_p1gws = tuple(np.clip(c1_vox_gws_p1gws[d_idx],0,s-1) for d_idx,s in enumerate(cost_array_local_gws_p1gws.shape))
+                    c2_vox_c_gws_p1gws = tuple(np.clip(c2_vox_gws_p1gws[d_idx],0,s-1) for d_idx,s in enumerate(cost_array_local_gws_p1gws.shape))
+                    
                     if not original_cell_mask_local_for_gws_p1gws[c1_vox_c_gws_p1gws] or not original_cell_mask_local_for_gws_p1gws[c2_vox_c_gws_p1gws]: continue
+                    
                     path_median_intensity_gws_p1gws = 0.0
                     try:
                         path_indices_tup_gws_p1gws, _ = route_through_array(cost_array_local_gws_p1gws, c1_vox_c_gws_p1gws, c2_vox_c_gws_p1gws, fully_connected=True, geometric=False)
                         if isinstance(path_indices_tup_gws_p1gws, np.ndarray) and path_indices_tup_gws_p1gws.ndim==2 and path_indices_tup_gws_p1gws.shape[1]>0:
                             path_intensities_vals_gws_p1gws = intensity_local_gws_p1gws[path_indices_tup_gws_p1gws[0], path_indices_tup_gws_p1gws[1], path_indices_tup_gws_p1gws[2]]
                             if path_intensities_vals_gws_p1gws.size > 0: path_median_intensity_gws_p1gws = np.median(path_intensities_vals_gws_p1gws)
-                    except: pass
+                    except (ValueError, IndexError):
+                        pass
+                    
                     ref_intensity_val_gws_p1gws = max(prop1_gws_p1gws.get('mean_intensity',1.0), prop2_gws_p1gws.get('mean_intensity',1.0), 1e-6)
                     ratio_val_gws_p1gws = path_median_intensity_gws_p1gws / ref_intensity_val_gws_p1gws if ref_intensity_val_gws_p1gws > 1e-6 else float('inf')
                     if ratio_val_gws_p1gws >= min_path_intensity_ratio:
-                        adj_matrix_gws_p1gws[soma_idx_map_gws_p1gws[lbl1_gws_p1gws], soma_idx_map_gws_p1gws[lbl2_gws_p1gws]] = adj_matrix_gws_p1gws[soma_idx_map_gws_p1gws[lbl2_gws_p1gws], soma_idx_map_gws_p1gws[lbl1_gws_p1gws]] = True
-            
-            flush_print(f"{log_main_prefix}     L{cell_label_p1} Creating watershed markers ({'memmap' if use_memmap_for_this_cell else 'RAM'})...")
+                        adj_matrix_gws_p1gws[soma_idx_map_gws_p1gws[lbl1_gws_p1gws], soma_idx_map_gws_p1gws[lbl2_gws_p1gws]] = True
+                        adj_matrix_gws_p1gws[soma_idx_map_gws_p1gws[lbl2_gws_p1gws], soma_idx_map_gws_p1gws[lbl1_gws_p1gws]] = True
+
             if use_memmap_for_this_cell:
-                markers_path = os.path.join(memmap_dir, f"cell_{cell_label_p1}_markers.mmp")
+                markers_path = os.path.join(memmap_dir, f"chunk_cell_{cell_label_p1}_markers.mmp")
                 ws_markers_local_gws_p1gws = np.memmap(markers_path, dtype=np.int32, mode='w+', shape=local_shape)
-                ws_markers_local_gws_p1gws[:] = 0
             else:
-                ws_markers_local_gws_p1gws = np.zeros_like(original_cell_mask_local_for_gws_p1gws, dtype=np.int32)
-            
+                ws_markers_local_gws_p1gws = np.zeros(local_shape, dtype=np.int32)
+            ws_markers_local_gws_p1gws[:] = 0
+
             current_ws_marker_id_gws_p1gws = 1
             ws_marker_to_orig_somas_gws_p1gws: Dict[int, List[int]] = {}; orig_soma_to_ws_marker_gws_p1gws: Dict[int, int] = {}
             if np.any(adj_matrix_gws_p1gws):
@@ -1077,149 +1407,87 @@ def separate_multi_soma_cells(
                     ws_markers_local_gws_p1gws[(soma_mask_local_orig_labels_gws_p1gws == sl_orig_gws) & original_cell_mask_local_for_gws_p1gws] = group_marker_id_gws
                     orig_soma_to_ws_marker_gws_p1gws[sl_orig_gws] = group_marker_id_gws
                     ws_marker_to_orig_somas_gws_p1gws[group_marker_id_gws] = [sl_orig_gws]; current_ws_marker_id_gws_p1gws +=1
+            
             num_final_ws_markers_gws_p1gws = current_ws_marker_id_gws_p1gws - 1
-            if num_final_ws_markers_gws_p1gws <= 1: flush_print(f"{log_main_prefix}     L{cell_label_p1} <=1 final WS marker. Skip WS."); continue
+            if num_final_ws_markers_gws_p1gws <= 1:
+                new_label = next_global_label_offset_val
+                final_output_mask[original_cell_mask_full_p1gws] = new_label
+                provenance_map[new_label] = cell_label_p1
+                next_global_label_offset_val += 1
+                continue 
             
-            flush_print(f"{log_main_prefix}     L{cell_label_p1} Calculating distance transform and landscape ({'memmap' if use_memmap_for_this_cell else 'RAM'})...")
-
-            if use_memmap_for_this_cell:
-                # --- Step 1: Use a memmap for the large, intermediate distance calculation ---
-                # This memmap stores the squared, scaled coordinate differences, shape: (3, z, y, x)
-                dt_intermediate_path = os.path.join(memmap_dir, f"cell_{cell_label_p1}_dt_intermediate.mmp")
-                intermediate_shape = (len(local_shape),) + tuple(local_shape)
-                dt_intermediate_memmap = np.memmap(dt_intermediate_path, dtype=np.float64, mode='w+', shape=intermediate_shape)
-                
-                # Our modified function populates this memmap. Note that the values inside are already squared.
-                distance_transform_edt(original_cell_mask_local_for_gws_p1gws, sampling=spacing_tuple, output=dt_intermediate_memmap)
-
-                # --- Step 2: Create the final watershed landscape memmap with the CORRECT shape ---
-                # The landscape must have the same shape as the cell mask: (z, y, x)
-                ws_landscape_path = os.path.join(memmap_dir, f"cell_{cell_label_p1}_landscape.mmp")
-                ws_landscape_gws = np.memmap(ws_landscape_path, dtype=np.float32, mode='w+', shape=local_shape)
-
-                # --- Step 3: Perform the final steps of the Euclidean distance calculation ---
-                # Sum the squared differences along the first axis. This creates a temporary (z,y,x) array in RAM.
-                final_dt_squared = np.add.reduce(dt_intermediate_memmap, axis=0)
-                
-                # Take the square root to get the final Euclidean distance. This is done in-place on the temporary array.
-                np.sqrt(final_dt_squared, out=final_dt_squared)
-                
-                # Now, negate the final distance and store it in the landscape memmap.
-                np.negative(final_dt_squared, out=ws_landscape_gws)
-                
-                # We need the final (non-negative) distance transform for the intensity weighting step later.
-                # We can reuse the temporary array for this.
-                dt_local_gws = final_dt_squared
-                
-                # Explicitly close and delete the large intermediate memmap to free up file handles.
-                del dt_intermediate_memmap
-
             else:
-                # This branch was already correct. It computes the final DT in one go and holds it in RAM.
-                dt_local_gws = distance_transform_edt(original_cell_mask_local_for_gws_p1gws, sampling=spacing_tuple)
-                ws_landscape_gws = -dt_local_gws.astype(np.float32)
+                if use_memmap_for_this_cell:
+                    dt_intermediate_path = os.path.join(memmap_dir, f"chunk_cell_{cell_label_p1}_dt_intermediate.mmp")
+                    intermediate_shape = (len(local_shape),) + tuple(local_shape)
+                    dt_intermediate_memmap = np.memmap(dt_intermediate_path, dtype=np.float64, mode='w+', shape=intermediate_shape)
+                    distance_transform_edt(original_cell_mask_local_for_gws_p1gws, sampling=spacing_tuple, output=dt_intermediate_memmap)
+                    ws_landscape_path = os.path.join(memmap_dir, f"chunk_cell_{cell_label_p1}_landscape.mmp")
+                    ws_landscape_gws = np.memmap(ws_landscape_path, dtype=np.float32, mode='w+', shape=local_shape)
+                    final_dt_squared = np.add.reduce(dt_intermediate_memmap, axis=0)
+                    np.sqrt(final_dt_squared, out=final_dt_squared)
+                    np.negative(final_dt_squared, out=ws_landscape_gws)
+                    dt_local_gws = final_dt_squared
+                    del dt_intermediate_memmap
+                else:
+                    dt_local_gws = distance_transform_edt(original_cell_mask_local_for_gws_p1gws, sampling=spacing_tuple)
+                    ws_landscape_gws = -dt_local_gws.astype(np.float32)
 
-            if intensity_weight > 1e-6:
-                flush_print(f"{log_main_prefix}     L{cell_label_p1} Adding intensity term to landscape...")
-                icell_gws = intensity_local_gws_p1gws[original_cell_mask_local_for_gws_p1gws]
-                if icell_gws.size > 0:
-                    min_ic_gws, max_ic_gws = np.min(icell_gws), np.max(icell_gws)
-                    if (max_ic_gws - min_ic_gws) > 1e-6:
-                        norm_int_term_gws = np.zeros_like(ws_landscape_gws); norm_int_term_gws[original_cell_mask_local_for_gws_p1gws] = (max_ic_gws - icell_gws) / (max_ic_gws - min_ic_gws)
-                        max_dt_gws = np.max(dt_local_gws); ws_landscape_gws += intensity_weight * norm_int_term_gws * (max_dt_gws if max_dt_gws > 1e-6 else 1.0)
-            
-            ws_markers_local_gws_p1gws[~original_cell_mask_local_for_gws_p1gws] = 0
-            
-            # --- Enhanced Pre-Watershed Diagnostics ---
-            flush_print(f"{log_main_prefix}     L{cell_label_p1} PRE-WATERSHED DIAGNOSTICS:")
-            flush_print(f"{log_main_prefix}       - Landscape shape: {ws_landscape_gws.shape}, dtype: {ws_landscape_gws.dtype}, is_memmap: {isinstance(ws_landscape_gws, np.memmap)}")
-            flush_print(f"{log_main_prefix}       - Markers shape:   {ws_markers_local_gws_p1gws.shape}, dtype: {ws_markers_local_gws_p1gws.dtype}, is_memmap: {isinstance(ws_markers_local_gws_p1gws, np.memmap)}")
-            flush_print(f"{log_main_prefix}       - Mask shape:      {original_cell_mask_local_for_gws_p1gws.shape}, dtype: {original_cell_mask_local_for_gws_p1gws.dtype}")
-            unique_markers, counts = np.unique(ws_markers_local_gws_p1gws, return_counts=True)
-            flush_print(f"{log_main_prefix}       - Unique markers ({len(unique_markers)}): {unique_markers}")
-            if np.any(np.isinf(ws_landscape_gws)): flush_print(f"{log_main_prefix}       - WARNING: Landscape contains Inf values!")
-            if np.any(np.isnan(ws_landscape_gws)): flush_print(f"{log_main_prefix}       - WARNING: Landscape contains NaN values!")
-            
-            flush_print(f"{log_main_prefix}     L{cell_label_p1} EXECUTING WATERSHED (this step will use RAM for its result)...")
-            ws_start_time = time.time()
-            global_ws_result_local_p1gws = _watershed_with_simpleitk(
-                landscape=ws_landscape_gws,
-                markers=ws_markers_local_gws_p1gws,
-                log_prefix=f"{log_main_prefix}     L{cell_label_p1}"
-            )
-            flush_print(f"{log_main_prefix}     L{cell_label_p1} Watershed finished. Time: {time.time() - ws_start_time:.2f}s. Result is in RAM.")
-
-            # --- [START] CORRECTED CODE BLOCK ---
-            # This block replaces the original post-watershed processing to prevent a memory spike.
-            # We modify the watershed result array directly in-place.
-            flush_print(f"{log_main_prefix}     L{cell_label_p1} Relabeling watershed result in-place...")
-            
-            largest_soma_lbl_gws, max_area_s_gws = -1, -1
-            for sl_prop_gws in valid_soma_labels_for_ws_gws_p1gws:
-                if soma_props_local_gws_p1gws[sl_prop_gws]['area'] > max_area_s_gws:
-                    max_area_s_gws = soma_props_local_gws_p1gws[sl_prop_gws]['area']
-                    largest_soma_lbl_gws = sl_prop_gws
-            main_marker_id_gws = orig_soma_to_ws_marker_gws_p1gws.get(largest_soma_lbl_gws, -1)
-
-            # Create a mapping from the old watershed labels to the new final labels first.
-            unique_ws_res_lbls_gws = np.unique(global_ws_result_local_p1gws[global_ws_result_local_p1gws > 0])
-            current_next_lbl_cell_gws = next_global_label_offset_val
-            label_map = {}
-            for res_lbl_gws in unique_ws_res_lbls_gws:
-                final_lbl_gws = cell_label_p1 if res_lbl_gws == main_marker_id_gws else current_next_lbl_cell_gws
-                label_map[res_lbl_gws] = final_lbl_gws
-                if res_lbl_gws != main_marker_id_gws:
+                if intensity_weight > 1e-6:
+                    icell_gws = intensity_local_gws_p1gws[original_cell_mask_local_for_gws_p1gws]
+                    if icell_gws.size > 0:
+                        min_ic_gws, max_ic_gws = np.min(icell_gws), np.max(icell_gws)
+                        if (max_ic_gws - min_ic_gws) > 1e-6:
+                            norm_int_term_gws = np.zeros_like(ws_landscape_gws); norm_int_term_gws[original_cell_mask_local_for_gws_p1gws] = (max_ic_gws - icell_gws) / (max_ic_gws - min_ic_gws)
+                            max_dt_gws = np.max(dt_local_gws); ws_landscape_gws += intensity_weight * norm_int_term_gws * (max_dt_gws if max_dt_gws > 1e-6 else 1.0)
+                
+                ws_markers_local_gws_p1gws[~original_cell_mask_local_for_gws_p1gws] = 0
+                
+                global_ws_result_local_p1gws = _watershed_with_simpleitk(landscape=ws_landscape_gws, markers=ws_markers_local_gws_p1gws, log_prefix=f"{log_main_prefix}     L{cell_label_p1}")
+                
+                unique_ws_res_lbls_gws = np.unique(global_ws_result_local_p1gws[global_ws_result_local_p1gws > 0])
+                current_next_lbl_cell_gws = next_global_label_offset_val
+                label_map = {}
+                for res_lbl_gws in unique_ws_res_lbls_gws:
+                    new_label = current_next_lbl_cell_gws
+                    label_map[res_lbl_gws] = new_label
+                    provenance_map[new_label] = cell_label_p1
                     current_next_lbl_cell_gws += 1
+                
+                temp_gws_mask_local_p1gws = np.zeros(local_shape, dtype=np.int32)
+                for old_label, new_label in label_map.items():
+                    temp_gws_mask_local_p1gws[global_ws_result_local_p1gws == old_label] = new_label
+                next_global_label_offset_val = current_next_lbl_cell_gws
+                
+                del global_ws_result_local_p1gws
+                del cost_array_local_gws_p1gws, dt_local_gws, ws_landscape_gws, ws_markers_local_gws_p1gws
+                gc.collect()
 
-            # Apply the mapping. This loop modifies the array in-place.
-            for old_label, new_label in label_map.items():
-                global_ws_result_local_p1gws[global_ws_result_local_p1gws == old_label] = new_label
-
-            next_global_label_offset_val = max(next_global_label_offset_val, current_next_lbl_cell_gws)
-
-            # Now that the result is relabeled, decide where to store it for post-processing.
-            # This logic prevents creating a second large in-memory array.
-            if use_memmap_for_this_cell:
-                flush_print(f"{log_main_prefix}     L{cell_label_p1} Storing relabeled mask to memmap...")
-                temp_gws_path = os.path.join(memmap_dir, f"cell_{cell_label_p1}_temp_gws.mmp")
-                temp_gws_mask_local_p1gws = np.memmap(temp_gws_path, dtype=np.int32, mode='w+', shape=local_shape)
-                temp_gws_mask_local_p1gws[:] = global_ws_result_local_p1gws
-                del global_ws_result_local_p1gws # Free the RAM version
-            else:
-                flush_print(f"{log_main_prefix}     L{cell_label_p1} Using in-memory relabeled mask...")
-                temp_gws_mask_local_p1gws = global_ws_result_local_p1gws # Just rename the pointer, no new memory used
-
-            flush_print(f"{log_main_prefix}     L{cell_label_p1} Freeing intermediate arrays...")
-            del cost_array_local_gws_p1gws, dt_local_gws, ws_landscape_gws, ws_markers_local_gws_p1gws
-            gc.collect()
-            # --- [END] CORRECTED CODE BLOCK ---
-
-            ws_lines_gws = (temp_gws_mask_local_p1gws == 0) & original_cell_mask_local_for_gws_p1gws
-            if np.any(ws_lines_gws):
-                line_coords_gws = np.argwhere(ws_lines_gws)
-                for zlg,ylg,xlg in line_coords_gws:
-                    nh_slice_gws = tuple(slice(max(0,c-1),min(s,c+2))for c,s in zip((zlg,ylg,xlg),temp_gws_mask_local_p1gws.shape))
-                    nh_vals_gws = temp_gws_mask_local_p1gws[nh_slice_gws]; un_nh_gws,cts_nh_gws=np.unique(nh_vals_gws[nh_vals_gws>0],return_counts=True)
-                    if un_nh_gws.size > 0: temp_gws_mask_local_p1gws[zlg,ylg,xlg] = un_nh_gws[np.argmax(cts_nh_gws)]
-            
-            flush_print(f"{log_main_prefix}     L{cell_label_p1} Merging small fragments...")
-            frag_merged_gws,sfm_iters_gws=True,0
-            while frag_merged_gws and sfm_iters_gws < 10:
-                sfm_iters_gws+=1; frag_merged_gws=False
-                curr_lbls_tgws = np.unique(temp_gws_mask_local_p1gws[temp_gws_mask_local_p1gws>0])
-                if len(curr_lbls_tgws)<=1:break
-                for lbl_sfm_gws in curr_lbls_tgws:
-                    curr_frag_gws=(temp_gws_mask_local_p1gws==lbl_sfm_gws);size_sfm_gws=np.sum(curr_frag_gws)
-                    if size_sfm_gws > 0 and size_sfm_gws < min_size_threshold:
-                        dil_frag_gws=binary_dilation(curr_frag_gws,footprint=footprint_p1_dilation_val)
-                        neigh_reg_gws = dil_frag_gws & (~curr_frag_gws) & original_cell_mask_local_for_gws_p1gws & (temp_gws_mask_local_p1gws!=0) & (temp_gws_mask_local_p1gws!=lbl_sfm_gws)
-                        if not np.any(neigh_reg_gws): continue
-                        neigh_lbls_gws,neigh_cts_gws=np.unique(temp_gws_mask_local_p1gws[neigh_reg_gws],return_counts=True)
-                        if neigh_lbls_gws.size==0:continue
-                        largest_neigh_lbl_gws=neigh_lbls_gws[np.argmax(neigh_cts_gws)];temp_gws_mask_local_p1gws[curr_frag_gws]=largest_neigh_lbl_gws
-                        frag_merged_gws=True;break
-
-            # --- Phase 1.5: Build Local Graph & Merge Weak Interfaces for THIS CELL ---
+                ws_lines_gws = (temp_gws_mask_local_p1gws == 0) & original_cell_mask_local_for_gws_p1gws
+                if np.any(ws_lines_gws):
+                    line_coords_gws = np.argwhere(ws_lines_gws)
+                    for zlg,ylg,xlg in line_coords_gws:
+                        nh_slice_gws = tuple(slice(max(0,c-1),min(s,c+2))for c,s in zip((zlg,ylg,xlg),temp_gws_mask_local_p1gws.shape))
+                        nh_vals_gws = temp_gws_mask_local_p1gws[nh_slice_gws]; un_nh_gws,cts_nh_gws=np.unique(nh_vals_gws[nh_vals_gws>0],return_counts=True)
+                        if un_nh_gws.size > 0: temp_gws_mask_local_p1gws[zlg,ylg,xlg] = un_nh_gws[np.argmax(cts_nh_gws)]
+                
+                frag_merged_gws,sfm_iters_gws=True,0
+                while frag_merged_gws and sfm_iters_gws < 10:
+                    sfm_iters_gws+=1; frag_merged_gws=False
+                    curr_lbls_tgws = np.unique(temp_gws_mask_local_p1gws[temp_gws_mask_local_p1gws>0])
+                    if len(curr_lbls_tgws)<=1:break
+                    for lbl_sfm_gws in curr_lbls_tgws:
+                        curr_frag_gws=(temp_gws_mask_local_p1gws==lbl_sfm_gws);size_sfm_gws=np.sum(curr_frag_gws)
+                        if size_sfm_gws > 0 and size_sfm_gws < min_size_threshold:
+                            dil_frag_gws=binary_dilation(curr_frag_gws,footprint=footprint_p1_dilation_val)
+                            neigh_reg_gws = dil_frag_gws & (~curr_frag_gws) & original_cell_mask_local_for_gws_p1gws & (temp_gws_mask_local_p1gws!=0) & (temp_gws_mask_local_p1gws!=lbl_sfm_gws)
+                            if not np.any(neigh_reg_gws): continue
+                            neigh_lbls_gws,neigh_cts_gws=np.unique(temp_gws_mask_local_p1gws[neigh_reg_gws],return_counts=True)
+                            if neigh_lbls_gws.size==0:continue
+                            largest_neigh_lbl_gws=neigh_lbls_gws[np.argmax(neigh_cts_gws)];temp_gws_mask_local_p1gws[curr_frag_gws]=largest_neigh_lbl_gws
+                            frag_merged_gws=True;break
+                
+                # --- Phase 1.5: Build Local Graph & Merge Weak Interfaces for THIS CELL ---
             flush_print(f"{log_main_prefix}     P1 L{cell_label_p1}: Building local graph for P1.5 merges on {np.sum(np.unique(temp_gws_mask_local_p1gws)>0)} GWS segments.")
             local_nodes_p15, local_edges_p15 = _build_adjacency_graph_for_cell(
                 temp_gws_mask_local_p1gws,
@@ -1266,11 +1534,8 @@ def separate_multi_soma_cells(
                             vol_A_loc_p15 = local_nodes_p15.get(lbl_A_loc_p15,{}).get('volume',0)
                             vol_B_loc_p15 = local_nodes_p15.get(lbl_B_loc_p15,{}).get('volume',0)
 
-                            if lbl_A_loc_p15 != cell_label_p1 and lbl_B_loc_p15 == cell_label_p1:
-                                label_to_keep_loc_p15, label_to_remove_loc_p15 = lbl_B_loc_p15, lbl_A_loc_p15
-                            elif lbl_A_loc_p15 == cell_label_p1 and lbl_B_loc_p15 != cell_label_p1:
-                                pass 
-                            elif vol_A_loc_p15 < vol_B_loc_p15:
+                            # This logic now correctly references only new labels, not cell_label_p1
+                            if vol_A_loc_p15 < vol_B_loc_p15:
                                 label_to_keep_loc_p15, label_to_remove_loc_p15 = lbl_B_loc_p15, lbl_A_loc_p15
                             
                             flush_print(f"{log_main_prefix}         Merging L{label_to_remove_loc_p15} into L{label_to_keep_loc_p15} in temp_gws_mask_local_p1gws.")
@@ -1290,7 +1555,8 @@ def separate_multi_soma_cells(
                     if not p1_5_merged_in_pass_loc: break 
             else:
                 flush_print(f"{log_main_prefix}     P1 L{cell_label_p1}: P1.5 - No interfaces or no merges needed based on graph.")
-            
+            # --- [END] RE-INSERTED PHASE 1.5 BLOCK ---
+
             flush_print(f"{log_main_prefix}     P1 L{cell_label_p1} Writing final segments to global mask...")
             output_mask_local_view_final_p1_val = final_output_mask[local_bbox_slices_p1gws]
             output_mask_local_view_final_p1_val[original_cell_mask_local_for_gws_p1gws] = \
@@ -1298,52 +1564,18 @@ def separate_multi_soma_cells(
             final_output_mask[local_bbox_slices_p1gws] = output_mask_local_view_final_p1_val
             
             max_lbl_in_cell_after_p15_val = np.max(temp_gws_mask_local_p1gws) if np.any(temp_gws_mask_local_p1gws) else 0
-            if max_lbl_in_cell_after_p15_val >= cell_label_p1 : 
+            if max_lbl_in_cell_after_p15_val >= next_global_label_offset_val : 
                  next_global_label_offset_val = max(next_global_label_offset_val, max_lbl_in_cell_after_p15_val + 1)
             
             flush_print(f"{log_main_prefix}     P1 L{cell_label_p1}: Finished P1 & P1.5. Max label in cell: {max_lbl_in_cell_after_p15_val}. Next global offset: {next_global_label_offset_val}.")
             del temp_gws_mask_local_p1gws, local_nodes_p15, local_edges_p15
-            
-        flush_print(f"{log_main_prefix} Phase 1 & 1.5 (GWS + Per-Cell Graph Merging) completed. Time: {time.time()-phase1_combined_time:.2f}s. Final next_global_label_offset after P1.5: {next_global_label_offset_val}")
 
-        flush_print(f"\n{log_main_prefix} Phase 2 (Local Splitting) has been REMOVED as per request.")
+        return final_output_mask, provenance_map
 
-        phase3_start_time = time.time()
-        flush_print(f"\n{log_main_prefix} Phase 3: Finalizing mask.")
-        try:
-            flush_print(f"{log_main_prefix} Filling internal voids...")
-            final_mask_filled = fill_internal_voids(final_output_mask) 
-        except NameError:
-            flush_print(f"{log_main_prefix} Warning: fill_internal_voids not defined. Skipping this step.")
-            final_mask_filled = final_output_mask.copy()
-
-        if np.any(final_mask_filled):
-            flush_print(f"{log_main_prefix} Relabeling final mask sequentially...")
-            relabeled_array, forward_map, inverse_map = relabel_sequential(
-                final_mask_filled.astype(np.int32), offset=1 
-            )
-            unique_labels_in_relabeled = np.unique(relabeled_array)
-            num_objects_final = len(unique_labels_in_relabeled[unique_labels_in_relabeled > 0])
-            max_label_val = num_objects_final if num_objects_final > 0 else 0
-            
-            flush_print(f"{log_main_prefix} Relabeled final mask contains {num_objects_final} objects (max label: {max_label_val}).")
-            output_to_return = relabeled_array.astype(np.int32)
-        else:
-            flush_print(f"{log_main_prefix} Final mask is empty.")
-            output_to_return = final_mask_filled.astype(np.int32)
-
-        flush_print(f"{log_main_prefix} Phase 3 (Finalization) completed. Time: {time.time()-phase3_start_time:.2f}s")
-        flush_print(f"{log_main_prefix} Total processing time: {time.time()-overall_start_time:.2f}s")
-        
-        return output_to_return
-
-    finally:
-        # --- Final Cleanup of Memory-Mapped Files ---
-        if use_memmap_feature and memmap_dir and os.path.exists(memmap_dir):
-            flush_print(f"{log_main_prefix} Final cleanup of memmap directory: {memmap_dir}")
-            # Force garbage collection to release file handles before attempting to delete
-            gc.collect()
-            rmtree(memmap_dir, ignore_errors=True)
+    except Exception as e:
+        flush_print(f"CRITICAL ERROR in _separate_multi_soma_cells_chunk: {e}")
+        traceback.print_exc()
+        return np.zeros_like(segmentation_mask, dtype=np.int32), {}
 
 # --- fill_internal_voids (ensure it's defined as before) ---
 def fill_internal_voids(segmentation_mask_input: np.ndarray) -> np.ndarray:

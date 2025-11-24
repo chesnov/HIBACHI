@@ -78,175 +78,223 @@ def extract_boundary_points_worker_2d(args):
     return label_idx, len(boundary_points_global)
 
 
-def calculate_pair_distances_worker_2d(args):
-    """Worker function to calculate distances between a pair of 2D masks."""
-    i, j, labels, temp_dir, spacing_yx, distances_matrix, points_matrix = args
+# --- NEW HELPER: Extracts boundaries for a specific list of labels ---
+def _extract_boundaries_for_chunk(labels_in_chunk, segmented_array, locations):
+    """
+    Extracts boundary points for a given list of labels (a chunk).
+    This runs in the main process and returns a dictionary of {label: points}.
+    """
+    boundaries = {}
+    for label in labels_in_chunk:
+        loc_index = label - 1
+        if loc_index < 0 or loc_index >= len(locations) or locations[loc_index] is None:
+            boundaries[label] = np.empty((0, 2), dtype=int)
+            continue
+        
+        slices = locations[loc_index]
+        buffered_slices = tuple(slice(max(0, s.start - 1), min(dim, s.stop + 1)) for s, dim in zip(slices, segmented_array.shape))
+        
+        region = segmented_array[buffered_slices]
+        offset_yx = np.array([s.start for s in buffered_slices])
 
-    label1 = labels[i]
-    label2 = labels[j]
-    is_target_pair = (DEBUG_TARGET_LABEL is not None and (label1 == DEBUG_TARGET_LABEL or label2 == DEBUG_TARGET_LABEL))
+        mask = (region == label)
+        if not np.any(mask):
+            boundaries[label] = np.empty((0, 2), dtype=int)
+            continue
 
-    try:
-        boundary_points1 = np.load(os.path.join(temp_dir, f"boundary_{label1}.npy"))
-        boundary_points2 = np.load(os.path.join(temp_dir, f"boundary_{label2}.npy"))
-    except Exception as e:
-        print(f"Warning: Error loading boundary points for masks {label1} or {label2}: {e}")
-        return i, j, np.inf, np.full(4, np.nan) # Return 4 NaNs for Y1,X1,Y2,X2
+        struct = ndi.generate_binary_structure(2, 1)
+        eroded_mask = binary_erosion(mask, struct)
+        boundary_mask = mask & ~eroded_mask
 
+        y_local, x_local = np.where(boundary_mask)
+        boundary_points_global = np.column_stack((y_local + offset_yx[0], x_local + offset_yx[1]))
+        boundaries[label] = boundary_points_global
+        
+    return boundaries
+
+# --- MODIFIED WORKER: Now takes arrays in memory, not file paths ---
+def calculate_pair_distances_worker_in_memory(args):
+    """
+    Worker function that calculates distance between a pair of masks
+    when their boundary points are already provided as numpy arrays.
+    """
+    label1, label2, boundary_points1, boundary_points2, spacing_yx = args
+    
     if boundary_points1.shape[0] == 0 or boundary_points2.shape[0] == 0:
-        return i, j, np.inf, np.full(4, np.nan)
+        return label1, label2, np.inf, np.full(4, np.nan)
 
-    # Scale points according to 2D spacing
     scaled_points1 = boundary_points1 * np.array(spacing_yx)
     scaled_points2 = boundary_points2 * np.array(spacing_yx)
 
     try:
         tree2 = cKDTree(scaled_points2)
     except ValueError:
-         return i, j, np.inf, np.full(4, np.nan)
+        return label1, label2, np.inf, np.full(4, np.nan)
 
     distances, indices = tree2.query(scaled_points1, k=1)
     
-    if distances.size == 0: # Handle empty distances array if scaled_points1 was empty after all
-        return i, j, np.inf, np.full(4, np.nan)
+    if distances.size == 0:
+        return label1, label2, np.inf, np.full(4, np.nan)
 
     min_idx = np.argmin(distances)
     min_distance = distances[min_idx]
 
-    # ORIGINAL PIXEL INDICES (Y, X)
     point1 = boundary_points1[min_idx]
     point2 = boundary_points2[indices[min_idx]]
 
-    result_points = np.array([point1[0], point1[1], point2[0], point2[1]]) # Y1, X1, Y2, X2
-
-    if is_target_pair:
-        debug_print(f"[Worker {os.getpid()}] Pair ({label1}, {label2}): Min dist {min_distance:.2f}. Closest point indices (Y,X): Point1={point1}, Point2={point2}", label=DEBUG_TARGET_LABEL)
-
-    return i, j, min_distance, result_points
+    result_points = np.array([point1[0], point1[1], point2[0], point2[1]])
+    return label1, label2, min_distance, result_points
 
 
 def shortest_distance_2d(segmented_array, spacing_yx=(1.0, 1.0),
                          temp_dir=None, n_jobs=None,
-                         batch_size=None):
+                         boundary_chunk_size=250):
     """
-    Calculate the shortest distance between boundaries of all 2D masks pairs.
+    Calculate shortest distance using a "chunk vs. chunk" approach.
+    VERSION 6: Fixes low-level HDF5 file creation error by using a local
+    temporary directory instead of the system's /tmp, which can have
+    filesystem or permission issues.
     """
     start_time = time.time()
     if segmented_array.ndim != 2: raise ValueError("Input must be 2D")
+    if boundary_chunk_size is None or boundary_chunk_size <= 0: boundary_chunk_size = 250
 
     if n_jobs is None: n_jobs = max(1, mp.cpu_count() - 1)
+    
+    try:
+        import tables # type: ignore # noqa
+    except ImportError:
+        raise ImportError("The 'tables' package is required. Please install it using 'pip install tables'")
 
     temp_dir_managed = False
     if temp_dir is None:
-        base_temp_dir = os.environ.get("TMPDIR") or os.environ.get("TEMP") or "/tmp"
-        temp_dir = tempfile.mkdtemp(prefix="shortest_dist_2d_", dir=base_temp_dir)
-        temp_dir_managed = True; print(f"DEBUG [shortest_distance_2d] Using managed temp dir: {temp_dir}")
-    else: os.makedirs(temp_dir, exist_ok=True); print(f"DEBUG [shortest_distance_2d] Using provided temp dir: {temp_dir}")
+        # --- ROBUSTNESS FIX: Prioritize local directory over system /tmp ---
+        try:
+            # Try to create a temp dir in the current working directory first.
+            local_path = os.path.join(os.getcwd(), 'temp_shortest_dist')
+            os.makedirs(local_path, exist_ok=True)
+            temp_dir = tempfile.mkdtemp(prefix="dist_2d_", dir=local_path)
+            print(f"DEBUG [shortest_distance_2d] Using local managed temp dir: {temp_dir}")
+        except OSError:
+            # If that fails (e.g., no write permissions), fall back to the system default.
+            base_temp_dir = os.environ.get("TMPDIR") or os.environ.get("TEMP") or "/tmp"
+            temp_dir = tempfile.mkdtemp(prefix="dist_2d_", dir=base_temp_dir)
+            print(f"DEBUG [shortest_distance_2d] Using system managed temp dir: {temp_dir}")
+        temp_dir_managed = True
+    else:
+        os.makedirs(temp_dir, exist_ok=True)
+        print(f"DEBUG [shortest_distance_2d] Using provided temp dir: {temp_dir}")
 
-    unique_labels = np.unique(segmented_array); labels = unique_labels[unique_labels > 0]; n_labels = len(labels)
+    unique_labels = np.unique(segmented_array)
+    labels = unique_labels[unique_labels > 0]
+    n_labels = len(labels)
+    points_cols = ['mask1', 'mask2', 'mask1_y', 'mask1_x', 'mask2_y', 'mask2_x']
+
+    def create_empty_hdf_store(path):
+        with pd.HDFStore(path, mode='w', libver='latest') as store:
+            store.put('points', pd.DataFrame(columns=points_cols), format='table', data_columns=True)
 
     if n_labels <= 1:
-        print("Need at least two masks to calculate 2D distances.")
-        if temp_dir_managed and os.path.exists(temp_dir): 
-            try: import shutil; shutil.rmtree(temp_dir) 
-            except OSError: pass
-        empty_df = pd.DataFrame(index=labels, columns=labels); empty_points = pd.DataFrame(columns=['mask1', 'mask2', 'mask1_y', 'mask1_x', 'mask2_y', 'mask2_x'])
+        empty_df = pd.DataFrame(index=labels, columns=labels)
         if n_labels == 1: empty_df.loc[labels[0], labels[0]] = 0.0
-        return empty_df, empty_points
+        points_hdf_path = os.path.join(temp_dir, 'all_points_final.h5')
+        create_empty_hdf_store(points_hdf_path)
+        return empty_df, points_hdf_path
 
-    print(f"DEBUG [shortest_distance_2d] Found {n_labels} masks. Calculating distances with {n_jobs} workers.")
+    print(f"DEBUG [shortest_distance_2d] Found {n_labels} masks. Using chunk size {boundary_chunk_size}.")
+    
+    points_hdf_path = os.path.join(temp_dir, 'all_points_final.h5')
+    create_empty_hdf_store(points_hdf_path)
 
-    # --- Boundary Point Extraction (2D Optimized) ---
-    print("DEBUG [shortest_distance_2d] Finding 2D object bounding boxes...")
+    dist_memmap_path = os.path.join(temp_dir, 'distances_final.mmap')
+    label_to_idx_map = {label: i for i, label in enumerate(labels)}
+    dist_memmap = np.memmap(dist_memmap_path, dtype=np.float32, mode='w+', shape=(n_labels, n_labels))
+    dist_memmap[:] = np.inf
+    np.fill_diagonal(dist_memmap, 0)
+    
     locations = ndi.find_objects(segmented_array, max_label=labels.max())
-    print(f"DEBUG [shortest_distance_2d] Found {len(locations if locations is not None else [])} potential 2D bounding boxes.")
+    if locations is None: locations = []
+    
+    label_chunks = [labels[i:i + boundary_chunk_size] for i in range(0, n_labels, boundary_chunk_size)]
+    num_chunks = len(label_chunks)
+    print(f"DEBUG [shortest_distance_2d] Split labels into {num_chunks} chunks.")
 
-    extract_args = []; labels_found_in_locations = []
-    if locations is None: locations = [] # Ensure locations is iterable
+    total_chunk_pairs = num_chunks * (num_chunks + 1) // 2
+    chunk_pbar = tqdm(total=total_chunk_pairs, desc="Processing Chunk Pairs")
 
-    for i, label in enumerate(labels):
-        if label -1 < len(locations) and locations[label-1] is not None:
-            slices = locations[label - 1]
-            buffered_slices = []
-            for s, max_dim in zip(slices, segmented_array.shape): # Use 2D shape
-                start = max(0, s.start - 1); stop = min(max_dim, s.stop + 1)
-                buffered_slices.append(slice(start, stop))
-            buffered_slices = tuple(buffered_slices)
-            try:
-                 region = segmented_array[buffered_slices]
-                 offset_yx = np.array([s.start for s in buffered_slices]) # 2D offset (Y, X)
-                 extract_args.append((i, label, region, temp_dir, spacing_yx, offset_yx))
-                 labels_found_in_locations.append(label)
-            except Exception as e: print(f"Warning: Error processing slices for label {label}: {e}")
-        else: # Create empty file
-             boundary_file = os.path.join(temp_dir, f"boundary_{label}.npy"); np.save(boundary_file, np.empty((0, 2), dtype=int))
+    for i in range(num_chunks):
+        for j in range(i, num_chunks):
+            chunk_pbar.update(1)
+            
+            boundaries_i = _extract_boundaries_for_chunk(label_chunks[i], segmented_array, locations)
+            boundaries_j = boundaries_i if i == j else _extract_boundaries_for_chunk(label_chunks[j], segmented_array, locations)
 
-    print(f"DEBUG [shortest_distance_2d] Prepared {len(extract_args)} tasks for boundary extraction.")
-    if extract_args:
-        with mp.Pool(processes=n_jobs) as pool:
-             list(tqdm(pool.imap_unordered(extract_boundary_points_worker_2d, extract_args), total=len(extract_args), desc="Extracting Boundaries"))
+            calc_args = []
+            if i == j:
+                chunk_labels = list(boundaries_i.keys())
+                for k1 in range(len(chunk_labels)):
+                    for k2 in range(k1 + 1, len(chunk_labels)):
+                        l1, l2 = chunk_labels[k1], chunk_labels[k2]
+                        calc_args.append((l1, l2, boundaries_i[l1], boundaries_i[l2], spacing_yx))
+            else:
+                for l1, points1 in boundaries_i.items():
+                    for l2, points2 in boundaries_j.items():
+                        calc_args.append((l1, l2, points1, points2, spacing_yx))
+            
+            if not calc_args:
+                del boundaries_i, boundaries_j
+                gc.collect()
+                continue
+                
+            with mp.Pool(processes=n_jobs) as pool:
+                results = pool.map(calculate_pair_distances_worker_in_memory, calc_args)
 
-    # --- Pairwise Distance Calculation (2D) ---
-    labels_to_process_distance = labels_found_in_locations; n_labels_processed = len(labels_to_process_distance)
-    if n_labels_processed <= 1:
-        print("Need >= 2 valid masks to calculate distances.")
-        if temp_dir_managed and os.path.exists(temp_dir): 
-            try: import shutil; shutil.rmtree(temp_dir) 
-            except OSError: pass
-        final_distance_df = pd.DataFrame(np.inf, index=labels, columns=labels); np.fill_diagonal(final_distance_df.values, 0)
-        final_points_df = pd.DataFrame(columns=['mask1', 'mask2', 'mask1_y', 'mask1_x', 'mask2_y', 'mask2_x'])
-        return final_distance_df, final_points_df
+            if results:
+                res_df = pd.DataFrame(results, columns=['label1', 'label2', 'distance', 'points'])
+                points_data = np.vstack(res_df['points'])
+                
+                idx1 = res_df['label1'].map(label_to_idx_map).values.astype(int)
+                idx2 = res_df['label2'].map(label_to_idx_map).values.astype(int)
+                dists = res_df['distance'].values.astype(np.float32)
+                dist_memmap[idx1, idx2] = dists
+                dist_memmap[idx2, idx1] = dists
 
-    print(f"DEBUG [shortest_distance_2d] Calculating pairwise distances for {n_labels_processed} valid labels...")
-    distances_matrix = np.full((n_labels_processed, n_labels_processed), np.inf, dtype=np.float32)
-    points_matrix = np.full((n_labels_processed, n_labels_processed, 4), np.nan, dtype=np.float32) # Y1,X1,Y2,X2
-    np.fill_diagonal(distances_matrix, 0)
+                points_chunk = pd.DataFrame({
+                    'mask1': res_df['label1'], 'mask2': res_df['label2'],
+                    'mask1_y': points_data[:, 0], 'mask1_x': points_data[:, 1],
+                    'mask2_y': points_data[:, 2], 'mask2_x': points_data[:, 3]
+                })
+                points_chunk.dropna().to_hdf(points_hdf_path, key='points', mode='a', format='table', append=True)
 
-    all_pairs = [(i, j) for i in range(n_labels_processed) for j in range(i + 1, n_labels_processed)]
-    calc_args = [(i, j, labels_to_process_distance, temp_dir, spacing_yx, distances_matrix, points_matrix) for i, j in all_pairs]
+            del boundaries_i, boundaries_j, results, calc_args
+            gc.collect()
 
-    if calc_args:
-        with mp.Pool(processes=n_jobs) as pool:
-            results = list(tqdm(pool.imap_unordered(calculate_pair_distances_worker_2d, calc_args), total=len(all_pairs), desc="Calculating Distances (2D)"))
+    chunk_pbar.close()
+    
+    final_distance_df = pd.DataFrame(dist_memmap, index=labels, columns=labels)
+    final_points_path = points_hdf_path
 
-        for i_res, j_res, distance, points_res in results: # Renamed loop variables
-            distances_matrix[i_res, j_res] = distances_matrix[j_res, i_res] = distance
-            points_matrix[i_res, j_res, :] = points_res
-            if not np.any(np.isnan(points_res)): points_matrix[j_res, i_res, :] = np.array([points_res[2], points_res[3], points_res[0], points_res[1]]) # Swap Y2,X2,Y1,X1
+    print(f"DEBUG [shortest_distance_2d] Finished. Distance matrix (memmap-backed) shape {final_distance_df.shape}.")
+    print(f"DEBUG [shortest_distance_2d] Points data stored at: {final_points_path}")
 
-    # --- Convert to DataFrames (2D) ---
-    distance_matrix_processed_df = pd.DataFrame(distances_matrix, index=labels_to_process_distance, columns=labels_to_process_distance)
-    points_flat = points_matrix.reshape(-1, 4)
-    mask1_labels_proc = np.repeat(labels_to_process_distance, n_labels_processed)
-    mask2_labels_proc = np.tile(labels_to_process_distance, n_labels_processed)
+    # Clean up the entire managed directory at the end.
+    if temp_dir_managed:
+        try:
+            # Ensure the memmap is closed before we try to delete its directory
+            del dist_memmap
+            gc.collect()
+            time.sleep(0.1) # Small delay to allow file handles to release
+            import shutil
+            shutil.rmtree(temp_dir)
+            print(f"DEBUG [shortest_distance_2d] Cleaned up managed temp dir: {temp_dir}")
+        except Exception as e:
+            print(f"Warning: Failed to clean up temp dir {temp_dir}: {e}")
 
-    points_processed_df = pd.DataFrame({
-        'mask1': mask1_labels_proc, 'mask2': mask2_labels_proc,
-        'mask1_y': points_flat[:, 0], 'mask1_x': points_flat[:, 1],
-        'mask2_y': points_flat[:, 2], 'mask2_x': points_flat[:, 3] # Correct column names
-    })
-    points_processed_df = points_processed_df[points_processed_df['mask1'] != points_processed_df['mask2']].dropna().reset_index(drop=True)
 
-    # Expand distance matrix to original full label set
-    final_distance_df = pd.DataFrame(np.inf, index=labels, columns=labels, dtype=np.float32)
-    np.fill_diagonal(final_distance_df.values, 0)
-    if not distance_matrix_processed_df.empty:
-        final_distance_df.loc[labels_to_process_distance, labels_to_process_distance] = distance_matrix_processed_df
-
-    final_points_df = points_processed_df # Return only calculated pairs
-
-    # --- DEBUG ---
-    print(f"DEBUG [shortest_distance_2d] Finished. Distance matrix shape {final_distance_df.shape}. Points DF shape {final_points_df.shape}")
-    if DEBUG_TARGET_LABEL is not None and DEBUG_TARGET_LABEL in final_points_df['mask1'].values: debug_print(f"Points DF sample for label {DEBUG_TARGET_LABEL}:\n{final_points_df[final_points_df['mask1'] == DEBUG_TARGET_LABEL].head()}", label=DEBUG_TARGET_LABEL)
-    elif DEBUG_TARGET_LABEL is None and not final_points_df.empty : print(f"DEBUG [shortest_distance_2d] Points DF head:\n{final_points_df.head()}")
-
-    # --- Cleanup ---
-    if temp_dir_managed and os.path.exists(temp_dir): 
-        try: import shutil; shutil.rmtree(temp_dir) 
-        except Exception as e: print(f"Warning: cleanup failed {temp_dir}: {e}")
-
-    elapsed = time.time() - start_time; print(f"DEBUG [shortest_distance_2d] Distance calculation finished in {elapsed:.1f} seconds")
-    return final_distance_df, final_points_df
+    elapsed = time.time() - start_time
+    print(f"DEBUG [shortest_distance_2d] Distance calculation finished in {elapsed:.1f} seconds")
+    
+    return final_distance_df, final_points_path
 
 
 # =============================================================================
@@ -872,15 +920,18 @@ def calculate_ramification_with_skan_2d(segmented_array, spacing_yx=(1.0, 1.0), 
 # Main Analysis Function (2D Adapted)
 # =============================================================================
 
+# --- MODIFIED: Added batch_size parameter to pass down to the distance function ---
 def analyze_segmentation_2d(segmented_array, spacing_yx=(1.0, 1.0),
                             calculate_distances=True,
                             calculate_skeletons=True,
                             skeleton_export_path=None,
                             temp_dir=None, n_jobs=None,
                             return_detailed=False,
-                            prune_spurs_le_um=0): # <-- ADDED PARAM
+                            prune_spurs_le_um=0,
+                            distance_batch_size=500_000): # <-- NEW PARAMETER
     """
     Comprehensive analysis of a 2D segmented array with optional smoothing/pruning.
+    MODIFIED to support scalable distance calculation via batching.
     """
     overall_start_time = time.time()
     print("\n" + "=" * 30)
@@ -913,7 +964,10 @@ def analyze_segmentation_2d(segmented_array, spacing_yx=(1.0, 1.0),
         print("\nDEBUG [analyze_segmentation_2d] [2/3] Calculating Pairwise Distances (2D)...")
         if len(labels) > 1:
             distance_matrix_df, all_pairs_points_df = shortest_distance_2d(
-                segmented_array, spacing_yx=spacing_yx, temp_dir=temp_dir, n_jobs=n_jobs
+                segmented_array, 
+                spacing_yx=spacing_yx, 
+                temp_dir=temp_dir, 
+                n_jobs=n_jobs
             )
             closest_neighbor_labels = []; shortest_distances = []
             point_self_y, point_self_x = [], []
