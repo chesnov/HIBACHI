@@ -1,14 +1,15 @@
-# 3D Microglia & Cell Segmentation Tool
+# HIBACHI
+### Heuristic-Informed Batch Analysis for Cell Histological Identification
 
-A modular, memory-safe application for segmenting, separating, and analyzing cells in large 2D and 3D microscopy datasets. Designed to process terabyte-scale volumes on standard laptops using aggressive memory mapping and chunked processing.
+**HIBACHI** is a modular, memory-safe application designed for the automated segmentation, separation, and analysis of cells in large 2D and 3D microscopy datasets. It is engineered to process terabyte-scale volumes on standard laptops by utilizing aggressive memory mapping, chunked processing, and heuristic graph-based separation.
 
 ## 🚀 Key Features
 
-*   **Memory Efficiency:** Uses `numpy.memmap` and `dask` to process images larger than physical RAM.
-*   **Workflow:** 5-step pipeline: Raw Segmentation → Artifact Removal → Soma Detection → Cell Splitting → Feature Extraction.
-*   **Batch Processing:** Automated processing of entire experiment folders with resume capability.
-*   **Interactive GUI:** Built on **Napari** and **PyQt5** for visualization and parameter tuning.
-*   **Robust Separation:** Advanced watershed and graph-based merging algorithms to separate touching cells in dense aggregates.
+*   **Memory Efficiency:** Uses `numpy.memmap` and `dask` to process images significantly larger than physical RAM.
+*   **Robust Separation:** Solves the "clumped cell" problem using a custom graph-based merge algorithm that analyzes geometric "necks" and intensity valleys.
+*   **Batch Processing:** "Set and Forget" automated processing of entire experiment folders with crash recovery and resume capability.
+*   **Interactive GUI:** Built on **Napari** and **PyQt5** for visualizing results and tuning parameters step-by-step.
+*   **Modular Workflow:** 5-step pipeline covering everything from raw signal enhancement to skeletonization.
 
 ---
 
@@ -19,26 +20,26 @@ A modular, memory-safe application for segmenting, separating, and analyzing cel
 *   **Git** (optional, to clone the repo).
 
 ### 1. Clone the Repository
-```bash
-git clone https://github.com/yourusername/3D_microglia_segment.git
-cd 3D_microglia_segment
-```
+'''bash
+git clone https://github.com/chesnov/HIBACHI.git
+cd HIBACHI
+'''
 
 ### 2. Create the Environment
 We provide an `environment.yaml` file that contains all necessary dependencies (Napari, SimpleITK, Dask, etc.).
 
-```bash
+'''bash
 # Create the environment from the file
 conda env create -f environment.yaml
 
 # Activate the environment
 conda activate microglia_segment
-```
+'''
 
 ### 3. Run the Application
-```bash
+'''bash
 python segment.py
-```
+'''
 
 ---
 
@@ -50,7 +51,7 @@ To use the **Batch Processor** and **Automatic Initialization**, your data must 
 Place all your raw `.tif` or `.tiff` images in a single folder. Do not create subfolders yet.
 
 ### 2. The Metadata CSV
-You must provide **exactly one** `.csv` file in that same folder. This file contains the physical dimensions of your images. This is crucial because the algorithm uses physical units (microns) for thresholds, not pixels.
+You must provide **exactly one** `.csv` file in that same folder. This file contains the physical dimensions of your images. This is crucial because HIBACHI uses physical units (microns) for thresholds, not pixels.
 
 **Required CSV Format:**
 
@@ -66,7 +67,7 @@ You must provide **exactly one** `.csv` file in that same folder. This file cont
 
 ### 3. Automatic Initialization
 When you load this folder in the GUI for the first time:
-1.  The app will detect the flat structure.
+1.  HIBACHI will detect the flat structure.
 2.  It will ask to **Organize** the project.
 3.  It will move every image into its own subfolder (e.g., `./image_01/image_01.tif`).
 4.  It will generate a `ramified_config.yaml` for each image, pre-filled with the voxel dimensions calculated from your CSV.
@@ -79,7 +80,7 @@ The pipeline consists of 5 modular steps. You can tune parameters for each step 
 
 1.  **Raw Segmentation:** Uses Hessian filters (Frangi/Sato) to detect tubular structures and global thresholding for volume.
 2.  **Edge Trimming:** Generates a 3D convex hull around the tissue and removes artifacts caused by edge damage/fluorescence.
-3.  **Soma Extraction:** "Peels" the binary mask using erosion to find the core seeds (cell bodies) of clumps.
+3.  **Soma Extraction:** "Peels" the binary mask using iterative erosion to find the core seeds (cell bodies) within dense clumps.
 4.  **Cell Separation:** Uses the seeds from Step 3 to perform a Marker-Controlled Watershed on the remaining mask, followed by a graph-based merge to fix over-segmentation.
 5.  **Feature Calculation:** Computes Volume, Surface Area, Sphericity, Skeleton/Ramification stats, and Pairwise Distances.
 
@@ -117,6 +118,3 @@ For every image, the following files are generated in `image_folder/image_name_p
 *   `processing_config_ramified.yaml`: A record of the exact parameters used for this run.
 
 ---
-
-## License
-[Insert License Here]
