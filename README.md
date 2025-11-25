@@ -20,26 +20,26 @@
 *   **Git** (optional, to clone the repo).
 
 ### 1. Clone the Repository
-'''bash
+```bash
 git clone https://github.com/chesnov/HIBACHI.git
 cd HIBACHI
-'''
+```
 
 ### 2. Create the Environment
 We provide an `environment.yaml` file that contains all necessary dependencies (Napari, SimpleITK, Dask, etc.).
 
-'''bash
+```bash
 # Create the environment from the file
 conda env create -f environment.yaml
 
 # Activate the environment
 conda activate microglia_segment
-'''
+```
 
 ### 3. Run the Application
-'''bash
+```bash
 python segment.py
-'''
+```
 
 ---
 
