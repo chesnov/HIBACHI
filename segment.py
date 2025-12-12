@@ -16,6 +16,27 @@ import os
 import traceback
 import multiprocessing
 
+# This monkeypatch fixes the "too many values to unpack" crash in Vispy/Napari
+# when switching between Panning (Shift+Click) and Rotating.
+try:
+    import vispy.scene.cameras.arcball as arcball_module
+    
+    # Save the original function
+    _original_arcball = arcball_module._arcball
+
+    def _patched_arcball(xy, wh):
+        # The crash happens because 'xy' sometimes contains 3 or more values 
+        # (e.g. pressure or z-depth) but the function assumes exactly 2 (x, y).
+        if len(xy) > 2:
+            xy = xy[:2]
+        return _original_arcball(xy, wh)
+
+    # Apply the patch
+    arcball_module._arcball = _patched_arcball
+    print("Applied Vispy Arcball camera patch.")
+except Exception as e:
+    print(f"Warning: Could not apply Vispy patch: {e}")
+
 # PyQt5 is the GUI framework used. 
 # QApplication is the singleton that manages the GUI control flow and main settings.
 # QMessageBox is used for reporting critical errors to the user.

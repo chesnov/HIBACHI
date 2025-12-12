@@ -209,6 +209,7 @@ class RamifiedStrategy(ProcessingStrategy):
         try:
             trimmed_labels_memmap = np.memmap(trimmed_seg_path, dtype=np.int32, mode='r', shape=self.image_shape)
             
+            # --- UPDATED PARAMETER DICTIONARY ---
             soma_extraction_params = {
                 "smallest_quantile": float(params.get("smallest_quantile", 25)),
                 "min_fragment_size": int(params.get("min_fragment_size", 30)),
@@ -218,6 +219,13 @@ class RamifiedStrategy(ProcessingStrategy):
                 "ratios_to_process": params.get("ratios_to_process", [0.3, 0.4, 0.5, 0.6]),
                 "intensity_percentiles_to_process": params.get("intensity_percentiles_to_process", [100, 90, 80, 70, 60, 50, 40, 30, 20, 10]),
                 "min_physical_peak_separation": float(params.get("min_physical_peak_separation", 7.0)),
+                
+                # --- NEW PARAMETER HERE ---
+                # We use .get() without a default, so it returns None if missing.
+                # The extract function handles None by falling back to legacy behavior.
+                "seeding_min_distance_um": params.get("seeding_min_distance_um"),
+                # --------------------------
+
                 "max_allowed_core_aspect_ratio": float(params.get("max_allowed_core_aspect_ratio", 10.0)),
                 "ref_vol_percentile_lower": int(params.get("ref_vol_percentile_lower", 30)),
                 "ref_vol_percentile_upper": int(params.get("ref_vol_percentile_upper", 70)),
@@ -227,6 +235,7 @@ class RamifiedStrategy(ProcessingStrategy):
                 "memmap_final_mask": True 
             }
             
+            # Now **soma_extraction_params will contain the new key
             cell_bodies = extract_soma_masks(trimmed_labels_memmap, image_stack, self.spacing, **soma_extraction_params)
             
             if isinstance(cell_bodies, np.memmap):

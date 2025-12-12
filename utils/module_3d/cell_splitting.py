@@ -1,31 +1,21 @@
-# --- START OF FILE utils/module_3d/cell_splitting.py ---
 import numpy as np
 import os
 from scipy import ndimage
-from skimage.measure import regionprops
 from skimage.morphology import binary_dilation, ball, footprint_rectangle
 from skimage.segmentation import relabel_sequential
-from skimage.graph import route_through_array
-import time
 import gc
-from typing import List, Dict, Optional, Tuple, Union, Any, Set
+from typing import List, Dict, Optional, Tuple, Set
 from tqdm import tqdm
-import traceback
-from shutil import rmtree
 
 # Import shared helpers
 try:
     from .segmentation_helpers import (
         flush_print, 
-        log_memory_usage, 
-        distance_transform_edt, 
         _watershed_with_simpleitk
     )
 except ImportError:
     from segmentation_helpers import (
         flush_print, 
-        log_memory_usage, 
-        distance_transform_edt, 
         _watershed_with_simpleitk
     )
 
@@ -40,7 +30,7 @@ def _get_chunk_slices(volume_shape, chunk_shape, overlap):
                     slice(x, min(x + chunk_shape[2], volume_shape[2])),
                 )
 
-# --- Graph & Metric Functions ---
+# --- Graph & Metric Functions (Standard) ---
 
 def _analyze_local_intensity_difference_optimized(
     interface_mask, region1_mask, region2_mask, intensity_vol_local, 
@@ -74,6 +64,9 @@ def _calculate_interface_metrics(
 
     mean_interface_intensity = np.mean(intensity_local[interface_mask])
     ratio = mean_interface_intensity / max(avg_soma_intensity_for_interface, 1e-6)
+    
+    # ratio < thresh => Dark => Split
+    # ratio > thresh => Bright => Merge
     ratio_threshold_passed = ratio < min_path_intensity_ratio_heuristic
 
     lid_passed = _analyze_local_intensity_difference_optimized(
@@ -126,63 +119,7 @@ def _build_adjacency_graph_for_cell(
             )
     return nodes, edges
 
-# --- Void Filling Helper ---
-
-def fill_internal_voids(segmentation_mask: np.ndarray) -> np.ndarray:
-    """
-    Fills internal holes within each labeled object. 
-    Crucial for skeletonization, as holes create false loops/webs.
-    """
-    flush_print("[VoidFill] Starting Internal Void Filling...")
-    
-    # Optimization: Only process objects that likely have holes.
-    # Or simpler: iterate all objects via find_objects
-    labels = np.unique(segmentation_mask)
-    labels = labels[labels > 0]
-    
-    if len(labels) == 0:
-        return segmentation_mask
-
-    slices = ndimage.find_objects(segmentation_mask)
-    
-    for i, label in enumerate(tqdm(labels, desc="Filling Voids")):
-        idx = label - 1
-        if idx >= len(slices) or slices[idx] is None: continue
-        
-        sl = slices[idx]
-        
-        # Create binary mask for just this object in its bounding box
-        crop = segmentation_mask[sl]
-        obj_mask = (crop == label)
-        
-        # Binary fill holes
-        # Note: binary_fill_holes works on 3D, filling any pocket not connected to the edge
-        filled_mask = ndimage.binary_fill_holes(obj_mask)
-        
-        # If changes occurred, write back
-        if np.any(filled_mask != obj_mask):
-            # We only want to update the pixels that became True and were not another label
-            # (Though bounding box usually implies we own the pixels, but overlaps exist in dense crops)
-            # To be safe: Only write to pixels that are currently label or 0
-            
-            # Actually, binary_fill_holes fills the 'background' inside.
-            # If that background belonged to another cell, we shouldn't overwrite it.
-            # But 'voids' usually implies background (0).
-            
-            # Safe update:
-            # Write 'label' where filled_mask is True AND (crop was label OR crop was 0)
-            # This prevents eating a neighbor that is nestled inside a C-shape.
-            
-            safe_fill = filled_mask & ((crop == label) | (crop == 0))
-            
-            # We need to write to the original array
-            # Using boolean indexing on a slice of a numpy array works
-            crop[safe_fill] = label
-            segmentation_mask[sl] = crop
-
-    return segmentation_mask
-
-# --- Worker & Coordinator ---
+# --- Worker Function ---
 
 def _separate_multi_soma_cells_chunk(
     segmentation_mask, intensity_volume, soma_mask, spacing, 
@@ -190,22 +127,34 @@ def _separate_multi_soma_cells_chunk(
 ):
     """
     Worker: Separates cells in a single chunk.
+    Returns: 
+        chunk_result (np.ndarray), 
+        provenance_map (dict), 
+        label_to_seeds_map (dict: local_label -> set(global_seed_ids))
     """
     chunk_result = np.zeros_like(segmentation_mask, dtype=np.int32)
-    provenance_map = {} 
+    label_to_seeds_map = {} 
     
     unique_labels = np.unique(segmentation_mask[segmentation_mask > 0])
-    # 1. Copy Single Cells
+    
+    # 1. Copy Single Cells (Pass-through)
     for lbl in unique_labels:
         if lbl not in multi_soma_cell_labels_list:
             chunk_result[segmentation_mask == lbl] = lbl
+            # Record seeds for single cells too (needed for stitching consistency)
+            seeds = np.unique(soma_mask[segmentation_mask == lbl])
+            if seeds.size > 0:
+                label_to_seeds_map[lbl] = set(seeds[seeds > 0])
 
     present_multi_soma = [l for l in multi_soma_cell_labels_list if l in unique_labels]
-    if not present_multi_soma: return chunk_result, provenance_map
+    
+    # If no multi-soma objects, return early
+    if not present_multi_soma: 
+        return chunk_result, {}, label_to_seeds_map
 
     next_local_label = label_offset
     
-    # 2. Process Multi-Soma
+    # 2. Process Multi-Soma Objects
     for cell_label in present_multi_soma:
         cell_mask_full = (segmentation_mask == cell_label)
         slices = ndimage.find_objects(cell_mask_full)
@@ -224,7 +173,7 @@ def _separate_multi_soma_cells_chunk(
             # Treated as single in this chunk
             new_label = next_local_label
             chunk_result[bbox_padded][local_mask] = new_label
-            provenance_map[new_label] = cell_label
+            label_to_seeds_map[new_label] = set(seeds_in_crop)
             next_local_label += 1
             continue
 
@@ -235,7 +184,8 @@ def _separate_multi_soma_cells_chunk(
 
         dt = ndimage.distance_transform_edt(local_mask, sampling=spacing)
         landscape = -dt
-        intensity_weight = kwargs.get('intensity_weight', 0.0)
+        intensity_weight = kwargs.get('intensity_weight', 0.5)
+        
         if intensity_weight > 0:
             norm_int = (local_intensity - local_intensity.min()) / (local_intensity.max() - local_intensity.min() + 1e-6)
             landscape += (norm_int * intensity_weight * dt.max())
@@ -247,11 +197,12 @@ def _separate_multi_soma_cells_chunk(
         ws_local = _watershed_with_simpleitk(landscape, markers)
         ws_local[~local_mask] = 0
         
+        # Internal Merge Step (Graph Cut)
         nodes, edges = _build_adjacency_graph_for_cell(
             ws_local, local_mask, local_soma, soma_props, local_intensity, spacing,
             kwargs.get('local_analysis_radius', 10),
-            kwargs.get('min_local_intensity_difference', 0.05),
-            kwargs.get('min_path_intensity_ratio', 0.8)
+            kwargs.get('min_local_intensity_difference', 0.0),
+            kwargs.get('min_path_intensity_ratio', 1.0)
         )
         
         merge_map = {i: i for i in range(len(seeds_in_crop) + 2)}
@@ -270,19 +221,49 @@ def _separate_multi_soma_cells_chunk(
         
         final_local_mask_clean, _, _ = relabel_sequential(final_local_mask)
         
-        final_local_mask_shifted = np.zeros_like(final_local_mask_clean)
+        # Write back to chunk and record seed ownership
+        chunk_result_view = chunk_result[bbox_padded]
+        
         for local_id in np.unique(final_local_mask_clean[final_local_mask_clean > 0]):
-            final_local_mask_shifted[final_local_mask_clean == local_id] = next_local_label
-            provenance_map[next_local_label] = cell_label
+            mask_l = (final_local_mask_clean == local_id)
+            
+            # Record which seeds ended up in this final segment
+            seeds_in_segment = np.unique(local_soma[mask_l])
+            seeds_in_segment = set(seeds_in_segment[seeds_in_segment > 0])
+            
+            # Assign global unique label
+            global_lbl = next_local_label
+            chunk_result_view[mask_l] = global_lbl
+            
+            label_to_seeds_map[global_lbl] = seeds_in_segment
             next_local_label += 1
             
-        chunk_result_view = chunk_result[bbox_padded]
-        mask_to_write = (final_local_mask_shifted > 0)
-        chunk_result_view[mask_to_write] = final_local_mask_shifted[mask_to_write]
         chunk_result[bbox_padded] = chunk_result_view
 
-    return chunk_result, provenance_map
+    return chunk_result, {}, label_to_seeds_map
 
+# --- Void Filling Helper ---
+
+def fill_internal_voids(segmentation_mask: np.ndarray) -> np.ndarray:
+    labels = np.unique(segmentation_mask)
+    labels = labels[labels > 0]
+    if len(labels) == 0: return segmentation_mask
+
+    slices = ndimage.find_objects(segmentation_mask)
+    for i, label in enumerate(tqdm(labels, desc="Filling Voids")):
+        idx = label - 1
+        if idx >= len(slices) or slices[idx] is None: continue
+        sl = slices[idx]
+        crop = segmentation_mask[sl]
+        obj_mask = (crop == label)
+        filled_mask = ndimage.binary_fill_holes(obj_mask)
+        if np.any(filled_mask != obj_mask):
+            safe_fill = filled_mask & ((crop == label) | (crop == 0))
+            crop[safe_fill] = label
+            segmentation_mask[sl] = crop
+    return segmentation_mask
+
+# --- Main Coordinator ---
 
 def separate_multi_soma_cells(
     segmentation_mask: np.ndarray, intensity_volume: np.ndarray, soma_mask: np.ndarray,
@@ -292,11 +273,11 @@ def separate_multi_soma_cells(
     **kwargs 
 ) -> np.ndarray:
     """
-    Main Coordinator: Chunk -> Process -> STITCH -> Merge.
+    Main Coordinator with Seed-Aware Stitching.
     """
-    flush_print("[SepMultiSoma] Starting...")
+    flush_print("[SepMultiSoma] Starting (Chunked + Seed-Aware)...")
     
-    # 1. Identify Cells
+    # 1. Identify Multi-Soma Cells
     unique_labels = np.unique(segmentation_mask[segmentation_mask > 0])
     cell_to_somas = {}
     soma_locs = ndimage.find_objects(soma_mask)
@@ -319,41 +300,43 @@ def separate_multi_soma_cells(
     
     next_label_offset = np.max(unique_labels) + 1
     chunk_slices = list(_get_chunk_slices(segmentation_mask.shape, chunk_shape, overlap))
-    chunk_result_paths = {}
-    global_provenance = {}
+    
+    chunk_data = {} # Stores (path, shape, seed_map)
     
     flush_print(f"  Processing {len(chunk_slices)} chunks...")
     
     for i, sl in enumerate(tqdm(chunk_slices, desc="Processing Chunks")):
         seg_chunk = segmentation_mask[sl]
-        # Skip chunks with no multi-soma cells
-        if not np.any(np.isin(seg_chunk, multi_soma_labels)):
-            chunk_result_paths[i] = (None, seg_chunk.shape)
-            continue
-
+        
+        # Optimization: Skip if no multi-soma cells involved
+        # (Though we must process single cells to ensure IDs are handled correctly if we relabel)
+        # For simplicity in stitching, we assume disjoint ID ranges per chunk if we used offsets,
+        # but here we used a rolling offset. 
+        # Actually, let's process everything to be safe with offsets.
+        
         int_chunk = intensity_volume[sl]
         soma_chunk = soma_mask[sl]
         
-        res, prov = _separate_multi_soma_cells_chunk(
+        # Dynamic label offset per chunk to avoid collisions before stitching
+        # (We use a large stride or just let them be high numbers, stitching resolves it)
+        # Using i * 1,000,000 ensures uniqueness temporarily
+        chunk_offset = (i + 1) * 1_000_000
+        
+        res, _, seed_map = _separate_multi_soma_cells_chunk(
             seg_chunk, int_chunk, soma_chunk,
-            spacing, next_label_offset, multi_soma_labels, **kwargs
+            spacing, chunk_offset, multi_soma_labels, **kwargs
         )
         
         path = os.path.join(memmap_dir, f"chunk_{i}.npy")
         np.save(path, res)
         
-        chunk_result_paths[i] = (path, seg_chunk.shape)
-        global_provenance.update(prov)
+        chunk_data[i] = {'path': path, 'shape': seg_chunk.shape, 'seed_map': seed_map}
         
-        if res.size > 0:
-            mx = np.max(res)
-            if mx >= next_label_offset: next_label_offset = mx + 1
-            
         del res, seg_chunk, int_chunk, soma_chunk
         gc.collect()
 
-    # 3. Stitching (Pixel Correspondence Analysis)
-    flush_print("  Analyzing overlap seams...")
+    # 3. Seed-Aware Stitching
+    flush_print("  Stitching with Seed Verification...")
     label_map = {} 
 
     shape_in_chunks = [
@@ -363,23 +346,26 @@ def separate_multi_soma_cells(
     ]
 
     for i, chunk_slice1 in enumerate(tqdm(chunk_slices, desc="Stitching Analysis")):
-        path1, shape1 = chunk_result_paths[i]
-        if path1 is None: continue 
-
+        if i not in chunk_data: continue
+        
         cz, cy, cx = np.unravel_index(i, shape_in_chunks)
         neighbors = []
         if cz + 1 < shape_in_chunks[0]: neighbors.append(np.ravel_multi_index((cz+1, cy, cx), shape_in_chunks))
         if cy + 1 < shape_in_chunks[1]: neighbors.append(np.ravel_multi_index((cz, cy+1, cx), shape_in_chunks))
         if cx + 1 < shape_in_chunks[2]: neighbors.append(np.ravel_multi_index((cz, cy, cx+1), shape_in_chunks))
 
-        res1 = np.load(path1)
+        data1 = chunk_data[i]
+        res1 = np.load(data1['path'])
+        seeds1_map = data1['seed_map']
 
         for j in neighbors:
-            path2, shape2 = chunk_result_paths[j]
-            if path2 is None: continue
-
+            if j not in chunk_data: continue
+            data2 = chunk_data[j]
             chunk_slice2 = chunk_slices[j]
-            
+            res2 = np.load(data2['path'])
+            seeds2_map = data2['seed_map']
+
+            # Calculate overlap slice
             overlap_slice_global = tuple(slice(max(s1.start, s2.start), min(s1.stop, s2.stop)) 
                                          for s1, s2 in zip(chunk_slice1, chunk_slice2))
             
@@ -387,8 +373,6 @@ def separate_multi_soma_cells(
                                  for s, cs in zip(overlap_slice_global, chunk_slice1))
             local_slice2 = tuple(slice(s.start - cs.start, s.stop - cs.start) 
                                  for s, cs in zip(overlap_slice_global, chunk_slice2))
-
-            res2 = np.load(path2)
             
             crop1 = res1[local_slice1]
             crop2 = res2[local_slice2]
@@ -396,12 +380,24 @@ def separate_multi_soma_cells(
             mask_overlap = (crop1 > 0) & (crop2 > 0)
             if not np.any(mask_overlap): continue
             
+            # Identify overlapping pairs
             l1_flat = crop1[mask_overlap]
             l2_flat = crop2[mask_overlap]
+            stacked = np.vstack((l1_flat, l2_flat))
+            unique_pairs = np.unique(stacked, axis=1).T
             
-            pairs = np.unique(np.vstack((l1_flat, l2_flat)), axis=1).T
-            
-            for id1, id2 in pairs:
+            for id1, id2 in unique_pairs:
+                # --- CRITICAL FIX: Seed Disjoint Check ---
+                s1_set = seeds1_map.get(id1, set())
+                s2_set = seeds2_map.get(id2, set())
+                
+                # If both segments have seeds, but those seeds are DIFFERENT,
+                # it means the boundary shifted and these are distinct cells.
+                # DO NOT MERGE.
+                if s1_set and s2_set and s1_set.isdisjoint(s2_set):
+                    continue
+                
+                # Otherwise (one is empty, or they share seeds), proceed with merge
                 root1 = label_map.get(id1, id1)
                 root2 = label_map.get(id2, id2)
                 
@@ -419,17 +415,10 @@ def separate_multi_soma_cells(
     final_path = os.path.join(memmap_dir, "stitched.mmp")
     final_mask = np.memmap(final_path, dtype=np.int32, mode='w+', shape=segmentation_mask.shape)
     
-    flush_print("  Initializing final mask...")
-    chunk_sz = 50
-    for z in tqdm(range(0, segmentation_mask.shape[0], chunk_sz), desc="Copying Base"):
-        end = min(z+chunk_sz, segmentation_mask.shape[0])
-        final_mask[z:end] = segmentation_mask[z:end]
-    
-    flush_print("  Applying stitched chunks...")
+    flush_print("  Writing stitched result...")
     for i, sl in enumerate(tqdm(chunk_slices, desc="Writing Result")):
-        path, shape = chunk_result_paths[i]
-        if path is None: continue 
-        
+        if i not in chunk_data: continue
+        path = chunk_data[i]['path']
         res = np.load(path)
         
         uniques = np.unique(res)
@@ -451,14 +440,8 @@ def separate_multi_soma_cells(
     del final_mask
     if os.path.exists(final_path): os.remove(final_path)
     
-    # 5. Relabel and Fill Voids (Correct Order)
-    # We fill voids BEFORE relabeling to ensure connected components are truly connected
-    
-    flush_print("  Filling internal voids...")
+    flush_print("  Refining...")
     ret = fill_internal_voids(ret)
-    
-    flush_print("  Relabeling sequentially...")
     ret, _, _ = relabel_sequential(ret)
     
     return ret
-# --- END OF FILE utils/module_3d/cell_splitting.py ---

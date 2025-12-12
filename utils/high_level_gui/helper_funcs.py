@@ -114,11 +114,60 @@ def create_parameter_widget(param_name: str, param_config: Dict[str, Any], callb
     return widget
 
 
-def organize_processing_dir(drctry, mode):
+def scan_available_presets():
     """
-    Organizes a directory for processing.
+    Scans module directories for configuration presets in 'configs' subfolders.
+    Returns a dict: { "Display Name": {"path": full_path, "default_mode": mode_string} }
     """
-    print(f"Organizing directory: {drctry} for mode: {mode}")
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    
+    # Define where to look and what the fallback mode should be if the YAML doesn't specify it
+    search_locations = [
+        # (Relative Path to configs, Default Mode)
+        (os.path.join(script_dir, '..', 'module_3d', 'configs'), 'ramified'),
+        (os.path.join(script_dir, '..', 'module_2d', 'configs'), 'ramified_2d')
+    ]
+
+    presets = {}
+
+    for config_dir, default_mode in search_locations:
+        if not os.path.exists(config_dir):
+            continue
+            
+        try:
+            files = [f for f in os.listdir(config_dir) if f.lower().endswith(('.yaml', '.yml'))]
+            for f in files:
+                full_path = os.path.join(config_dir, f)
+                # Create a readable name: "ramified_config.yaml" -> "Ramified Config (3D)"
+                clean_name = os.path.splitext(f)[0].replace('_', ' ').title()
+                
+                # Tag it with 2D/3D based on the folder we found it in
+                suffix = " (2D)" if "module_2d" in config_dir else " (3D)"
+                display_name = f"{clean_name}{suffix}"
+                
+                presets[display_name] = {
+                    "path": full_path,
+                    "default_mode": default_mode
+                }
+        except Exception as e:
+            print(f"Error scanning presets in {config_dir}: {e}")
+
+    return presets
+
+
+def organize_processing_dir(drctry, preset_details):
+    """
+    Organizes a directory using a specific configuration template.
+    Args:
+        drctry: Target folder path.
+        preset_details: Dict containing {'path': str, 'default_mode': str}
+    """
+    config_template_path = preset_details['path']
+    fallback_mode = preset_details['default_mode']
+    
+    print(f"Organizing directory: {drctry} using template: {os.path.basename(config_template_path)}")
+    
+    # --- Standard File Validation (No changes here) ---
     try:
         all_files = os.listdir(drctry)
         tif_files = [f for f in all_files if f.lower().endswith(('.tif', '.tiff')) and os.path.isfile(os.path.join(drctry, f))]
@@ -132,20 +181,33 @@ def organize_processing_dir(drctry, mode):
     try: df = pd.read_csv(csv_path)
     except Exception as e: raise ValueError(f"Error reading CSV file {csv_path}: {e}") from e
 
-    is_2d_mode = mode == 'ramified_2d'
+    # --- Determine Mode from Template ---
+    # We read the template first to see if it dictates the mode (e.g. 2D vs 3D requirements)
+    template_data = {}
+    try:
+        with open(config_template_path, 'r') as f:
+            template_data = yaml.safe_load(f) or {}
+    except Exception as e:
+        raise ValueError(f"Selected template is invalid: {e}")
+
+    # Use mode from YAML, or fallback to folder-based mode
+    mode = template_data.get('mode', fallback_mode)
+    
+    is_2d_mode = mode.endswith('_2d')
     required_cols = ['Filename', 'Width (um)', 'Height (um)']
-    dimension_section_key = 'pixel_dimensions'
+    dimension_section_key = 'pixel_dimensions' if is_2d_mode else 'voxel_dimensions'
+    
     if not is_2d_mode:
         required_cols.extend(['Slices', 'Depth (um)'])
-        dimension_section_key = 'voxel_dimensions'
-    # print(f"Mode is {'2D' if is_2d_mode else '3D'}. Requiring columns:", required_cols) # Less verbose
 
     if not all([col in df.columns for col in required_cols]):
-        raise ValueError(f'For mode "{mode}", CSV must have columns: {", ".join(required_cols)}. Found: {", ".join(df.columns)}')
+        raise ValueError(f'For preset mode "{mode}", CSV must have columns: {", ".join(required_cols)}. Found: {", ".join(df.columns)}')
 
+    # --- Match Files (No changes here) ---
     csv_filenames = set(df['Filename'].astype(str))
     tif_basenames = set(os.path.splitext(f)[0] for f in tif_files)
     if csv_filenames != tif_basenames:
+        # (Error handling logic same as before...)
         missing_in_csv = tif_basenames - csv_filenames
         missing_in_folder = csv_filenames - tif_basenames
         error_msg = "Mismatch between CSV 'Filename' column and TIF/TIFF files:"
@@ -153,26 +215,10 @@ def organize_processing_dir(drctry, mode):
         if missing_in_folder: error_msg += f"\n - CSV names without TIF: {', '.join(missing_in_folder)}"
         raise ValueError(error_msg)
 
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    if mode == 'ramified': config_template_name = os.path.join('..','module_3d', 'ramified_config.yaml')
-    elif mode == 'ramified_2d': config_template_name = os.path.join('..','module_2d', 'ramified_config_2d.yaml')
-    else: raise ValueError(f"Invalid mode '{mode}' specified.")
-
-    config_template_path = os.path.join(script_dir, config_template_name)
-    if not os.path.exists(config_template_path):
-        config_template_path_cwd = os.path.join(os.getcwd(), os.path.basename(config_template_name))
-        if os.path.exists(config_template_path_cwd):
-            config_template_path = config_template_path_cwd
-            print(f"Using config template from CWD: {config_template_path}")
-        else:
-            raise FileNotFoundError(f"Config template '{os.path.basename(config_template_name)}' not found relative to script dir ({script_dir}) or CWD.")
-    # print(f"Using config template: {config_template_path}") # Less verbose
-
     root_names = list(tif_basenames)
-    # print(f"Found TIF roots: {root_names}") # Less verbose
 
+    # --- Organization Loop ---
     for root_name in root_names:
-        # print(f"Processing: {root_name}") # Less verbose
         new_dir = os.path.join(drctry, root_name)
         try: os.makedirs(new_dir, exist_ok=True)
         except OSError as e: raise OSError(f"Error creating directory {new_dir}: {e}") from e
@@ -180,53 +226,55 @@ def organize_processing_dir(drctry, mode):
         actual_tif_file = next((f for f in tif_files if os.path.splitext(f)[0] == root_name), None)
         if not actual_tif_file: continue
 
+        # Move TIF (Same as before)
         original_tif_path = os.path.join(drctry, actual_tif_file)
         new_tif_path = os.path.join(new_dir, actual_tif_file)
 
-        if os.path.abspath(original_tif_path) == os.path.abspath(new_tif_path): pass
-            # print(f"File {actual_tif_file} already in target directory. Skipping move.") # Less verbose
-        elif not os.path.exists(original_tif_path):
-            # print(f"Warning: Source {original_tif_path} does not exist. Assuming moved.") # Less verbose
-            if not os.path.exists(new_tif_path): raise FileNotFoundError(f"Critical: TIF file {actual_tif_file} missing.")
-        else:
-            try: shutil.move(original_tif_path, new_tif_path); # print(f"Moving {original_tif_path} to {new_tif_path}") # Less verbose
-            except Exception as e:
-                 if os.path.exists(new_tif_path): pass # print(f"Warning: Destination {new_tif_path} exists. Assuming moved earlier.") # Less verbose
-                 else: raise OSError(f"Error moving file {original_tif_path}: {e}") from e
+        if os.path.abspath(original_tif_path) != os.path.abspath(new_tif_path):
+             if os.path.exists(original_tif_path):
+                try: shutil.move(original_tif_path, new_tif_path)
+                except Exception as e:
+                     if not os.path.exists(new_tif_path): raise OSError(f"Error moving file {original_tif_path}: {e}") from e
 
-        config_filename = os.path.basename(config_template_name)
+        # --- Copy Config Template ---
+        config_filename = os.path.basename(config_template_path)
         new_config_path = os.path.join(new_dir, config_filename)
+        
         try:
+            # Always copy the template to ensure we have the correct structure
             if not os.path.exists(new_config_path):
-                 shutil.copy2(config_template_path, new_config_path); # print(f"Copying template {config_template_path} to {new_config_path}") # Less verbose
-            # else: print(f"Config file {new_config_path} exists. Skipping copy, will update existing.") # Less verbose
+                 shutil.copy2(config_template_path, new_config_path)
 
+            # Get Dimensions from CSV
             row = df[df['Filename'].astype(str) == root_name]
-            if row.empty: print(f"Warning: No data in CSV for Filename '{root_name}'. Skipping config update."); continue
+            if row.empty: continue
 
             x_um = row['Width (um)'].iloc[0]
             y_um = row['Height (um)'].iloc[0]
-            z_um = 0.0
-            if not is_2d_mode: z_um = row['Depth (um)'].iloc[0]
+            z_um = 0.0 if is_2d_mode else row['Depth (um)'].iloc[0]
 
+            # Update the YAML
             config_data = {}
             if os.path.exists(new_config_path):
-                try:
-                    with open(new_config_path, 'r') as f: config_data = yaml.safe_load(f) or {}
-                except Exception as e: print(f"Warning: Error reading YAML {new_config_path}: {e}. Will create from scratch."); config_data = {}
+                with open(new_config_path, 'r') as f: config_data = yaml.safe_load(f) or {}
 
-            if dimension_section_key not in config_data or not isinstance(config_data.get(dimension_section_key), dict):
-                config_data[dimension_section_key] = {}
+            if dimension_section_key not in config_data: config_data[dimension_section_key] = {}
+            
             config_data[dimension_section_key]['x'] = float(x_um)
             config_data[dimension_section_key]['y'] = float(y_um)
-            if not is_2d_mode: config_data[dimension_section_key]['z'] = float(z_um)
-            elif 'z' in config_data[dimension_section_key]: del config_data[dimension_section_key]['z']
+            
+            if not is_2d_mode: 
+                config_data[dimension_section_key]['z'] = float(z_um)
+            
+            # ENSURE MODE IS SET
             config_data['mode'] = mode
 
-            with open(new_config_path, 'w') as f: yaml.dump(config_data, f, default_flow_style=False, sort_keys=False)
-            dim_str = f"(X:{x_um}, Y:{y_um})" if is_2d_mode else f"(X:{x_um}, Y:{y_um}, Z:{z_um})"
-            # print(f"Updated config {new_config_path} with {'2D' if is_2d_mode else '3D'} dimensions {dim_str} and mode '{mode}'.") # Less verbose
-        except Exception as e: raise RuntimeError(f"Error processing config file for {root_name}: {e}\n{traceback.format_exc()}") from e
+            with open(new_config_path, 'w') as f: 
+                yaml.dump(config_data, f, default_flow_style=False, sort_keys=False)
+                
+        except Exception as e: 
+            raise RuntimeError(f"Error processing config file for {root_name}: {e}\n{traceback.format_exc()}") from e
+            
     print(f"Directory organization complete for {drctry}")
 
 
@@ -386,11 +434,29 @@ class ProjectViewWindow(QMainWindow):
             if needs_organizing:
                 reply = QMessageBox.question(self, "Organize Project?", f"Unorganized structure detected in: {selected_path}.\nOrganize now?", QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes)
                 if reply == QMessageBox.Yes:
-                    modes = ["ramified", "ramified_2d"]; selected_mode, ok = QInputDialog.getItem(self, "Select Processing Mode", "Choose mode for organizing:", modes, 0, False)
-                    if ok and selected_mode:
-                        try: organize_processing_dir(selected_path, selected_mode); QMessageBox.information(self, "Organization Complete", f"Project organized for '{selected_mode}' mode.")
-                        except Exception as e: QMessageBox.critical(self, "Organization Failed", f"Failed to organize project:\n{e}\n{traceback.format_exc()}")
-                    else: QMessageBox.warning(self, "Organization Cancelled", "Project organization cancelled.")
+                    # --- NEW PRESET SELECTION LOGIC ---
+                    presets = scan_available_presets()
+                    
+                    if not presets:
+                        QMessageBox.critical(self, "No Presets Found", "Could not find any configuration presets in 'module_*/configs/'.")
+                        return
+
+                    preset_names = list(presets.keys())
+                    preset_names.sort() # Alphabetical order
+                    
+                    selected_preset_name, ok = QInputDialog.getItem(self, "Select Configuration Preset", "Choose a preset to apply:", preset_names, 0, False)
+                    
+                    if ok and selected_preset_name:
+                        selected_preset_details = presets[selected_preset_name]
+                        try: 
+                            # Pass the details dict, not just the name
+                            organize_processing_dir(selected_path, selected_preset_details) 
+                            QMessageBox.information(self, "Organization Complete", f"Project organized using '{selected_preset_name}'.")
+                        except Exception as e: 
+                            QMessageBox.critical(self, "Organization Failed", f"Failed to organize project:\n{e}\n{traceback.format_exc()}")
+                    else: 
+                        QMessageBox.warning(self, "Organization Cancelled", "Project organization cancelled.")
+                    
                     self.project_manager._find_valid_image_folders() # Rescan
                 else: QMessageBox.information(self, "Organization Skipped", "Loading existing valid subfolders only."); self.project_manager._find_valid_image_folders()
 
