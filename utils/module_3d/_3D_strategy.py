@@ -15,7 +15,9 @@ from ..high_level_gui.processing_strategies import ProcessingStrategy, StepDefin
 try:
     from .initial_3d_segmentation import segment_cells_first_pass_raw
     from .remove_artifacts import apply_hull_trimming
-    from .ramified_segmenter import extract_soma_masks, separate_multi_soma_cells
+    # Direct imports from the actual modules
+    from .soma_extraction import extract_soma_masks
+    from .cell_splitting import separate_multi_soma_cells
     from .calculate_features_3d import analyze_segmentation
 except ImportError as e:
     print(f"CRITICAL ERROR: Could not import 3D segmentation modules: {e}")
@@ -117,7 +119,9 @@ class RamifiedStrategy(ProcessingStrategy):
                     min_size_voxels=int(params.get("min_size", 2000)),
                     low_threshold_percentile=float(params.get("low_threshold_percentile", 25.0)),
                     high_threshold_percentile=float(params.get("high_threshold_percentile", 95.0)),
-                    skip_tubular_enhancement=skip_tubular_enhancement
+                    skip_tubular_enhancement=skip_tubular_enhancement,
+                    soma_preservation_factor=float(params.get("soma_preservation_factor", 0.0)),
+                    subtract_background_radius=int(params.get("subtract_background_radius", 0))
                 )
 
             if not temp_raw_labels_dat_path or not os.path.exists(temp_raw_labels_dat_path):
@@ -167,7 +171,8 @@ class RamifiedStrategy(ProcessingStrategy):
                 min_size_voxels=int(params.get("min_size_voxels", 50)),
                 smoothing_iterations=int(params.get("smoothing_iterations", 1)),
                 heal_iterations=int(params.get("heal_iterations", 1)),
-                edge_distance_chunk_size_z=int(params.get("edge_distance_chunk_size_z", 32))
+                edge_distance_chunk_size_z=int(params.get("edge_distance_chunk_size_z", 32)),
+                z_erosion_iterations=int(params.get("z_erosion_iterations", 0))
             )
 
             if not temp_trimmed_dat_path or not os.path.exists(temp_trimmed_dat_path):
@@ -327,9 +332,20 @@ class RamifiedStrategy(ProcessingStrategy):
         final_seg_memmap = None
         try:
             final_seg_memmap = np.memmap(final_seg_path, dtype=np.int32, mode='r', shape=self.image_shape)
-
+            
+            # Use the original image if available, else try image_stack
+            intensity_vol = self.intermediate_state.get('original_volume_ref', image_stack)
+            
+            # Define FCS Path
+            fcs_path = os.path.join(self.processed_dir, f"metrics_{self.mode_name}.fcs")
+            
             metrics_df, detailed_outputs = analyze_segmentation(
-                segmented_array=final_seg_memmap, spacing=self.spacing, **params, return_detailed=True
+                segmented_array=final_seg_memmap, 
+                intensity_image=intensity_vol, # <--- Pass Intensity
+                spacing=self.spacing, 
+                fcs_export_path=fcs_path,      # <--- Pass FCS Path
+                **params, 
+                return_detailed=True
             )
             
             if metrics_df is not None: 

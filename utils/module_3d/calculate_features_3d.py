@@ -13,6 +13,13 @@ from skimage.morphology import skeletonize # type: ignore
 from skan import Skeleton, summarize # type: ignore
 from tqdm.auto import tqdm # type: ignore
 
+# --- NEW IMPORT ---
+try:
+    import fcswrite # type: ignore
+except ImportError:
+    fcswrite = None
+    print("Warning: 'fcswrite' not installed. FCS export will be disabled.")
+
 def flush_print(*args, **kwargs):
     print(*args, **kwargs)
     import sys
@@ -268,6 +275,55 @@ def calculate_depth(segmented_array, spacing=(1.0, 1.0, 1.0)):
             results.append({'label': lbl, 'depth_um': np.nan})
     return pd.DataFrame(results)
 
+def calculate_intensity(segmented_array, intensity_image):
+    """
+    Calculates fluorescence intensity stats for each cell.
+    """
+    flush_print("  [Metrics] Calculating Intensity Stats...")
+    
+    # Safety Check: Dimensions must match
+    if segmented_array.shape != intensity_image.shape:
+        print(f"    Warning: Shape mismatch (Seg: {segmented_array.shape} vs Int: {intensity_image.shape}). Skipping intensity.")
+        return pd.DataFrame()
+
+    labels = np.unique(segmented_array)
+    labels = labels[labels > 0]
+    if len(labels) == 0: return pd.DataFrame()
+    
+    locations = ndi.find_objects(segmented_array)
+    results = []
+    
+    for lbl in tqdm(labels, desc="    Intensity"):
+        idx = lbl - 1
+        if idx >= len(locations) or locations[idx] is None: continue
+        
+        sl = locations[idx]
+        mask_crop = (segmented_array[sl] == lbl)
+        int_crop = intensity_image[sl]
+        
+        # Extract pixel values within the mask
+        values = int_crop[mask_crop]
+        
+        if values.size > 0:
+            mean_int = np.mean(values)
+            median_int = np.median(values)
+            std_int = np.std(values)
+            sum_int = np.sum(values) # Integrated Density
+            max_int = np.max(values)
+        else:
+            mean_int, median_int, std_int, sum_int, max_int = 0, 0, 0, 0, 0
+            
+        results.append({
+            'label': lbl,
+            'mean_intensity': mean_int,
+            'median_intensity': median_int,
+            'std_intensity': std_int,
+            'integrated_density': sum_int,
+            'max_intensity': max_int
+        })
+        
+    return pd.DataFrame(results)
+
 # =============================================================================
 # 3. SKELETONIZATION
 # =============================================================================
@@ -410,13 +466,52 @@ def calculate_ramification_with_skan(segmented_array, spacing, skeleton_export_p
     if use_memmap: skel_out.flush()
     return pd.DataFrame(stats_list), pd.concat(detailed_dfs, ignore_index=True) if detailed_dfs else pd.DataFrame(), skel_out
 
+def export_to_fcs(metrics_df, fcs_path):
+    """
+    Exports the metrics DataFrame to an FCS file.
+    Note: FCS only supports numeric columns.
+    """
+    if fcswrite is None:
+        print("  [Export] 'fcswrite' not installed. Skipping FCS export.")
+        return
+
+    if metrics_df is None or metrics_df.empty:
+        print("  [Export] No metrics to export.")
+        return
+
+    try:
+        flush_print(f"  [Export] Writing FCS file: {os.path.basename(fcs_path)}")
+        
+        # 1. Filter numeric columns
+        numeric_df = metrics_df.select_dtypes(include=[np.number]).copy()
+        
+        # 2. Handle NaN/Inf (FCS doesn't like them)
+        numeric_df.replace([np.inf, -np.inf], np.nan, inplace=True)
+        numeric_df.fillna(0, inplace=True)
+        
+        # 3. Ensure 'label' is a parameter if present
+        if 'label' not in numeric_df.columns and 'label' in metrics_df.columns:
+            numeric_df['label'] = metrics_df['label']
+            
+        # 4. Get column names and data
+        columns = list(numeric_df.columns)
+        data = numeric_df.values
+        
+        # 5. Write
+        fcswrite.write_fcs(filename=fcs_path, chn_names=columns, data=data)
+        
+    except Exception as e:
+        print(f"  [Export] Error writing FCS: {e}")
+        traceback.print_exc()
+
 # =============================================================================
 # 4. MAIN ENTRY POINT
 # =============================================================================
 
-def analyze_segmentation(segmented_array, spacing=(1.0, 1.0, 1.0), 
+def analyze_segmentation(segmented_array, intensity_image=None, spacing=(1.0, 1.0, 1.0), 
                          calculate_distances=True, calculate_skeletons=True,
-                         skeleton_export_path=None, temp_dir=None, n_jobs=None,
+                         skeleton_export_path=None, fcs_export_path=None, 
+                         temp_dir=None, n_jobs=None,
                          return_detailed=False, prune_spurs_le_um=0.0):
     flush_print("\n--- Starting Feature Calculation ---")
     
@@ -428,7 +523,13 @@ def analyze_segmentation(segmented_array, spacing=(1.0, 1.0, 1.0),
     metrics_df = pd.merge(vol_df, depth_df, on='label', how='outer')
     detailed_outputs = {}
     
-    # 2. Distances
+    # 2. Intensity (NEW)
+    if intensity_image is not None:
+        int_df = calculate_intensity(segmented_array, intensity_image)
+        if not int_df.empty:
+            metrics_df = pd.merge(metrics_df, int_df, on='label', how='outer')
+    
+    # 3. Distances
     if calculate_distances:
         dist_df, pts_df = shortest_distance(segmented_array, spacing, temp_dir, n_jobs)
         
@@ -467,7 +568,7 @@ def analyze_segmentation(segmented_array, spacing=(1.0, 1.0, 1.0),
                 detailed_outputs['all_pairs_points'] = nearest_pts_df
                 print(f"  [Dist] Filtered visualization: {len(nearest_pts_df)} lines (nearest neighbors only).")
 
-    # 3. Skeletons
+    # 4. Skeletons
     if calculate_skeletons:
         summ_skel, detail_skel, skel_arr = calculate_ramification_with_skan(
             segmented_array, spacing, skeleton_export_path, prune_spurs_le_um
@@ -477,6 +578,10 @@ def analyze_segmentation(segmented_array, spacing=(1.0, 1.0, 1.0),
         if return_detailed:
             detailed_outputs['detailed_branches'] = detail_skel
             detailed_outputs['skeleton_array'] = skel_arr
+
+    # 5. FCS Export (NEW)
+    if fcs_export_path:
+        export_to_fcs(metrics_df, fcs_export_path)
 
     flush_print("--- Analysis Complete ---")
     return metrics_df, detailed_outputs if return_detailed else {}

@@ -1,9 +1,10 @@
 # --- START OF FILE utils/module_3d/remove_artifacts.py ---
 import numpy as np
-from scipy.ndimage import generate_binary_structure
-from scipy.ndimage import distance_transform_edt as scipy_edt 
+from scipy import ndimage
+from scipy.ndimage import distance_transform_edt, binary_fill_holes, binary_erosion, binary_dilation, generate_binary_structure
 from skimage.filters import threshold_otsu # type: ignore
-from skimage.morphology import convex_hull_image # type: ignore
+from skimage.transform import resize # type: ignore
+from skimage.morphology import disk, binary_closing # type: ignore
 import traceback
 import tempfile
 import os
@@ -12,403 +13,334 @@ from shutil import rmtree, copyfile
 import gc
 import math
 
-# Dask imports for out-of-core 3D processing
+# Dask Imports for Re-Labeling
 import dask.array as da
 from dask.diagnostics import ProgressBar
-import dask_image.ndmorph
 import dask_image.ndmeasure
-import zarr
 
-# Dask configuration
-# 'threads' is safest for local file IO.
+# Dask Config
 DASK_SCHEDULER = 'threads'
 
 def _safe_close_memmap(memmap_obj):
-    """
-    Helper to flush and close memmap to ensure data is written to disk.
-    Returns None so the caller can assign the result to the variable,
-    releasing the reference.
-    """
-    if memmap_obj is None:
-        return None
+    if memmap_obj is None: return None
     try:
-        if hasattr(memmap_obj, 'flush'):
-            memmap_obj.flush()
+        if hasattr(memmap_obj, 'flush'): memmap_obj.flush()
         if hasattr(memmap_obj, '_mmap') and memmap_obj._mmap is not None:
             memmap_obj._mmap.close()
-    except Exception:
-        pass
+    except Exception: pass
     return None
 
-def generate_hull_boundary_and_stack(
-    volume,
-    cell_mask,
-    parent_temp_dir,
-    hull_erosion_iterations=1,
-    smoothing_iterations=1
-    ):
+def relabel_and_filter_fragments(labels_memmap, min_size_voxels):
     """
-    Generates a smooth 3D Convex Hull around the tissue and extracts the boundary layer.
+    Re-calculates connected components (Labels) and filters small fragments.
+    Solves the issue where disjoint fragments share an ID and bypass size checks.
     """
-    print("\n  [HullGen] Generating Smoothed Hull Boundary...")
+    if min_size_voxels <= 0: return
+
+    print(f"  [Refine] Re-labeling and filtering fragments < {min_size_voxels} voxels...")
+    
+    # 1. Setup Dask Array
+    # Chunking Z is critical for 3D labeling
+    chunk_size = (64, 256, 256)
+    
+    # We treat the input as a binary mask first
+    d_seg = da.from_array(labels_memmap, chunks=chunk_size)
+    binary_mask = (d_seg > 0)
+    
+    # 2. Re-Label Connected Components
+    # This separates fragments into unique IDs
+    structure = generate_binary_structure(3, 1)
+    labeled_dask, num_features_dask = dask_image.ndmeasure.label(binary_mask, structure=structure)
+    
+    # Trigger compute to get total count
+    num_features = num_features_dask.compute()
+    
+    if num_features == 0:
+        print("    No objects remaining.")
+        return
+
+    # 3. Calculate Sizes (Histogram)
+    print(f"    Analyzing {num_features} fragments...")
+    # bins=num_features+1 because range is [0, num_features]
+    counts, _ = da.histogram(labeled_dask, bins=num_features+1, range=[0, num_features])
+    counts_val = counts.compute()
+    
+    # 4. Identify Keepers
+    # counts_val[i] is size of label i. Index 0 is background.
+    # We want indices where size >= min_size (and i > 0)
+    valid_labels_mask = (counts_val >= min_size_voxels)
+    valid_labels_mask[0] = False # Ensure background remains 0
+    
+    # Get the IDs to keep
+    ids_to_keep = np.where(valid_labels_mask)[0]
+    
+    print(f"    Fragments: {num_features}. Kept: {len(ids_to_keep)}. Removed: {num_features - len(ids_to_keep)}.")
+    
+    # 5. Apply Filter and Save
+    # We effectively map: ID -> ID (if valid) else 0.
+    # isin is memory efficient in dask for this
+    
+    # Create the filter mask
+    mask_keep = da.isin(labeled_dask, ids_to_keep)
+    
+    # Apply to the NEW labels (labeled_dask) or mask? 
+    # Better to save the NEW labels so they are contiguous and clean for Step 3.
+    final_dask = da.where(mask_keep, labeled_dask, 0)
+    
+    print("    Writing filtered result...")
+    with ProgressBar(dt=2):
+        da.store(final_dask, labels_memmap, lock=True, scheduler=DASK_SCHEDULER)
+        
+    labels_memmap.flush()
+
+def apply_clamped_z_erosion(labels_path, shape, iterations):
+    """ Clamped Z-Erosion (Flattening without fragmentation). """
+    if iterations <= 0: return
+    print(f"  [Z-Correct] Clamped Erosion (iter={iterations})...")
+    
+    fp = np.memmap(labels_path, dtype=np.int32, mode='r+', shape=shape)
+    
+    chunk_size = 64
+    overlap = iterations + 2
+    total_z = shape[0]
+    
+    structure = np.zeros((3, 1, 1), dtype=bool)
+    structure[:, 0, 0] = 1
+    
+    for start_z in tqdm(range(0, total_z, chunk_size), desc="    Z-Correction"):
+        end_z = min(start_z + chunk_size, total_z)
+        r_start = max(0, start_z - overlap)
+        r_end = min(total_z, end_z + overlap)
+        
+        chunk_data = fp[r_start:r_end].copy()
+        mask = (chunk_data > 0)
+        
+        if not np.any(mask): continue
+        
+        eroded_mask = ndimage.binary_erosion(mask, structure=structure, iterations=iterations)
+        
+        footprint_orig = np.max(mask, axis=0)
+        footprint_erod = np.max(eroded_mask, axis=0)
+        lost_map = footprint_orig & (~footprint_erod)
+        
+        if np.any(lost_map):
+            top_idx = np.argmax(mask, axis=0)
+            mask_flipped = mask[::-1, :, :]
+            bottom_idx_flipped = np.argmax(mask_flipped, axis=0)
+            bottom_idx = mask.shape[0] - 1 - bottom_idx_flipped
+            mid_idx = (top_idx + bottom_idx) // 2
+            
+            ys, xs = np.where(lost_map)
+            zs = mid_idx[ys, xs]
+            eroded_mask[zs, ys, xs] = True
+            
+        chunk_data[~eroded_mask] = 0
+        
+        w_start_rel = start_z - r_start
+        w_end_rel = w_start_rel + (end_z - start_z)
+        fp[start_z:end_z] = chunk_data[w_start_rel:w_end_rel]
+        
+    fp.flush()
+    _safe_close_memmap(fp)
+
+def generate_tight_hull_stack(volume, cell_mask, temp_dir, downsample_factor=4):
+    """ Generates a Tight Hull using Morphological Closing. """
+    print(f"\n  [HullGen] Generating Tight Hull (Downsample {downsample_factor}x)...")
     original_shape = volume.shape
+    hull_path = os.path.join(temp_dir, 'tight_hull.dat')
+    hull_memmap = np.memmap(hull_path, dtype=bool, mode='w+', shape=original_shape)
     
-    internal_temp_dir = tempfile.mkdtemp(prefix="hullgen_internal_", dir=parent_temp_dir)
-    smoothed_hull_path = os.path.join(parent_temp_dir, 'smoothed_hull.dat')
-    boundary_path = os.path.join(parent_temp_dir, 'boundary.dat') if hull_erosion_iterations > 0 else None
+    pixels = volume[::50, ::50, ::50].ravel()
+    valid = pixels[pixels > 0]
+    thresh = (threshold_otsu(valid) * 0.5) if valid.size > 0 else 0
     
-    # Initialize variables to None so 'finally' block can check them safely
-    initial_hull_stack = None
-    smoothed_hull_stack = None
-    boundary_memmap = None
+    small_h = original_shape[1] // downsample_factor
+    small_w = original_shape[2] // downsample_factor
+    struct_elem = disk(10) 
     
-    try:
-        # --- Step 1: Create Initial Hull (Slice-by-Slice) ---
-        print("    [1/4] Creating initial 2D hull stack...")
-        initial_hull_path = os.path.join(internal_temp_dir, 'initial_hull.dat')
-        initial_hull_stack = np.memmap(initial_hull_path, dtype=bool, mode='w+', shape=original_shape)
-        
-        # Calculate Otsu threshold
-        otsu_samples = volume[::100].ravel() # Subsample every 100th pixel for speed
-        valid_samples = otsu_samples[otsu_samples > 0]
-        
-        if valid_samples.size > 0:
-            tissue_thresh = threshold_otsu(valid_samples)
-            print(f"      Tissue Threshold: {tissue_thresh:.2f}")
-        else:
-            tissue_thresh = 0
-            print("      Warning: Volume appears empty (all zeros). Threshold set to 0.")
-        
-        del otsu_samples, valid_samples
+    for z in tqdm(range(original_shape[0]), desc="    Hull Computation"):
+        vol_slice = volume[z]
+        seg_slice = cell_mask[z]
+        if not np.any(vol_slice > thresh) and not np.any(seg_slice): continue
+            
+        mask_raw = (vol_slice > thresh) | (seg_slice > 0)
+        small_mask = resize(mask_raw, (small_h, small_w), order=0, preserve_range=True, anti_aliasing=False).astype(bool)
+        closed = binary_closing(small_mask, footprint=struct_elem)
+        filled = binary_fill_holes(closed)
+        final_mask = resize(filled, (original_shape[1], original_shape[2]), order=0, preserve_range=True, anti_aliasing=False).astype(bool)
+        hull_memmap[z] = final_mask
 
-        # Process slices
-        nonzero_slices = 0
-        for z in tqdm(range(original_shape[0]), desc="    Calculating 2D Hulls"):
-            combined_mask_slice = (volume[z] > tissue_thresh) | (cell_mask[z] > 0)
-            if np.any(combined_mask_slice):
-                try:
-                    initial_hull_stack[z] = convex_hull_image(np.ascontiguousarray(combined_mask_slice))
-                    nonzero_slices += 1
-                except Exception as e:
-                    # convex_hull_image can fail on weird inputs (e.g. single point)
-                    pass
-        
-        # Close memmap to force write to disk before Dask reads it
-        # CRITICAL FIX: Do NOT use 'del' here. The assignment to None releases the object.
-        initial_hull_stack = _safe_close_memmap(initial_hull_stack)
-        
-        # Verify data exists
-        check_hull = np.memmap(initial_hull_path, dtype=bool, mode='r', shape=original_shape)
-        total_hull_pixels = np.count_nonzero(check_hull)
-        print(f"      Initial Hull Pixels: {total_hull_pixels} (in {nonzero_slices} slices)")
-        del check_hull
+    return hull_memmap
 
-        if total_hull_pixels == 0:
-             print("    Warning: Initial hull stack is empty. Cannot proceed.")
-             return None, None
-
-        # --- Step 2: Smooth Hull (Dask 3D) ---
-        print(f"    [2/4] Smoothing 3D hull ({smoothing_iterations} iter) with Dask...")
-        
-        # Re-open as Read-Only for Dask
-        initial_hull_input = np.memmap(initial_hull_path, dtype=bool, mode='r', shape=original_shape)
-        
-        dask_chunk_size = (32, 256, 256)
-        hull_dask_array = da.from_array(initial_hull_input, chunks=dask_chunk_size)
-        
-        struct_3d = generate_binary_structure(3, 1)
-        
-        if smoothing_iterations > 0:
-            hull_dask_array = dask_image.ndmorph.binary_closing(hull_dask_array, structure=struct_3d, iterations=smoothing_iterations)
-            hull_dask_array = dask_image.ndmorph.binary_opening(hull_dask_array, structure=struct_3d, iterations=smoothing_iterations)
-
-        temp_zarr_path = os.path.join(internal_temp_dir, 'temp_smoothed.zarr')
-        print("      Writing smoothed hull to Zarr...")
-        with ProgressBar(dt=2):
-            hull_dask_array.to_zarr(temp_zarr_path, overwrite=True)
-            
-        # Close input source
-        del hull_dask_array, initial_hull_input
-        gc.collect()
-        
-        # Write Zarr -> Memmap
-        smoothed_hull_stack = np.memmap(smoothed_hull_path, dtype=bool, mode='w+', shape=original_shape)
-        zarr_array = zarr.open(temp_zarr_path, mode='r')
-        
-        # Efficient copy
-        batch_size = 10
-        for i in tqdm(range(0, original_shape[0], batch_size), desc="    Exporting smoothed hull"):
-            end = min(i + batch_size, original_shape[0])
-            smoothed_hull_stack[i:end] = zarr_array[i:end]
-            
-        smoothed_hull_stack = _safe_close_memmap(smoothed_hull_stack)
-        
-        # Verify
-        check_smooth = np.memmap(smoothed_hull_path, dtype=bool, mode='r', shape=original_shape)
-        print(f"      Smoothed Hull Pixels: {np.count_nonzero(check_smooth)}")
-        del check_smooth
-        
-        # --- Step 3: Calculate Boundary (Erosion) ---
-        if hull_erosion_iterations > 0:
-            print(f"    [3/4] Calculating boundary zone ({hull_erosion_iterations} iter erosion)...")
-            
-            smoothed_dask = da.from_zarr(temp_zarr_path)
-            
-            eroded_hull_dask = dask_image.ndmorph.binary_erosion(smoothed_dask, structure=struct_3d, iterations=hull_erosion_iterations)
-            
-            # Boundary = Hull AND (NOT ErodedHull)
-            boundary_dask = smoothed_dask & (~eroded_hull_dask)
-            
-            boundary_zarr_path = os.path.join(internal_temp_dir, 'boundary.zarr')
-            print("      Writing boundary to Zarr...")
-            with ProgressBar(dt=2):
-                boundary_dask.to_zarr(boundary_zarr_path, overwrite=True)
-            
-            del smoothed_dask, eroded_hull_dask, boundary_dask
-            gc.collect()
-            
-            boundary_memmap = np.memmap(boundary_path, dtype=bool, mode='w+', shape=original_shape)
-            boundary_zarr = zarr.open(boundary_zarr_path, mode='r')
-            
-            for i in tqdm(range(0, original_shape[0], batch_size), desc="    Exporting boundary"):
-                end = min(i + batch_size, original_shape[0])
-                boundary_memmap[i:end] = boundary_zarr[i:end]
-                
-            boundary_memmap = _safe_close_memmap(boundary_memmap)
-            
-            # Verify
-            check_bound = np.memmap(boundary_path, dtype=bool, mode='r', shape=original_shape)
-            print(f"      Boundary Pixels: {np.count_nonzero(check_bound)}")
-            del check_bound
-        
-        return boundary_path, smoothed_hull_path
-
-    finally:
-        # Extra cleanup safety
-        # Check if variable exists AND is not None before closing/deleting
-        if 'initial_hull_stack' in locals() and initial_hull_stack is not None:
-             del initial_hull_stack
-        if 'smoothed_hull_stack' in locals() and smoothed_hull_stack is not None:
-             del smoothed_hull_stack
-        if 'boundary_memmap' in locals() and boundary_memmap is not None:
-             del boundary_memmap
-        
-        gc.collect()
-        
-        if internal_temp_dir and os.path.exists(internal_temp_dir):
-            try: rmtree(internal_temp_dir, ignore_errors=True)
-            except: pass
-
-
-def trim_object_edges_by_distance(
-    segmentation_memmap, original_volume, hull_boundary_path, spacing,
-    parent_temp_dir, distance_threshold, global_brightness_cutoff, min_remaining_size=10
+def trim_edges_with_core_protection(
+    labels_memmap, volume_memmap, hull_memmap, spacing,
+    distance_threshold, global_brightness_cutoff
     ):
     """
-    Removes segmented objects that are close to the hull boundary.
+    Edge Trimming with Core Protection.
+    Note: Removed min_size_voxels from here, handled in relabel_and_filter_fragments.
     """
-    print("\n  [EdgeTrim] Trimming Object Edges by Distance...")
-    original_shape = segmentation_memmap.shape
-    trim_temp_dir = tempfile.mkdtemp(prefix="trim_stages_", dir=parent_temp_dir)
-    hull_boundary_memmap = None
+    print("  [EdgeTrim] Trimming with Core Protection...")
     
-    try:
-        # --- Stage A: Distance Transform ---
-        print(f"    [A] Calculating distance transform from boundary...")
-        dask_chunk_size = (64, 256, 256)
-        
-        # Read-Only access to boundary
-        hull_boundary_memmap = np.memmap(hull_boundary_path, dtype=bool, mode='r', shape=original_shape)
-        boundary_dask = da.from_array(hull_boundary_memmap, chunks=dask_chunk_size)
-        
-        def block_edt(block, spacing):
-            return scipy_edt(~block, sampling=spacing).astype(np.float32)
+    total_z = labels_memmap.shape[0]
+    
+    # 1. Distance Map
+    print("    Calculating global distance map...")
+    dist_map_path = os.path.join(os.path.dirname(labels_memmap.filename), 'dist_map.dat')
+    dist_memmap = np.memmap(dist_map_path, dtype=np.float32, mode='w+', shape=labels_memmap.shape)
+    
+    rows, cols = labels_memmap.shape[1], labels_memmap.shape[2]
+    slice_bytes = rows * cols * 4 
+    target_ram = 1024**3
+    edt_chunk_z = max(10, min(100, int(target_ram / slice_bytes)))
+    edt_overlap = int(30 / spacing[0]) + 5
+    
+    for z in tqdm(range(0, total_z, edt_chunk_z), desc="    Distance Transform"):
+        z0 = max(0, z - edt_overlap)
+        z1 = min(total_z, z + edt_chunk_z + edt_overlap)
+        hull_chunk = hull_memmap[z0:z1]
+        dt_chunk = distance_transform_edt(hull_chunk, sampling=spacing)
+        w_start = z - z0; w_end = w_start + min(z + edt_chunk_z, total_z) - z
+        dist_memmap[z : min(z + edt_chunk_z, total_z)] = dt_chunk[w_start:w_end].astype(np.float32)
+    dist_memmap.flush()
 
-        edt_dask = boundary_dask.map_blocks(
-            block_edt,
-            spacing=spacing,
-            dtype=np.float32
-        )
+    # 2. Protection & Filter
+    protection_radius_um = 6.0
+    protection_iter = max(2, min(10, int(protection_radius_um / spacing[0])))
+    
+    print(f"    Applying Protection (Dilate Bright Cores {protection_iter}x)...")
+    
+    scan_chunk_size = 64
+    scan_overlap = protection_iter + 2
+    deleted_voxels = 0
+    struct_protect = generate_binary_structure(3, 1) 
+    
+    for z in tqdm(range(0, total_z, scan_chunk_size), desc="    Processing"):
+        end_z = min(z + scan_chunk_size, total_z)
+        r_start = max(0, z - scan_overlap)
+        r_end = min(total_z, end_z + scan_overlap)
         
-        edt_path = os.path.join(trim_temp_dir, 'edt.zarr')
-        print("      Saving EDT to Zarr...")
-        with ProgressBar(dt=2):
-            edt_dask.to_zarr(edt_path, overwrite=True)
+        lbl_chunk = labels_memmap[r_start:r_end]
+        vol_chunk = volume_memmap[r_start:r_end]
+        dist_chunk = dist_memmap[r_start:r_end]
         
-        # Cleanup Dask graphs
-        del boundary_dask, edt_dask
-        # Close the memmap file explicitly
-        hull_boundary_memmap = _safe_close_memmap(hull_boundary_memmap)
-        gc.collect()
+        if not np.any(lbl_chunk): continue
         
-        # --- Stage B: Apply Trimming Mask ---
-        print(f"    [B] Applying trim mask...")
-        edt_zarr = zarr.open(edt_path, mode='r')
-        edt_dask_from_zarr = da.from_zarr(edt_zarr)
+        # A. Identify Cores (Bright)
+        core_mask = (lbl_chunk > 0) & (vol_chunk > global_brightness_cutoff)
         
-        # Ensure segmentation map is flushed before reading into Dask
-        segmentation_memmap.flush()
-        
-        seg_dask = da.from_array(segmentation_memmap, chunks=dask_chunk_size)
-        vol_dask = da.from_array(original_volume, chunks=dask_chunk_size)
-        
-        trim_mask_dask = ( 
-            (seg_dask > 0) & 
-            (edt_dask_from_zarr < distance_threshold) & 
-            (vol_dask < global_brightness_cutoff) 
-        )
-        
-        trimmed_seg_dask = da.where(trim_mask_dask, 0, seg_dask)
-        
-        trimmed_path = os.path.join(trim_temp_dir, 'trimmed_seg.zarr')
-        print("      Saving trimmed segmentation to Zarr...")
-        with ProgressBar(dt=2):
-            trimmed_seg_dask.to_zarr(trimmed_path, overwrite=True)
-            
-        del edt_zarr, edt_dask_from_zarr, seg_dask, vol_dask, trim_mask_dask, trimmed_seg_dask
-        gc.collect()
-        
-        # --- Stage C: Clean Fragments ---
-        print(f"    [C] Cleaning fragments and re-labeling...")
-        trimmed_zarr = zarr.open(trimmed_path, mode='r')
-        trimmed_dask_from_zarr = da.from_zarr(trimmed_zarr)
-        
-        s = generate_binary_structure(3, 1)
-        labeled_array, num_features = dask_image.ndmeasure.label(trimmed_dask_from_zarr > 0, structure=s)
-        
-        with ProgressBar(dt=1):
-            num_features_val = num_features.compute(scheduler=DASK_SCHEDULER)
-        
-        final_labeled_dask = None
-        if num_features_val > 0:
-            print(f"      Found {num_features_val} objects. Filtering small ones...")
-            with ProgressBar(dt=1):
-                object_sizes, _ = da.histogram(labeled_array, bins=np.arange(num_features_val + 2))
-                object_sizes_val = object_sizes.compute(scheduler=DASK_SCHEDULER)
-            
-            large_labels = np.where(object_sizes_val[1:] >= min_remaining_size)[0] + 1
-            
-            if len(large_labels) < num_features_val:
-                print(f"      Removing {num_features_val - len(large_labels)} small objects...")
-                keep_mask_dask = da.isin(labeled_array, large_labels)
-                final_labeled_dask, _ = dask_image.ndmeasure.label(keep_mask_dask, structure=s)
-            else:
-                final_labeled_dask = labeled_array
+        # B. Create Protection
+        if np.any(core_mask):
+            protected_mask = binary_dilation(core_mask, structure=struct_protect, iterations=protection_iter)
         else:
-            final_labeled_dask = da.zeros_like(trimmed_dask_from_zarr, dtype=np.int32)
-        
-        # Write back to segmentation_memmap (inplace)
-        print("      Writing final trimmed result to output file...")
-        with ProgressBar(dt=2):
-            da.store(final_labeled_dask, segmentation_memmap, scheduler=DASK_SCHEDULER)
+            protected_mask = np.zeros_like(core_mask, dtype=bool)
             
-        segmentation_memmap.flush()
-        print(f"    [EdgeTrim] Done.")
-
-    finally:
-        if 'hull_boundary_memmap' in locals() and hull_boundary_memmap is not None:
-            del hull_boundary_memmap
-        gc.collect()
+        # C. Kill Logic: Danger & Not Protected
+        to_delete = (lbl_chunk > 0) & (dist_chunk < distance_threshold) & (~protected_mask)
         
-        if trim_temp_dir and os.path.exists(trim_temp_dir):
-            try: rmtree(trim_temp_dir, ignore_errors=True)
-            except: pass
+        w_start = z - r_start
+        w_end = w_start + (end_z - z)
+        center_delete = to_delete[w_start:w_end]
+        center_lbls = labels_memmap[z:end_z]
+        
+        count = np.count_nonzero(center_delete)
+        if count > 0:
+            deleted_voxels += count
+            center_lbls[center_delete] = 0
+            labels_memmap[z:end_z] = center_lbls
+            
+    labels_memmap.flush()
+    print(f"    Deleted {deleted_voxels} artifact voxels.")
+        
+    _safe_close_memmap(dist_memmap)
+    if os.path.exists(dist_map_path): os.remove(dist_map_path)
 
 
 def apply_hull_trimming(
-    raw_labels_path,
-    original_volume,
-    spacing,
-    hull_boundary_thickness_phys,
-    edge_trim_distance_threshold,
-    brightness_cutoff_factor,
-    segmentation_threshold,
-    min_size_voxels,
-    smoothing_iterations=1,
-    heal_iterations=1,
-    edge_distance_chunk_size_z=32
+    raw_labels_path, original_volume, spacing, hull_boundary_thickness_phys,
+    edge_trim_distance_threshold, brightness_cutoff_factor, segmentation_threshold,
+    min_size_voxels, smoothing_iterations=1, heal_iterations=1,
+    edge_distance_chunk_size_z=32, z_erosion_iterations=0,
+    post_smoothing_iter=0
     ):
-    """
-    Main Entry Point for Step 2.
-    """
+    """ Main Entry Point for Step 2. """
     print(f"\n--- Applying Hull Generation and Edge Trimming ---")
-    
     original_shape = original_volume.shape
-    
-    # Create a robust temp directory
-    workflow_temp_dir = tempfile.mkdtemp(prefix="hull_trim_workflow_")
-    final_output_temp_dir = None
-    
+    workflow_temp_dir = tempfile.mkdtemp(prefix="hull_trim_")
+    final_output_temp_dir = tempfile.mkdtemp(prefix="trimmed_final_")
     trimmed_labels_memmap = None
+    hull_memmap = None
     hull_boundary_for_return = None
     
     try:
-        # 1. Setup Output File
-        final_output_temp_dir = tempfile.mkdtemp(prefix="trimmed_labels_")
+        # 1. Output
         final_output_path = os.path.join(final_output_temp_dir, 'trimmed_labels.dat')
-        
         copyfile(raw_labels_path, final_output_path)
-        
-        # Open as Read/Write
         trimmed_labels_memmap = np.memmap(final_output_path, dtype=np.int32, mode='r+', shape=original_shape)
 
-        # 2. Generate Hull
-        min_spacing_val = min(s for s in spacing if s > 1e-9)
-        erosion_iterations = math.ceil(hull_boundary_thickness_phys / min_spacing_val) if hull_boundary_thickness_phys > 0 else 0
+        # 2. Z-Correction (Clamped)
+        if z_erosion_iterations > 0:
+            apply_clamped_z_erosion(final_output_path, original_shape, z_erosion_iterations)
 
-        hull_boundary_path, smoothed_hull_path = generate_hull_boundary_and_stack(
-            volume=original_volume,
-            cell_mask=trimmed_labels_memmap,
-            parent_temp_dir=workflow_temp_dir,
-            hull_erosion_iterations=erosion_iterations,
-            smoothing_iterations=smoothing_iterations
-        )
-        
-        # 3. Trim Edges
-        if hull_boundary_path and os.path.exists(hull_boundary_path) and edge_trim_distance_threshold > 0:
+        # 3. Edge Trimming
+        if edge_trim_distance_threshold > 0:
+            hull_memmap = generate_tight_hull_stack(original_volume, trimmed_labels_memmap, workflow_temp_dir, downsample_factor=4)
             
-            global_brightness_cutoff = segmentation_threshold * brightness_cutoff_factor
-            print(f"  Edge Trim: DistThresh={edge_trim_distance_threshold}, BrightCutoff={global_brightness_cutoff:.4f}")
+            # Recalculate Threshold
+            print("  [Filter] Checking reference intensity...")
+            raw_pixels = original_volume[::50, ::50, ::50].ravel()
+            valid = raw_pixels[raw_pixels > 0]
+            raw_otsu = threshold_otsu(valid) if valid.size > 0 else 0
             
-            trim_object_edges_by_distance(
-                segmentation_memmap=trimmed_labels_memmap,
-                original_volume=original_volume,
-                hull_boundary_path=hull_boundary_path,
+            vol_max = np.max(raw_pixels) if raw_pixels.size > 0 else 0
+            ref_thresh = raw_otsu if (vol_max > 5 and segmentation_threshold < 2.0) else segmentation_threshold
+            global_brightness_cutoff = ref_thresh * brightness_cutoff_factor
+            
+            print(f"  Edge Trim Active: Dist<{edge_trim_distance_threshold}um, CoreBrightness>{int(global_brightness_cutoff)}")
+            
+            trim_edges_with_core_protection(
+                labels_memmap=trimmed_labels_memmap,
+                volume_memmap=original_volume,
+                hull_memmap=hull_memmap,
                 spacing=spacing,
-                parent_temp_dir=workflow_temp_dir,
                 distance_threshold=edge_trim_distance_threshold,
-                global_brightness_cutoff=global_brightness_cutoff,
-                min_remaining_size=min_size_voxels
+                global_brightness_cutoff=global_brightness_cutoff
             )
             
-            # Load boundary for return (Read-Only)
-            temp_bound = np.memmap(hull_boundary_path, dtype=bool, mode='r', shape=original_shape)
-            hull_boundary_for_return = np.array(temp_bound)
-            del temp_bound
+            # Viz
+            eroded_hull = np.zeros_like(hull_memmap, dtype=bool)
+            struct = np.ones((3,3,3), dtype=bool)
+            for z in range(0, original_shape[0], 32):
+                end_z = min(z + 32, original_shape[0])
+                r0, r1 = max(0, z-1), min(original_shape[0], end_z+1)
+                h_c = hull_memmap[r0:r1]
+                e_c = ndimage.binary_erosion(h_c, structure=struct, iterations=1)
+                eroded_hull[z:end_z] = e_c[(z-r0):(z-r0)+(end_z-z)]
+            hull_boundary_for_return = (hull_memmap ^ eroded_hull)
             
         else:
-            print("  Skipping edge trimming (Threshold=0 or Hull failed).")
+            print("  Edge Trim Disabled (Dist=0).")
+            hull_memmap = None 
             hull_boundary_for_return = np.zeros(original_shape, dtype=bool)
-        
-        # Clean close output file
+
+        # 4. FINAL CLEANUP: Re-label and Filter Size
+        # This fixes fragmentation caused by Z-Erosion and Trimming
+        if min_size_voxels > 0:
+            relabel_and_filter_fragments(trimmed_labels_memmap, min_size_voxels)
+
         trimmed_labels_memmap = _safe_close_memmap(trimmed_labels_memmap)
+        hull_memmap = _safe_close_memmap(hull_memmap)
         
         return final_output_path, final_output_temp_dir, hull_boundary_for_return
 
     except Exception as e:
-        print(f"\n!!! ERROR during Hull Trimming Workflow: {e} !!!")
-        traceback.print_exc()
-        if final_output_temp_dir and os.path.exists(final_output_temp_dir):
-            rmtree(final_output_temp_dir, ignore_errors=True)
+        print(f"\n!!! ERROR during Hull Trimming Workflow: {e} !!!"); traceback.print_exc()
+        if final_output_temp_dir and os.path.exists(final_output_temp_dir): rmtree(final_output_temp_dir, ignore_errors=True)
         return None, None, None
-        
     finally:
-        # Ensure everything is closed
-        if 'trimmed_labels_memmap' in locals():
-            trimmed_labels_memmap = _safe_close_memmap(trimmed_labels_memmap)
+        if 'trimmed_labels_memmap' in locals(): trimmed_labels_memmap = _safe_close_memmap(trimmed_labels_memmap)
+        if 'hull_memmap' in locals(): hull_memmap = _safe_close_memmap(hull_memmap)
         gc.collect()
-        
-        # Cleanup temp dir
         if workflow_temp_dir and os.path.exists(workflow_temp_dir):
             try: rmtree(workflow_temp_dir, ignore_errors=True)
             except: pass

@@ -30,7 +30,7 @@ def _get_chunk_slices(volume_shape, chunk_shape, overlap):
                     slice(x, min(x + chunk_shape[2], volume_shape[2])),
                 )
 
-# --- Graph & Metric Functions (Standard) ---
+# --- Graph & Metric Functions ---
 
 def _analyze_local_intensity_difference_optimized(
     interface_mask, region1_mask, region2_mask, intensity_vol_local, 
@@ -127,10 +127,6 @@ def _separate_multi_soma_cells_chunk(
 ):
     """
     Worker: Separates cells in a single chunk.
-    Returns: 
-        chunk_result (np.ndarray), 
-        provenance_map (dict), 
-        label_to_seeds_map (dict: local_label -> set(global_seed_ids))
     """
     chunk_result = np.zeros_like(segmentation_mask, dtype=np.int32)
     label_to_seeds_map = {} 
@@ -141,18 +137,17 @@ def _separate_multi_soma_cells_chunk(
     for lbl in unique_labels:
         if lbl not in multi_soma_cell_labels_list:
             chunk_result[segmentation_mask == lbl] = lbl
-            # Record seeds for single cells too (needed for stitching consistency)
             seeds = np.unique(soma_mask[segmentation_mask == lbl])
             if seeds.size > 0:
                 label_to_seeds_map[lbl] = set(seeds[seeds > 0])
 
     present_multi_soma = [l for l in multi_soma_cell_labels_list if l in unique_labels]
     
-    # If no multi-soma objects, return early
     if not present_multi_soma: 
         return chunk_result, {}, label_to_seeds_map
 
     next_local_label = label_offset
+    min_size_thresh = kwargs.get('min_size_threshold', 0)
     
     # 2. Process Multi-Soma Objects
     for cell_label in present_multi_soma:
@@ -170,7 +165,6 @@ def _separate_multi_soma_cells_chunk(
         seeds_in_crop = seeds_in_crop[seeds_in_crop > 0]
         
         if len(seeds_in_crop) < 2:
-            # Treated as single in this chunk
             new_label = next_local_label
             chunk_result[bbox_padded][local_mask] = new_label
             label_to_seeds_map[new_label] = set(seeds_in_crop)
@@ -217,21 +211,57 @@ def _separate_multi_soma_cells_chunk(
         unique_ws_ids = np.unique(ws_local[ws_local > 0])
         for old_id in unique_ws_ids:
             merged_id = merge_map[old_id]
-            final_local_mask[ws_local == old_id] = next_local_label + merged_id 
+            final_local_mask[ws_local == old_id] = merged_id 
+
+        # --- CORRECTED FIX: Re-absorb small fragments immediately ---
+        # If any split part is too small, merge it back into its touching neighbor.
+        if min_size_thresh > 0:
+            iter_merge = 0
+            while iter_merge < 5: # Safety limit
+                l_ids, l_counts = np.unique(final_local_mask[final_local_mask > 0], return_counts=True)
+                small_frags = l_ids[l_counts < min_size_thresh]
+                
+                if len(small_frags) == 0:
+                    break
+                    
+                frag_merge_map = {}
+                change_occurred = False
+                
+                for s_frag in small_frags:
+                    s_frag_mask = (final_local_mask == s_frag)
+                    # Dilate to find neighbors
+                    dilated = binary_dilation(s_frag_mask, footprint=footprint_rectangle((3,3,3)))
+                    neighbors = final_local_mask[dilated]
+                    # Neighbors must be part of the same parent (non-zero) and not self
+                    neighbors = neighbors[(neighbors != 0) & (neighbors != s_frag)]
+                    
+                    if neighbors.size > 0:
+                        # Merge into the neighbor we touch the most (Original Label Logic)
+                        n_ids_local, n_counts_local = np.unique(neighbors, return_counts=True)
+                        best_neighbor = n_ids_local[np.argmax(n_counts_local)]
+                        frag_merge_map[s_frag] = best_neighbor
+                        change_occurred = True
+                
+                if not change_occurred:
+                    break
+                    
+                for old_f, new_f in frag_merge_map.items():
+                    final_local_mask[final_local_mask == old_f] = new_f
+                    
+                iter_merge += 1
+        # -------------------------------------------------------------
         
+        # Now make global
         final_local_mask_clean, _, _ = relabel_sequential(final_local_mask)
         
-        # Write back to chunk and record seed ownership
         chunk_result_view = chunk_result[bbox_padded]
         
         for local_id in np.unique(final_local_mask_clean[final_local_mask_clean > 0]):
             mask_l = (final_local_mask_clean == local_id)
             
-            # Record which seeds ended up in this final segment
             seeds_in_segment = np.unique(local_soma[mask_l])
             seeds_in_segment = set(seeds_in_segment[seeds_in_segment > 0])
             
-            # Assign global unique label
             global_lbl = next_local_label
             chunk_result_view[mask_l] = global_lbl
             
@@ -307,19 +337,9 @@ def separate_multi_soma_cells(
     
     for i, sl in enumerate(tqdm(chunk_slices, desc="Processing Chunks")):
         seg_chunk = segmentation_mask[sl]
-        
-        # Optimization: Skip if no multi-soma cells involved
-        # (Though we must process single cells to ensure IDs are handled correctly if we relabel)
-        # For simplicity in stitching, we assume disjoint ID ranges per chunk if we used offsets,
-        # but here we used a rolling offset. 
-        # Actually, let's process everything to be safe with offsets.
-        
         int_chunk = intensity_volume[sl]
         soma_chunk = soma_mask[sl]
         
-        # Dynamic label offset per chunk to avoid collisions before stitching
-        # (We use a large stride or just let them be high numbers, stitching resolves it)
-        # Using i * 1,000,000 ensures uniqueness temporarily
         chunk_offset = (i + 1) * 1_000_000
         
         res, _, seed_map = _separate_multi_soma_cells_chunk(
@@ -365,7 +385,6 @@ def separate_multi_soma_cells(
             res2 = np.load(data2['path'])
             seeds2_map = data2['seed_map']
 
-            # Calculate overlap slice
             overlap_slice_global = tuple(slice(max(s1.start, s2.start), min(s1.stop, s2.stop)) 
                                          for s1, s2 in zip(chunk_slice1, chunk_slice2))
             
@@ -380,24 +399,19 @@ def separate_multi_soma_cells(
             mask_overlap = (crop1 > 0) & (crop2 > 0)
             if not np.any(mask_overlap): continue
             
-            # Identify overlapping pairs
             l1_flat = crop1[mask_overlap]
             l2_flat = crop2[mask_overlap]
             stacked = np.vstack((l1_flat, l2_flat))
             unique_pairs = np.unique(stacked, axis=1).T
             
             for id1, id2 in unique_pairs:
-                # --- CRITICAL FIX: Seed Disjoint Check ---
                 s1_set = seeds1_map.get(id1, set())
                 s2_set = seeds2_map.get(id2, set())
                 
-                # If both segments have seeds, but those seeds are DIFFERENT,
-                # it means the boundary shifted and these are distinct cells.
-                # DO NOT MERGE.
+                # SEED DISJOINT CHECK
                 if s1_set and s2_set and s1_set.isdisjoint(s2_set):
                     continue
                 
-                # Otherwise (one is empty, or they share seeds), proceed with merge
                 root1 = label_map.get(id1, id1)
                 root2 = label_map.get(id2, id2)
                 

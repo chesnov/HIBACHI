@@ -60,7 +60,6 @@ def create_parameter_widget(param_name: str, param_config: Dict[str, Any], callb
                     cleaned_str = value_str.strip()
                     if not cleaned_str: new_list = []
                     else: new_list = [float(x.strip()) for x in cleaned_str.split(',') if x.strip()]
-                    # print(f"Parsed list for {param_name}: {new_list}") # Optional Debug
                     if new_list != last_valid_list:
                          callback(new_list)
                          last_valid_list[:] = new_list
@@ -167,7 +166,7 @@ def organize_processing_dir(drctry, preset_details):
     
     print(f"Organizing directory: {drctry} using template: {os.path.basename(config_template_path)}")
     
-    # --- Standard File Validation (No changes here) ---
+    # --- Standard File Validation ---
     try:
         all_files = os.listdir(drctry)
         tif_files = [f for f in all_files if f.lower().endswith(('.tif', '.tiff')) and os.path.isfile(os.path.join(drctry, f))]
@@ -182,7 +181,6 @@ def organize_processing_dir(drctry, preset_details):
     except Exception as e: raise ValueError(f"Error reading CSV file {csv_path}: {e}") from e
 
     # --- Determine Mode from Template ---
-    # We read the template first to see if it dictates the mode (e.g. 2D vs 3D requirements)
     template_data = {}
     try:
         with open(config_template_path, 'r') as f:
@@ -190,24 +188,20 @@ def organize_processing_dir(drctry, preset_details):
     except Exception as e:
         raise ValueError(f"Selected template is invalid: {e}")
 
-    # Use mode from YAML, or fallback to folder-based mode
     mode = template_data.get('mode', fallback_mode)
-    
     is_2d_mode = mode.endswith('_2d')
     required_cols = ['Filename', 'Width (um)', 'Height (um)']
     dimension_section_key = 'pixel_dimensions' if is_2d_mode else 'voxel_dimensions'
-    
     if not is_2d_mode:
         required_cols.extend(['Slices', 'Depth (um)'])
 
     if not all([col in df.columns for col in required_cols]):
         raise ValueError(f'For preset mode "{mode}", CSV must have columns: {", ".join(required_cols)}. Found: {", ".join(df.columns)}')
 
-    # --- Match Files (No changes here) ---
+    # --- Match Files ---
     csv_filenames = set(df['Filename'].astype(str))
     tif_basenames = set(os.path.splitext(f)[0] for f in tif_files)
     if csv_filenames != tif_basenames:
-        # (Error handling logic same as before...)
         missing_in_csv = tif_basenames - csv_filenames
         missing_in_folder = csv_filenames - tif_basenames
         error_msg = "Mismatch between CSV 'Filename' column and TIF/TIFF files:"
@@ -226,7 +220,6 @@ def organize_processing_dir(drctry, preset_details):
         actual_tif_file = next((f for f in tif_files if os.path.splitext(f)[0] == root_name), None)
         if not actual_tif_file: continue
 
-        # Move TIF (Same as before)
         original_tif_path = os.path.join(drctry, actual_tif_file)
         new_tif_path = os.path.join(new_dir, actual_tif_file)
 
@@ -241,11 +234,9 @@ def organize_processing_dir(drctry, preset_details):
         new_config_path = os.path.join(new_dir, config_filename)
         
         try:
-            # Always copy the template to ensure we have the correct structure
             if not os.path.exists(new_config_path):
                  shutil.copy2(config_template_path, new_config_path)
 
-            # Get Dimensions from CSV
             row = df[df['Filename'].astype(str) == root_name]
             if row.empty: continue
 
@@ -253,20 +244,15 @@ def organize_processing_dir(drctry, preset_details):
             y_um = row['Height (um)'].iloc[0]
             z_um = 0.0 if is_2d_mode else row['Depth (um)'].iloc[0]
 
-            # Update the YAML
             config_data = {}
             if os.path.exists(new_config_path):
                 with open(new_config_path, 'r') as f: config_data = yaml.safe_load(f) or {}
 
             if dimension_section_key not in config_data: config_data[dimension_section_key] = {}
-            
             config_data[dimension_section_key]['x'] = float(x_um)
             config_data[dimension_section_key]['y'] = float(y_um)
+            if not is_2d_mode: config_data[dimension_section_key]['z'] = float(z_um)
             
-            if not is_2d_mode: 
-                config_data[dimension_section_key]['z'] = float(z_um)
-            
-            # ENSURE MODE IS SET
             config_data['mode'] = mode
 
             with open(new_config_path, 'w') as f: 
@@ -308,9 +294,7 @@ class ProjectManager:
     def _find_valid_image_folders(self):
         self.image_folders = []
         if not self.project_path or not os.path.isdir(self.project_path):
-            # print("Project path not set or invalid, cannot find image folders.") # Can be less verbose
             return
-        # print(f"Scanning for valid image folders in: {self.project_path}") # Can be less verbose
         try:
             for item in os.listdir(self.project_path):
                 potential_folder_path = os.path.join(self.project_path, item)
@@ -320,12 +304,10 @@ class ProjectManager:
                         tif_files = [f for f in folder_contents if f.lower().endswith(('.tif', '.tiff')) and os.path.isfile(os.path.join(potential_folder_path, f))]
                         yaml_files = [f for f in folder_contents if f.lower().endswith(('.yaml', '.yml')) and os.path.isfile(os.path.join(potential_folder_path, f))]
                         if len(tif_files) == 1 and len(yaml_files) == 1:
-                            # print(f"  Found valid image folder: {item}") # Less verbose
                             self.image_folders.append(potential_folder_path)
                     except OSError as e: print(f"Warning: Could not read subdirectory {potential_folder_path}: {e}")
         except OSError as e: print(f"Error listing contents of project path {self.project_path}: {e}"); self.image_folders = []
         self.image_folders.sort(key=natural_sort_key)
-        # print(f"Found {len(self.image_folders)} valid image folders.") # Can be less verbose
     def get_image_details(self, folder_path):
         try:
             contents = os.listdir(folder_path)
@@ -352,7 +334,7 @@ class ProjectViewWindow(QMainWindow):
 
     def initUI(self):
         self.setWindowTitle("Image Segmentation Project")
-        self.setGeometry(100, 100, 700, 450) # Adjusted width for one batch button
+        self.setGeometry(100, 100, 700, 450)
         central_widget = QWidget(); layout = QVBoxLayout()
         self.project_path_label = QLabel("Project Path: Not Selected"); layout.addWidget(self.project_path_label)
         self.image_list = QListWidget(); self.image_list.itemDoubleClicked.connect(self.open_image_view); layout.addWidget(self.image_list)
@@ -360,21 +342,18 @@ class ProjectViewWindow(QMainWindow):
         button_layout = QHBoxLayout()
         select_project_btn = QPushButton("Select/Load Project Folder"); select_project_btn.clicked.connect(self.load_project); button_layout.addWidget(select_project_btn)
 
-        # --- SINGLE BATCH PROCESS BUTTON ---
         self.batch_process_all_btn = QPushButton("Process All Compatible Folders")
         self.batch_process_all_btn.clicked.connect(self.run_batch_processing_all_compatible)
-        self.batch_process_all_btn.setEnabled(False) # Initially disabled
+        self.batch_process_all_btn.setEnabled(False)
         if BatchProcessor is None:
             self.batch_process_all_btn.setToolTip("BatchProcessor module not available. Check console for import errors.")
         else:
-            self.batch_process_all_btn.setToolTip("Load a project with compatible folders (e.g., 'ramified', 'ramified_2d') to enable.")
+            self.batch_process_all_btn.setToolTip("Load a project with compatible folders to enable.")
         button_layout.addWidget(self.batch_process_all_btn)
-        # --- END SINGLE BATCH PROCESS BUTTON ---
 
         layout.addLayout(button_layout); central_widget.setLayout(layout); self.setCentralWidget(central_widget)
 
     def _update_batch_button_state(self):
-        """Updates the enabled state of the single batch processing button."""
         if BatchProcessor is None:
             self.batch_process_all_btn.setEnabled(False)
             self.batch_process_all_btn.setToolTip("BatchProcessor module not available.")
@@ -385,15 +364,9 @@ class ProjectViewWindow(QMainWindow):
             self.batch_process_all_btn.setToolTip("Load a project to enable.")
             return
 
-        # Check if any loaded folder has a mode supported by BatchProcessor
-        # Assuming BatchProcessor instance is not needed just to check its supported_strategies keys
-        # If BatchProcessor class is available, we can access its class variable or a temp instance.
-        # For simplicity, let's assume we know the keys or can get them from a dummy instance.
-        # More robustly, BatchProcessor could have a static method for supported keys.
-        # For now, let's create a temporary instance just for this check if BatchProcessor is not None
-        temp_processor = BatchProcessor(self.project_manager) # Minimal impact
+        temp_processor = BatchProcessor(self.project_manager)
         supported_modes = temp_processor.supported_strategies.keys()
-        del temp_processor # Clean up
+        del temp_processor
 
         has_compatible_folders = any(
             self.project_manager.get_image_details(fp).get('mode') in supported_modes
@@ -411,7 +384,7 @@ class ProjectViewWindow(QMainWindow):
     def load_project(self):
         selected_path = self.project_manager.select_project_folder()
         if not selected_path:
-            self._update_batch_button_state() # Update even on cancel
+            self._update_batch_button_state()
             return
 
         self.project_path_label.setText(f"Project Path: {selected_path}"); self.image_list.clear()
@@ -428,13 +401,12 @@ class ProjectViewWindow(QMainWindow):
                 if root_tifs and len(root_csvs) == 1:
                     tif_basenames = set(os.path.splitext(f)[0] for f in root_tifs)
                     existing_matching_dirs = tif_basenames.intersection(set(root_dirs))
-                    if not existing_matching_dirs: needs_organizing = True; # print(f"Detected unorganized project structure in: {selected_path}") # Less verbose
+                    if not existing_matching_dirs: needs_organizing = True
             except OSError as e: QMessageBox.critical(self, "Error Listing Directory", f"Could not read directory contents:\n{selected_path}\n{e}"); self._update_batch_button_state(); return
 
             if needs_organizing:
                 reply = QMessageBox.question(self, "Organize Project?", f"Unorganized structure detected in: {selected_path}.\nOrganize now?", QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes)
                 if reply == QMessageBox.Yes:
-                    # --- NEW PRESET SELECTION LOGIC ---
                     presets = scan_available_presets()
                     
                     if not presets:
@@ -442,14 +414,13 @@ class ProjectViewWindow(QMainWindow):
                         return
 
                     preset_names = list(presets.keys())
-                    preset_names.sort() # Alphabetical order
+                    preset_names.sort()
                     
                     selected_preset_name, ok = QInputDialog.getItem(self, "Select Configuration Preset", "Choose a preset to apply:", preset_names, 0, False)
                     
                     if ok and selected_preset_name:
                         selected_preset_details = presets[selected_preset_name]
                         try: 
-                            # Pass the details dict, not just the name
                             organize_processing_dir(selected_path, selected_preset_details) 
                             QMessageBox.information(self, "Organization Complete", f"Project organized using '{selected_preset_name}'.")
                         except Exception as e: 
@@ -457,7 +428,7 @@ class ProjectViewWindow(QMainWindow):
                     else: 
                         QMessageBox.warning(self, "Organization Cancelled", "Project organization cancelled.")
                     
-                    self.project_manager._find_valid_image_folders() # Rescan
+                    self.project_manager._find_valid_image_folders()
                 else: QMessageBox.information(self, "Organization Skipped", "Loading existing valid subfolders only."); self.project_manager._find_valid_image_folders()
 
             if not self.project_manager.image_folders and not needs_organizing:
@@ -475,7 +446,7 @@ class ProjectViewWindow(QMainWindow):
         except Exception as e:
             QMessageBox.critical(self, "Error Loading Project", f"An unexpected error occurred:\n{e}\n{traceback.format_exc()}"); self.image_list.clear(); self.project_path_label.setText("Project Path: Error")
         finally:
-            self._update_batch_button_state() # Update button state after loading attempt
+            self._update_batch_button_state()
 
 
     def open_image_view(self, item):
@@ -488,19 +459,13 @@ class ProjectViewWindow(QMainWindow):
 
 
     def run_batch_processing_all_compatible(self):
-        """Handles the click of the 'Process All Compatible Folders' button."""
-        if not self.batch_process_all_btn.isEnabled():
-            QMessageBox.warning(self, "Batch Processing Unavailable",
-                                "Batch processing is currently not available. "
-                                "Ensure BatchProcessor module is loaded and a project with compatible folders is open.");
-            return
+        if not self.batch_process_all_btn.isEnabled(): return
 
-        # Determine compatible folders again, just to be sure
         temp_processor = BatchProcessor(self.project_manager)
         supported_modes = temp_processor.supported_strategies.keys()
         del temp_processor
 
-        compatible_folders_info = [] # Store (folder_path, mode)
+        compatible_folders_info = []
         for fp in self.project_manager.image_folders:
             details = self.project_manager.get_image_details(fp)
             mode = details.get('mode')
@@ -508,145 +473,43 @@ class ProjectViewWindow(QMainWindow):
                 compatible_folders_info.append((fp, mode))
 
         if not compatible_folders_info:
-            QMessageBox.information(self, "No Compatible Folders",
-                                    f"No folders configured for supported modes ({', '.join(supported_modes)}) found. "
-                                    "The button should have been disabled.");
-            self._update_batch_button_state() # Correct button state
-            return
+            QMessageBox.information(self, "No Compatible Folders", "No folders configured for supported modes found.")
+            self._update_batch_button_state(); return
 
         num_folders = len(compatible_folders_info)
-        # Create a more informative list for the confirmation dialog
-        folder_summary_list = [f"  - {os.path.basename(fp_info[0])} (Mode: {fp_info[1]})" for fp_info in compatible_folders_info[:5]] # Show first 5
+        folder_summary_list = [f"  - {os.path.basename(fp_info[0])} (Mode: {fp_info[1]})" for fp_info in compatible_folders_info[:5]]
         if num_folders > 5: folder_summary_list.append("  - ... and more.")
         folder_summary_str = "\n".join(folder_summary_list)
 
-
         force_restart_processing = False
         reply_force = QMessageBox.question(self, f"Force Restart Option (All Compatible)",
-                                     f"For the {num_folders} compatible folder(s):\n{folder_summary_str}\n\n"
-                                     "Do you want to force reprocessing of ALL steps, even if previously completed?",
+                                     f"For the {num_folders} compatible folder(s):\n{folder_summary_str}\n\nDo you want to force reprocessing of ALL steps?",
                                      QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
-        if reply_force == QMessageBox.Yes:
-            force_restart_processing = True
-            print(f"User chose to FORCE RESTART all processing for compatible folders.")
+        if reply_force == QMessageBox.Yes: force_restart_processing = True
 
-        reply_confirm = QMessageBox.question(self, f"Confirm Batch Processing (All Compatible)",
-                                     f"Process {num_folders} compatible folder(s)?\n{folder_summary_str}\n\n"
-                                     f"{'ALL STEPS WILL BE REPROCESSED.' if force_restart_processing else 'Processing will attempt to resume incomplete folders.'}\n"
-                                     f"Existing processed data will be affected.\nThis can take time.",
+        reply_confirm = QMessageBox.question(self, f"Confirm Batch Processing",
+                                     f"Process {num_folders} compatible folder(s)?\n\n{'ALL STEPS REPROCESSED.' if force_restart_processing else 'Resuming incomplete folders.'}",
                                      QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes)
         if reply_confirm == QMessageBox.No: return
 
         print(f"Starting batch processing for {num_folders} compatible folders...");
         original_tooltip = self.batch_process_all_btn.toolTip()
-        self.batch_process_all_btn.setEnabled(False);
-        self.batch_process_all_btn.setToolTip("Processing... Please wait.")
+        self.batch_process_all_btn.setEnabled(False); self.batch_process_all_btn.setToolTip("Processing... Please wait.")
         QApplication.processEvents()
 
         processor = BatchProcessor(self.project_manager)
         try:
-            # Call the modified process_all_folders which infers mode per folder
-            successful_count, failed_count, skipped_count = processor.process_all_folders(
-                force_restart_all=force_restart_processing
-            )
-            summary_msg = f"Batch processing for all compatible folders finished.\n\n" \
-                          f"Successfully processed/resumed/completed: {successful_count} folder(s)\n" \
-                          f"Failed during processing: {failed_count} folder(s)\n" \
-                          f"Skipped (unsupported mode/error before start): {skipped_count} folder(s)\n\n" \
-                          f"Check console output for detailed logs and errors."
-            if failed_count > 0: QMessageBox.warning(self, "Batch Processing Complete (with issues)", summary_msg)
-            else: QMessageBox.information(self, "Batch Processing Complete", summary_msg)
+            successful_count, failed_count, skipped_count = processor.process_all_folders(force_restart_all=force_restart_processing)
+            summary_msg = f"Batch processing finished.\nSuccess: {successful_count}\nFailed: {failed_count}\nSkipped: {skipped_count}"
+            QMessageBox.information(self, "Batch Processing Complete", summary_msg)
         except Exception as e:
-            print(f"Critical error during 'Process All Compatible Folders': {e}"); traceback.print_exc();
-            QMessageBox.critical(self, "Batch Processing Error", f"Error: {e}\nCheck console.")
+            print(f"Critical error: {e}"); traceback.print_exc(); QMessageBox.critical(self, "Error", f"Error: {e}")
         finally:
             self.batch_process_all_btn.setToolTip(original_tooltip)
             self._update_batch_button_state()
-            print(f"Batch processing GUI action for 'All Compatible Folders' finished.")
-
-    # Generic batch processing runner
-    def run_batch_processing_for_mode(self, mode_key: str):
-        """Handles the click of a 'Process All' button for a specific mode."""
-        
-        target_button = None
-        mode_display_name = ""
-        if mode_key == "ramified":
-            target_button = self.batch_process_ramified_btn
-            mode_display_name = "Ramified 3D"
-        elif mode_key == "ramified_2d":
-            target_button = self.batch_process_ramified_2d_btn
-            mode_display_name = "Ramified 2D"
-        else:
-            QMessageBox.critical(self, "Internal Error", f"Unknown mode key '{mode_key}' for batch processing.")
-            return
-
-        if target_button is None or not target_button.isEnabled():
-            QMessageBox.warning(self, f"Batch Processing ({mode_display_name}) Unavailable",
-                                f"Batch processing for {mode_display_name} mode is currently not available. "
-                                f"Ensure a project with '{mode_key}' folders is loaded.");
-            return
-
-        # Confirm folders for the specific mode
-        folders_to_process = [
-            fp for fp in self.project_manager.image_folders
-            if self.project_manager.get_image_details(fp).get('mode') == mode_key
-        ]
-        if not folders_to_process:
-            QMessageBox.information(self, f"No {mode_display_name} Images",
-                                    f"No folders configured for '{mode_key}' mode found. "
-                                    f"The 'Process All ({mode_display_name})' button should have been disabled.");
-            self._update_batch_buttons_state()
-            return
-
-        num_folders = len(folders_to_process)
-
-        force_restart_processing = False
-        reply_force = QMessageBox.question(self, f"Force Restart Option ({mode_display_name})",
-                                     f"For the {num_folders} '{mode_key}' folder(s):\n"
-                                     "Do you want to force reprocessing of ALL steps, even if previously completed?",
-                                     QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
-        if reply_force == QMessageBox.Yes:
-            force_restart_processing = True
-            print(f"User chose to FORCE RESTART all processing for '{mode_key}' mode.")
-
-
-        reply_confirm = QMessageBox.question(self, f"Confirm Batch Processing ({mode_display_name})",
-                                     f"Process {num_folders} '{mode_key}' mode folder(s)?\n"
-                                     f"{'ALL STEPS WILL BE REPROCESSED.' if force_restart_processing else 'Processing will attempt to resume incomplete folders.'}\n"
-                                     f"Existing processed data for {'all steps (if forcing restart)' if force_restart_processing else 'steps to be run'} will be overwritten.\n"
-                                     "This can take time.",
-                                     QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes)
-        if reply_confirm == QMessageBox.No: return
-
-        print(f"Starting batch processing for {num_folders} '{mode_key}' folders...");
-        original_tooltip = target_button.toolTip()
-        target_button.setEnabled(False);
-        target_button.setToolTip("Processing... Please wait.")
-        QApplication.processEvents()
-
-        processor = BatchProcessor(self.project_manager) # ProjectManager already has all folders
-        try:
-            successful_count, failed_count = processor.process_all_folders(
-                target_strategy_key=mode_key, # Pass the specific mode key
-                force_restart_all=force_restart_processing
-            )
-            summary_msg = f"Batch processing for '{mode_display_name}' finished.\n\n" \
-                          f"Successfully processed/resumed/completed: {successful_count} folder(s)\n" \
-                          f"Failed during processing: {failed_count} folder(s)\n\n" \
-                          f"Check console output for detailed logs and errors."
-            if failed_count > 0: QMessageBox.warning(self, f"Batch Processing ({mode_display_name}) Complete (with issues)", summary_msg)
-            else: QMessageBox.information(self, f"Batch Processing ({mode_display_name}) Complete", summary_msg)
-        except Exception as e:
-            print(f"Critical error during batch processing for mode '{mode_key}': {e}"); traceback.print_exc();
-            QMessageBox.critical(self, f"Batch Processing ({mode_display_name}) Error", f"Error: {e}\nCheck console.")
-        finally:
-            target_button.setToolTip(original_tooltip)
-            self._update_batch_buttons_state() # Update all buttons based on current project state
-            print(f"Batch processing GUI action for mode '{mode_key}' finished.")
 
 
     def closeEvent(self, event: QCloseEvent):
-        # print("ProjectViewWindow closeEvent. Quitting application.") # Less verbose
         reply = QMessageBox.question(self, 'Confirm Exit', "Exit application?", QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
         if reply == QMessageBox.Yes: app = QApplication.instance(); app.quit(); event.accept()
         else: event.ignore()
@@ -659,21 +522,17 @@ def _check_if_last_window():
     project_view_exists_valid = False
     if project_window:
         try: _ = project_window.isVisible(); project_view_exists_valid = True
-        except RuntimeError: project_view_exists_valid = False # C++ object deleted
+        except RuntimeError: project_view_exists_valid = False
     active_windows = app.topLevelWidgets()
     other_visible_task_windows = [w for w in active_windows if w is not project_window and w.isVisible()]
 
     pv_is_visible = project_window.isVisible() if project_view_exists_valid else False
 
     if (not project_view_exists_valid or not pv_is_visible) and not other_visible_task_windows:
-        # print("CheckIfLastWindow: Project View gone/hidden, no other visible windows. Quitting.") # Less verbose
         app.quit()
-    # else: # Less verbose
-        # print(f"CheckIfLastWindow: Project View visible or other windows active. Not quitting. (PV exists/valid: {project_view_exists_valid}, PV visible: {pv_is_visible}, Other visible: {len(other_visible_task_windows)})")
 
 
 def _handle_napari_close():
-    # print("Napari window destroyed signal.") # Less verbose
     QTimer.singleShot(100, _check_if_last_window)
 
 
@@ -685,7 +544,7 @@ def interactive_segmentation_with_config(selected_folder=None):
     viewer = None
     try:
         if selected_folder is None or not os.path.isdir(selected_folder): raise ValueError("No valid image folder provided.")
-        input_dir = selected_folder; # print(f"Starting interactive segmentation for: {input_dir}") # Less verbose
+        input_dir = selected_folder
         try:
              contents = os.listdir(input_dir)
              tif_files = [f for f in contents if f.lower().endswith(('.tif', '.tiff'))]; yaml_files = [f for f in contents if f.lower().endswith(('.yaml', '.yml'))]
@@ -701,7 +560,7 @@ def interactive_segmentation_with_config(selected_folder=None):
         if not processing_mode: QMessageBox.critical(None, "Config Error", f"YAML ({config_path}) must have 'mode'."); app_state.show_project_view_signal.emit(); return
         if processing_mode not in ["ramified", "ramified_2d"]: QMessageBox.critical(None, "Config Error", f"Invalid mode '{processing_mode}' in YAML."); app_state.show_project_view_signal.emit(); return
         try:
-            image_stack = tiff.imread(file_loc); # print(f"Loaded: {file_loc}, shape {image_stack.shape}, dtype {image_stack.dtype}") # Less verbose
+            image_stack = tiff.imread(file_loc)
             expected_ndim = 2 if processing_mode == "ramified_2d" else 3
             if image_stack.ndim != expected_ndim: raise ValueError(f"Expected {expected_ndim}D image for mode '{processing_mode}', got {image_stack.ndim}D.")
             if image_stack.size == 0: raise ValueError("Image stack empty.")
@@ -710,9 +569,8 @@ def interactive_segmentation_with_config(selected_folder=None):
         viewer = napari.Viewer(title=f"Segmentation: {os.path.basename(input_dir)} ({processing_mode.capitalize()} Mode)")
         qt_window_to_connect = viewer.window._qt_window if viewer and viewer.window and hasattr(viewer.window, '_qt_window') else None
         if qt_window_to_connect:
-            try: qt_window_to_connect.destroyed.connect(_handle_napari_close); # print(f"Connected destroyed signal for: {qt_window_to_connect}") # Less verbose
+            try: qt_window_to_connect.destroyed.connect(_handle_napari_close)
             except Exception as connect_error: print(f"Warning: Failed to connect destroyed signal: {connect_error}")
-        # else: print("Warning: Could not find Qt window for destroyed signal.") # Less verbose
 
         gui_manager = DynamicGUIManager(viewer, config, image_stack, file_loc, processing_mode)
         try: back_button_widget = create_back_to_project_button(viewer); viewer.window.add_dock_widget(back_button_widget, area="left", name="Navigation")
@@ -721,8 +579,12 @@ def interactive_segmentation_with_config(selected_folder=None):
         @magicgui(call_button="▶ Next Step / Run Current")
         def continue_processing():
             parent_widget = viewer.window._qt_window if viewer and viewer.window and hasattr(viewer.window, '_qt_window') else None
-            try: gui_manager.execute_processing_step(); update_navigation_buttons()
-            except Exception as e: error_msg = f"Error during processing:\n{str(e)}\n{traceback.format_exc()}"; QMessageBox.critical(parent_widget, "Processing Error", error_msg); print(error_msg)
+            try: 
+                # Just execute. Buttons are handled by signals.
+                gui_manager.execute_processing_step()
+            except Exception as e: 
+                error_msg = f"Error during processing:\n{str(e)}\n{traceback.format_exc()}"
+                QMessageBox.critical(parent_widget, "Processing Error", error_msg); print(error_msg)
 
         @magicgui(call_button="◀ Previous Step")
         def go_to_previous_step():
@@ -734,7 +596,6 @@ def interactive_segmentation_with_config(selected_folder=None):
                     prev_step_name = gui_manager.processing_steps[gui_manager.current_step["value"]]
                     gui_manager.create_step_widgets(prev_step_name); update_navigation_buttons()
                 except Exception as e: error_msg = f"Error going to previous step:\n{str(e)}\n{traceback.format_exc()}"; QMessageBox.critical(parent_widget, "Navigation Error", error_msg); print(error_msg)
-            # else: print("Already at first step.") # Less verbose
 
         def update_navigation_buttons():
             try:
@@ -748,6 +609,17 @@ def interactive_segmentation_with_config(selected_folder=None):
                         continue_processing.label = f"Run Step {current_idx+1}: {display_name}"
                     else: continue_processing.label = "Processing Complete"
             except Exception as e: print(f"Error updating nav buttons: {e}")
+
+        def disable_buttons_during_process():
+            """Slot connected to process_started signal."""
+            if hasattr(continue_processing, 'enabled'): continue_processing.enabled = False
+            if hasattr(go_to_previous_step, 'enabled'): go_to_previous_step.enabled = False
+            if hasattr(continue_processing, 'label'): continue_processing.label = "Processing... (Please Wait)"
+
+        # --- SIGNAL CONNECTIONS ---
+        gui_manager.process_started.connect(disable_buttons_during_process)
+        gui_manager.process_finished.connect(update_navigation_buttons)
+        # --------------------------
 
         step_widget_container = QWidget(); step_layout = QVBoxLayout(); step_widget_container.setLayout(step_layout)
         step_layout.addWidget(continue_processing.native); step_layout.addWidget(go_to_previous_step.native); step_layout.setContentsMargins(5,5,5,5)

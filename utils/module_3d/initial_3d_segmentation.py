@@ -1,7 +1,7 @@
 # --- START OF FILE utils/module_3d/initial_3d_segmentation.py ---
 import numpy as np
 from scipy import ndimage
-from scipy.ndimage import gaussian_filter, generate_binary_structure
+from scipy.ndimage import gaussian_filter, generate_binary_structure, white_tophat
 from skimage.filters import frangi, sato # type: ignore
 import tempfile
 import os
@@ -24,12 +24,6 @@ seed = 42
 np.random.seed(seed)
 
 def _init_worker():
-    """
-    Initializer for worker processes.
-    Crucial for preventing 'Thread Explosion'. 
-    We force low-level math libraries (BLAS/OpenMP) to use a single thread 
-    per worker, since we are already parallelizing via Multiprocessing.
-    """
     import os
     os.environ["OMP_NUM_THREADS"] = "1"
     os.environ["MKL_NUM_THREADS"] = "1"
@@ -37,7 +31,7 @@ def _init_worker():
     os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
     os.environ["NUMEXPR_NUM_THREADS"] = "1"
 
-def _process_slice_worker(z, input_memmap_info, output_memmap_info, sigmas_voxel_2d, black_ridges, frangi_alpha, frangi_beta, frangi_gamma):
+def _process_slice_worker(z, input_memmap_info, output_memmap_info, sigmas_voxel_2d, black_ridges, frangi_alpha, frangi_beta, frangi_gamma, soma_preservation_factor, subtract_background_radius):
     """
     Static Worker Function for Multiprocessing.
     """
@@ -51,10 +45,18 @@ def _process_slice_worker(z, input_memmap_info, output_memmap_info, sigmas_voxel
         input_memmap = np.memmap(input_path, dtype=input_dtype, mode='r', shape=input_shape)
         output_memmap = np.memmap(output_path, dtype=output_dtype, mode='r+', shape=output_shape)
         
-        # Load data
+        # Load data (float32)
         slice_data = input_memmap[z].astype(np.float32, copy=True)
         
-        # Filters
+        # 0. Background Subtraction (NEW: Fixes Edge Artifacts)
+        # Removes "large" glowing structures (like tissue block edges) while keeping small details.
+        if subtract_background_radius > 0:
+            # Structuring element size ~ 2 * radius + 1
+            struct_size = int(2 * subtract_background_radius + 1)
+            # Apply White Top-Hat
+            slice_data = white_tophat(slice_data, size=struct_size)
+
+        # 1. Apply Vesselness Filters (Detects Processes)
         frangi_result_2d = frangi(
             slice_data, sigmas=sigmas_voxel_2d, alpha=frangi_alpha, 
             beta=frangi_beta, gamma=frangi_gamma, black_ridges=black_ridges, mode='reflect'
@@ -63,31 +65,36 @@ def _process_slice_worker(z, input_memmap_info, output_memmap_info, sigmas_voxel
             slice_data, sigmas=sigmas_voxel_2d, black_ridges=black_ridges, mode='reflect'
         )
         
-        # Combine
-        combined = np.maximum(frangi_result_2d, sato_result_2d)
+        # Combine filters (Max Projection)
+        filters_combined = np.maximum(frangi_result_2d, sato_result_2d)
         
+        # 2. Soma Rescue (Hybrid Fusion)
+        if soma_preservation_factor > 0:
+            f_max = np.percentile(filters_combined, 99)
+            if f_max > 1e-9:
+                s_max = np.percentile(slice_data, 99)
+                if s_max > 1e-9:
+                    scale_factor = f_max / s_max
+                    normalized_raw = slice_data * scale_factor
+                    filters_combined = np.maximum(filters_combined, normalized_raw * soma_preservation_factor)
+
         # Write result
-        output_memmap[z] = combined
-        
-        # OPTIMIZATION: Removed explicit .flush() here. 
-        # Constant flushing from parallel workers causes I/O lock contention on the file.
-        # We let the OS page cache handle writes and flush once at the end.
-        
+        output_memmap[z] = filters_combined
         return None 
 
     except Exception as e:
         return f"Error_slice_{z}: {str(e)}"
     finally:
-        # Cleanup references
         del input_memmap, output_memmap
-        # gc.collect() # Optional inside worker, can be skipped for speed if RAM isn't tight
 
 
 def enhance_tubular_structures_slice_by_slice(
     volume, scales, spacing, black_ridges=False,
     frangi_alpha=0.5, frangi_beta=0.5, frangi_gamma=15,
     apply_3d_smoothing=True, smoothing_sigma_phys=0.5,
-    skip_tubular_enhancement=False
+    skip_tubular_enhancement=False,
+    soma_preservation_factor=0.0,
+    subtract_background_radius=0  # New Parameter
 ):
     """
     Coordinator for the tubular enhancement step.
@@ -160,7 +167,6 @@ def enhance_tubular_structures_slice_by_slice(
         pool = None
         try:
             print(f"  [Enhance] Starting slice-by-slice (2.5D) tubular enhancement...")
-            # Conservative worker count
             num_workers = max(1, os.cpu_count() - 2 if os.cpu_count() > 2 else 1)
             
             xy_spacing = spacing[1:]
@@ -170,6 +176,7 @@ def enhance_tubular_structures_slice_by_slice(
             input_info = (input_volume_memmap.filename, input_volume_memmap.shape, input_volume_memmap.dtype)
             output_info = (output_path, output_memmap.shape, output_memmap.dtype)
             
+            # Pass new param to worker
             worker_func = partial(
                 _process_slice_worker, 
                 input_memmap_info=input_info, 
@@ -178,10 +185,11 @@ def enhance_tubular_structures_slice_by_slice(
                 black_ridges=black_ridges, 
                 frangi_alpha=frangi_alpha, 
                 frangi_beta=frangi_beta, 
-                frangi_gamma=frangi_gamma
+                frangi_gamma=frangi_gamma,
+                soma_preservation_factor=soma_preservation_factor,
+                subtract_background_radius=subtract_background_radius 
             )
             
-            # Use initializer to limit threads per worker
             pool = Pool(processes=num_workers, initializer=_init_worker)
             
             results = list(tqdm(
@@ -190,12 +198,10 @@ def enhance_tubular_structures_slice_by_slice(
                 desc="  [Enhance] Applying 2D Filters (Parallel)"
             ))
             
-            # Check results
             errors = [r for r in results if r is not None]
             if errors:
                 raise RuntimeError(f"Parallel slice processing failed. First error: {errors[0]}")
                 
-            # Explicit flush AFTER all workers are done
             output_memmap.flush()
             
         finally:
@@ -203,7 +209,6 @@ def enhance_tubular_structures_slice_by_slice(
                 pool.terminate()
                 pool.join()
 
-    # Cleanup
     del input_volume_memmap
     gc.collect()
     for d_path in temp_dirs_created_internally:
@@ -216,7 +221,9 @@ def segment_cells_first_pass_raw(
     volume, spacing, tubular_scales=[0.5, 1.0, 2.0, 3.0],
     smooth_sigma=0.5, connect_max_gap_physical=1.0, min_size_voxels=50,
     low_threshold_percentile=25.0, high_threshold_percentile=95.0,
-    skip_tubular_enhancement=False
+    skip_tubular_enhancement=False,
+    soma_preservation_factor=0.0,
+    subtract_background_radius=0  # New Parameter
     ):
     """
     Main entry point for Step 1.
@@ -232,7 +239,9 @@ def segment_cells_first_pass_raw(
         processed_input_memmap, _, processed_input_temp_dir = enhance_tubular_structures_slice_by_slice(
             volume, scales=tubular_scales, spacing=spacing,
             apply_3d_smoothing=(smooth_sigma > 0), smoothing_sigma_phys=smooth_sigma,
-            skip_tubular_enhancement=skip_tubular_enhancement
+            skip_tubular_enhancement=skip_tubular_enhancement,
+            soma_preservation_factor=soma_preservation_factor,
+            subtract_background_radius=subtract_background_radius # Pass through
         )
         temp_dirs_to_clean.append(processed_input_temp_dir)
         
@@ -243,7 +252,7 @@ def segment_cells_first_pass_raw(
         normalized_path = os.path.join(normalized_temp_dir, 'normalized.dat')
         normalized_memmap = np.memmap(normalized_path, dtype=np.float32, mode='w+', shape=volume.shape)
         
-        # Z-profile
+        # Z-profile logic (Unchanged)
         raw_high_percentiles = []
         slice_indices = np.arange(volume.shape[0])
         
@@ -317,6 +326,7 @@ def segment_cells_first_pass_raw(
         connected_memmap = np.memmap(connected_path, dtype=bool, mode='w+', shape=volume.shape)
         
         binary_dask = da.from_array(binary_memmap, chunks=dask_chunk_size)
+        
         radius_vox = [math.ceil((connect_max_gap_physical / 2) / s) if s > 1e-9 else 0 for s in spacing]
         structure = np.ones(tuple(max(1, 2 * r + 1) for r in radius_vox), dtype=bool) if any(r > 0 for r in radius_vox) else None
         
@@ -388,7 +398,9 @@ def segment_cells_first_pass_raw(
             'tubular_scales': tubular_scales, 'smooth_sigma': smooth_sigma,
             'connect_max_gap_physical': connect_max_gap_physical, 'min_size_voxels': min_size_voxels,
             'low_threshold_percentile': low_threshold_percentile, 'high_threshold_percentile': high_threshold_percentile,
-            'original_shape': volume.shape, 'skip_tubular_enhancement': skip_tubular_enhancement
+            'original_shape': volume.shape, 'skip_tubular_enhancement': skip_tubular_enhancement,
+            'soma_preservation_factor': soma_preservation_factor,
+            'subtract_background_radius': subtract_background_radius
         }
         return labels_path, labels_temp_dir, segmentation_threshold, first_pass_params
 
