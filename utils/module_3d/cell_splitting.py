@@ -1,7 +1,7 @@
 import numpy as np
 import os
 from scipy import ndimage
-from skimage.morphology import binary_dilation, ball, footprint_rectangle
+from skimage.morphology import binary_dilation, footprint_rectangle
 from skimage.segmentation import relabel_sequential
 import gc
 from typing import List, Dict, Optional, Tuple, Set
@@ -36,6 +36,7 @@ def _analyze_local_intensity_difference_optimized(
     interface_mask, region1_mask, region2_mask, intensity_vol_local, 
     local_analysis_radius, min_local_intensity_difference_threshold
 ):
+    from skimage.morphology import ball
     footprint_elem = ball(local_analysis_radius) if local_analysis_radius > 1 else footprint_rectangle((3,3,3))
     analysis_zone = binary_dilation(interface_mask, footprint=footprint_elem)
     la_r1 = analysis_zone & region1_mask
@@ -65,10 +66,7 @@ def _calculate_interface_metrics(
     mean_interface_intensity = np.mean(intensity_local[interface_mask])
     ratio = mean_interface_intensity / max(avg_soma_intensity_for_interface, 1e-6)
     
-    # ratio < thresh => Dark => Split
-    # ratio > thresh => Bright => Merge
     ratio_threshold_passed = ratio < min_path_intensity_ratio_heuristic
-
     lid_passed = _analyze_local_intensity_difference_optimized(
         interface_mask, mask_A_local, mask_B_local, intensity_local,
         local_analysis_radius, min_local_intensity_difference
@@ -213,42 +211,62 @@ def _separate_multi_soma_cells_chunk(
             merged_id = merge_map[old_id]
             final_local_mask[ws_local == old_id] = merged_id 
 
-        # --- CORRECTED FIX: Re-absorb small fragments immediately ---
-        # If any split part is too small, merge it back into its touching neighbor.
-        if min_size_thresh > 0:
-            iter_merge = 0
-            while iter_merge < 5: # Safety limit
-                l_ids, l_counts = np.unique(final_local_mask[final_local_mask > 0], return_counts=True)
-                small_frags = l_ids[l_counts < min_size_thresh]
+        # --- FIX: Seed-Based Orphan Reassignment ---
+        # Instead of just filtering by size, we check if fragments contain a seed.
+        # If a fragment contains NO seed, it is an orphan and must be merged.
+        
+        # Get list of all current labels in this block
+        unique_result_ids = np.unique(final_local_mask)
+        unique_result_ids = unique_result_ids[unique_result_ids > 0]
+        
+        dilation_struct = footprint_rectangle((3,3,3))
+
+        for uid in unique_result_ids:
+            # Mask for this specific cell label
+            cell_mask = (final_local_mask == uid)
+            
+            # Break into disconnected components
+            cc_labels, num_cc = ndimage.label(cell_mask)
+            
+            if num_cc <= 1:
+                continue # Connected, perfectly fine
+            
+            # Analyze components to find which one holds the Seed
+            # (seeds_in_crop maps to indexes 1..N based on markers logic above)
+            # markers[local_soma == s_id] = idx + 1
+            
+            # We need to check if a component overlaps with ANY seed marker
+            
+            # Components
+            for i in range(1, num_cc + 1):
+                frag_mask = (cc_labels == i)
                 
-                if len(small_frags) == 0:
-                    break
-                    
-                frag_merge_map = {}
-                change_occurred = False
+                # Check for seed presence in this fragment
+                has_seed = np.any(markers[frag_mask] > 0)
                 
-                for s_frag in small_frags:
-                    s_frag_mask = (final_local_mask == s_frag)
-                    # Dilate to find neighbors
-                    dilated = binary_dilation(s_frag_mask, footprint=footprint_rectangle((3,3,3)))
-                    neighbors = final_local_mask[dilated]
-                    # Neighbors must be part of the same parent (non-zero) and not self
-                    neighbors = neighbors[(neighbors != 0) & (neighbors != s_frag)]
+                if not has_seed:
+                    # ORPHAN DETECTED: This fragment has no soma seed inside.
+                    # It must be merged into a neighbor.
                     
-                    if neighbors.size > 0:
-                        # Merge into the neighbor we touch the most (Original Label Logic)
-                        n_ids_local, n_counts_local = np.unique(neighbors, return_counts=True)
-                        best_neighbor = n_ids_local[np.argmax(n_counts_local)]
-                        frag_merge_map[s_frag] = best_neighbor
-                        change_occurred = True
-                
-                if not change_occurred:
-                    break
+                    dilated = binary_dilation(frag_mask, footprint=dilation_struct)
+                    neighbor_labels = final_local_mask[dilated]
                     
-                for old_f, new_f in frag_merge_map.items():
-                    final_local_mask[final_local_mask == old_f] = new_f
+                    # Valid neighbor: Non-zero and NOT the fragment's current ID
+                    valid_neighbors = neighbor_labels[(neighbor_labels != 0) & (neighbor_labels != uid)]
                     
-                iter_merge += 1
+                    if valid_neighbors.size > 0:
+                        # Merge into best physical neighbor (mode)
+                        n_ids, n_counts = np.unique(valid_neighbors, return_counts=True)
+                        best_neighbor = n_ids[np.argmax(n_counts)]
+                        final_local_mask[frag_mask] = best_neighbor
+                    else:
+                        # Truly isolated debris?
+                        # If huge, maybe keep (could be artifact). If small, delete.
+                        if min_size_thresh > 0 and np.sum(frag_mask) < min_size_thresh:
+                            final_local_mask[frag_mask] = 0
+                        else:
+                            # Keep it as is (rare case: large detached chunk)
+                            pass
         # -------------------------------------------------------------
         
         # Now make global

@@ -9,16 +9,21 @@ import gc
 from shutil import rmtree, copyfile
 import time
 import tempfile
+import tifffile as tiff
+import random
+import yaml # type: ignore
+import colorsys
+import dask.array as da # For lazy overlap calculation
 
 from ..high_level_gui.processing_strategies import ProcessingStrategy, StepDefinition
 
 try:
     from .initial_3d_segmentation import segment_cells_first_pass_raw
     from .remove_artifacts import apply_hull_trimming
-    # Direct imports from the actual modules
     from .soma_extraction import extract_soma_masks
     from .cell_splitting import separate_multi_soma_cells
-    from .calculate_features_3d import analyze_segmentation
+    from .calculate_features_3d import analyze_segmentation, export_to_fcs
+    from .interaction_analysis import calculate_interaction_metrics
 except ImportError as e:
     print(f"CRITICAL ERROR: Could not import 3D segmentation modules: {e}")
     raise
@@ -26,77 +31,50 @@ except ImportError as e:
 
 class RamifiedStrategy(ProcessingStrategy):
     """
-    Orchestrates the 5-step segmentation workflow for Ramified Microglia in 3D.
+    Orchestrates the 5-step segmentation workflow + Interaction Analysis.
     """
 
     def _get_mode_name(self) -> str:
         return "ramified"
 
     def get_step_definitions(self) -> List[StepDefinition]:
-        """
-        Defines the workflow.
-        Format: {'method': 'function_name', 'artifact': 'checkpoint_file_key'}
-        
-        The 'artifact' key corresponds to keys in get_checkpoint_files().
-        If the file exists, the step is considered complete.
-        """
         return [
-            # Step 1
-            {
-                "method": "execute_raw_segmentation",
-                "artifact": "raw_segmentation" 
-            },
-            # Step 2
-            {
-                "method": "execute_trim_edges",
-                "artifact": "trimmed_segmentation"
-            },
-            # Step 3
-            {
-                "method": "execute_soma_extraction",
-                "artifact": "cell_bodies"
-            },
-            # Step 4
-            {
-                "method": "execute_cell_separation",
-                "artifact": "final_segmentation"
-            },
-            # Step 5
-            {
-                "method": "execute_calculate_features",
-                "artifact": "metrics_df" 
-            }
+            {"method": "execute_raw_segmentation", "artifact": "raw_segmentation"},
+            {"method": "execute_trim_edges", "artifact": "trimmed_segmentation"},
+            {"method": "execute_soma_extraction", "artifact": "cell_bodies"},
+            {"method": "execute_cell_separation", "artifact": "final_segmentation"},
+            {"method": "execute_calculate_features", "artifact": "metrics_df"},
+            # Step 6 is optional/repeatable
+            {"method": "execute_interaction_analysis", "artifact": None} 
         ]
 
     def get_checkpoint_files(self) -> Dict[str, str]:
         files = super().get_checkpoint_files()
-        mode_prefix = self.mode_name
-        
-        files["raw_segmentation"] = os.path.join(self.processed_dir, f"raw_segmentation_{mode_prefix}.dat")
-        files["edge_mask"] = os.path.join(self.processed_dir, f"{mode_prefix}_edge_mask.dat")
-        files["trimmed_segmentation"] = os.path.join(self.processed_dir, f"trimmed_segmentation_{mode_prefix}.dat")
-        files["cell_bodies"] = os.path.join(self.processed_dir, f"cell_bodies.dat")
-        files["final_segmentation"] = os.path.join(self.processed_dir, f"final_segmentation_{mode_prefix}.dat")
-        files["skeleton_array"] = os.path.join(self.processed_dir, f"skeleton_array_{mode_prefix}.dat")
-        
-        files["distances_matrix"] = os.path.join(self.processed_dir, f"distances_matrix_{mode_prefix}.csv")
-        files["points_matrix"] = os.path.join(self.processed_dir, f"points_matrix_{mode_prefix}.csv")
-        files["branch_data"] = os.path.join(self.processed_dir, f"branch_data_{mode_prefix}.csv")
-        
+        p = self.mode_name
+        files.update({
+            "raw_segmentation": os.path.join(self.processed_dir, f"raw_segmentation_{p}.dat"),
+            "edge_mask": os.path.join(self.processed_dir, f"{p}_edge_mask.dat"),
+            "trimmed_segmentation": os.path.join(self.processed_dir, f"trimmed_segmentation_{p}.dat"),
+            "cell_bodies": os.path.join(self.processed_dir, f"cell_bodies.dat"),
+            "final_segmentation": os.path.join(self.processed_dir, f"final_segmentation_{p}.dat"),
+            "skeleton_array": os.path.join(self.processed_dir, f"skeleton_array_{p}.dat"),
+            "distances_matrix": os.path.join(self.processed_dir, f"distances_matrix_{p}.csv"),
+            "points_matrix": os.path.join(self.processed_dir, f"points_matrix_{p}.csv"),
+            "branch_data": os.path.join(self.processed_dir, f"branch_data_{p}.csv"),
+            "last_interaction_meta": os.path.join(self.processed_dir, "last_interaction_meta.yaml")
+        })
         return files
 
-    def _close_memmap(self, memmap_obj: Union[np.memmap, np.ndarray, None]):
+    def _close_memmap(self, memmap_obj):
         if memmap_obj is None: return
-        if isinstance(memmap_obj, np.memmap):
-            try:
+        try:
+            if isinstance(memmap_obj, np.memmap):
                 memmap_obj.flush()
-                if hasattr(memmap_obj, '_mmap') and memmap_obj._mmap is not None:
-                    memmap_obj._mmap.close()
-            except Exception as e:
-                print(f"Warning: Error closing memmap: {e}")
+                if hasattr(memmap_obj, '_mmap') and memmap_obj._mmap: memmap_obj._mmap.close()
+        except: pass
         del memmap_obj
 
-    # --- EXECUTION STEPS (Logic remains unchanged) ---
+    # --- EXECUTION STEPS ---
 
     def execute_raw_segmentation(self, viewer, image_stack: Any, params: Dict) -> bool:
         if image_stack is None: return False
@@ -172,7 +150,8 @@ class RamifiedStrategy(ProcessingStrategy):
                 smoothing_iterations=int(params.get("smoothing_iterations", 1)),
                 heal_iterations=int(params.get("heal_iterations", 1)),
                 edge_distance_chunk_size_z=int(params.get("edge_distance_chunk_size_z", 32)),
-                z_erosion_iterations=int(params.get("z_erosion_iterations", 0))
+                z_erosion_iterations=int(params.get("z_erosion_iterations", 0)),
+                post_smoothing_iter=int(params.get("post_smoothing_iter", 0))
             )
 
             if not temp_trimmed_dat_path or not os.path.exists(temp_trimmed_dat_path):
@@ -214,7 +193,6 @@ class RamifiedStrategy(ProcessingStrategy):
         try:
             trimmed_labels_memmap = np.memmap(trimmed_seg_path, dtype=np.int32, mode='r', shape=self.image_shape)
             
-            # --- UPDATED PARAMETER DICTIONARY ---
             soma_extraction_params = {
                 "smallest_quantile": float(params.get("smallest_quantile", 25)),
                 "min_fragment_size": int(params.get("min_fragment_size", 30)),
@@ -224,13 +202,7 @@ class RamifiedStrategy(ProcessingStrategy):
                 "ratios_to_process": params.get("ratios_to_process", [0.3, 0.4, 0.5, 0.6]),
                 "intensity_percentiles_to_process": params.get("intensity_percentiles_to_process", [100, 90, 80, 70, 60, 50, 40, 30, 20, 10]),
                 "min_physical_peak_separation": float(params.get("min_physical_peak_separation", 7.0)),
-                
-                # --- NEW PARAMETER HERE ---
-                # We use .get() without a default, so it returns None if missing.
-                # The extract function handles None by falling back to legacy behavior.
                 "seeding_min_distance_um": params.get("seeding_min_distance_um"),
-                # --------------------------
-
                 "max_allowed_core_aspect_ratio": float(params.get("max_allowed_core_aspect_ratio", 10.0)),
                 "ref_vol_percentile_lower": int(params.get("ref_vol_percentile_lower", 30)),
                 "ref_vol_percentile_upper": int(params.get("ref_vol_percentile_upper", 70)),
@@ -240,7 +212,6 @@ class RamifiedStrategy(ProcessingStrategy):
                 "memmap_final_mask": True 
             }
             
-            # Now **soma_extraction_params will contain the new key
             cell_bodies = extract_soma_masks(trimmed_labels_memmap, image_stack, self.spacing, **soma_extraction_params)
             
             if isinstance(cell_bodies, np.memmap):
@@ -333,17 +304,14 @@ class RamifiedStrategy(ProcessingStrategy):
         try:
             final_seg_memmap = np.memmap(final_seg_path, dtype=np.int32, mode='r', shape=self.image_shape)
             
-            # Use the original image if available, else try image_stack
             intensity_vol = self.intermediate_state.get('original_volume_ref', image_stack)
-            
-            # Define FCS Path
             fcs_path = os.path.join(self.processed_dir, f"metrics_{self.mode_name}.fcs")
             
             metrics_df, detailed_outputs = analyze_segmentation(
                 segmented_array=final_seg_memmap, 
-                intensity_image=intensity_vol, # <--- Pass Intensity
+                intensity_image=intensity_vol,
                 spacing=self.spacing, 
-                fcs_export_path=fcs_path,      # <--- Pass FCS Path
+                fcs_export_path=fcs_path,
                 **params, 
                 return_detailed=True
             )
@@ -357,7 +325,6 @@ class RamifiedStrategy(ProcessingStrategy):
                 skel_memmap = np.memmap(skeleton_path, dtype=skeleton_array_result.dtype, mode='w+', shape=skeleton_array_result.shape)
                 skel_memmap[:] = skeleton_array_result[:]
                 self._close_memmap(skel_memmap)
-                
                 del skeleton_array_result
                 if 'skeleton_array' in detailed_outputs: del detailed_outputs['skeleton_array']
                 gc.collect()
@@ -382,6 +349,89 @@ class RamifiedStrategy(ProcessingStrategy):
             self._close_memmap(final_seg_memmap)
             gc.collect()
 
+    # --- STEP 6: Interaction Analysis ---
+
+    def execute_interaction_analysis(self, viewer, image_stack, params: Dict) -> bool:
+        print("\n--- Executing Step 6: Multi-Channel Interaction ---")
+        
+        target_root_dir = params.get("target_channel_folder")
+        if not target_root_dir or not os.path.isdir(target_root_dir):
+            print("Error: Invalid reference directory.")
+            return False
+
+        sample_folder_name = os.path.basename(os.path.dirname(self.processed_dir))
+        ref_sample_dir = os.path.join(target_root_dir, sample_folder_name)
+        
+        if not os.path.exists(ref_sample_dir):
+            raise FileNotFoundError(f"Reference sample folder '{sample_folder_name}' not found in {target_root_dir}")
+
+        ref_processed_dir = None
+        for item in os.listdir(ref_sample_dir):
+            if "_processed_" in item and os.path.isdir(os.path.join(ref_sample_dir, item)):
+                ref_processed_dir = os.path.join(ref_sample_dir, item)
+                break
+        
+        if not ref_processed_dir:
+            raise FileNotFoundError(f"No '_processed_' folder found inside {ref_sample_dir}.")
+
+        ref_seg_path = None
+        for f in os.listdir(ref_processed_dir):
+            if f.startswith("final_segmentation") and f.endswith(".dat"):
+                ref_seg_path = os.path.join(ref_processed_dir, f)
+                break
+        
+        if not ref_seg_path:
+             raise FileNotFoundError(f"No 'final_segmentation.dat' found in {ref_processed_dir}")
+            
+        print(f"  Found Reference Mask: {ref_seg_path}")
+        ref_name = os.path.basename(target_root_dir)
+
+        # 2. Persist Metadata for Visualization
+        meta_path = self.get_checkpoint_files()["last_interaction_meta"]
+        try:
+            with open(meta_path, 'w') as f:
+                yaml.dump({
+                    'ref_seg_path': ref_seg_path,
+                    'ref_raw_path': os.path.join(ref_sample_dir, f"{sample_folder_name}.tif"),
+                    'ref_name': ref_name
+                }, f)
+        except: pass
+        
+        # 3. Calculation
+        final_seg_path = self.get_checkpoint_files()["final_segmentation"]
+        
+        interaction_df = calculate_interaction_metrics(
+            primary_mask_path=final_seg_path,
+            reference_mask_path=ref_seg_path,
+            shape=self.image_shape,
+            spacing=self.spacing,
+            reference_name=ref_name,
+            calculate_distance=params.get("calculate_distance", True),
+            calculate_overlap=params.get("calculate_overlap", True)
+        )
+        
+        if not interaction_df.empty:
+            metrics_path = self.get_checkpoint_files()["metrics_df"]
+            if os.path.exists(metrics_path):
+                main_df = pd.read_csv(metrics_path)
+                cols_to_drop = [c for c in main_df.columns if c in interaction_df.columns and c != 'label']
+                if cols_to_drop: main_df.drop(columns=cols_to_drop, inplace=True)
+                
+                merged_df = pd.merge(main_df, interaction_df, on='label', how='left')
+                merged_df.to_csv(metrics_path, index=False)
+                print(f"  Merged {len(interaction_df.columns)-1} new columns into metrics CSV.")
+                
+                fcs_path = os.path.join(self.processed_dir, f"metrics_{self.mode_name}.fcs")
+                if os.path.exists(fcs_path):
+                    export_to_fcs(merged_df, fcs_path)
+            else:
+                out_csv = os.path.join(self.processed_dir, f"interaction_{ref_name}.csv")
+                interaction_df.to_csv(out_csv, index=False)
+        else:
+            print("  Warning: No interactions found.")
+
+        return True
+
     def _add_neighbor_lines(self, viewer, points_df):
         if points_df is None or points_df.empty: return
         lines = []
@@ -392,9 +442,12 @@ class RamifiedStrategy(ProcessingStrategy):
             
         layer_name = f"Neighbor Connections_{self.mode_name}"
         if layer_name in viewer.layers: viewer.layers.remove(layer_name)
+        
+        display_scale = (self.z_scale_factor, 1, 1)
+        
         viewer.add_shapes(
             lines, shape_type='line', edge_color='red', edge_width=1, name=layer_name,
-            scale=tuple(self.spacing) if hasattr(self, 'z_scale_factor') and self.z_scale_factor == 1.0 else (self.z_scale_factor, 1, 1)
+            scale=display_scale
         )
 
     def load_checkpoint_data(self, viewer, checkpoint_step: int):
@@ -402,6 +455,11 @@ class RamifiedStrategy(ProcessingStrategy):
         files = self.get_checkpoint_files()
         print(f"Loading checkpoint data up to step {checkpoint_step}...")
         
+        # Clear old ref/overlap layers
+        for layer in viewer.layers:
+            if "Ref:" in layer.name or "Overlap:" in layer.name: 
+                viewer.layers.remove(layer.name)
+
         layer_base_names = ["Raw Intermediate Segmentation", "Trimmed Intermediate Segmentation", 
                             "Edge Mask", "Final segmentation", "Cell bodies", "Skeletons", "Neighbor Connections"]
         for name in layer_base_names:
@@ -429,8 +487,85 @@ class RamifiedStrategy(ProcessingStrategy):
                 try:
                     df = pd.read_csv(pts_path)
                     self._add_neighbor_lines(viewer, df)
-                except Exception as e:
-                    print(f"Error loading neighbor lines: {e}")
+                except Exception as e: print(f"Error loading neighbor lines: {e}")
+        
+        # --- LOAD STEP 6 VISUALIZATION ---
+        if checkpoint_step >= 6:
+            meta_path = files.get("last_interaction_meta")
+            if meta_path and os.path.exists(meta_path):
+                print(f"  Loading Interaction Viz from {meta_path}")
+                try:
+                    with open(meta_path, 'r') as f: meta = yaml.safe_load(f)
+                    ref_path = meta.get('ref_seg_path')
+                    ref_raw = meta.get('ref_raw_path')
+                    ref_name = meta.get('ref_name', 'Ref')
+                    
+                    display_scale = (self.z_scale_factor, 1, 1)
+
+                    if ref_path and os.path.exists(ref_path):
+                        file_size = os.path.getsize(ref_path)
+                        expected_size = np.prod(self.image_shape) * 4
+                        
+                        if file_size != expected_size:
+                            print(f"    WARNING: Reference mask size mismatch. Skipping.")
+                        else:
+                            # 1. Load Reference Mask
+                            ref_data = np.memmap(ref_path, dtype=np.int32, mode='r', shape=self.image_shape)
+                            
+                            # Monochrome Palette
+                            unique_labels = np.unique(ref_data)
+                            unique_labels = unique_labels[unique_labels > 0]
+                            colormap = {}
+                            if len(unique_labels) > 0:
+                                for lbl in unique_labels:
+                                    h = 0.55 + (0.1 * random.random()) 
+                                    s = 0.4 + (0.4 * random.random())
+                                    v = 0.8 + (0.2 * random.random())
+                                    r, g, b = colorsys.hsv_to_rgb(h, s, v)
+                                    colormap[lbl] = (r, g, b, 1.0)
+                                
+                                layer = viewer.add_labels(ref_data, name=f"Ref: {ref_name}", scale=display_scale)
+                                layer.color = colormap
+                                
+                            # 2. Compute and Load Overlap Layer
+                            # Lazy calc using Dask to avoid RAM explosion
+                            print("    Calculating Overlap Visualization...")
+                            primary_path = files.get("final_segmentation")
+                            if primary_path and os.path.exists(primary_path):
+                                p_data = np.memmap(primary_path, dtype=np.int32, mode='r', shape=self.image_shape)
+                                
+                                # Convert to Dask
+                                d_p = da.from_array(p_data, chunks=(32, 256, 256))
+                                d_r = da.from_array(ref_data, chunks=(32, 256, 256))
+                                
+                                # Boolean overlap
+                                d_overlap = (d_p > 0) & (d_r > 0)
+                                
+                                # Add as Image layer (Yellow)
+                                viewer.add_image(
+                                    d_overlap, 
+                                    name=f"Overlap: {ref_name}", 
+                                    colormap="yellow", 
+                                    blending="additive", 
+                                    opacity=0.6,
+                                    scale=display_scale
+                                )
+
+                            # Hide primary intermediates
+                            for layer in viewer.layers:
+                                if any(x in layer.name for x in ["Raw", "Trimmed", "Edge", "Cell bodies"]):
+                                    layer.visible = False
+
+                    if ref_raw and os.path.exists(ref_raw):
+                         try:
+                             ref_img = tiff.imread(ref_raw)
+                             if ref_img.shape == self.image_shape:
+                                 viewer.add_image(ref_img, name=f"Ref Intensity", blending='additive', colormap='magenta', scale=display_scale)
+                         except: pass
+
+                except Exception as e: 
+                    print(f"Error loading interaction viz: {e}")
+                    traceback.print_exc()
 
     def cleanup_step_artifacts(self, viewer, step_number: int):
         files = self.get_checkpoint_files()

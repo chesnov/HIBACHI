@@ -33,7 +33,7 @@ We provide an `environment.yaml` file that contains all necessary dependencies (
 conda env create -f environment.yaml
 
 # Activate the environment
-conda activate microglia_segment
+conda activate hibachi
 ```
 
 ### 3. Run the Application

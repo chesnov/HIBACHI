@@ -1,4 +1,4 @@
-name: 3dsegment
+name: hibachi
 channels:
 - conda-forge
 - defaults
@@ -21,3 +21,7 @@ dependencies:
   - seaborn~=0.13.2
   - tiffile~=2018.10.18
   - zarr~=3.0.2
+  - dask-image~=2024.5.3
+  - simpleitk~=2.5.2
+  - skan~=0.12.2
+  - aicspylibczi~=3.3.1

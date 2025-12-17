@@ -74,6 +74,12 @@ execute_trim_edges_ramified:
       min: 0
       max: 10000
       step: 10
+    z_erosion_iterations:
+      label: Z-Anisotropy Correction (Erosion)
+      type: int
+      value: 2
+      min: 0
+      max: 10
 execute_soma_extraction_ramified:
   name: Execute Soma Extraction
   parameters:

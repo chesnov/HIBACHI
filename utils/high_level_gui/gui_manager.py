@@ -11,7 +11,7 @@ from typing import Dict, Any, List
 # Qt Imports
 from PyQt5.QtWidgets import ( # type: ignore
     QMessageBox, QWidget, QVBoxLayout, QScrollArea, QLabel, 
-    QTextEdit, QProgressBar, QApplication
+    QTextEdit, QProgressBar, QApplication, QPushButton, QFileDialog
 )
 from PyQt5.QtCore import QThread, pyqtSignal, QObject, Qt # type: ignore
 from PyQt5.QtGui import QTextCursor # type: ignore
@@ -26,7 +26,7 @@ except ImportError as e:
     print(f"Error importing dependencies in gui_manager.py: {e}")
     raise
 
-# --- 1. Output Redirector (To show tqdm/print in GUI) ---
+# --- 1. Output Redirector ---
 class OutputStream(QObject):
     text_written = pyqtSignal(str)
     def write(self, text):
@@ -48,8 +48,6 @@ class StepWorker(QThread):
 
     def run(self):
         try:
-            # CRITICAL: viewer=None prevents segmentation faults.
-            # GUI updates happen in the main thread upon completion.
             success = self.strategy.execute_step(
                 step_index=self.step_index, 
                 viewer=None, 
@@ -63,16 +61,12 @@ class StepWorker(QThread):
             self.finished_signal.emit(False)
 
 # --- 3. Main GUI Manager ---
-class DynamicGUIManager(QObject):  # <--- Changed to inherit QObject
-    """
-    Manages the interactive GUI sidebar in Napari.
-    """
-    # Signals to communicate with helper_funcs.py
+class DynamicGUIManager(QObject):
     process_started = pyqtSignal()
     process_finished = pyqtSignal()
 
     def __init__(self, viewer, config, image_stack, file_loc, processing_mode):
-        super().__init__() # <--- Initialize QObject
+        super().__init__()
         self.viewer = viewer
         self.initial_config = config.copy()
         self.config = config.copy()
@@ -83,7 +77,6 @@ class DynamicGUIManager(QObject):  # <--- Changed to inherit QObject
         self.current_widgets: Dict[Any, Any] = {}
         self.current_step = {"value": 0}
         self.parameter_values: Dict[str, Any] = {}
-        
         self.worker = None
         self.original_stdout = sys.stdout
         self.original_stderr = sys.stderr
@@ -100,105 +93,89 @@ class DynamicGUIManager(QObject):  # <--- Changed to inherit QObject
                 'ramified_2d': Ramified2DStrategy
             }.get(self.processing_mode)
             
-            if not strategy_class: 
-                raise ValueError(f"Unsupported processing mode: {self.processing_mode}")
+            if not strategy_class: raise ValueError(f"Unsupported mode: {self.processing_mode}")
             
             self.strategy = strategy_class(
-                self.config, 
-                self.processed_dir, 
-                self.image_stack.shape, 
-                self.spacing, 
-                self.z_scale_factor
+                self.config, self.processed_dir, 
+                self.image_stack.shape, self.spacing, self.z_scale_factor
             )
             
-            self.processing_steps: List[str] = self.strategy.get_step_names()
-            self.num_steps: int = self.strategy.num_steps
-            
+            self.processing_steps = self.strategy.get_step_names()
+            self.num_steps = self.strategy.num_steps
             self.step_display_names = { 
                 name: name.replace('execute_', '').replace('_', ' ').title() 
                 for name in self.processing_steps 
             }
-            
             print(f"Initialized strategy '{self.processing_mode}' with {self.num_steps} steps.")
-            
         except Exception as e:
-             print(f"FATAL ERROR initializing processing strategy: {e}")
-             traceback.print_exc()
-             raise
+             print(f"FATAL ERROR: {e}"); traceback.print_exc(); raise
 
         self._initialize_layers()
         self.restore_from_checkpoint()
 
     def _calculate_spacing(self):
         is_2d_mode = self.processing_mode.endswith("_2d")
-        dim_section_key = 'pixel_dimensions' if is_2d_mode else 'voxel_dimensions'
-        dimensions = self.config.get(dim_section_key, {})
+        dim_key = 'pixel_dimensions' if is_2d_mode else 'voxel_dimensions'
+        dim = self.config.get(dim_key, {})
         try:
-            total_x_um = float(dimensions.get('x', 1.0))
-            total_y_um = float(dimensions.get('y', 1.0))
-            total_z_um = 1.0 if is_2d_mode else float(dimensions.get('z', 1.0))
-        except (ValueError, TypeError):
-            total_x_um, total_y_um, total_z_um = 1.0, 1.0, 1.0
+            tx, ty, tz = float(dim.get('x', 1.0)), float(dim.get('y', 1.0)), float(dim.get('z', 1.0))
+        except: tx, ty, tz = 1.0, 1.0, 1.0
 
         shape = self.image_stack.shape
-        num_dims = len(shape)
-
-        if num_dims == 2:
-            y_pixel_size = total_y_um / shape[0] if shape[0] > 0 else 1.0
-            x_pixel_size = total_x_um / shape[1] if shape[1] > 0 else 1.0
-            self.spacing = [1.0, y_pixel_size, x_pixel_size]
-            self.z_scale_factor = 1.0
-        elif num_dims == 3:
-            z_pixel_size = total_z_um / shape[0] if shape[0] > 0 else 1.0
-            y_pixel_size = total_y_um / shape[1] if shape[1] > 0 else 1.0
-            x_pixel_size = total_x_um / shape[2] if shape[2] > 0 else 1.0
-            self.spacing = [z_pixel_size, y_pixel_size, x_pixel_size]
-            self.z_scale_factor = z_pixel_size / x_pixel_size if x_pixel_size > 1e-9 else 1.0
+        if len(shape) == 2:
+            ys, xs = 1.0, 1.0
+            if shape[0]>0: ys = ty/shape[0]
+            if shape[1]>0: xs = tx/shape[1]
+            self.spacing = [1.0, ys, xs]; self.z_scale_factor = 1.0
+        elif len(shape) == 3:
+            zs, ys, xs = 1.0, 1.0, 1.0
+            if shape[0]>0: zs = tz/shape[0]
+            if shape[1]>0: ys = ty/shape[1]
+            if shape[2]>0: xs = tx/shape[2]
+            self.spacing = [zs, ys, xs]
+            self.z_scale_factor = zs/xs if xs > 1e-9 else 1.0
         else:
             self.spacing = [1.0, 1.0, 1.0]; self.z_scale_factor = 1.0
 
     def _initialize_layers(self):
         layer_name = f"Original stack ({self.processing_mode} mode)"
-        if layer_name in self.viewer.layers:
-            self.viewer.layers.remove(layer_name)
-        image_ndim = self.image_stack.ndim
-        scale = (self.z_scale_factor, 1, 1) if image_ndim == 3 else (self.spacing[1], self.spacing[2])
+        if layer_name in self.viewer.layers: self.viewer.layers.remove(layer_name)
+        scale = (self.z_scale_factor, 1, 1) if self.image_stack.ndim == 3 else (self.spacing[1], self.spacing[2])
         self.viewer.add_image(self.image_stack, name=layer_name, scale=scale)
 
     def restore_from_checkpoint(self):
         checkpoint_step = self.strategy.get_last_completed_step()
         if checkpoint_step > 0:
-            checkpoint_files = self.strategy.get_checkpoint_files()
-            config_file = checkpoint_files.get("config")
-            if config_file and os.path.exists(config_file):
+            files = self.strategy.get_checkpoint_files()
+            if files.get("config") and os.path.exists(files["config"]):
                 try:
-                    with open(config_file, 'r') as file: saved_config = yaml.safe_load(file)
-                    if saved_config:
-                        self.config.update(saved_config)
-                        self.strategy.config = self.config
-                        loaded_state = self.config.get('saved_state', {})
-                        if 'segmentation_threshold' in loaded_state:
-                            self.strategy.intermediate_state['segmentation_threshold'] = float(loaded_state['segmentation_threshold'])
-                except Exception as e: print(f"Error loading saved config: {e}")
+                    with open(files["config"], 'r') as f: 
+                        saved = yaml.safe_load(f)
+                        if saved: 
+                            self.config.update(saved)
+                            self.strategy.config = self.config
+                            if 'saved_state' in self.config:
+                                s = self.config['saved_state']
+                                if 'segmentation_threshold' in s:
+                                    self.strategy.intermediate_state['segmentation_threshold'] = float(s['segmentation_threshold'])
+                except: pass
 
             msg = QMessageBox()
             if checkpoint_step == self.num_steps:
-                msg.setText("All steps complete.")
-                msg.setInformativeText("View results or restart?")
-                view_btn = msg.addButton("View", QMessageBox.YesRole)
-                restart_btn = msg.addButton("Restart", QMessageBox.NoRole)
+                msg.setText("All steps complete."); msg.setInformativeText("View results or restart?")
+                view = msg.addButton("View", QMessageBox.YesRole)
+                rst = msg.addButton("Restart", QMessageBox.NoRole)
                 msg.exec_()
-                if msg.clickedButton() == view_btn:
+                if msg.clickedButton() == view:
                     self.load_checkpoint_data(checkpoint_step)
                     self.current_step["value"] = checkpoint_step
                 else: self._confirm_restart()
             else:
-                msg.setText("Resume?")
-                msg.setInformativeText(f"Resume from Step {checkpoint_step + 1} or restart?")
-                resume_btn = msg.addButton("Resume", QMessageBox.YesRole)
-                restart_btn = msg.addButton("Restart", QMessageBox.NoRole)
+                msg.setText("Resume?"); msg.setInformativeText(f"Resume from Step {checkpoint_step + 1}?")
+                res = msg.addButton("Resume", QMessageBox.YesRole)
+                rst = msg.addButton("Restart", QMessageBox.NoRole)
                 msg.exec_()
-                if msg.clickedButton() == resume_btn:
+                if msg.clickedButton() == res:
                     self.strategy.intermediate_state['original_volume_ref'] = self.image_stack
                     self.load_checkpoint_data(checkpoint_step)
                     self.current_step["value"] = checkpoint_step
@@ -209,8 +186,7 @@ class DynamicGUIManager(QObject):  # <--- Changed to inherit QObject
             self.create_step_widgets(self.processing_steps[0])
 
     def _confirm_restart(self):
-        parent_widget = self.viewer.window._qt_window if self.viewer and self.viewer.window else None
-        reply = QMessageBox.question(parent_widget, "Confirm Restart", "Delete existing files?", QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        reply = QMessageBox.question(self.viewer.window._qt_window, "Confirm Restart", "Delete existing files?", QMessageBox.Yes | QMessageBox.No)
         if reply == QMessageBox.Yes:
             self.delete_all_checkpoint_files()
             self.current_step["value"] = 0
@@ -222,9 +198,8 @@ class DynamicGUIManager(QObject):  # <--- Changed to inherit QObject
         else: self.restore_from_checkpoint()
 
     def delete_all_checkpoint_files(self):
-        files_to_delete = self.strategy.get_checkpoint_files()
-        for key, file_path in files_to_delete.items():
-            self.strategy._remove_file_safely(file_path)
+        for k, v in self.strategy.get_checkpoint_files().items():
+            self.strategy._remove_file_safely(v)
 
     def load_checkpoint_data(self, checkpoint_step: int):
         self.strategy.load_checkpoint_data(self.viewer, checkpoint_step)
@@ -232,150 +207,190 @@ class DynamicGUIManager(QObject):  # <--- Changed to inherit QObject
     def cleanup_step(self, step_number: int):
         self.strategy.cleanup_step_artifacts(self.viewer, step_number)
 
-    # --- Threaded Execution ---
-
+    # --- Step Execution ---
     def execute_processing_step(self):
         step_index = self.current_step["value"]
         if step_index >= self.num_steps: return
 
-        logical_step_method_name = self.processing_steps[step_index]
-        step_display_name = self.step_display_names.get(logical_step_method_name, f"Step {step_index + 1}")
+        logical_step = self.processing_steps[step_index]
+        step_display = self.step_display_names.get(logical_step, f"Step {step_index + 1}")
         
         current_values = self.get_current_values()
+        
+        if logical_step == "execute_interaction_analysis":
+            if not current_values.get("target_channel_folder"):
+                QMessageBox.warning(None, "Missing Input", "Please select a Reference Channel folder first.")
+                return
+
         self.strategy.save_config(self.config)
         
-        for i in range(step_index + 1, self.num_steps + 1):
-             self.cleanup_step(i)
+        # Don't cleanup if repeating step 6
+        if logical_step != "execute_interaction_analysis":
+             for i in range(step_index + 1, self.num_steps + 1):
+                 self.cleanup_step(i)
         
         if 'original_volume_ref' not in self.strategy.intermediate_state:
             self.strategy.intermediate_state['original_volume_ref'] = self.image_stack
 
-        # Setup Logs
-        self.log_widget.clear()
-        self.log_widget.append(f"--- Starting {step_display_name} ---\n")
+        self.log_widget.clear(); self.log_widget.append(f"--- Starting {step_display} ---\n")
         self._set_ui_busy(True)
-        
-        # Signal start (Disables buttons in helper_funcs)
         self.process_started.emit()
 
         self.output_stream = OutputStream()
         self.output_stream.text_written.connect(self._append_log)
-        sys.stdout = self.output_stream
-        sys.stderr = self.output_stream 
+        sys.stdout = self.output_stream; sys.stderr = self.output_stream
 
-        # Start Worker
         self.worker = StepWorker(self.strategy, step_index, self.image_stack, current_values)
         self.worker.finished_signal.connect(self._on_step_finished)
         self.worker.start()
 
     def _append_log(self, text):
         cursor = self.log_widget.textCursor()
-        cursor.movePosition(QTextCursor.End)
-        cursor.insertText(text)
-        self.log_widget.setTextCursor(cursor)
-        self.log_widget.ensureCursorVisible()
+        cursor.movePosition(QTextCursor.End); cursor.insertText(text)
+        self.log_widget.setTextCursor(cursor); self.log_widget.ensureCursorVisible()
 
     def _on_step_finished(self, success):
-        # Restore Output
-        sys.stdout = self.original_stdout
-        sys.stderr = self.original_stderr
+        sys.stdout = self.original_stdout; sys.stderr = self.original_stderr
+        self._set_ui_busy(False); self.worker = None
         
-        self._set_ui_busy(False)
-        self.worker = None 
-
         step_index = self.current_step["value"]
-        logical_step_method_name = self.processing_steps[step_index]
-        step_display_name = self.step_display_names.get(logical_step_method_name, f"Step {step_index + 1}")
-        parent_widget = self.viewer.window._qt_window if self.viewer else None
+        logical_step = self.processing_steps[step_index]
+        step_display = self.step_display_names.get(logical_step, f"Step {step_index + 1}")
 
         if success:
-            self.log_widget.append(f"\n--- {step_display_name} COMPLETED ---")
+            self.log_widget.append(f"\n--- {step_display} COMPLETED ---")
             
-            # Update GUI on Main Thread
-            try:
+            # --- CRITICAL FIX: Log Errors in GUI if Viz fails ---
+            try: 
                 self.strategy.load_checkpoint_data(self.viewer, step_index + 1)
             except Exception as e:
-                print(f"Error updating visualization: {e}")
-            
+                err_msg = f"\n!!! Visualization Failed !!!\n{str(e)}\nSee console for traceback."
+                self.log_widget.append(err_msg)
+                print(f"Viz Error: {e}")
+                traceback.print_exc()
+
             self.strategy.save_config(self.config)
-            self.current_step["value"] += 1
             
-            if self.current_step["value"] < self.num_steps:
-                next_step_name = self.processing_steps[self.current_step["value"]]
-                self.create_step_widgets(next_step_name)
+            if logical_step == "execute_interaction_analysis":
+                QMessageBox.information(None, "Analysis Complete", "Interaction analysis finished.\nSee the log below for details.\nYou can select another channel to compare against.")
             else:
-                self.clear_current_widgets()
-                QMessageBox.information(parent_widget, "Complete", "All steps finished.")
+                self.current_step["value"] += 1
+                if self.current_step["value"] < self.num_steps:
+                    self.create_step_widgets(self.processing_steps[self.current_step["value"]])
+                else:
+                    self.clear_current_widgets()
+                    QMessageBox.information(None, "Complete", "All steps finished.")
         else:
-            self.log_widget.append(f"\n!!! {step_display_name} FAILED !!!")
-            QMessageBox.warning(parent_widget, "Step Failed", 
-                                f"Step '{step_display_name}' failed.\nCheck the log below for details.")
-                                
-        # Signal finish (Updates buttons in helper_funcs)
+            self.log_widget.append(f"\n!!! {step_display} FAILED !!!")
+            QMessageBox.warning(None, "Step Failed", "Check log for details.")
+        
         self.process_finished.emit()
 
     def _set_ui_busy(self, is_busy):
         if self.current_widgets:
-             for dock in self.current_widgets.keys():
-                 dock.widget().setEnabled(not is_busy)
+             for dock in self.current_widgets.keys(): dock.widget().setEnabled(not is_busy)
 
     def clear_current_widgets(self):
-        for dock_widget in list(self.current_widgets.keys()):
-            self.viewer.window.remove_dock_widget(dock_widget)
+        for dock in list(self.current_widgets.keys()):
+            self.viewer.window.remove_dock_widget(dock)
         self.current_widgets.clear()
+
+    # --- Widget Creation ---
 
     def create_step_widgets(self, step_method_name: str):
         self.clear_current_widgets()
         self.parameter_values = {}
-
         config_key = self.strategy.get_config_key(step_method_name)
-        step_display_name = self.step_display_names.get(step_method_name, step_method_name)
+        step_display = self.step_display_names.get(step_method_name, step_method_name)
+        
+        if step_method_name == "execute_interaction_analysis":
+            self.create_interaction_widgets(step_display, config_key)
+            return
+
         step_config = self.config.get(config_key, {})
         parameters = step_config.get("parameters", {}) if isinstance(step_config, dict) else {}
 
-        scroll_content_widget = QWidget()
-        scroll_layout = QVBoxLayout(scroll_content_widget)
+        scroll_w = QWidget(); scroll_l = QVBoxLayout(scroll_w)
+        lbl = QLabel(f"Parameters: {step_display}"); lbl.setStyleSheet("font-weight: bold;")
+        scroll_l.addWidget(lbl)
+
+        if isinstance(parameters, dict):
+            for pname, pconf in parameters.items():
+                try:
+                    cb = lambda val, k=config_key, p=pname: self.parameter_changed(k, p, val)
+                    w = create_parameter_widget(pname, pconf, cb)
+                    if w: 
+                        scroll_l.addWidget(w.native)
+                        self.parameter_values[pname] = pconf.get('value')
+                except: pass
         
-        title_label = QLabel(f"Parameters: {step_display_name}")
-        if self.viewer and self.viewer.window and self.viewer.window._qt_window:
-            font = self.viewer.window._qt_window.font()
-            font.setBold(True)
-            title_label.setFont(font)
-        scroll_layout.addWidget(title_label)
+        self._add_log_widget(scroll_l)
+        self._dock_widget(scroll_w, step_display)
+
+    def create_interaction_widgets(self, step_display, config_key):
+        scroll_w = QWidget(); layout = QVBoxLayout(scroll_w)
+        
+        lbl = QLabel(f"{step_display}"); lbl.setStyleSheet("font-weight: bold; font-size: 14px;")
+        layout.addWidget(lbl)
+        
+        desc = QLabel("Select a processed project folder for another channel (e.g. Plaques/Vessels).")
+        desc.setWordWrap(True); layout.addWidget(desc)
+
+        self.btn_select_ref = QPushButton("Analyze with Other Channels...")
+        self.btn_select_ref.setStyleSheet("padding: 8px; font-weight: bold;")
+        self.btn_select_ref.clicked.connect(self.select_reference_channel)
+        layout.addWidget(self.btn_select_ref)
+        
+        self.lbl_ref_path = QLabel("No reference selected")
+        self.lbl_ref_path.setStyleSheet("color: #666; font-style: italic; margin-bottom: 10px;")
+        self.lbl_ref_path.setWordWrap(True)
+        layout.addWidget(self.lbl_ref_path)
+
+        step_config = self.config.get(config_key, {})
+        parameters = step_config.get("parameters", {})
         
         if isinstance(parameters, dict):
-            for param_name, param_config in parameters.items():
+            for pname, pconf in parameters.items():
+                if pname == "target_channel_folder": continue
                 try:
-                    callback = lambda value, key=config_key, pn=param_name: self.parameter_changed(key, pn, value)
-                    widget = create_parameter_widget(param_name, param_config, callback)
-                    if widget: 
-                        scroll_layout.addWidget(widget.native)
-                        val = param_config.get('value')
-                        self.parameter_values[param_name] = val
-                except Exception as e: print(f"ERROR creating widget for '{param_name}': {e}")
+                    cb = lambda val, k=config_key, p=pname: self.parameter_changed(k, p, val)
+                    w = create_parameter_widget(pname, pconf, cb)
+                    if w: 
+                        layout.addWidget(w.native)
+                        self.parameter_values[pname] = pconf.get('value')
+                except: pass
+
+        self._add_log_widget(layout)
+        self._dock_widget(scroll_w, step_display)
+
+    def select_reference_channel(self):
+        start_dir = os.path.dirname(self.inputdir)
+        folder = QFileDialog.getExistingDirectory(None, "Select Reference Channel Project", start_dir)
         
-        # Log Widget
-        log_label = QLabel("Processing Log (ETA):")
-        scroll_layout.addWidget(log_label)
-        self.log_widget = QTextEdit()
-        self.log_widget.setReadOnly(True)
+        if folder:
+            self.parameter_values['target_channel_folder'] = folder
+            display_name = os.path.basename(folder)
+            self.lbl_ref_path.setText(f"Selected: {display_name}")
+            self.lbl_ref_path.setStyleSheet("color: #2E8B57; font-weight: bold;")
+
+    def _add_log_widget(self, layout):
+        layout.addWidget(QLabel("Log:"))
+        self.log_widget = QTextEdit(); self.log_widget.setReadOnly(True)
         self.log_widget.setMinimumHeight(150)
         self.log_widget.setStyleSheet("font-family: monospace;")
-        scroll_layout.addWidget(self.log_widget)
+        layout.addWidget(self.log_widget)
+        layout.addStretch()
 
-        scroll_layout.addStretch()
-        scroll_area = QScrollArea()
-        scroll_area.setWidgetResizable(True)
-        scroll_area.setWidget(scroll_content_widget)
-        
-        dock_widget = self.viewer.window.add_dock_widget(scroll_area, area="right", name=f"Step: {step_display_name}")
-        self.current_widgets[dock_widget] = scroll_area
+    def _dock_widget(self, widget, name):
+        scroll = QScrollArea(); scroll.setWidgetResizable(True); scroll.setWidget(widget)
+        dock = self.viewer.window.add_dock_widget(scroll, area="right", name=f"Step: {name}")
+        self.current_widgets[dock] = scroll
 
     def parameter_changed(self, config_key: str, param_name: str, value: Any):
         try:
             self.config[config_key]["parameters"][param_name]["value"] = value
             self.parameter_values[param_name] = value
-        except Exception as e: pass
+        except Exception: pass
 
     def get_current_values(self) -> Dict[str, Any]:
         return self.parameter_values.copy()

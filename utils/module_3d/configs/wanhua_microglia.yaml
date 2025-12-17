@@ -1,6 +1,4 @@
 mode: ramified
-
-# --- Step 1: Raw Segmentation ---
 execute_raw_segmentation_ramified:
   name: Execute Raw Segmentation
   parameters:
@@ -28,7 +26,7 @@ execute_raw_segmentation_ramified:
     low_threshold_percentile:
       label: Low Threshold Percentile (Raw Seg)
       type: float
-      value: 98.0
+      value: 97.0
       min: 0.0
       max: 100.0
       step: 0.1
@@ -46,47 +44,43 @@ execute_raw_segmentation_ramified:
       min: 0.0
       max: 10.0
       step: 0.1
-
-# --- Step 2: Edge Trimming ---
 execute_trim_edges_ramified:
   name: Execute Edge Trimming
   parameters:
     edge_trim_distance_threshold:
       label: Edge Trim Distance (um)
       type: float
-      value: 4.0
+      value: 0.0
       min: 0.0
       max: 20.0
       step: 0.1
     hull_boundary_thickness_phys:
       label: Hull Boundary Thickness (um)
       type: float
-      value: 1.0
+      value: 2.0
       min: 0.1
       max: 10.0
       step: 0.1
     brightness_cutoff_factor:
       label: Brightness Cutoff Factor
       type: float
-      value: 1000000.0
+      value: 10.0
       min: 0.0
       max: 10000000
       step: 0.1
     min_size_voxels:
       label: Min Size (Voxels, Post-Trim)
       type: int
-      value: 2000
+      value: 10
       min: 0
       max: 10000
       step: 10
     z_erosion_iterations:
       label: Z-Anisotropy Correction (Erosion)
       type: int
-      value: 2
+      value: 0
       min: 0
       max: 10
-
-# --- Step 3: Soma Extraction (Finding Seeds) ---
 execute_soma_extraction_ramified:
   name: Execute Soma Extraction
   parameters:
@@ -135,7 +129,7 @@ execute_soma_extraction_ramified:
     min_fragment_size:
       label: Min Seed Size (Voxels)
       type: int
-      value: 2500
+      value: 100
       min: 1
       max: 1000000
       step: 10
@@ -149,7 +143,7 @@ execute_soma_extraction_ramified:
     core_volume_target_factor_upper:
       label: Soma Vol Factor (Upper)
       type: float
-      value: 10.0
+      value: 2.0
       min: 1.0
       max: 50.0
       step: 0.1
@@ -163,21 +157,21 @@ execute_soma_extraction_ramified:
     min_physical_peak_separation:
       label: Min Peak Separation (um)
       type: float
-      value: 7.0
+      value: 15.0
       min: 1.0
       max: 20.0
       step: 0.1
     ref_vol_percentile_lower:
       label: Ref Volume Percentile (Lower)
       type: int
-      value: 5
+      value: 1
       min: 0
       max: 100
       step: 1
     ref_vol_percentile_upper:
       label: Ref Volume Percentile (Upper)
       type: int
-      value: 95
+      value: 5
       min: 0
       max: 100
       step: 1
@@ -209,15 +203,13 @@ execute_soma_extraction_ramified:
       min: 1.0
       max: 50.0
       step: 0.5
-
-# --- Step 4: Cell Separation (Splitting Blobs) ---
 execute_cell_separation_ramified:
   name: Execute Cell Separation
   parameters:
     min_size_threshold:
       label: Min Final Cell Size (Voxels)
       type: float
-      value: 20000.0
+      value: 1000.0
       min: 0.0
       max: 1000000.0
       step: 1.0
@@ -231,14 +223,14 @@ execute_cell_separation_ramified:
     min_path_intensity_ratio:
       label: Min Path Intensity Ratio (Merge thresh)
       type: float
-      value: 0.6
+      value: 5.0
       min: 0.0
       max: 100.0
       step: 0.01
     min_local_intensity_difference:
       label: Min Local Intensity Diff (Merge thresh)
       type: float
-      value: 0.01
+      value: 0.0
       min: 0.0
       max: 100.0
       step: 0.01
@@ -256,8 +248,6 @@ execute_cell_separation_ramified:
       min: 0.0
       max: 10.0
       step: 0.1
-
-# --- Step 5: Feature Calculation ---
 execute_calculate_features_ramified:
   name: Execute Feature Calculation (3D)
   parameters:
@@ -268,11 +258,9 @@ execute_calculate_features_ramified:
       min: 0
       max: 200
       step: 0.01
-
-# --- Global Settings ---
 voxel_dimensions:
-  x: 424.27
-  y: 424.27
-  z: 167.0
+  x: 424.26499999999993
+  y: 424.26499999999993
+  z: 160.0
 saved_state:
-  segmentation_threshold: 0.043508924543857574
+  segmentation_threshold: 0.03371111806482076
