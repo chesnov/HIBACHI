@@ -13,7 +13,7 @@ import tifffile as tiff
 import random
 import yaml # type: ignore
 import colorsys
-import dask.array as da # For lazy overlap calculation
+import dask.array as da
 
 from ..high_level_gui.processing_strategies import ProcessingStrategy, StepDefinition
 
@@ -44,7 +44,6 @@ class RamifiedStrategy(ProcessingStrategy):
             {"method": "execute_soma_extraction", "artifact": "cell_bodies"},
             {"method": "execute_cell_separation", "artifact": "final_segmentation"},
             {"method": "execute_calculate_features", "artifact": "metrics_df"},
-            # Step 6 is optional/repeatable
             {"method": "execute_interaction_analysis", "artifact": None} 
         ]
 
@@ -386,23 +385,14 @@ class RamifiedStrategy(ProcessingStrategy):
         print(f"  Found Reference Mask: {ref_seg_path}")
         ref_name = os.path.basename(target_root_dir)
 
-        # 2. Persist Metadata for Visualization
-        meta_path = self.get_checkpoint_files()["last_interaction_meta"]
-        try:
-            with open(meta_path, 'w') as f:
-                yaml.dump({
-                    'ref_seg_path': ref_seg_path,
-                    'ref_raw_path': os.path.join(ref_sample_dir, f"{sample_folder_name}.tif"),
-                    'ref_name': ref_name
-                }, f)
-        except: pass
-        
         # 3. Calculation
+        # Pass output dir for intersection mask saving
         final_seg_path = self.get_checkpoint_files()["final_segmentation"]
         
-        interaction_df = calculate_interaction_metrics(
+        primary_df, ref_df, intersection_path = calculate_interaction_metrics(
             primary_mask_path=final_seg_path,
             reference_mask_path=ref_seg_path,
+            output_dir=self.processed_dir, # Save intersection mask here
             shape=self.image_shape,
             spacing=self.spacing,
             reference_name=ref_name,
@@ -410,25 +400,45 @@ class RamifiedStrategy(ProcessingStrategy):
             calculate_overlap=params.get("calculate_overlap", True)
         )
         
-        if not interaction_df.empty:
+        # 4. Save Results
+        if not primary_df.empty:
+            # Merge Primary Stats
             metrics_path = self.get_checkpoint_files()["metrics_df"]
             if os.path.exists(metrics_path):
                 main_df = pd.read_csv(metrics_path)
-                cols_to_drop = [c for c in main_df.columns if c in interaction_df.columns and c != 'label']
+                cols_to_drop = [c for c in main_df.columns if c in primary_df.columns and c != 'label']
                 if cols_to_drop: main_df.drop(columns=cols_to_drop, inplace=True)
                 
-                merged_df = pd.merge(main_df, interaction_df, on='label', how='left')
+                merged_df = pd.merge(main_df, primary_df, on='label', how='left')
                 merged_df.to_csv(metrics_path, index=False)
-                print(f"  Merged {len(interaction_df.columns)-1} new columns into metrics CSV.")
+                print(f"  Merged {len(primary_df.columns)-1} new columns into metrics CSV.")
                 
                 fcs_path = os.path.join(self.processed_dir, f"metrics_{self.mode_name}.fcs")
                 if os.path.exists(fcs_path):
                     export_to_fcs(merged_df, fcs_path)
             else:
                 out_csv = os.path.join(self.processed_dir, f"interaction_{ref_name}.csv")
-                interaction_df.to_csv(out_csv, index=False)
+                primary_df.to_csv(out_csv, index=False)
+                
+            # Save Reference Stats (Coverage)
+            if not ref_df.empty:
+                ref_csv = os.path.join(self.processed_dir, f"interaction_{ref_name}_coverage.csv")
+                ref_df.to_csv(ref_csv, index=False)
+                print(f"  Saved Reference Coverage Stats: {ref_csv}")
         else:
             print("  Warning: No interactions found.")
+
+        # 2. Persist Metadata for Visualization (Updated with intersection path)
+        meta_path = self.get_checkpoint_files()["last_interaction_meta"]
+        try:
+            with open(meta_path, 'w') as f:
+                yaml.dump({
+                    'ref_seg_path': ref_seg_path,
+                    'ref_raw_path': os.path.join(ref_sample_dir, f"{sample_folder_name}.tif"),
+                    'ref_name': ref_name,
+                    'intersection_path': intersection_path
+                }, f)
+        except: pass
 
         return True
 
@@ -499,17 +509,19 @@ class RamifiedStrategy(ProcessingStrategy):
                     ref_path = meta.get('ref_seg_path')
                     ref_raw = meta.get('ref_raw_path')
                     ref_name = meta.get('ref_name', 'Ref')
+                    inter_path = meta.get('intersection_path') # New
                     
                     display_scale = (self.z_scale_factor, 1, 1)
 
+                    # 1. Reference Mask
                     if ref_path and os.path.exists(ref_path):
+                        # SAFETY CHECK: File size must match
                         file_size = os.path.getsize(ref_path)
                         expected_size = np.prod(self.image_shape) * 4
                         
                         if file_size != expected_size:
                             print(f"    WARNING: Reference mask size mismatch. Skipping.")
                         else:
-                            # 1. Load Reference Mask
                             ref_data = np.memmap(ref_path, dtype=np.int32, mode='r', shape=self.image_shape)
                             
                             # Monochrome Palette
@@ -527,35 +539,24 @@ class RamifiedStrategy(ProcessingStrategy):
                                 layer = viewer.add_labels(ref_data, name=f"Ref: {ref_name}", scale=display_scale)
                                 layer.color = colormap
                                 
-                            # 2. Compute and Load Overlap Layer
-                            # Lazy calc using Dask to avoid RAM explosion
-                            print("    Calculating Overlap Visualization...")
-                            primary_path = files.get("final_segmentation")
-                            if primary_path and os.path.exists(primary_path):
-                                p_data = np.memmap(primary_path, dtype=np.int32, mode='r', shape=self.image_shape)
-                                
-                                # Convert to Dask
-                                d_p = da.from_array(p_data, chunks=(32, 256, 256))
-                                d_r = da.from_array(ref_data, chunks=(32, 256, 256))
-                                
-                                # Boolean overlap
-                                d_overlap = (d_p > 0) & (d_r > 0)
-                                
-                                # Add as Image layer (Yellow)
-                                viewer.add_image(
-                                    d_overlap, 
-                                    name=f"Overlap: {ref_name}", 
-                                    colormap="yellow", 
-                                    blending="additive", 
-                                    opacity=0.6,
-                                    scale=display_scale
-                                )
+                                for layer in viewer.layers:
+                                    if any(x in layer.name for x in ["Raw", "Trimmed", "Edge", "Cell bodies"]):
+                                        layer.visible = False
 
-                            # Hide primary intermediates
-                            for layer in viewer.layers:
-                                if any(x in layer.name for x in ["Raw", "Trimmed", "Edge", "Cell bodies"]):
-                                    layer.visible = False
+                    # 2. Intersection Mask (Unique Labels)
+                    if inter_path and os.path.exists(inter_path):
+                        print(f"    Loading Intersection Labels: {inter_path}")
+                        int_data = np.memmap(inter_path, dtype=np.int32, mode='r', shape=self.image_shape)
+                        
+                        # Use high-contrast rainbow for intersections
+                        viewer.add_labels(
+                            int_data, 
+                            name=f"Overlap Regions ({ref_name})", 
+                            scale=display_scale,
+                            opacity=0.8
+                        )
 
+                    # 3. Reference Intensity
                     if ref_raw and os.path.exists(ref_raw):
                          try:
                              ref_img = tiff.imread(ref_raw)
