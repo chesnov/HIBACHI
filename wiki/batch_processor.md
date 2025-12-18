@@ -1,48 +1,57 @@
-# BatchProcessor.py
+# Batch Processor (`batch_processor.py`)
 
 **Location:** `utils/high_level_gui/batch_processor.py`
 
 ## Overview
-The `BatchProcessor` class handles the automated, sequential processing of multiple image folders. It acts as a bridge between the file system (iterating over folders) and the specific segmentation logic (Strategies).
+The `BatchProcessor` is the engine behind the "Process All Compatible Folders" button. It allows for "Set and Forget" automation, enabling you to process hundreds of datasets sequentially without user intervention.
+
+It acts as a **Headless Controller**: it instantiates the appropriate Strategy (2D or 3D) for each folder but provides `None` instead of a Napari viewer, ensuring that the pipeline runs purely on disk/CPU/RAM without rendering overhead.
 
 ## Key Responsibilities
-1.  **Iteration:** Loops through a list of folders identified by the `ProjectManager`.
-2.  **Strategy Selection:** dynamic instantiation of the correct processing strategy (e.g., `RamifiedStrategy`, `Ramified2DStrategy`) based on the `mode` defined in the folder's YAML config.
-3.  **Memory Management:** 
-    *   Loads the heavy image stack (`.tif`) into RAM.
-    *   Passes it to the strategy.
-    *   **Crucial:** Ensures the image stack is deleted and garbage collected (`gc.collect()`) immediately after processing a folder to prevent RAM saturation on laptops.
-4.  **State Management:** Checks `checkpoint` files to determine if a folder is already finished or if it should resume from a specific step.
 
-## Class: `BatchProcessor`
+### 1. Project Iteration
+*   It asks the `ProjectManager` for a list of valid image folders.
+*   It filters them: checks if the `mode` defined in their `processing_config.yaml` is supported (e.g., `ramified` or `ramified_2d`).
 
-### `__init__(self, project_manager)`
-*   **Input:** `project_manager` (Object holding the list of valid image folders).
-*   **Action:** Registers supported strategies (Ramified 3D, Ramified 2D).
+### 2. Spacing Normalization
+*   Before processing, it reads the physical dimensions from the config.
+*   **3D Mode:** Calculates `(Z, Y, X)` spacing and the Z-anisotropy scale factor.
+*   **2D Mode:** Calculates `(1.0, Y, X)` spacing. It forces Z=1.0 to ensure 3D functions (like distance transforms) work mathematically on 2D planes without errors.
 
-### `_calculate_spacing_for_batch(self, config, image_shape)`
-*   **Purpose:** Derives physical voxel size (microns) from the YAML config.
-*   **Logic:** Handles both 2D and 3D logic to calculate the `z_scale_factor` used for aspect-ratio correct visualization and isotropic processing.
+### 3. Memory Safety
+Batch processing terabytes of data is prone to "Memory Leaks" (RAM filling up over time). The Batch Processor handles this strictly:
+*   **Explicit Deletion:** It manually deletes the heavy image array and the Strategy instance after every folder.
+*   **Garbage Collection:** It forces `gc.collect()` between steps and between folders to reclaim memory immediately.
 
-### `process_single_folder(self, folder_path, target_strategy_key, force_restart)`
-*   **Purpose:** Orchestrates the processing of ONE specific folder.
-*   **Memory Safety:** Uses a `try...finally` block to strictly delete the `image_stack` numpy array and the `strategy_instance` after execution, regardless of success or failure.
-*   **Workflow:**
-    1.  Reads YAML config.
-    2.  Loads TIFF image (High Memory Usage Event).
-    3.  Instantiates the specific Strategy class.
-    4.  Checks existing checkpoint files to see which steps are done.
-    5.  Iterates through the remaining steps, calling `strategy_instance.execute_step`.
+### 4. Smart Resume (Checkpointing)
+*   It checks which `.dat` files already exist in the folder.
+*   If a folder crashed at Step 3, the Batch Processor detects `trimmed_segmentation.dat` exists and skips Steps 1 & 2, resuming instantly at Step 3.
 
-### `process_all_folders(self, force_restart_all)`
-*   **Purpose:** The public entry point called by the GUI.
-*   **Logic:** 
-    1.  Scans all folders in the project.
-    2.  Filters them by supported modes.
-    3.  Calls `process_single_folder` one by one.
-    4.  Aggregates success/failure statistics.
+---
 
-## Dependencies
-*   `tifffile`: For loading microscopy data.
-*   `gc`: Garbage collection interface (used aggressively).
-*   `processing_strategies`: Base class and helper functions.
+## Usage logic
+
+### `process_all_folders(force_restart_all=False)`
+The main entry point.
+*   **`force_restart_all=False` (Default):** The "Resume" mode. It will skip any folder that is already 100% complete. It will finish any folder that is partially complete.
+*   **`force_restart_all=True`:** The "Nuclear" option. It deletes **ALL** processing outputs for **ALL** folders and starts everything from scratch. Use with caution.
+
+### `process_single_folder(...)`
+*   **Input:** Path to a specific folder.
+*   **Logic:**
+    1.  Validates files (`.tif`, `.yaml`).
+    2.  Loads the Image (RAM usage spikes here).
+    3.  Initializes the correct Strategy (2D or 3D).
+    4.  Runs the loop: `strategy.execute_step(...)`.
+    5.  **Clean up:** Deletes the image from RAM immediately.
+
+---
+
+## Interaction Analysis in Batch Mode
+To perform **Step 6 (Interaction Analysis)** in batch mode:
+1.  Open **one** image in the GUI.
+2.  Go to Step 6.
+3.  Click "Analyze with Other Channels..." and select the reference project.
+4.  **Save** (Run the step). This writes the `target_channel_folder` path into the `processing_config.yaml`.
+5.  **Propagate:** Copy this line in the yaml config to your other folders (or use a script to update them).
+6.  Run Batch Processing. The processor will see the config setting and execute the interaction analysis for every folder automatically.

@@ -95,13 +95,14 @@ Detailed documentation for the architecture, logic, and parameter tuning of each
 *   **[GUI Manager (gui_manager.py)](wiki/gui_manager.md):** Manages the sidebar interactions and state.
 *   **[Batch Processor (batch_processor.py)](wiki/batch_processor.md):** Logic for iterating over folders and managing memory during batch runs.
 
-### The 3D Pipeline (Modules)
-*   **[Strategy Controller (_3D_strategy.py)](wiki/_3D_strategy.md):** The orchestrator that manages data flow between steps.
-*   **[Step 1: Raw Segmentation (initial_3d_segmentation.py)](wiki/initial_3d_segmentation.md):** Tubular enhancement and thresholding logic.
-*   **[Step 2: Edge Trimming (remove_artifacts.py)](wiki/remove_artifacts.md):** 3D Convex hull and boundary cleaning.
-*   **[Step 3: Soma Extraction (soma_extraction.py)](wiki/soma_extraction.md):** **(Read for Tuning)** How to detect cell seeds.
-*   **[Step 4: Cell Separation (cell_splitting.py)](wiki/cell_splitting.md):** **(Read for Tuning)** How to split touching cells and fix straight-line artifacts.
-*   **[Step 5: Features (calculate_features_3d.py)](wiki/calculate_features_3d.md):** Metrics, skeletonization, and distance mapping.
+### The Pipeline (Modules)
+*   **[Strategy Controller](wiki/processing_strategies.md):** The orchestrator that manages data flow between steps.
+*   **[Step 1: Raw Segmentation](wiki/initial_segmentation.md):** Tubular enhancement and thresholding logic.
+*   **[Step 2: Edge Trimming](wiki/remove_artifacts.md):** Hull and boundary cleaning.
+*   **[Step 3: Soma Extraction](wiki/soma_extraction.md):** **(Read for Tuning)** How to detect cell seeds.
+*   **[Step 4: Cell Separation](wiki/cell_splitting.md):** **(Read for Tuning)** How to split touching cells and fix straight-line artifacts.
+*   **[Step 5: Feature Extraction](wiki/calculate_features.md):** Metrics, skeletonization, and distance mapping.\
+*   **[Step 6: Cross-Channel Analysis](wiki/interaction_analysis.md):** Quantify overlaps, distances and more.
 *   **[Helpers (segmentation_helpers.py)](wiki/segmentation_helpers.md):** Shared math and system utilities.
 
 ---
