@@ -25,3 +25,4 @@ dependencies:
   - simpleitk~=2.5.2
   - skan~=0.12.2
   - aicspylibczi~=3.3.1
+  - fcswrite~=0.6.4
