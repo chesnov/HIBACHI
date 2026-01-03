@@ -8,27 +8,28 @@ execute_raw_segmentation_ramified:
       label: Tubular Scales (comma-sep floats)
       type: list
       value:
-      - 0.5
-      - 0.1
+      - 1.0
+      - 1.5
+      - 3.0
       element_type: float
     min_size:
       label: Minimum Size (Voxels, Raw Seg)
       type: int
-      value: 2000
+      value: 1000
       min: 10
       max: 50000
       step: 10
     smooth_sigma:
       label: Smooth Sigma (Initial)
       type: float
-      value: 1.1
+      value: 0.2
       min: 0.1
       max: 10.0
       step: 0.1
     low_threshold_percentile:
       label: Low Threshold Percentile (Raw Seg)
       type: float
-      value: 98.0
+      value: 95.0
       min: 0.0
       max: 100.0
       step: 0.1
@@ -79,6 +80,13 @@ execute_trim_edges_ramified:
       min: 0
       max: 10000
       step: 10
+    hull_closing_radius:
+      label: Hull closing radius
+      type: int
+      value: 1
+      min: 0
+      max: 10000
+      step: 1
     z_erosion_iterations:
       label: Z-Anisotropy Correction (Erosion)
       type: int

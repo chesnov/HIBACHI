@@ -67,6 +67,13 @@ execute_trim_edges_ramified:
       min: 0.0
       max: 10000000
       step: 0.1
+    hull_closing_radius:
+      label: Hull closing radius
+      type: int
+      value: 1
+      min: 0
+      max: 10000
+      step: 1
     min_size_voxels:
       label: Min Size (Voxels, Post-Trim)
       type: int

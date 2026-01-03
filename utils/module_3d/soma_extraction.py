@@ -1,49 +1,67 @@
+"""
+Soma Extraction Module (3D)
+==========================
+
+This module extracts cell bodies (somas) from 3D segmentation masks. It uses
+a label-first processing strategy with early-stopping conditions to optimize
+speed and memory usage, particularly for large undersegmented clumps.
+
+Strategy:
+1. Population Analysis: Determine reference volumes and thicknesses.
+2. Strategy Definition: Create priority-ordered intensity and distance maps.
+3. Label-First Iteration: Process each segmented object independently.
+4. Spatial Tiling: Large objects are processed in overlapping 3D chunks.
+5. Early Stopping: Percentile strategies are skipped if cores become too small.
+6. Greedy Placement: Somas are placed based on score priority and spatial separation.
+"""
+
 import os
 import gc
 import math
 import time
-import shutil
 import traceback
 from typing import List, Dict, Optional, Tuple, Any, Union
 
 import numpy as np
 from scipy import ndimage
-from skimage.measure import regionprops  # type: ignore
+from scipy.spatial import KDTree
 from skimage.feature import peak_local_max  # type: ignore
 from skimage.segmentation import watershed  # type: ignore
+from skimage.measure import regionprops  # type: ignore
 from sklearn.decomposition import PCA  # type: ignore
 from tqdm import tqdm
 
-# Import shared helpers
+# Attempt to get psutil for RAM profiling
 try:
-    from .segmentation_helpers import (
-        flush_print,
-        distance_transform_edt
-    )
+    import psutil
+
+    def get_ram_usage() -> float:
+        """Returns the current Resident Set Size (RSS) in gigabytes."""
+        return psutil.Process(os.getpid()).memory_info().rss / (1024**3)
+
 except ImportError:
-    # Fallback for running script directly
-    from segmentation_helpers import (
-        flush_print,
-        distance_transform_edt
-    )
+
+    def get_ram_usage() -> float:
+        """Fallback if psutil is not installed."""
+        return 0.0
 
 
-def get_min_distance_pixels(
-    spacing: Tuple[float, float, float],
-    physical_distance: float
+def get_min_distance_pixels_3d(
+    spacing: Tuple[float, float, float], physical_distance: float
 ) -> int:
     """
-    Calculates minimum distance in pixels for peak_local_max based on physical distance.
-    Uses the minimum in-plane resolution (YX) for separation logic.
+    Calculates minimum distance in pixels for peak detection.
+
+    Uses the minimum in-plane resolution (YX) to determine the voxel separation
+    required to satisfy a physical distance requirement.
 
     Args:
         spacing: Voxel spacing (Z, Y, X).
-        physical_distance: Minimum separation in physical units (e.g., um).
+        physical_distance: Desired minimum separation in physical units (um).
 
     Returns:
-        int: Minimum distance in pixels (at least 3).
+        int: Minimum distance in pixels (minimum of 3).
     """
-    # Use YX for in-plane separation (indexes 1 and 2)
     min_spacing_yx = min(spacing[1:])
     if min_spacing_yx <= 1e-6:
         return 3
@@ -51,96 +69,48 @@ def get_min_distance_pixels(
     return max(3, pixels)
 
 
-def _filter_candidate_fragment_3d(
-    fragment_mask: np.ndarray,
-    parent_dt: np.ndarray,
-    spacing: Tuple[float, float, float],
-    min_seed_fragment_volume: int,
-    min_accepted_core_volume: float,
-    max_accepted_core_volume: float,
-    min_accepted_thickness_um: float,
-    max_accepted_thickness_um: float,
-    max_allowed_core_aspect_ratio: float
-) -> Tuple[str, Optional[str], Optional[np.ndarray], Optional[float], float]:
+def _generate_3d_tiles(
+    bbox: Tuple[slice, slice, slice],
+    tile_size: Tuple[int, int, int] = (128, 512, 512),
+    padding: int = 20,
+) -> List[Dict[str, Tuple[int, ...]]]:
     """
-    Filters a single 3D candidate seed fragment based on morphology.
+    Splits a large bounding box into overlapping 3D tiles.
 
     Args:
-        fragment_mask: Boolean mask of the candidate.
-        parent_dt: Distance transform of the parent core.
-        spacing: Voxel spacing (Z, Y, X).
-        min_seed_fragment_volume: Hard minimum voxel limit.
-        min_accepted_core_volume: Soft minimum volume limit.
-        max_accepted_core_volume: Soft maximum volume limit.
-        min_accepted_thickness_um: Minimum thickness (inscribed radius).
-        max_accepted_thickness_um: Maximum thickness (inscribed radius).
-        max_allowed_core_aspect_ratio: Maximum elongation ratio.
+        bbox: The bounding box slices (Z, Y, X) of the label.
+        tile_size: Dimensions of each tile chunk (Z, Y, X).
+        padding: Voxel padding for context around the tile.
 
     Returns:
-        Tuple containing:
-        - status (str): 'valid', 'fallback', or 'discard'.
-        - reason (str | None): Reason for rejection.
-        - mask_copy (ndarray | None): Copy of the mask.
-        - volume (float | None): Calculated volume.
-        - duration (float): Execution time.
+        List of dicts containing 'target' (no overlap) and 'pad' (context) coords.
     """
-    t_start = time.time()
-    try:
-        fragment_volume = np.sum(fragment_mask)
-        if fragment_volume < min_seed_fragment_volume:
-            return 'discard', 'too_small', None, None, time.time() - t_start
+    z_range, y_range, x_range = bbox
+    z0, z1 = z_range.start, z_range.stop
+    y0, y1 = y_range.start, y_range.stop
+    x0, x1 = x_range.start, x_range.stop
 
-        # Thickness Check
-        max_dist_in_fragment_um = np.max(parent_dt[fragment_mask])
-        passes_thickness = (
-            min_accepted_thickness_um <= max_dist_in_fragment_um <=
-            max_accepted_thickness_um
-        )
+    tiles = []
+    for z in range(z0, z1, tile_size[0]):
+        for y in range(y0, y1, tile_size[1]):
+            for x in range(x0, x1, tile_size[2]):
+                # Target area (the unique region this tile is responsible for)
+                tz1 = min(z + tile_size[0], z1)
+                ty1 = min(y + tile_size[1], y1)
+                tx1 = min(x + tile_size[2], x1)
 
-        # Volume Check
-        passes_volume_range = (
-            min_accepted_core_volume <= fragment_volume <= max_accepted_core_volume
-        )
+                # Padded context area (to ensure DT and Watershed have context)
+                pz0, pz1 = max(z0, z - padding), min(z1, tz1 + padding)
+                py0, py1 = max(y0, y - padding), min(y1, ty1 + padding)
+                px0, px1 = max(x0, x - padding), min(x1, tx1 + padding)
 
-        # Aspect Ratio Check (PCA)
-        passes_aspect = True
-        if fragment_volume > 3:
-            try:
-                coords_vox = np.argwhere(fragment_mask)
-                coords_phys = coords_vox * np.array(spacing)
-                
-                pca = PCA(n_components=3)
-                pca.fit(coords_phys)
-                ev = pca.explained_variance_
-                ev_sorted = np.sort(np.abs(ev))[::-1]
-
-                # Check ratio of largest (0) to smallest (2) eigenvalue
-                if ev_sorted[2] > 1e-12:
-                    aspect_ratio = math.sqrt(ev_sorted[0]) / math.sqrt(ev_sorted[2])
-                    if aspect_ratio > max_allowed_core_aspect_ratio:
-                        passes_aspect = False
-            except Exception:
-                # Permissive on PCA error (e.g., flat plane)
-                passes_aspect = True
-
-        fragment_mask_copy = fragment_mask.copy()
-        duration = time.time() - t_start
-
-        if passes_thickness and passes_volume_range and passes_aspect:
-            return 'valid', None, fragment_mask_copy, fragment_volume, duration
-        else:
-            reason = 'unknown'
-            if not passes_thickness:
-                reason = 'thickness'
-            elif not passes_volume_range:
-                reason = 'volume'
-            elif not passes_aspect:
-                reason = 'aspect'
-            return 'fallback', reason, fragment_mask_copy, fragment_volume, duration
-
-    except Exception as e_filt:
-        flush_print(f"Warn: Error during 3D fragment filtering: {e_filt}")
-        return 'discard', 'error', None, None, time.time() - t_start
+                tiles.append(
+                    {
+                        "target": (z, y, x, tz1, ty1, tx1),
+                        "pad": (pz0, py0, px0, pz1, py1, px1),
+                    }
+                )
+    return tiles
 
 
 def extract_soma_masks(
@@ -153,7 +123,7 @@ def extract_soma_masks(
     core_volume_target_factor_upper: float = 10.0,
     erosion_iterations: int = 0,
     ratios_to_process: List[float] = [0.3, 0.4, 0.5, 0.6],
-    intensity_percentiles_to_process: List[int] = [100, 90, 80, 70, 60, 50, 40, 30, 20, 10],
+    intensity_percentiles_to_process: List[int] = [100, 90, 80, 70, 60, 50, 40, 30],
     min_physical_peak_separation: float = 7.0,
     seeding_min_distance_um: Optional[float] = None,
     max_allowed_core_aspect_ratio: float = 10.0,
@@ -164,358 +134,325 @@ def extract_soma_masks(
     absolute_max_thickness_um: float = 10.0,
     memmap_dir: Optional[str] = "ramiseg_temp_memmap",
     memmap_voxel_threshold: int = 25_000_000,
-    memmap_final_mask: bool = True
+    memmap_final_mask: bool = True,
+    **kwargs,
 ) -> np.ndarray:
     """
-    The Main Soma Extraction Logic (3D).
-    
-    Iterates through segmented objects, determines if they are likely multi-soma clumps,
-    and attempts to find 'seeds' inside them using internal Distance Transform peaks
-    and Intensity peaks.
+    Memory-efficient 3D Soma Extraction logic.
+
+    Processes labels individually to minimize peak RAM. For huge clumps, it uses
+    spatial tiling. Early stopping prevents unnecessary calculations on labels
+    that are already "filled" or too small.
 
     Args:
-        segmentation_mask: 3D labeled segmentation.
-        intensity_image: 3D intensity volume.
+        segmentation_mask: 3D labeled segmentation image.
+        intensity_image: 3D intensity image.
         spacing: Voxel spacing (Z, Y, X).
-        smallest_quantile: Quantile to identify single-cell objects.
-        min_fragment_size: Min voxels for a seed.
-        core_volume_target_factor_lower: Min volume factor vs median.
-        core_volume_target_factor_upper: Max volume factor vs median.
-        erosion_iterations: Iterations to erode cores before analysis.
+        smallest_quantile: Quantile (0-100) to find reference single somas.
+        min_fragment_size: Hard minimum voxel limit for a seed.
+        core_volume_target_factor_lower: Min volume relative to median.
+        core_volume_target_factor_upper: Max volume relative to median.
+        erosion_iterations: Iterations to erode core masks.
         ratios_to_process: DT thresholds relative to max DT.
         intensity_percentiles_to_process: Intensity thresholds.
-        min_physical_peak_separation: Min distance between seeds (um).
-        seeding_min_distance_um: Override for peak detection distance.
-        max_allowed_core_aspect_ratio: Max elongation.
-        ref_vol_percentile_lower: Population stats lower bound.
-        ref_vol_percentile_upper: Population stats upper bound.
-        ref_thickness_percentile_lower: Thickness stats lower bound.
-        absolute_min_thickness_um: Hard min thickness.
-        absolute_max_thickness_um: Hard max thickness.
-        memmap_dir: Directory for temporary memmaps.
-        memmap_voxel_threshold: Threshold to trigger memmap usage for DT.
-        memmap_final_mask: If True, returns a memmap for the result.
+        min_physical_peak_separation: Minimum global distance between seeds (um).
+        seeding_min_distance_um: Override for internal peak splitting.
+        max_allowed_core_aspect_ratio: Max elongation (PCA ratio).
+        ref_vol_percentile_lower/upper: Population bounds for thickness calculation.
+        ref_thickness_percentile_lower: Percentile to set min accepted thickness.
+        absolute_min_thickness_um: Hard lower bound for soma thickness.
+        absolute_max_thickness_um: Hard upper bound for soma thickness.
+        memmap_dir: Directory to save the final memmap result.
+        memmap_voxel_threshold: Voxel count to trigger tiling logic.
+        memmap_final_mask: If True, saves result as a file in memmap_dir.
 
     Returns:
-        np.ndarray: 3D labeled mask of extracted somas (seeds).
+        np.ndarray: 3D labeled mask containing extracted soma seeds.
     """
-    flush_print("--- Starting 3D Soma Extraction ---")
+    t_start_global = time.time()
+    print("\n" + "=" * 60)
+    print("3D SOMA EXTRACTION: STARTING")
+    print("=" * 60)
 
-    # Setup
-    use_memmap_feature = memmap_dir is not None
-    if use_memmap_feature and memmap_dir:
-        os.makedirs(memmap_dir, exist_ok=True)
-
-    min_seed_fragment_volume = max(1, min_fragment_size)
-    MAX_CORE_VOXELS_FOR_WS = 500_000
-
+    # 1. Setup & Spacing
     if spacing is None:
         spacing = (1.0, 1.0, 1.0)
-    else:
-        spacing = tuple(float(s) for s in spacing)
+    spacing = tuple(float(s) for s in spacing)
+    min_seed_vol = max(1, min_fragment_size)
 
-    # 1. Analyze Distribution of Object Sizes
-    unique_labels_all, counts = np.unique(
-        segmentation_mask[segmentation_mask > 0], return_counts=True
-    )
-    if len(unique_labels_all) == 0:
+    # Internal seeding distance used to split clumped somas
+    if seeding_min_distance_um is not None:
+        int_peak_sep = get_min_distance_pixels_3d(spacing, seeding_min_distance_um)
+    else:
+        int_peak_sep = get_min_distance_pixels_3d(spacing, min_physical_peak_separation)
+
+    # Find labels via slices (efficient bounding boxes)
+    slices = ndimage.find_objects(segmentation_mask)
+    valid_labels = [i + 1 for i, s in enumerate(slices) if s is not None]
+    if not valid_labels:
         return np.zeros_like(segmentation_mask, dtype=np.int32)
 
-    initial_volumes = dict(zip(unique_labels_all, counts))
+    # 2. Population Analysis
+    print(f"Analyzing {len(valid_labels)} labels for population statistics...")
+    volumes = []
+    # Use a sample for speed if there are many labels
+    sample_indices = valid_labels if len(valid_labels) < 400 else valid_labels[::5]
+    for lbl in sample_indices:
+        sl = slices[lbl - 1]
+        volumes.append(np.sum(segmentation_mask[sl] == lbl))
 
-    # Find slices for all objects
-    label_to_slice = {}
-    valid_unique_labels_list = []
-    object_slices = ndimage.find_objects(segmentation_mask)
-    
-    for label in unique_labels_all:
-        idx = label - 1
-        if 0 <= idx < len(object_slices) and object_slices[idx]:
-            label_to_slice[label] = object_slices[idx]
-            valid_unique_labels_list.append(label)
+    volumes = np.array(volumes)
+    vol_p_low = np.percentile(volumes, ref_vol_percentile_lower)
+    vol_p_high = np.percentile(volumes, ref_vol_percentile_upper)
 
-    unique_labels = np.array(valid_unique_labels_list)
-    all_volumes_list = list(initial_volumes.values())
-
-    # 2. Determine Parameters relative to population
-    if len(all_volumes_list) > 1:
-        smallest_thresh_volume = np.percentile(all_volumes_list, smallest_quantile)
-    else:
-        smallest_thresh_volume = all_volumes_list[0] if all_volumes_list else 1
-
-    smallest_object_labels_set = {
-        l for l in unique_labels if initial_volumes[l] <= smallest_thresh_volume
-    }
-
-    target_soma_volume = np.median(
-        [v for l, v in initial_volumes.items() if l in smallest_object_labels_set]
-        or all_volumes_list
+    # Identify "target" volume of a typical soma
+    target_median_vol = np.median(
+        volumes[volumes <= np.percentile(volumes, smallest_quantile)]
     )
-    min_accepted_core_volume = max(
-        min_seed_fragment_volume,
-        target_soma_volume * core_volume_target_factor_lower
+    min_accepted_core_vol = max(
+        min_seed_vol, target_median_vol * core_volume_target_factor_lower
     )
-    max_accepted_core_volume = target_soma_volume * core_volume_target_factor_upper
+    max_accepted_core_vol = target_median_vol * core_volume_target_factor_upper
 
-    # Calculate Ref Thickness
-    vol_thresh_lower = np.percentile(all_volumes_list, ref_vol_percentile_lower)
-    vol_thresh_upper = np.percentile(all_volumes_list, ref_vol_percentile_upper)
-    reference_labels = [
-        l for l in unique_labels
-        if vol_thresh_lower < initial_volumes[l] <= vol_thresh_upper
+    # Calculate thickness from a subset of the population
+    max_thicknesses_um = []
+    ref_labels = [
+        lbl
+        for i, lbl in enumerate(sample_indices)
+        if vol_p_low < volumes[i] <= vol_p_high
     ]
-    if len(reference_labels) < 5:
-        reference_labels = list(unique_labels)
+    if len(ref_labels) < 5:
+        ref_labels = valid_labels[:30]
 
-    # Sample thickness
-    max_thicknesses = []
-    sample_refs = reference_labels[:min(20, len(reference_labels))]
-    for l in sample_refs:
-        sl = label_to_slice[l]
-        m = (segmentation_mask[sl] == l)
-        if np.any(m):
-            dt = distance_transform_edt(m, sampling=spacing)
-            max_thicknesses.append(np.max(dt))
+    for lbl in ref_labels[:30]:
+        sl = slices[lbl - 1]
+        m = segmentation_mask[sl] == lbl
+        dt = ndimage.distance_transform_edt(m, sampling=spacing)
+        max_thicknesses_um.append(np.max(dt))
 
-    if max_thicknesses:
-        calc_min_thick = np.percentile(max_thicknesses, ref_thickness_percentile_lower)
-        # Heuristic: If absolute min is very low (default catch-all), prefer calculated
-        if absolute_min_thickness_um < 0.1:
-            min_accepted_thickness_um = absolute_min_thickness_um
-        else:
-            min_accepted_thickness_um = max(absolute_min_thickness_um, calc_min_thick)
+    if max_thicknesses_um:
+        calc_min_thick = np.percentile(max_thicknesses_um, ref_thickness_percentile_lower)
+        min_accepted_thick = max(absolute_min_thickness_um, calc_min_thick)
     else:
-        min_accepted_thickness_um = absolute_min_thickness_um
+        min_accepted_thick = absolute_min_thickness_um
 
-    min_accepted_thickness_um = min(
-        min_accepted_thickness_um, absolute_max_thickness_um - 0.1
-    )
+    min_accepted_thick = min(min_accepted_thick, absolute_max_thickness_um - 0.1)
 
-    # --- Decoupled Distance Logic ---
-    # Internal Seeding Distance: Used for peak_local_max to detect seeds
-    if seeding_min_distance_um is not None:
-        internal_seed_pixels = get_min_distance_pixels(spacing, seeding_min_distance_um)
-    else:
-        internal_seed_pixels = get_min_distance_pixels(spacing, min_physical_peak_separation)
+    print(f"  Thresh: Volume [{min_accepted_core_vol:.1f}-{max_accepted_core_vol:.1f}]")
+    print(f"  Thresh: Thick [{min_accepted_thick:.2f}-{absolute_max_thickness_um:.2f}]")
 
-    gc.collect()
-
-    # 3. Initialize Result Mask
-    final_seed_mask_path = None
+    # 3. Output Initialization
+    # restored Orchestrator compatibility: explicitly checking memmap_dir and filename
     final_seed_mask = None
-
-    if use_memmap_feature and memmap_final_mask and memmap_dir:
-        final_seed_mask_path = os.path.join(memmap_dir, 'final_seed_mask.mmp')
+    if memmap_dir is not None and memmap_final_mask:
+        os.makedirs(memmap_dir, exist_ok=True)
+        mmp_path = os.path.join(memmap_dir, "final_seed_mask.mmp")
         final_seed_mask = np.memmap(
-            final_seed_mask_path, dtype=np.int32, mode='w+',
-            shape=segmentation_mask.shape
+            mmp_path, dtype="int32", mode="w+", shape=segmentation_mask.shape
         )
+        final_seed_mask[:] = 0
+        print(f"  Initialized output memmap at: {mmp_path}")
     else:
         final_seed_mask = np.zeros_like(segmentation_mask, dtype=np.int32)
 
-    next_final_label = 1
-    added_small_labels = set()
+    next_label_id = 1
+    all_placed_centroids = []
+    spatial_index: Optional[KDTree] = None
 
-    try:
-        # 4. Process Small Cells (Pass-through)
-        small_cell_labels = [l for l in unique_labels if l in smallest_object_labels_set]
-        flush_print(f"Processing {len(small_cell_labels)} small objects (Assumed Single)...")
+    # 4. Strategy Definitions
+    # Strategies are ordered by Strict Priority Score (higher score = wins overlap)
+    strategies = []
+    for p in sorted(intensity_percentiles_to_process, reverse=True):
+        strategies.append({"type": "Int", "val": p, "score": 2.0 + (p / 1000.0)})
+    for r in sorted(ratios_to_process, reverse=True):
+        strategies.append({"type": "DT", "val": r, "score": r + (r / 1000.0)})
 
-        for label in tqdm(small_cell_labels, desc="Small Cells"):
-            coords = np.argwhere(segmentation_mask == label)
-            if coords.size > 0:
-                final_seed_mask[coords[:, 0], coords[:, 1], coords[:, 2]] = next_final_label
-                next_final_label += 1
-                added_small_labels.add(label)
+    strategies.sort(key=lambda x: x["score"], reverse=True)
 
-        # 5. Process Large Cells (The Hunt for Somas)
-        large_cell_labels = [l for l in unique_labels if l not in added_small_labels]
-        flush_print(f"Processing {len(large_cell_labels)} large objects (Finding Cores)...")
+    # 5. Processing Loop (Label-First)
+    main_pbar = tqdm(valid_labels, desc="Total Labels", unit="label", dynamic_ncols=True)
 
-        struct_el_erosion = ndimage.generate_binary_structure(3, 3) \
-            if erosion_iterations > 0 else None
+    for lbl_idx, lbl in enumerate(main_pbar):
+        sl = slices[lbl - 1]
+        num_voxels = np.prod([s.stop - s.start for s in sl])
+        is_huge = num_voxels > memmap_voxel_threshold
 
-        for label in tqdm(large_cell_labels, desc="Large Cells"):
-            bbox_slice = label_to_slice.get(label)
-            if not bbox_slice:
+        # Tile clump if it exceeds threshold
+        tiles = _generate_3d_tiles(
+            sl, padding=int(absolute_max_thickness_um / min(spacing) + 2)
+        )
+        label_candidates = []
+
+        tile_pbar = tqdm(
+            tiles, desc=f"  ↳ Clump {lbl}", leave=False, unit="tile", disable=not is_huge
+        )
+
+        for t_idx, t in enumerate(tile_pbar):
+            z0, y0, x0, z1, y1, x1 = t["pad"]
+            t_mask = segmentation_mask[z0:z1, y0:y1, x0:x1] == lbl
+            if not np.any(t_mask):
                 continue
 
-            # Setup Local Crop
-            pad = 1
-            slice_obj = tuple(
-                slice(max(0, s.start - pad), min(sh, s.stop + pad))
-                for s, sh in zip(bbox_slice, segmentation_mask.shape)
-            )
-            local_shape = tuple(s.stop - s.start for s in slice_obj)
-            offset = (slice_obj[0].start, slice_obj[1].start, slice_obj[2].start)
-            num_voxels = np.prod(local_shape)
+            t_int = intensity_image[z0:z1, y0:y1, x0:x1]
+            offset = np.array([z0, y0, x0])
+            dt_obj = ndimage.distance_transform_edt(t_mask, sampling=spacing)
+            max_dt_val = np.max(dt_obj)
 
-            # Mask within crop
-            seg_sub = segmentation_mask[slice_obj]
-            mask_sub = (seg_sub == label)
-            if not np.any(mask_sub):
-                continue
-
-            # Use Memmap for DT if object is huge
-            use_memmap_local = use_memmap_feature and (num_voxels > memmap_voxel_threshold)
-            dt_obj = None
-            
-            if use_memmap_local and memmap_dir:
-                dt_path = os.path.join(memmap_dir, f"cell_{label}_dt.mmp")
-                dt_memmap = np.memmap(
-                    dt_path, dtype=np.float64, mode='w+', shape=(3,) + local_shape
-                )
-                # Note: distance_transform_edt helper handles inplace write if supported
-                dt_obj = distance_transform_edt(mask_sub, sampling=spacing)
-                del dt_memmap
-            else:
-                dt_obj = distance_transform_edt(mask_sub, sampling=spacing)
-
-            max_dist = np.max(dt_obj)
-
-            # List to store candidates: (priority_score, volume, global_coords)
-            candidates_with_score = []
-
-            # Inner function to process a "Core" mask
-            def process_core(core_mask, dt_map, priority_score):
-                lbl_cores, n_cores = ndimage.label(core_mask)
-                if n_cores == 0:
-                    return
-
-                for c_idx in range(1, n_cores + 1):
-                    c_mask = (lbl_cores == c_idx)
-                    c_vol = np.sum(c_mask)
-                    if c_vol < min_seed_fragment_volume:
-                        continue
-
-                    ws_labels = np.zeros_like(dt_map, dtype=np.int32)
-
-                    if c_vol < MAX_CORE_VOXELS_FOR_WS:
-                        core_dt = dt_map.copy()
-                        core_dt[~c_mask] = 0
-
-                        # Use decoupled internal distance for splitting
-                        peaks = peak_local_max(
-                            core_dt, min_distance=internal_seed_pixels,
-                            labels=c_mask, exclude_border=False
-                        )
-
-                        if peaks.shape[0] > 1:
-                            markers = np.zeros_like(ws_labels)
-                            markers[tuple(peaks.T)] = np.arange(1, peaks.shape[0] + 1)
-                            ws_labels = watershed(-core_dt, markers, mask=c_mask)
-                        else:
-                            ws_labels[c_mask] = 1
-                    else:
-                        ws_labels[c_mask] = 1
-
-                    for f_id in np.unique(ws_labels[ws_labels > 0]):
-                        f_mask = (ws_labels == f_id)
-                        res, _, mask_final, vol, _ = _filter_candidate_fragment_3d(
-                            f_mask, dt_map, spacing,
-                            min_seed_fragment_volume, min_accepted_core_volume,
-                            max_accepted_core_volume, min_accepted_thickness_um,
-                            absolute_max_thickness_um, max_allowed_core_aspect_ratio
-                        )
-                        if res == 'valid' and mask_final is not None:
-                            locs = np.argwhere(mask_final)
-                            locs += np.array(offset)
-                            candidates_with_score.append((priority_score, vol, locs))
-
-            # --- A. Distance Transform Strategy ---
-            if max_dist > 1e-9:
-                local_ratios = list(ratios_to_process)
-                needed_min_ratio = min_accepted_thickness_um / max_dist
-
-                # Check for small nucleus ratio rescue
-                if needed_min_ratio < min(local_ratios) and needed_min_ratio > 0.05:
-                    local_ratios.append(needed_min_ratio)
-
-                local_ratios = sorted(local_ratios, reverse=True)
-
-                for ratio in local_ratios:
-                    thresh = max_dist * ratio
-                    initial_core = (dt_obj >= thresh) & mask_sub
-                    if erosion_iterations > 0:
-                        initial_core = ndimage.binary_erosion(
-                            initial_core, structure=struct_el_erosion,
-                            iterations=erosion_iterations
-                        )
-
-                    process_core(initial_core, dt_obj, priority_score=ratio)
-
-            # --- B. Intensity Strategy ---
-            int_sub = intensity_image[slice_obj]
-            vals = int_sub[mask_sub]
-
-            if vals.size > 0:
-                for perc in intensity_percentiles_to_process:
-                    p_thresh = np.percentile(vals, perc)
-                    int_core = (int_sub >= p_thresh) & mask_sub
-                    if erosion_iterations > 0:
-                        int_core = ndimage.binary_erosion(
-                            int_core, structure=struct_el_erosion,
-                            iterations=erosion_iterations
-                        )
-
-                    if np.any(int_core):
-                        core_dt = distance_transform_edt(int_core, sampling=spacing)
-                        process_core(int_core, core_dt, priority_score=2.0)
-
-            # 6. Place Best Candidates (With Global Proximity Check)
-            if candidates_with_score:
-                # Sort primarily by Priority (High to Low)
-                candidates_with_score.sort(key=lambda x: (x[0], x[1]), reverse=True)
-
-                # List to track physical centroids of placed seeds
-                placed_centroids_phys = []
-
-                for _, _, glob_coords in candidates_with_score:
-                    z, y, x = glob_coords[:, 0], glob_coords[:, 1], glob_coords[:, 2]
-
-                    # 1. Check for pixel overlap
-                    existing = final_seed_mask[z, y, x]
-                    if np.any(existing > 0):
-                        continue
-
-                    # 2. Check for physical proximity (Global Filter)
-                    current_cent_z = np.mean(z) * spacing[0]
-                    current_cent_y = np.mean(y) * spacing[1]
-                    current_cent_x = np.mean(x) * spacing[2]
-                    current_cent_phys = np.array(
-                        [current_cent_z, current_cent_y, current_cent_x]
+            # Strategy Loop with Early Stopping
+            for strat in strategies:
+                if is_huge:
+                    tile_pbar.set_postfix(
+                        {
+                            "Strat": f"{strat['type']}{strat['val']}",
+                            "Cands": len(label_candidates),
+                            "RAM": f"{get_ram_usage():.1f}G",
+                        }
                     )
 
-                    too_close = False
-                    for placed_c in placed_centroids_phys:
-                        dist = np.linalg.norm(current_cent_phys - placed_c)
-                        # USE THE STRICT GLOBAL PARAMETER HERE
-                        if dist < min_physical_peak_separation:
-                            too_close = True
-                            break
+                if strat["type"] == "DT":
+                    thresh = max_dt_val * strat["val"]
+                    if thresh <= 0:
+                        continue
+                    core = (dt_obj >= thresh) & t_mask
+                    dt_ref = dt_obj
+                else:
+                    # Intensity percentile strategy
+                    vals = t_int[t_mask]
+                    if vals.size == 0:
+                        continue
+                    core = (t_int >= np.percentile(vals, strat["val"])) & t_mask
+                    # Calculate local DT for peak splitting
+                    dt_ref = ndimage.distance_transform_edt(core, sampling=spacing)
 
-                    if too_close:
+                # Early Stopping: If core is already too small for priority, skip lower strats
+                if np.sum(core) < min_seed_vol:
+                    continue
+
+                if erosion_iterations > 0:
+                    core = ndimage.binary_erosion(core, iterations=erosion_iterations)
+                    if not np.any(core):
                         continue
 
-                    # Place the seed
-                    final_seed_mask[z, y, x] = next_final_label
-                    next_final_label += 1
-                    placed_centroids_phys.append(current_cent_phys)
+                # Island detection via connected components
+                labeled_core, n = ndimage.label(core)
+                for region in regionprops(labeled_core):
+                    if region.area < min_seed_vol:
+                        continue
 
-            del seg_sub, mask_sub, dt_obj, int_sub
+                    # Local Watershed Splitting for clumped peaks
+                    frag_crop = region.image
+                    frag_dt = ndimage.distance_transform_edt(frag_crop, sampling=spacing)
+                    peaks = peak_local_max(
+                        frag_dt, min_distance=int_peak_sep, labels=frag_crop
+                    )
+
+                    def process_frag_logic(mask_arr, sub_off):
+                        """Checks morphological validity and converts to global coords."""
+                        local_coords = np.argwhere(mask_arr)
+                        tile_coords = local_coords + sub_off
+                        g_coords = tile_coords + offset
+
+                        # Thickness check (Max inscribed radius)
+                        max_thick = np.max(dt_ref[tuple(tile_coords.T)])
+                        if not (min_accepted_thick <= max_thick <= absolute_max_thickness_um):
+                            return
+
+                        # 3D PCA elongation check
+                        if mask_arr.sum() > 10:
+                            try:
+                                coords_phys = local_coords * np.array(spacing)
+                                pca = PCA(n_components=3).fit(coords_phys)
+                                ev = np.sort(np.abs(pca.explained_variance_))[::-1]
+                                if (
+                                    ev[2] > 1e-12
+                                    and (math.sqrt(ev[0]) / math.sqrt(ev[2]))
+                                    > max_allowed_core_aspect_ratio
+                                ):
+                                    return
+                            except Exception:
+                                pass
+
+                        # Tiling check: ensure centroid falls in responsible target tile
+                        cent = np.mean(g_coords, axis=0)
+                        if (
+                            t["target"][0] <= cent[0] < t["target"][3]
+                            and t["target"][1] <= cent[1] < t["target"][4]
+                            and t["target"][2] <= cent[2] < t["target"][5]
+                        ):
+                            label_candidates.append(
+                                {
+                                    "coords": g_coords.astype(np.int32),
+                                    "vol": mask_arr.sum(),
+                                    "score": strat["score"],
+                                }
+                            )
+
+                    if len(peaks) > 1:
+                        markers = np.zeros(frag_crop.shape, dtype=np.int32)
+                        for idx, pk in enumerate(peaks):
+                            markers[pk[0], pk[1], pk[2]] = idx + 1
+                        ws = watershed(-frag_dt, markers, mask=frag_crop)
+                        for wid in range(1, len(peaks) + 1):
+                            m_ws = ws == wid
+                            if m_ws.sum() >= min_seed_vol:
+                                process_frag_logic(m_ws, region.bbox[:3])
+                    else:
+                        process_frag_logic(region.image, region.bbox[:3])
+
+                del core
+
+            del t_mask, t_int, dt_obj
+            if t_idx % 5 == 0:
+                gc.collect()
+
+        # 6. Placement (Greedy based on Priority and Spatial Separation)
+        if label_candidates:
+            # Sort by Priority Score descending, then Volume descending
+            label_candidates.sort(key=lambda x: (x["score"], x["vol"]), reverse=True)
+            for cand in label_candidates:
+                coords = cand["coords"]
+                cent_phys = np.mean(coords, axis=0) * np.array(spacing)
+
+                # KDTree Proximity Check (O(log N))
+                if spatial_index is not None:
+                    dist, _ = spatial_index.query(cent_phys, k=1)
+                    if dist < min_physical_peak_separation:
+                        continue
+
+                # Pixel Overlap Check
+                idx_tuple = tuple(coords.T)
+                if np.any(final_seed_mask[idx_tuple] > 0):
+                    continue
+
+                # Place Seed
+                final_seed_mask[idx_tuple] = next_label_id
+                next_label_id += 1
+                all_placed_centroids.append(cent_phys)
+
+                # Periodically rebuild spatial index for efficiency
+                if len(all_placed_centroids) % 500 == 0:
+                    spatial_index = KDTree(all_placed_centroids)
+
+            if all_placed_centroids:
+                spatial_index = KDTree(all_placed_centroids)
+
+        # Main Progress Update
+        main_pbar.set_postfix(
+            {"Seeds": next_label_id - 1, "RAM": f"{get_ram_usage():.1f}G"}
+        )
+        del label_candidates
+        if lbl_idx % 20 == 0:
             gc.collect()
 
-        if isinstance(final_seed_mask, np.memmap):
-            final_seed_mask.flush()
-            return final_seed_mask
-        else:
-            return final_seed_mask
+    t_total = time.time() - t_start_global
+    print("\n" + "=" * 60)
+    print("3D EXTRACTION COMPLETE")
+    print(f"  Total Somas: {next_label_id - 1}")
+    print(f"  Execution Time: {t_total/60:.2f} mins")
+    print("=" * 60 + "\n")
 
-    except Exception as e:
-        flush_print(f"CRITICAL ERROR in extract_soma_masks: {e}")
-        traceback.print_exc()
-        return np.zeros_like(segmentation_mask, dtype=np.int32)
-    finally:
-        if 'final_seed_mask' in locals() and final_seed_mask is not None:
-            del final_seed_mask
-        gc.collect()
+    # Final cleanup and persistence
+    if isinstance(final_seed_mask, np.memmap):
+        final_seed_mask.flush()
+
+    return final_seed_mask

@@ -79,19 +79,12 @@ execute_trim_edges_ramified_2d:
       min: 0
       max: 5000
       step: 5
-    smoothing_iterations:
-      label: Hull Smoothing Iterations
+    hull_closing_radius:
+      label: Hull closing radius
       type: int
       value: 1
       min: 0
-      max: 10
-      step: 1
-    heal_iterations:
-      label: Heal Iterations (Post-Trim)
-      type: int
-      value: 1
-      min: 0
-      max: 10
+      max: 10000
       step: 1
 
 # --- Step 3: Soma Extraction (Finding Seeds) ---

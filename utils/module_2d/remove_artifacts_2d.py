@@ -1,5 +1,6 @@
 import os
 import gc
+import math
 import shutil
 import tempfile
 import traceback
@@ -12,11 +13,27 @@ from scipy.ndimage import (
     distance_transform_edt,
     binary_dilation,
     generate_binary_structure,
-    binary_fill_holes  # Moved here from skimage
+    binary_fill_holes
 )
 from skimage.filters import threshold_otsu  # type: ignore
 from skimage.transform import resize  # type: ignore
-from skimage.morphology import disk, binary_closing  # type: ignore
+from skimage.morphology import disk, binary_closing, binary_dilation as sk_dilation, remove_small_objects  # type: ignore
+
+
+def _get_safe_temp_dir(base_path: Optional[str] = None, suffix: str = "") -> str:
+    """
+    Creates a temporary directory.
+    If base_path is provided, creates 'hibachi_scratch' inside it.
+    Otherwise, creates it in the current working directory.
+    """
+    if base_path and os.path.isdir(base_path):
+        scratch_root = os.path.join(base_path, "hibachi_scratch")
+    else:
+        scratch_root = os.path.abspath("hibachi_scratch")
+    
+    os.makedirs(scratch_root, exist_ok=True)
+    return tempfile.mkdtemp(prefix=f"step2_2d_{suffix}_", dir=scratch_root)
+
 
 def _safe_close_memmap(memmap_obj: Any) -> None:
     """Safely closes a numpy memmap object."""
@@ -38,17 +55,12 @@ def relabel_and_filter_fragments_2d(
     """
     Re-labels connected components and filters small fragments in 2D.
     Matches 3D logic: Label -> Size Filter -> Re-index.
-
-    Args:
-        labels_memmap: Memory-mapped 2D array of labels (modified in-place).
-        min_size_pixels: Minimum size in pixels to retain.
     """
     if min_size_pixels <= 0:
         return
 
     print(f"  [Refine] Re-labeling and filtering fragments < {min_size_pixels} px...")
 
-    # Load into memory for processing (2D is usually small enough)
     mask = labels_memmap[:] > 0
     
     # 1. Label connected components
@@ -62,17 +74,12 @@ def relabel_and_filter_fragments_2d(
         return
 
     # 2. Calculate Sizes
-    # bincount is fast; index 0 is background
     counts = np.bincount(labeled_array.ravel())
     
     # 3. Filter
-    # Create a mapping: old_label -> new_label (or 0 if filtered)
-    # We want to keep contiguous IDs
     new_labels = np.zeros(num_features + 1, dtype=np.int32)
     current_new_id = 1
     
-    # Identify indices (labels) that meet the size criteria
-    # We skip index 0 (background)
     keep_indices = np.where(counts[1:] >= min_size_pixels)[0] + 1
     kept_count = len(keep_indices)
     
@@ -83,7 +90,6 @@ def relabel_and_filter_fragments_2d(
     print(f"    Fragments: {num_features}. Kept: {kept_count}. Removed: {num_features - kept_count}.")
 
     # 4. Apply mapping and save
-    # This maps the labeled_array integers through the new_labels array
     final_labels = new_labels[labeled_array]
     
     labels_memmap[:] = final_labels[:]
@@ -93,38 +99,39 @@ def relabel_and_filter_fragments_2d(
 def generate_tight_hull_2d(
     image: np.ndarray,
     cell_mask: np.ndarray,
+    hull_closing_radius: int = 10,
     downsample_factor: int = 4
 ) -> np.ndarray:
     """
-    Generates a tight hull using morphological closing on downsampled image.
-    Matches 3D logic: Downsample -> Otsu -> Close -> Fill -> Upsample.
-
-    Args:
-        image: Original 2D intensity image.
-        cell_mask: Current segmentation mask.
-        downsample_factor: Factor to scale down for morphology.
-
-    Returns:
-        np.ndarray: Boolean hull mask (in-memory).
+    Generates a solid 'Shrink-Wrap' hull around the tissue slice.
+    Uses Log-Space Otsu and Morphological Closing (Concave Hull).
     """
-    print(f"  [HullGen] Generating Tight Hull (Downsample {downsample_factor}x)...")
+    print(f"  [HullGen] Generating Concave Hull (Radius {hull_closing_radius}, DS {downsample_factor}x)...")
     
-    # Calculate global threshold for tissue
-    # Sample pixels to avoid scanning whole image if large
+    # 1. Robust Global Threshold Calculation (Log-Space Otsu)
     valid = image[image > 0]
     if valid.size > 0:
-        sample = np.random.choice(valid, min(valid.size, 100000), replace=False)
-        thresh = threshold_otsu(sample) * 0.5
+        # Sample if huge
+        if valid.size > 200000:
+            valid = np.random.choice(valid, 200000, replace=False)
+            
+        log_pixels = np.log1p(valid.astype(np.float32))
+        try:
+            log_thresh = threshold_otsu(log_pixels)
+        except:
+            log_thresh = 0
+        # Use 0.8 factor to match 3D logic
+        tissue_thresh = (np.expm1(log_thresh)) * 0.8
     else:
-        thresh = 0
+        tissue_thresh = 0
 
-    # Downsampled dimensions
+    print(f"    Tissue Threshold: {tissue_thresh:.2f}")
+
     h, w = image.shape
     small_h = h // downsample_factor
     small_w = w // downsample_factor
     
-    # Create raw mask: Tissue OR Segmentation
-    mask_raw = (image > thresh) | (cell_mask > 0)
+    mask_raw = (image > tissue_thresh) | (cell_mask > 0)
     
     if not np.any(mask_raw):
         return np.zeros_like(image, dtype=bool)
@@ -135,10 +142,30 @@ def generate_tight_hull_2d(
         order=0, preserve_range=True, anti_aliasing=False
     ).astype(bool)
 
-    # Morphology
-    # Using disk(10) to match 3D hardcoded value
-    struct_elem = disk(10)
-    closed = binary_closing(small_mask, footprint=struct_elem)
+    # Filter Noise BEFORE hull generation
+    small_mask = remove_small_objects(small_mask, min_size=100)
+
+    if not np.any(small_mask):
+        return np.zeros_like(image, dtype=bool)
+
+    # Morphological Operations
+    # 1. Bridge sparse cells (Dilation)
+    bridged = sk_dilation(small_mask, footprint=disk(3))
+    
+    # 2. Define Hull Shape (Closing)
+    struct_elem = disk(hull_closing_radius)
+    closed = binary_closing(bridged, footprint=struct_elem)
+    
+    # 3. Filter: Keep ONLY Largest Component
+    labeled_hull, num_features = ndimage.label(closed)
+    if num_features > 1:
+        counts = np.bincount(labeled_hull.ravel())
+        counts[0] = 0 # Ignore background
+        largest_label = np.argmax(counts)
+        print(f"    Keeping largest tissue component (Label {largest_label}). Removing {num_features-1} artifacts.")
+        closed = (labeled_hull == largest_label)
+
+    # 4. Fill Holes
     filled = binary_fill_holes(closed)
 
     # Upsample
@@ -160,40 +187,24 @@ def trim_edges_with_core_protection_2d(
 ) -> None:
     """
     Trims edges based on distance from hull, protecting bright cores.
-    Matches 3D logic: Distance Map -> Core Protection -> Filter.
-
-    Args:
-        labels_memmap: 2D Labels (modified in-place).
-        image: Original 2D intensity image.
-        hull_mask: Boolean hull mask.
-        spacing: Pixel spacing (y, x).
-        distance_threshold: Physical distance to trim (um).
-        global_brightness_cutoff: Intensity threshold for core protection.
     """
     print("  [EdgeTrim] Trimming with Core Protection (2D)...")
 
-    # 1. Distance Map
-    # Distance from background (outside hull) into the tissue
-    # distance_transform_edt calculates distance to nearest zero. 
-    # Since hull_mask is 1 (Tissue) and 0 (Background), this gives dist from edge inwards.
+    # 1. Distance Map (from background/hull edge)
     print("    Calculating distance map...")
     dist_map = distance_transform_edt(hull_mask, sampling=spacing)
 
-    # 2. Protection
-    # Protect if Bright Core
+    # 2. Protection (Bright Cores)
     protection_radius_um = 6.0
-    # Determine iterations: radius / pixel_size
     avg_spacing = np.mean(spacing)
     protection_iter = max(2, min(10, int(protection_radius_um / avg_spacing)))
     
     print(f"    Applying Protection (Dilate Bright Cores {protection_iter}x)...")
     
-    # Identify cores
     mask_labels = labels_memmap[:] > 0
     mask_bright = image > global_brightness_cutoff
     core_mask = mask_labels & mask_bright
     
-    # Dilate cores
     if np.any(core_mask):
         struct = generate_binary_structure(2, 1)
         protected_mask = binary_dilation(
@@ -203,8 +214,6 @@ def trim_edges_with_core_protection_2d(
         protected_mask = np.zeros_like(core_mask)
 
     # 3. Kill Logic
-    # Delete if: Labeled AND Near Edge AND Not Protected
-    # Near Edge means Distance < Threshold
     to_delete = (mask_labels) & (dist_map < distance_threshold) & (~protected_mask)
     
     count = np.sum(to_delete)
@@ -216,40 +225,69 @@ def trim_edges_with_core_protection_2d(
         print("    No artifact pixels found to delete.")
 
 
+def _trim_zero_data_edges_2d(
+    labels_memmap: np.memmap,
+    image: np.ndarray,
+    spacing: Tuple[float, float],
+    distance_threshold: float
+) -> None:
+    """
+    Specifically removes artifacts at the boundary of Missing Tiles (Pixel Value 0).
+    """
+    print("  [ZeroTrim] Removing Missing Tile Artifacts...")
+    
+    # 1. Identify 'True Zero' regions (Missing Tiles)
+    is_zero = (image < 1e-4)
+    
+    if not np.any(is_zero):
+        print("    No zero-value regions found.")
+        return
+
+    # 2. Calculate distance FROM the void
+    dist_from_void = distance_transform_edt(~is_zero, sampling=spacing)
+    
+    # 3. Hard Delete
+    mask_distance = (dist_from_void < distance_threshold)
+    
+    if distance_threshold > 0:
+        avg_pixel_size = np.mean(spacing)
+        if distance_threshold < avg_pixel_size:
+            # Ensure immediate boundary is caught even if thresh is small
+            mask_distance |= (dist_from_void <= (avg_pixel_size * 1.5))
+    
+    to_delete = (labels_memmap[:] > 0) & mask_distance
+    
+    count = np.sum(to_delete)
+    if count > 0:
+        labels_memmap[to_delete] = 0
+        labels_memmap.flush()
+        print(f"    Deleted {count} pixels at tile boundaries.")
+    else:
+        print("    No tile boundary artifacts found within threshold.")
+
+
 def apply_hull_trimming_2d(
     raw_labels_path: str,
     original_image: np.ndarray,
     spacing: Union[Tuple[float, float], Tuple[float, float, float]],
     segmentation_threshold: float,
-    hull_boundary_thickness_phys: float,  # Unused in main logic, kept for signature parity
+    hull_boundary_thickness_phys: float,
     edge_trim_distance_threshold: float,
     brightness_cutoff_factor: float,
     min_size_pixels: int,
-    smoothing_iterations: int = 1,  # Unused in main logic, kept for signature parity
-    heal_iterations: int = 1        # Unused in main logic, kept for signature parity
+    smoothing_iterations: int = 1,
+    heal_iterations: int = 1,
+    temp_root_path: Optional[str] = None
 ) -> Tuple[Optional[str], Optional[str], Optional[np.ndarray]]:
     """
     Main Entry Point for Step 2 (2D).
-    Applies Hull Generation, Edge Trimming, and Size Filtering.
+    Applies Zero-Edge Trimming, Hull Generation, Edge Trimming, and Size Filtering.
 
     Args:
-        raw_labels_path: Path to input .dat file.
-        original_image: 2D Intensity image.
-        spacing: Pixel spacing.
-        segmentation_threshold: Threshold from Step 1.
-        hull_boundary_thickness_phys: (Unused parity arg)
-        edge_trim_distance_threshold: Distance to trim.
-        brightness_cutoff_factor: Multiplier for core protection.
-        min_size_pixels: Size filter.
-        smoothing_iterations: (Unused parity arg)
-        heal_iterations: (Unused parity arg)
-
-    Returns:
-        Tuple: (output_path, temp_dir, hull_boundary_mask_for_viz)
+        smoothing_iterations: Mapped to hull_closing_radius (1->10, 2->15, etc).
     """
     print(f"\n--- Applying Hull Generation and Edge Trimming (2D) ---")
     
-    # Validate spacing
     try:
         if len(spacing) == 3:
             spacing_2d = tuple(float(s) for s in spacing[1:])
@@ -259,9 +297,16 @@ def apply_hull_trimming_2d(
         spacing_2d = (1.0, 1.0)
 
     original_shape = original_image.shape
-    final_output_temp_dir = tempfile.mkdtemp(prefix="trimmed_final_2d_")
+    
+    # Safe temp dir
+    final_output_temp_dir = _get_safe_temp_dir(temp_root_path, "trimmed_final_2d")
+    
     trimmed_labels_memmap = None
     hull_boundary_for_return = None
+
+    # Map iterations to radius
+    hull_closing_radius = (max(1, smoothing_iterations) * 5) + 5
+    print(f"  Hull Closing Radius: {hull_closing_radius}")
 
     try:
         # 1. Output Setup
@@ -273,16 +318,24 @@ def apply_hull_trimming_2d(
 
         # 2. Edge Trimming
         if edge_trim_distance_threshold > 0:
-            # A. Generate Hull
-            hull_mask = generate_tight_hull_2d(
-                original_image, trimmed_labels_memmap, downsample_factor=4
+            
+            # A. ZERO EDGE TRIM (Hard)
+            _trim_zero_data_edges_2d(
+                trimmed_labels_memmap, original_image, spacing_2d, 
+                edge_trim_distance_threshold
             )
 
-            # B. Recalculate Threshold (Robustness)
+            # B. Generate Hull (Tissue Edge)
+            hull_mask = generate_tight_hull_2d(
+                original_image, trimmed_labels_memmap, 
+                hull_closing_radius=hull_closing_radius,
+                downsample_factor=4
+            )
+
+            # C. Recalculate Threshold
             print("  [Filter] Checking reference intensity...")
             valid = original_image[original_image > 0]
             if valid.size > 0:
-                # Subsample if large
                 sub = np.random.choice(valid, min(valid.size, 100000))
                 raw_otsu = threshold_otsu(sub)
                 vol_max = np.max(sub)
@@ -290,16 +343,15 @@ def apply_hull_trimming_2d(
                 raw_otsu = 0
                 vol_max = 0
             
-            # Heuristic: If image is dim or seg threshold suspicious, fallback to otsu
             ref_thresh = raw_otsu if (vol_max > 5 and segmentation_threshold < 2.0) else segmentation_threshold
             global_brightness_cutoff = ref_thresh * brightness_cutoff_factor
             
             print(f"  Edge Trim Active: Dist<{edge_trim_distance_threshold}um, "
                   f"CoreBrightness>{global_brightness_cutoff:.2f}")
 
-            # C. Trim
+            # D. Trim Tissue Edges (with Protection)
             trim_edges_with_core_protection_2d(
-                labels_memmap=trimmed_labels_memmap,
+                trimmed_labels_memmap,
                 image=original_image,
                 hull_mask=hull_mask,
                 spacing=spacing_2d,
@@ -307,8 +359,7 @@ def apply_hull_trimming_2d(
                 global_brightness_cutoff=global_brightness_cutoff
             )
 
-            # D. Generate Boundary for Viz
-            # Erode hull slightly to get a rim
+            # E. Generate Boundary for Viz
             struct = generate_binary_structure(2, 1)
             eroded_hull = ndimage.binary_erosion(hull_mask, structure=struct, iterations=1)
             hull_boundary_for_return = (hull_mask ^ eroded_hull)
@@ -321,7 +372,6 @@ def apply_hull_trimming_2d(
         if min_size_pixels > 0:
             relabel_and_filter_fragments_2d(trimmed_labels_memmap, min_size_pixels)
 
-        # Cleanup handle
         _safe_close_memmap(trimmed_labels_memmap)
 
         return final_output_path, final_output_temp_dir, hull_boundary_for_return

@@ -123,7 +123,10 @@ class DynamicGUIManager(QObject):
         self.original_stdout = sys.stdout
         self.original_stderr = sys.stderr
         self.output_stream: Optional[OutputStream] = None
+        
+        # Initialize Persistent Log Widget
         self.log_widget: Optional[QTextEdit] = None
+        self._init_persistent_log()
 
         # Project Paths
         self.inputdir = os.path.dirname(self.file_loc)
@@ -174,6 +177,21 @@ class DynamicGUIManager(QObject):
 
         self._initialize_layers()
         self.restore_from_checkpoint()
+
+    def _init_persistent_log(self) -> None:
+        """Creates a permanent log widget that isn't destroyed between steps."""
+        self.log_widget = QTextEdit()
+        self.log_widget.setReadOnly(True)
+        # Limit height to avoid squashing parameters
+        self.log_widget.setMinimumHeight(150)
+        self.log_widget.setMaximumHeight(200)  # <-- Added max height
+        self.log_widget.setStyleSheet("font-family: monospace; font-size: 11px;")
+        
+        # Add to Napari as a separate dock widget
+        # 'area="right"' puts it on the sidebar. Napari usually stacks docks.
+        self.viewer.window.add_dock_widget(
+            self.log_widget, area="right", name="Process Log"
+        )
 
     def _calculate_spacing(self) -> None:
         """Parses spacing from config or defaults to 1.0."""
@@ -357,6 +375,7 @@ class DynamicGUIManager(QObject):
             self.strategy.intermediate_state['original_volume_ref'] = self.image_stack
 
         # Setup UI
+        # ONLY clear log here, when starting a new run explicitly
         if self.log_widget:
             self.log_widget.clear()
             self.log_widget.append(f"--- Starting {step_display} ---\n")
@@ -378,11 +397,10 @@ class DynamicGUIManager(QObject):
         self.worker.start()
 
     def _append_log(self, text: str) -> None:
-        """Appends text to the GUI log widget (Thread-safe)."""
-        # Python check: object might be None if cleaned up
+        """Appends text to the GUI log widget."""
         if not self.log_widget:
             return
-            
+        
         try:
             # C++ check: might raise RuntimeError if wrapped object deleted
             cursor = self.log_widget.textCursor()
@@ -391,23 +409,19 @@ class DynamicGUIManager(QObject):
             self.log_widget.setTextCursor(cursor)
             self.log_widget.ensureCursorVisible()
         except RuntimeError:
-            # The widget has been destroyed by Qt
             self.log_widget = None
 
     def _on_step_finished(self, success: bool) -> None:
         """Callback when the worker thread finishes."""
-        # 1. Immediate Stdout Restoration
-        # This prevents print statements from crashing if the log widget is gone
+        # Restore Stdout immediately
         sys.stdout = self.original_stdout
         sys.stderr = self.original_stderr
         
         self.worker = None
         
-        # 2. Re-enable UI (if it exists)
         try:
             self._set_ui_busy(False)
         except RuntimeError:
-            # Main window closed during processing
             return
         
         step_index = self.current_step["value"]
@@ -472,11 +486,9 @@ class DynamicGUIManager(QObject):
         """Disables/Enables parameter widgets during processing."""
         if not self.current_widgets:
             return
-            
-        # Iterate safely
+        
         for dock in list(self.current_widgets.keys()):
             try:
-                # Check C++ validity
                 if dock.widget():
                     dock.widget().setEnabled(not is_busy)
             except RuntimeError:
@@ -530,7 +542,7 @@ class DynamicGUIManager(QObject):
                 except Exception:
                     pass
         
-        self._add_log_widget(scroll_l)
+        # Log is persistent, so we don't add it here
         self._dock_widget(scroll_w, step_display)
 
     def create_interaction_widgets(self, step_display: str, config_key: str) -> None:
@@ -576,7 +588,6 @@ class DynamicGUIManager(QObject):
                 except Exception:
                     pass
 
-        self._add_log_widget(layout)
         self._dock_widget(scroll_w, step_display)
 
     def select_reference_channel(self) -> None:
@@ -591,16 +602,6 @@ class DynamicGUIManager(QObject):
             display_name = os.path.basename(folder)
             self.lbl_ref_path.setText(f"Selected: {display_name}")
             self.lbl_ref_path.setStyleSheet("color: #2E8B57; font-weight: bold;")
-
-    def _add_log_widget(self, layout: QVBoxLayout) -> None:
-        """Adds a log text box to the layout."""
-        layout.addWidget(QLabel("Log:"))
-        self.log_widget = QTextEdit()
-        self.log_widget.setReadOnly(True)
-        self.log_widget.setMinimumHeight(150)
-        self.log_widget.setStyleSheet("font-family: monospace;")
-        layout.addWidget(self.log_widget)
-        layout.addStretch()
 
     def _dock_widget(self, widget: QWidget, name: str) -> None:
         """Docks the given widget into the Napari window."""

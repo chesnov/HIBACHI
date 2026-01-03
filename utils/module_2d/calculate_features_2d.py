@@ -11,7 +11,7 @@ import numpy as np
 import pandas as pd
 from scipy import ndimage as ndi
 from scipy.spatial import cKDTree
-from skimage.morphology import skeletonize, binary_erosion  # type: ignore
+from skimage.morphology import skeletonize, binary_closing, disk
 from skimage.measure import regionprops, find_contours  # type: ignore
 from skimage.feature import peak_local_max  # type: ignore
 from skan import Skeleton, summarize  # type: ignore
@@ -336,13 +336,54 @@ def calculate_intensity_2d(segmented_array, intensity_image):
 # 3. SKELETONIZATION (2D)
 # =============================================================================
 
+def _break_skeleton_cycles_2d(skeleton_binary):
+    """
+    Robustly breaks cycles by ensuring the skeleton is thinned 
+    before breaking, preventing 'thick' loops from surviving.
+    """
+    # 1. Ensure the skeleton is strictly 1-pixel thick first
+    pruned = _prune_internal_artifacts_2d(skeleton_binary.astype(np.uint8))
+    kernel = np.array([[1,1,1],[1,0,1],[1,1,1]], dtype=np.uint8)
+    
+    for _ in range(20):
+        # 2. Isolate the loop 'cores' by peeling endpoints
+        core = pruned.copy()
+        while True:
+            neighbors = ndi.convolve(core, kernel, mode='constant', cval=0)
+            endpoints = (core == 1) & (neighbors <= 1)
+            if not np.any(endpoints):
+                break
+            core[endpoints] = 0
+        
+        if not np.any(core):
+            break
+            
+        # 3. Identify junctions to avoid breaking them
+        all_neighbors = ndi.convolve(pruned, kernel, mode='constant', cval=0)
+        junctions = (pruned == 1) & (all_neighbors >= 3)
+        
+        # 4. Find one break-point per loop
+        labeled_core, n = ndi.label(core, structure=np.ones((3,3)))
+        for i in range(1, n + 1):
+            component = (labeled_core == i)
+            # Prefer breaking away from junctions
+            candidates = np.argwhere(component & ~junctions)
+            if len(candidates) == 0:
+                candidates = np.argwhere(component)
+            
+            if len(candidates) > 0:
+                by, bx = candidates[0]
+                pruned[by, bx] = 0
+                
+    return pruned.astype(bool)
+
 def _trace_spur_length_and_path_2d(skeleton, start_y, start_x, spacing):
-    """Traces 2D spur from endpoint."""
+    """Traces 2D spur from endpoint. Stops exactly BEFORE a junction."""
     if skeleton[start_y, start_x] == 0: return 0.0, []
     
     visited = set()
     current = (start_y, start_x)
-    path = [current]
+    path = []
     total_len = 0.0
     
     offsets = [(-1,-1), (-1,0), (-1,1), (0,-1), (0,1), (1,-1), (1,0), (1,1)]
@@ -350,42 +391,39 @@ def _trace_spur_length_and_path_2d(skeleton, start_y, start_x, spacing):
     while True:
         visited.add(current)
         cy, cx = current
-        neighbors = []
         
+        neighbors = []
         for dy, dx in offsets:
             ny, nx = cy + dy, cx + dx
             if (0 <= ny < skeleton.shape[0] and 
                 0 <= nx < skeleton.shape[1] and 
-                skeleton[ny, nx] and (ny, nx) not in visited):
-                neighbors.append((ny, nx))
+                skeleton[ny, nx]):
+                if (ny, nx) not in visited:
+                    neighbors.append((ny, nx))
         
-        if len(neighbors) != 1: break # Endpoint or Junction
-        
-        next_node = neighbors[0]
-        dy_um = (next_node[0] - cy) * spacing[0]
-        dx_um = (next_node[1] - cx) * spacing[1]
-        dist = np.sqrt(dy_um**2 + dx_um**2)
-        total_len += dist
-        current = next_node
-        path.append(current)
+        if len(neighbors) == 1:
+            path.append(current) 
+            next_node = neighbors[0]
+            dy_um = (next_node[0] - cy) * spacing[0]
+            dx_um = (next_node[1] - cx) * spacing[1]
+            total_len += np.sqrt(dy_um**2 + dx_um**2)
+            current = next_node
+        else:
+            # Junction or isolated end reached
+            break
         
     return total_len, path
 
 
 def _prune_skeleton_spurs_2d(skeleton_binary, spacing, max_spur_length_um):
-    """Prunes short spurs from 2D skeleton."""
+    """Prunes short spurs while protecting junctions."""
     if max_spur_length_um <= 0: return skeleton_binary
     
     pruned = skeleton_binary.copy().astype(np.uint8)
-    
     kernel = np.array([[1,1,1],[1,0,1],[1,1,1]], dtype=np.uint8)
     
-    changed = True
-    iters = 0
-    while changed and iters < 50:
+    for _ in range(5): 
         changed = False
-        iters += 1
-        
         neighbors = ndi.convolve(pruned, kernel, mode='constant', cval=0)
         endpoints = (pruned == 1) & (neighbors == 1)
         
@@ -396,68 +434,34 @@ def _prune_skeleton_spurs_2d(skeleton_binary, spacing, max_spur_length_um):
             if pruned[y, x] == 0: continue
             
             length, path = _trace_spur_length_and_path_2d(pruned, y, x, spacing)
-            if length <= max_spur_length_um:
-                # Remove path, but protect junctions
-                # The last point in 'path' is the node before junction/end
-                # We need to check if the node *after* the path is a junction
-                
-                # Simple removal: remove all in path except last if it's a junction
-                # The tracer stops BEFORE a junction.
-                # So we can remove the whole traced path safely?
-                # Let's verify neighbor count of last point in path relative to pruned
-                
+            if length <= max_spur_length_um and len(path) > 0:
                 for py, px in path:
-                    # Double check we don't break connectivity of a junction
-                    # (Simplified: just remove)
                     pruned[py, px] = 0
                 changed = True
+        if not changed: break
                 
     return pruned
 
 
 def _prune_internal_artifacts_2d(skeleton_binary):
-    """
-    Removes redundant internal pixels (ladder artifacts) often produced by 
-    skeletonization of thick 2D shapes.
-    """
+    """Removes 'ladder' artifacts while preserving connectivity."""
     pruned = skeleton_binary.copy().astype(np.uint8)
-    kernel = np.array([[1,1,1],[1,0,1],[1,1,1]], dtype=np.uint8)
-    
-    for _ in range(50):
-        neighbors = ndi.convolve(pruned, kernel, mode='constant', cval=0)
-        # Candidate: Pixel with >= 2 neighbors
-        candidates = np.argwhere((pruned == 1) & (neighbors >= 2))
-        if candidates.shape[0] == 0: break
-        
-        removed_count = 0
-        padded = np.pad(pruned, 1, mode='constant')
-        
+    for _ in range(3):
+        changed = False
+        candidates = np.argwhere(pruned == 1)
         for r, c in candidates:
-            # Check if removing this pixel breaks local connectivity
-            # Extract 3x3 neighborhood
-            roi = padded[r:r+3, c:c+3].copy()
-            roi[1, 1] = 0 # Simulate removal
-            
-            lbl, n = ndi.label(roi, structure=np.ones((3,3)))
-            # If still 1 component (or 0), we can remove it?
-            # We want to remove pixels that are redundant. 
-            # If removing it doesn't increase component count, it might be redundant.
-            # But we must preserve the 'curve'.
-            
-            # Simple heuristic: If we have 2 neighbors and they are adjacent to each other,
-            # then the center pixel forms a small triangle -> Redundant.
-            
-            # Get neighbor coords relative to center
-            ns = np.argwhere(roi == 1)
-            if len(ns) == 2:
-                # Check distance between neighbors
-                d = np.abs(ns[0] - ns[1])
-                if np.max(d) == 1: # Adjacent (8-conn)
+            y_min, y_max = max(0, r-1), min(pruned.shape[0], r+2)
+            x_min, x_max = max(0, c-1), min(pruned.shape[1], c+2)
+            roi = pruned[y_min:y_max, x_min:x_max].copy()
+            cr, cc = r - y_min, c - x_min
+            _, before = ndi.label(roi, structure=np.ones((3,3)))
+            roi[cr, cc] = 0 
+            _, after = ndi.label(roi, structure=np.ones((3,3)))
+            if before == after and before > 0:
+                if np.sum(roi) > 1:
                     pruned[r, c] = 0
-                    removed_count += 1
-                    
-        if removed_count == 0: break
-        
+                    changed = True
+        if not changed: break
     return pruned
 
 
@@ -522,9 +526,9 @@ def calculate_ramification_with_skan_2d(
     use_memmap = (skeleton_export_path is not None)
     if use_memmap:
         os.makedirs(os.path.dirname(skeleton_export_path), exist_ok=True)
-        skel_out = np.memmap(skeleton_export_path, dtype=np.uint8, mode='w+', shape=original_shape)
+        skel_out = np.memmap(skeleton_export_path, dtype=np.int32, mode='w+', shape=original_shape)
     else:
-        skel_out = np.zeros(original_shape, dtype=np.uint8)
+        skel_out = np.zeros(original_shape, dtype=np.int32)
         
     labels = np.unique(segmented_array)
     labels = labels[labels > 0]
@@ -540,60 +544,65 @@ def calculate_ramification_with_skan_2d(
         sl = locations[idx]
         offset = np.array([s.start for s in sl])
         
-        crop = segmented_array[sl]
-        mask = (crop == lbl)
+        mask = (segmented_array[sl] == lbl).astype(bool)
         if not np.any(mask): continue
         
-        # 1. Skeletonize
-        skel = skeletonize(mask)
+        # --- FIX: ROBUST HOLE FILLING ---
+        # 1. Pad the mask so holes touching the crop edge are correctly filled
+        mask = np.pad(mask, pad_width=2, mode='constant', constant_values=0)
         
-        # 2. Prune
-        if prune_spurs_le_um > 0:
+        # 2. Morphological Closing (Seals 1-2 pixel 'leaks' to the background)
+        # Using a disk(1) or a 3x3 square is usually enough.
+        mask = binary_closing(mask, np.ones((3, 3)))
+        
+        # 3. Fill holes
+        mask = ndi.binary_fill_holes(mask)
+        
+        # 4. Remove padding
+        mask = mask[2:-2, 2:-2]
+        
+        # --- SKELETONIZATION ---
+        try:
+            skel = skeletonize(mask, method='lee')
+        except:
+            skel = skeletonize(mask)
+        
+        if np.any(skel):
+            # Clean artifacts (laddering) before breaking cycles
+            skel = _prune_internal_artifacts_2d(skel)
+            # Break any surviving topological loops
+            skel = _break_skeleton_cycles_2d(skel)
+
+        # Prune small spurs
+        if prune_spurs_le_um > 0 and np.any(skel):
             skel = _prune_skeleton_spurs_2d(skel, spacing, prune_spurs_le_um)
             
-        # 3. Clean Artifacts (Ladder)
+        # Final cleanup
         if np.any(skel):
             skel = _prune_internal_artifacts_2d(skel)
             
-        # 4. Analyze
-        skan_branches, skan_len, avg_len = 0, 0.0, 0.0
-        try:
-            if np.any(skel):
+        # Skan / Analysis (logic remains the same)
+        skan_len, skan_branches, avg_len = 0.0, 0, 0.0
+        if np.any(skel):
+            try:
                 skel_obj = Skeleton(skel, spacing=spacing)
                 summ = summarize(skel_obj, separator='-')
                 if not summ.empty:
                     summ['label'] = lbl
-                    # Fix coords: coord-src-0 (Y), coord-src-1 (X)
                     for c in summ.columns:
                         if 'coord' in c:
-                            axis = int(c.split('-')[-1]) # 0 or 1
+                            axis = int(c.split('-')[-1])
                             summ[c] += offset[axis]
                     detailed_dfs.append(summ)
-                    
                     skan_len = summ['branch-distance'].sum()
-                    skan_branches = len(summ) # SKAN segments
+                    skan_branches = len(summ)
                     avg_len = summ['branch-distance'].mean()
-        except Exception: pass
+            except: pass
         
-        # True Topology
         true_branches, n_junc, n_end, _ = _analyze_skeleton_topology_2d(skel, spacing)
         
-        # 5. Save Visual
         if np.any(skel):
-            out_view = skel_out[sl]
-            # Write 1 for skeleton to allow visualization (or label?)
-            # 3D code writes label. Let's write label.
-            # Warning: uint8 only supports 255 labels.
-            # The 3D code creates int32 array.
-            # I declared uint8 above. I should fix that if I want to store labels.
-            # But the 2D function signature implies returning `skel_out`.
-            # Let's switch to int32 for safety if memory allows, or just binary for viz.
-            # Given `skeleton_export_path` usually ends in `.npy` or `.dat` for large data,
-            # let's assume we want labels.
-            # Wait, `skel_out` initialized as uint8?
-            # I'll check `calculate_features_3d`. It uses int32.
-            # I will re-init `skel_out` as int32 below.
-            pass
+            skel_out[sl][skel > 0] = lbl
 
         stats_list.append({
             'label': lbl, 
@@ -605,13 +614,7 @@ def calculate_ramification_with_skan_2d(
             'skan_num_skeleton_pixels': np.count_nonzero(skel)
         })
 
-    # Fix dtype for output
-    if use_memmap:
-        skel_out.flush()
-        # Re-open as int32 for final write? 
-        # Actually, simpler: I'll just change the init type at the top.
-        pass # See correction in actual function body below.
-
+    if use_memmap: skel_out.flush()
     return pd.DataFrame(stats_list), pd.concat(detailed_dfs, ignore_index=True) if detailed_dfs else pd.DataFrame(), skel_out
 
 
@@ -736,7 +739,6 @@ def calculate_ramification_with_skan_2d(
     use_memmap = (skeleton_export_path is not None)
     if use_memmap:
         os.makedirs(os.path.dirname(skeleton_export_path), exist_ok=True)
-        # Use int32 to store labels
         skel_out = np.memmap(skeleton_export_path, dtype=np.int32, mode='w+', shape=original_shape)
     else:
         skel_out = np.zeros(original_shape, dtype=np.int32)
@@ -759,21 +761,24 @@ def calculate_ramification_with_skan_2d(
         mask = (crop == lbl)
         if not np.any(mask): continue
         
-        # 1. Skeletonize
-        skel = skeletonize(mask)
+        # 1. Skeletonize using 'lee' (more consistent for microscopy)
+        try:
+            skel = skeletonize(mask, method='lee')
+        except:
+            skel = skeletonize(mask)
         
-        # 2. Prune
+        # 2. Prune spurs
         if prune_spurs_le_um > 0:
             skel = _prune_skeleton_spurs_2d(skel, spacing, prune_spurs_le_um)
             
-        # 3. Clean Artifacts
+        # 3. Clean Artifacts (Safe connectivity)
         if np.any(skel):
             skel = _prune_internal_artifacts_2d(skel)
             
-        # 4. Analyze
-        skan_branches, skan_len, avg_len = 0, 0.0, 0.0
-        try:
-            if np.any(skel):
+        # 4. Skan Analysis
+        skan_len, skan_branches, avg_len = 0.0, 0, 0.0
+        if np.any(skel):
+            try:
                 skel_obj = Skeleton(skel, spacing=spacing)
                 summ = summarize(skel_obj, separator='-')
                 if not summ.empty:
@@ -786,16 +791,14 @@ def calculate_ramification_with_skan_2d(
                     skan_len = summ['branch-distance'].sum()
                     skan_branches = len(summ)
                     avg_len = summ['branch-distance'].mean()
-        except Exception: pass
+            except: pass
         
-        # True Topology
+        # True Topology metrics
         true_branches, n_junc, n_end, _ = _analyze_skeleton_topology_2d(skel, spacing)
         
-        # 5. Save Visual
+        # 5. Save Visual Labels
         if np.any(skel):
-            out_view = skel_out[sl]
-            out_view[skel > 0] = lbl
-            skel_out[sl] = out_view
+            skel_out[sl][skel > 0] = lbl
 
         stats_list.append({
             'label': lbl, 
@@ -807,7 +810,5 @@ def calculate_ramification_with_skan_2d(
             'skan_num_skeleton_pixels': np.count_nonzero(skel)
         })
 
-    if use_memmap:
-        skel_out.flush()
-
+    if use_memmap: skel_out.flush()
     return pd.DataFrame(stats_list), pd.concat(detailed_dfs, ignore_index=True) if detailed_dfs else pd.DataFrame(), skel_out

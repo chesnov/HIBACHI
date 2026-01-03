@@ -3,239 +3,318 @@ import gc
 import math
 import time
 import shutil
-import traceback
 import tempfile
-import warnings
-from typing import Tuple, List, Dict, Any, Optional, Union
+import traceback
+import multiprocessing as mp
+from functools import partial
+from typing import Tuple, List, Dict, Any, Optional, Union, Generator
 
 import numpy as np
-import psutil
+import zarr
+import dask.array as da
+import dask_image.ndmorph
+import dask_image.ndmeasure
+from dask.diagnostics import ProgressBar
 from scipy import ndimage
-from scipy.ndimage import gaussian_filter, generate_binary_structure, label as ndimage_label
+from scipy.ndimage import gaussian_filter, generate_binary_structure, white_tophat
 from skimage.filters import frangi, sato  # type: ignore
 from skimage.morphology import remove_small_objects, disk  # type: ignore
+from tqdm import tqdm
 
-# Set seed for reproducibility
+# Set fixed seed for reproducibility
 SEED = 42
 np.random.seed(SEED)
 
 
-def create_memmap(
-    data: Optional[np.ndarray] = None,
-    dtype: Optional[Any] = None,
-    shape: Optional[Tuple[int, ...]] = None,
-    prefix: str = 'temp_2d',
-    directory: Optional[str] = None
-) -> Tuple[np.memmap, str, str]:
-    """
-    Creates a memory-mapped array for efficient 2D data handling.
+def _init_worker() -> None:
+    """Initializes worker processes to use single-threaded BLAS/OMP."""
+    os.environ["OMP_NUM_THREADS"] = "1"
+    os.environ["MKL_NUM_THREADS"] = "1"
+    os.environ["OPENBLAS_NUM_THREADS"] = "1"
+    os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
+    os.environ["NUMEXPR_NUM_THREADS"] = "1"
 
-    Args:
-        data: Optional data to write immediately.
-        dtype: Data type of the array.
-        shape: Shape of the array.
-        prefix: Filename prefix.
-        directory: Directory for the temp file. Created if None.
 
-    Returns:
-        Tuple[np.memmap, str, str]: (memmap_obj, file_path, directory_path)
-    """
-    if directory is None:
-        directory = tempfile.mkdtemp(prefix=f"{prefix}_dir_")
-    
-    path = os.path.join(directory, f'{prefix}.dat')
-    
-    if data is not None:
-        shape = data.shape
-        dtype = data.dtype
-        result = np.memmap(path, dtype=dtype, mode='w+', shape=shape)
-        result[:] = data[:]
-        result.flush()
+def _get_safe_temp_dir(base_path: Optional[str], suffix: str = "") -> str:
+    """Creates a temporary directory in the project folder to prevent /tmp overflows."""
+    if base_path and os.path.isdir(base_path):
+        scratch_root = os.path.join(base_path, "hibachi_scratch")
     else:
-        if shape is None or dtype is None:
-            raise ValueError("Shape and dtype must be provided if data is None")
-        result = np.memmap(path, dtype=dtype, mode='w+', shape=shape)
+        scratch_root = os.path.abspath("hibachi_scratch")
     
-    return result, path, directory
+    os.makedirs(scratch_root, exist_ok=True)
+    return tempfile.mkdtemp(prefix=f"step1_2d_{suffix}_", dir=scratch_root)
 
 
-def enhance_tubular_structures_2d(
+def _cleanup_registry(registry: Dict[str, Tuple[Any, str, str]]) -> None:
+    """
+    Helper to clean up intermediate memmaps tracked in a registry.
+    Args:
+        registry: Dict mapping key -> (memmap_obj, path, temp_dir)
+    """
+    for key in list(registry.keys()):
+        mm, path, d = registry.pop(key)
+        # Close memmap handle
+        if isinstance(mm, np.memmap) and hasattr(mm, '_mmap') and mm._mmap is not None:
+            try:
+                mm._mmap.close()
+            except Exception:
+                pass
+        del mm
+        
+        # Remove directory
+        if d and os.path.exists(d):
+            try:
+                shutil.rmtree(d, ignore_errors=True)
+            except Exception:
+                pass
+
+
+def _get_chunk_slices_2d(
+    shape: Tuple[int, ...],
+    chunk_shape: Tuple[int, ...],
+    overlap: int = 0
+) -> Generator[Tuple[Tuple[slice, ...], Tuple[slice, ...]], None, None]:
+    """
+    Generates read/write slices for 2D chunked processing.
+    
+    Args:
+        shape: (Y, X)
+        chunk_shape: (Y_chunk, X_chunk)
+    """
+    y_shape, x_shape = shape
+    cy, cx = chunk_shape
+
+    for y in range(0, y_shape, cy):
+        for x in range(0, x_shape, cx):
+            # Valid output region (no overlap)
+            y_start, y_stop = y, min(y + cy, y_shape)
+            x_start, x_stop = x, min(x + cx, x_shape)
+            
+            write_slice = (
+                slice(y_start, y_stop),
+                slice(x_start, x_stop)
+            )
+
+            # Input region (with overlap, clamped)
+            y_start_pad = max(0, y_start - overlap)
+            y_stop_pad = min(y_shape, y_stop + overlap)
+            x_start_pad = max(0, x_start - overlap)
+            x_stop_pad = min(x_shape, x_stop + overlap)
+
+            read_slice = (
+                slice(y_start_pad, y_stop_pad),
+                slice(x_start_pad, x_stop_pad)
+            )
+
+            yield read_slice, write_slice
+
+
+def _process_block_worker_2d(
+    chunk_info: Tuple[Tuple[slice, ...], Tuple[slice, ...]],
+    input_memmap_info: Tuple[str, Tuple[int, ...], Any],
+    output_memmap_info: Tuple[str, Tuple[int, ...], Any],
+    sigmas_voxel_2d: List[float],
+    sigma_voxel_2d_smooth: Optional[Tuple[float, float]],
+    black_ridges: bool,
+    frangi_alpha: float,
+    frangi_beta: float,
+    frangi_gamma: float,
+    subtract_background_radius: int
+) -> Optional[str]:
+    """
+    Worker function for processing a 2D block.
+    Matches 3D logic: Scale-Independent Filtering with Intensity Gating.
+    """
+    input_memmap = None
+    output_memmap = None
+    try:
+        read_slices, write_slices = chunk_info
+        input_path, input_shape, input_dtype = input_memmap_info
+        output_path, output_shape, output_dtype = output_memmap_info
+
+        # Open memmaps
+        input_memmap = np.memmap(
+            input_path, dtype=input_dtype, mode='r', shape=input_shape
+        )
+        output_memmap = np.memmap(
+            output_path, dtype=output_dtype, mode='r+', shape=output_shape
+        )
+
+        # Load Chunk
+        block_data = input_memmap[read_slices].astype(np.float32)
+
+        # 0. Pre-Smoothing
+        if sigma_voxel_2d_smooth is not None:
+            block_data = gaussian_filter(
+                block_data, sigma=sigma_voxel_2d_smooth, mode='reflect'
+            )
+
+        # Background Subtraction
+        if subtract_background_radius > 0:
+            struct_size = int(2 * subtract_background_radius + 1)
+            block_data = white_tophat(block_data, size=struct_size)
+
+        # --- Scale-Independent Filter Logic (Same as 3D) ---
+        combined_scales = np.zeros_like(block_data, dtype=np.float32)
+
+        for sigma in sigmas_voxel_2d:
+            # DYNAMIC BETA:
+            # Small scales (< 2.0): Enforce tubes (beta=frangi_beta)
+            # Large scales (>= 2.0): Allow blobs/somas (beta=1.0)
+            beta_val = 1.0 if sigma >= 2.0 else frangi_beta
+            
+            f_res = frangi(
+                block_data, sigmas=[sigma], 
+                alpha=frangi_alpha, beta=beta_val, gamma=frangi_gamma,
+                black_ridges=black_ridges, mode='reflect'
+            )
+            s_res = sato(
+                block_data, sigmas=[sigma], 
+                black_ridges=black_ridges, mode='reflect'
+            )
+            
+            scale_res = np.maximum(f_res, s_res)
+            
+            # INTENSITY GATING:
+            # If scale is large (soma), weight response by raw intensity
+            if sigma >= 2.0:
+                scale_res *= block_data
+            
+            combined_scales = np.maximum(combined_scales, scale_res)
+
+        # Crop padding
+        y_start_rel = write_slices[0].start - read_slices[0].start
+        y_stop_rel = y_start_rel + (write_slices[0].stop - write_slices[0].start)
+        x_start_rel = write_slices[1].start - read_slices[1].start
+        x_stop_rel = x_start_rel + (write_slices[1].stop - write_slices[1].start)
+
+        result_crop = combined_scales[y_start_rel:y_stop_rel, x_start_rel:x_stop_rel]
+
+        # Write
+        output_memmap[write_slices] = result_crop
+        return None
+
+    except Exception as e:
+        return f"Error_chunk_{chunk_info}: {str(e)}"
+    finally:
+        try:
+            del input_memmap, output_memmap, block_data, combined_scales
+        except:
+            pass
+        gc.collect()
+
+
+def enhance_tubular_structures_blocked_2d(
     image: np.ndarray,
     scales: List[float],
-    spacing: Union[Tuple[float, float], Tuple[float, float, float]],
+    spacing: Tuple[float, float],
+    temp_root_path: Optional[str],
     black_ridges: bool = False,
     frangi_alpha: float = 0.5,
     frangi_beta: float = 0.5,
-    frangi_gamma: float = 15.0,
+    frangi_gamma: float = 2.0,
     apply_smoothing: bool = True,
     smoothing_sigma_phys: float = 0.5,
-    skip_enhancement: bool = False
-) -> Tuple[Optional[np.memmap], Optional[str], Optional[str]]:
+    skip_enhancement: bool = False,
+    subtract_background_radius: int = 0
+) -> Tuple[np.memmap, str, str]:
     """
-    Enhances tubular structures in a 2D image using Frangi/Sato filters.
-    Can skip enhancement (pass-through) if skip_enhancement is True.
-
-    Args:
-        image: 2D Input image.
-        scales: List of physical scales (um) for vessel detection.
-        spacing: Pixel spacing (y, x) or (z, y, x).
-        black_ridges: If True, detect black ridges on white.
-        frangi_alpha, frangi_beta, frangi_gamma: Filter parameters.
-        apply_smoothing: Whether to apply pre-filter Gaussian smoothing.
-        smoothing_sigma_phys: Smoothing sigma in microns.
-        skip_enhancement: If True, returns smoothed input without filtering.
-
-    Returns:
-        Tuple: (output_memmap, output_path, output_temp_dir) or (None, None, None) on error.
+    Enhances tubular structures using 2D chunked processing.
     """
-    print(f"Starting 2D tubular enhancement...")
-    if image.ndim != 2:
-        print(f"Error: Input image must be 2D. Got shape {image.shape}")
-        return None, None, None
-
-    # --- Extract Spacing ---
-    try:
-        if len(spacing) == 3:
-            spacing_yx = tuple(float(s) for s in spacing[1:])
-        elif len(spacing) == 2:
-            spacing_yx = tuple(float(s) for s in spacing)
-        else:
-            raise ValueError(f"Invalid spacing length: {len(spacing)}")
-        
-        if not all(s > 1e-9 for s in spacing_yx):
-            raise ValueError("Spacing must be positive")
-    except Exception as e:
-        print(f"Warning: Invalid spacing {spacing}. Using (1.0, 1.0). Error: {e}")
-        spacing_yx = (1.0, 1.0)
-
-    # --- Check Scales vs Smoothing (Only if not skipping) ---
-    if not skip_enhancement:
-        min_scale = min(scales) if scales else 0
-        if apply_smoothing and smoothing_sigma_phys >= min_scale:
-            print(f"  WARNING: Smoothing sigma ({smoothing_sigma_phys} um) >= smallest scale ({min_scale} um).")
-            print(f"           Fine structures may be washed out. Consider reducing smooth_sigma.")
-
-    # --- Pre-Smoothing ---
-    input_image_processed = image
-    smoothing_applied = False
+    print(f"  [Enhance] Image: {image.shape}, Spacing: {spacing} (Block Mode 2D)")
     
-    if apply_smoothing and smoothing_sigma_phys > 0:
-        print(f"  Applying initial 2D smoothing (sigma={smoothing_sigma_phys} um)...")
-        try:
-            sigma_pixels = tuple(smoothing_sigma_phys / s for s in spacing_yx)
-            img_float = input_image_processed.astype(np.float32, copy=False)
-            smoothed_image = gaussian_filter(img_float, sigma=sigma_pixels, mode='reflect')
-            input_image_processed = smoothed_image
-            smoothing_applied = True
-        except Exception as e:
-            print(f"  Error during smoothing: {e}. Skipping.")
-    
-    # Ensure float32
-    if input_image_processed.dtype != np.float32:
-        input_image_processed = input_image_processed.astype(np.float32)
+    # Output Setup
+    output_temp_dir = _get_safe_temp_dir(temp_root_path, 'tubular_output')
+    output_path = os.path.join(output_temp_dir, 'processed_image.dat')
+    output_memmap = np.memmap(
+        output_path, dtype=np.float32, mode='w+', shape=image.shape
+    )
 
-    # --- Skip Logic (Pass-Through) ---
     if skip_enhancement:
-        print("  Skipping filter calculation (Pass-through).")
-        try:
-            out_memmap, out_path, out_dir = create_memmap(
-                data=input_image_processed, dtype=np.float32, prefix='enhanced_2d'
-            )
-            if smoothing_applied:
-                del input_image_processed
-            gc.collect()
-            return out_memmap, out_path, out_dir
-        except Exception as e:
-            print(f"Error saving pass-through memmap: {e}")
-            return None, None, None
+        print("  [Enhance] Skipping filters (Pass-through).")
+        chunk_gen = _get_chunk_slices_2d(image.shape, (2048, 2048), overlap=0)
+        for _, write_slice in tqdm(list(chunk_gen), desc="  [Enhance] Copying"):
+            output_memmap[write_slice] = image[write_slice].astype(np.float32)
+        output_memmap.flush()
+        return output_memmap, output_path, output_temp_dir
 
-    # --- Filter Calculation ---
-    avg_spacing = np.mean(spacing_yx)
-    sigmas_pixels = sorted([s / avg_spacing for s in scales if s > 0])
-    
-    if not sigmas_pixels:
-        print("Error: No valid positive scales provided.")
-        return None, None, None
-
-    print(f"  Applying Frangi/Sato filters (sigmas={sigmas_pixels})...")
-    enhanced_result = None
-    
-    try:
-        start_time = time.time()
-        
-        frangi_res = frangi(
-            input_image_processed, sigmas=sigmas_pixels, alpha=frangi_alpha,
-            beta=frangi_beta, gamma=frangi_gamma, black_ridges=black_ridges, mode='reflect'
+    # Configuration
+    sigma_voxel_2d_smooth = None
+    overlap_px = 0
+    if apply_smoothing and smoothing_sigma_phys > 0:
+        sigma_voxel_2d_smooth = tuple(
+            smoothing_sigma_phys / s if s > 0 else 0 for s in spacing
         )
-        sato_res = sato(
-            input_image_processed, sigmas=sigmas_pixels, black_ridges=black_ridges, mode='reflect'
-        )
-        
-        enhanced_result = np.maximum(frangi_res, sato_res)
-        
-        del frangi_res, sato_res
-        if smoothing_applied:
-            del input_image_processed
-        gc.collect()
-        
-        print(f"  Filtering finished in {time.time() - start_time:.2f}s.")
-        
-    except Exception as e:
-        print(f"Error during 2D filtering: {e}")
-        traceback.print_exc()
-        return None, None, None
+        overlap_px = math.ceil(max(sigma_voxel_2d_smooth) * 3)
 
-    # --- Save to Memmap ---
-    try:
-        out_memmap, out_path, out_dir = create_memmap(
-            data=enhanced_result, dtype=np.float32, prefix='enhanced_2d'
-        )
-        del enhanced_result
-        gc.collect()
-        return out_memmap, out_path, out_dir
-    except Exception as e:
-        print(f"Error creating output memmap: {e}")
-        return None, None, None
-
-
-def connect_fragmented_processes_2d(
-    binary_mask: np.ndarray,
-    spacing: Tuple[float, float],
-    max_gap_physical: float = 1.0
-) -> Tuple[np.memmap, str]:
-    """
-    Connects fragmented 2D binary structures using morphological closing.
-
-    Args:
-        binary_mask: Input boolean mask.
-        spacing: Pixel spacing (y, x).
-        max_gap_physical: Maximum gap to bridge (um).
-
-    Returns:
-        Tuple: (connected_memmap, temp_dir)
-    """
-    print(f"Connecting fragments (2D) max gap: {max_gap_physical} um...")
-    
+    # Filters
     avg_spacing = np.mean(spacing)
-    radius_pix = math.ceil((max_gap_physical / 2) / avg_spacing)
-    structure = disk(radius_pix)
+    sigmas_voxel_2d = sorted([s / avg_spacing for s in scales if s > 0])
     
-    print(f"  Closing radius: {radius_pix} pixels")
-    
-    temp_dir = tempfile.mkdtemp(prefix="connect_2d_")
-    out_path = os.path.join(temp_dir, 'connected.dat')
-    connected_mask = np.memmap(out_path, dtype=bool, mode='w+', shape=binary_mask.shape)
-    
-    try:
-        ndimage.binary_closing(binary_mask, structure=structure, output=connected_mask)
-        connected_mask.flush()
-    except Exception as e:
-        print(f"Error during binary closing: {e}")
-        del connected_mask
-        shutil.rmtree(temp_dir)
-        raise e
+    max_filter_sigma = max(sigmas_voxel_2d) if sigmas_voxel_2d else 0
+    overlap_px = max(overlap_px, math.ceil(max_filter_sigma * 4))
+    overlap_px = max(overlap_px, 32) # Minimum safe overlap
 
-    return connected_mask, temp_dir
+    # Chunks
+    # Use larger chunks for 2D (e.g. 2048x2048) since no Z dimension consumes RAM
+    chunk_shape = (2048, 2048) 
+    chunks = list(_get_chunk_slices_2d(image.shape, chunk_shape, overlap=overlap_px))
+    
+    # Input Dump (if not memmap)
+    temp_dirs_created: List[str] = []
+    if not isinstance(image, np.memmap):
+        print("  [Enhance] Dumping input to temp memmap...")
+        dump_dir = _get_safe_temp_dir(temp_root_path, 'input_dump')
+        temp_dirs_created.append(dump_dir)
+        dump_path = os.path.join(dump_dir, 'input_dump.dat')
+        input_memmap = np.memmap(
+            dump_path, dtype=image.dtype, mode='w+', shape=image.shape
+        )
+        input_memmap[:] = image[:]
+        input_memmap.flush()
+        input_info = (dump_path, image.shape, image.dtype)
+    else:
+        input_info = (image.filename, image.shape, image.dtype)
+
+    output_info = (output_path, image.shape, np.float32)
+    num_workers = max(1, os.cpu_count() - 2 if os.cpu_count() > 2 else 1)
+
+    worker_func = partial(
+        _process_block_worker_2d,
+        input_memmap_info=input_info,
+        output_memmap_info=output_info,
+        sigmas_voxel_2d=sigmas_voxel_2d,
+        sigma_voxel_2d_smooth=sigma_voxel_2d_smooth,
+        black_ridges=black_ridges,
+        frangi_alpha=frangi_alpha,
+        frangi_beta=frangi_beta,
+        frangi_gamma=frangi_gamma,
+        subtract_background_radius=subtract_background_radius
+    )
+
+    print(f"  [Enhance] Processing {len(chunks)} blocks (overlap {overlap_px})...")
+    
+    pool = mp.Pool(processes=num_workers, initializer=_init_worker, maxtasksperchild=5)
+    try:
+        results = list(tqdm(
+            pool.imap_unordered(worker_func, chunks),
+            total=len(chunks),
+            desc="  [Enhance] 2D Filtering"
+        ))
+        errors = [r for r in results if r is not None]
+        if errors:
+            raise RuntimeError(f"Block processing failed: {errors[0]}")
+        output_memmap.flush()
+    finally:
+        pool.terminate()
+        pool.join()
+        for d in temp_dirs_created:
+            if os.path.exists(d):
+                shutil.rmtree(d, ignore_errors=True)
+        gc.collect()
+
+    return output_memmap, output_path, output_temp_dir
 
 
 def segment_cells_first_pass_raw_2d(
@@ -246,30 +325,20 @@ def segment_cells_first_pass_raw_2d(
     connect_max_gap_physical: float = 1.0,
     min_size_pixels: int = 50,
     low_threshold_percentile: float = 95.0,
-    high_threshold_percentile: float = 100.0
+    high_threshold_percentile: float = 100.0,
+    skip_tubular_enhancement: bool = False,
+    subtract_background_radius: int = 0,
+    temp_root_path: Optional[str] = None,
+    **kwargs: Any
 ) -> Tuple[Optional[str], Optional[str], float, Dict[str, Any]]:
     """
-    Executes the Raw 2D Segmentation Pipeline:
-    Enhance -> Normalize -> Threshold -> Connect -> Clean -> Label.
-
-    Args:
-        image: 2D Input array.
-        spacing: Pixel dimensions.
-        tubular_scales: Scales for Frangi filter. If [0.0], enhancement is skipped.
-        smooth_sigma: Pre-smoothing sigma (um).
-        connect_max_gap_physical: Gap closing distance (um).
-        min_size_pixels: Minimum object size to retain.
-        low_threshold_percentile: Percentile for binary thresholding.
-        high_threshold_percentile: Percentile for normalization max.
-
-    Returns:
-        Tuple: (labels_path, labels_temp_dir, calculated_threshold, params_dict)
+    Executes Step 1: Raw Segmentation Pipeline (2D).
+    Pipeline: Normalize -> Enhance -> Threshold -> Connect -> Clean -> Label.
+    Uses Block-Based processing for memory safety on large XY planes.
     """
-    if image.ndim != 2:
-        print(f"Error: Image must be 2D. Got {image.shape}")
-        return None, None, 0.0, {}
+    print(f"\n--- Step 1: Raw 2D Segmentation (Chunk-Optimized) ---")
 
-    # Extract spacing
+    # Extract 2D spacing
     try:
         if len(spacing) == 3:
             spacing_2d = tuple(float(s) for s in spacing[1:])
@@ -278,150 +347,244 @@ def segment_cells_first_pass_raw_2d(
     except:
         spacing_2d = (1.0, 1.0)
 
-    params_record = {
-        'spacing': spacing_2d,
-        'tubular_scales': tubular_scales,
-        'smooth_sigma': smooth_sigma,
-        'connect_max_gap_physical': connect_max_gap_physical,
-        'min_size_pixels': min_size_pixels,
-        'low_threshold_percentile': low_threshold_percentile,
-        'high_threshold_percentile': high_threshold_percentile
-    }
-
-    # Detect Skip Condition (0.0 implies disable)
-    skip_enhancement = False
+    # Check Skip
     if len(tubular_scales) == 1 and abs(tubular_scales[0]) < 1e-9:
-        skip_enhancement = True
+        skip_tubular_enhancement = True
     elif not tubular_scales:
-        skip_enhancement = True
+        skip_tubular_enhancement = True
 
-    print("\n--- Starting Raw 2D Segmentation ---")
-    memmap_registry = {}  # Keep track of intermediates to clean up
-    
-    def cleanup_registry():
-        for key in list(memmap_registry.keys()):
-            cleanup_registry_item(memmap_registry, key)
-
-    segmentation_threshold = 0.0
+    temp_dirs_to_clean: List[str] = []
+    final_labels_memmap = None
     labels_path = None
     labels_temp_dir = None
+    segmentation_threshold = 0.0
+
+    # Registry for cleanup
+    memmap_registry: Dict[str, Tuple[Any, str, str]] = {}
 
     try:
-        # --- 1. Enhancement ---
-        enhanced_mm, enh_path, enh_dir = enhance_tubular_structures_2d(
-            image, scales=tubular_scales, spacing=spacing_2d,
-            apply_smoothing=(smooth_sigma > 0), smoothing_sigma_phys=smooth_sigma,
-            skip_enhancement=skip_enhancement
+        # --- Stage 1: Normalization (Chunked) ---
+        print("\n  [Step 1.1] Normalizing image brightness...")
+        normalized_temp_dir = _get_safe_temp_dir(temp_root_path, 'normalize')
+        temp_dirs_to_clean.append(normalized_temp_dir)
+        normalized_path = os.path.join(normalized_temp_dir, 'normalized.dat')
+        normalized_memmap = np.memmap(
+            normalized_path, dtype=np.float32, mode='w+', shape=image.shape
         )
-        if enhanced_mm is None:
-            raise RuntimeError("Enhancement failed.")
-        memmap_registry['enhanced'] = (enhanced_mm, enh_path, enh_dir)
+        memmap_registry['normalized'] = (normalized_memmap, normalized_path, normalized_temp_dir)
 
-        # --- 2. Normalization ---
-        print("\nStep 2: Normalizing...")
-        norm_dir = tempfile.mkdtemp(prefix="norm_2d_")
-        norm_path = os.path.join(norm_dir, 'norm.dat')
-        norm_mm = np.memmap(norm_path, dtype=np.float32, mode='w+', shape=image.shape)
-        memmap_registry['normalized'] = (norm_mm, norm_path, norm_dir)
-
-        # Sample for high percentile
-        valid_pixels = enhanced_mm[np.isfinite(enhanced_mm)]
-        if valid_pixels.size > 0:
-            sample = np.random.choice(valid_pixels, min(valid_pixels.size, 500000))
-            high_val = np.percentile(sample, high_threshold_percentile)
-            if high_val < 1e-9: high_val = 1.0 # Prevent div by zero
+        # 1a. Global Percentile (Reservoir Sampling)
+        MAX_SAMPLES = 5_000_000
+        # Convert generator to list for reuse
+        processing_chunks = list(_get_chunk_slices_2d(image.shape, (2048, 2048), overlap=0))
+        reservoir = []
+        
+        for read_sl, _ in tqdm(processing_chunks, desc="    Sampling Histogram"):
+            chunk = image[read_sl]
+            # Subsample
+            vals = chunk[::8, ::8].ravel()
+            vals = vals[vals > 0] # Ignore strict zero background
+            if vals.size > 0:
+                if len(reservoir) < MAX_SAMPLES:
+                    take = min(len(vals), MAX_SAMPLES - len(reservoir))
+                    reservoir.extend(vals[:take])
+        
+        if reservoir:
+            high_val = np.percentile(reservoir, high_threshold_percentile)
+            if high_val < 1e-9: high_val = 1.0
         else:
             high_val = 1.0
+            
+        print(f"    Normalization Max (p{high_threshold_percentile}): {high_val:.2f}")
 
-        norm_mm[:] = enhanced_mm[:] / high_val
-        norm_mm.flush()
+        # 1b. Apply Normalization
+        for read_sl, _ in tqdm(processing_chunks, desc="    Applying Normalization"):
+            chunk = image[read_sl].astype(np.float32)
+            normalized_memmap[read_sl] = chunk / high_val
         
-        cleanup_registry_item(memmap_registry, 'enhanced')
+        normalized_memmap.flush()
 
-        # --- 3. Thresholding ---
-        print("\nStep 3: Thresholding...")
-        bin_dir = tempfile.mkdtemp(prefix="bin_2d_")
-        bin_path = os.path.join(bin_dir, 'bin.dat')
-        bin_mm = np.memmap(bin_path, dtype=bool, mode='w+', shape=image.shape)
-        memmap_registry['binary'] = (bin_mm, bin_path, bin_dir)
-
-        # Calc threshold
-        valid_norm = norm_mm[np.isfinite(norm_mm)]
-        if valid_norm.size > 0:
-            sample = np.random.choice(valid_norm, min(valid_norm.size, 500000))
-            segmentation_threshold = float(np.percentile(sample, low_threshold_percentile))
-        else:
-            segmentation_threshold = 0.0
-        
-        print(f"  Threshold ({low_threshold_percentile}%): {segmentation_threshold:.4f}")
-        
-        bin_mm[:] = norm_mm[:] > segmentation_threshold
-        bin_mm.flush()
-        
-        cleanup_registry_item(memmap_registry, 'normalized')
-
-        # --- 4. Connection ---
-        print("\nStep 4: Connecting fragments...")
-        conn_mm, conn_dir = connect_fragmented_processes_2d(
-            bin_mm, spacing=spacing_2d, max_gap_physical=connect_max_gap_physical
+        # --- Stage 2: Enhancement (Blocked) ---
+        print("\n  [Step 1.2] Feature Enhancement (on Normalized Data)...")
+        enhanced_memmap, enh_path, enhanced_temp_dir = enhance_tubular_structures_blocked_2d(
+            normalized_memmap,
+            scales=tubular_scales,
+            spacing=spacing_2d,
+            temp_root_path=temp_root_path,
+            apply_smoothing=(smooth_sigma > 0),
+            smoothing_sigma_phys=smooth_sigma,
+            skip_enhancement=skip_tubular_enhancement,
+            subtract_background_radius=subtract_background_radius,
+            frangi_gamma=2.0 # Fixed to 2.0 as per 3D tuning
         )
-        memmap_registry['connected'] = (conn_mm, conn_mm.filename, conn_dir)
-        
-        cleanup_registry_item(memmap_registry, 'binary')
+        memmap_registry['enhanced'] = (enhanced_memmap, enh_path, enhanced_temp_dir)
+        temp_dirs_to_clean.append(enhanced_temp_dir)
 
-        # --- 5. Cleaning ---
-        print(f"\nStep 5: Cleaning objects < {min_size_pixels} pixels...")
-        clean_dir = tempfile.mkdtemp(prefix="clean_2d_")
-        clean_path = os.path.join(clean_dir, 'clean.dat')
-        clean_mm = np.memmap(clean_path, dtype=bool, mode='w+', shape=image.shape)
-        memmap_registry['cleaned'] = (clean_mm, clean_path, clean_dir)
+        # Cleanup Normalization (save space)
+        _cleanup_registry({'normalized': memmap_registry.pop('normalized')})
 
-        # In-memory processing for small object removal (fast for 2D)
-        temp_arr = np.array(conn_mm)
-        remove_small_objects(temp_arr, min_size=min_size_pixels, connectivity=1, out=clean_mm)
-        clean_mm.flush()
-        del temp_arr
+        # --- Stage 3: Thresholding ---
+        print("\n  [Step 1.3] Calculating threshold...")
+        thresh_samples = []
+        # Reuse processing_chunks list
+        for read_sl, _ in tqdm(processing_chunks[::2], desc="    Sampling Enhanced"):
+            chunk = enhanced_memmap[read_sl]
+            vals = chunk[::8, ::8].ravel()
+            vals = vals[np.isfinite(vals)]
+            vals = vals[vals > 1e-6]
+            if vals.size > 0:
+                thresh_samples.append(vals)
         
-        cleanup_registry_item(memmap_registry, 'connected')
+        if thresh_samples:
+            all_s = np.concatenate(thresh_samples)
+            if all_s.size > MAX_SAMPLES:
+                all_s = np.random.choice(all_s, MAX_SAMPLES, replace=False)
+            segmentation_threshold = float(np.percentile(all_s, low_threshold_percentile))
+        
+        print(f"    Calculated Threshold: {segmentation_threshold:.6f}")
 
-        # --- 6. Labeling ---
-        print("\nStep 6: Labeling...")
-        labels_temp_dir = tempfile.mkdtemp(prefix="labels_2d_")
-        labels_path = os.path.join(labels_temp_dir, 'labels.dat')
-        labels_mm = np.memmap(labels_path, dtype=np.int32, mode='w+', shape=image.shape)
+        # Create Binary
+        binary_temp_dir = _get_safe_temp_dir(temp_root_path, 'binary')
+        temp_dirs_to_clean.append(binary_temp_dir)
+        binary_path = os.path.join(binary_temp_dir, 'b.dat')
+        binary_memmap = np.memmap(
+            binary_path, dtype=bool, mode='w+', shape=image.shape
+        )
+        memmap_registry['binary'] = (binary_memmap, binary_path, binary_temp_dir)
+
+        # Reuse processing_chunks list
+        for read_sl, _ in tqdm(processing_chunks, desc="    Creating Binary Mask"):
+            chunk = enhanced_memmap[read_sl]
+            binary_memmap[read_sl] = (chunk > segmentation_threshold)
         
-        temp_arr = np.array(clean_mm)
-        structure = generate_binary_structure(2, 1) # 4-connectivity
-        
-        # Output logic for ndimage.label (returns count only when output is specified)
-        num = ndimage_label(temp_arr, structure=structure, output=labels_mm)
-        
-        labels_mm.flush()
-        print(f"  Found {num} objects.")
-        
-        # We don't delete labels_mm here; we return the path
-        if hasattr(labels_mm, '_mmap'): labels_mm._mmap.close()
-        del labels_mm
-        
-        cleanup_registry_item(memmap_registry, 'cleaned')
+        binary_memmap.flush()
+
+        # Cleanup Enhanced
+        _cleanup_registry({'enhanced': memmap_registry.pop('enhanced')})
         gc.collect()
 
+        # --- Stage 4: Cleaning & Labeling (Dask) ---
+        print("\n  [Step 1.4] Cleaning & Labeling (Dask)...")
+        
+        # Use smaller chunks for Dask graph
+        dask_chunk_size = (4096, 4096)
+        
+        connected_temp_dir = _get_safe_temp_dir(temp_root_path, 'connected')
+        temp_dirs_to_clean.append(connected_temp_dir)
+        connected_path = os.path.join(connected_temp_dir, 'connected.dat')
+        connected_memmap = np.memmap(
+            connected_path, dtype=bool, mode='w+', shape=image.shape
+        )
+        memmap_registry['connected'] = (connected_memmap, connected_path, connected_temp_dir)
+
+        binary_dask = da.from_array(binary_memmap, chunks=dask_chunk_size)
+        
+        # Morphological Closing
+        avg_spacing = np.mean(spacing_2d)
+        radius_px = math.ceil((connect_max_gap_physical / 2) / avg_spacing)
+        if radius_px > 0:
+            structure = disk(radius_px)
+            # Dask binary_closing for 2D needs 2D structure
+            connected_dask = dask_image.ndmorph.binary_closing(
+                binary_dask, structure=structure
+            )
+        else:
+            connected_dask = binary_dask
+            
+        print("    Applying binary closing...")
+        with ProgressBar(dt=5):
+            da.store(connected_dask, connected_memmap, scheduler='threads')
+        
+        # Cleanup Binary
+        _cleanup_registry({'binary': memmap_registry.pop('binary')})
+
+        # Labeling
+        labeled_temp_dir = _get_safe_temp_dir(temp_root_path, 'labeled_zarr')
+        temp_dirs_to_clean.append(labeled_temp_dir)
+        labeled_zarr_path = os.path.join(labeled_temp_dir, 'labeled.zarr')
+        
+        d_conn = da.from_array(connected_memmap, chunks=dask_chunk_size)
+        structure_lab = generate_binary_structure(2, 1) # 4-conn
+        
+        print("    Labeling connected components...")
+        labeled_dask, num_features_dask = dask_image.ndmeasure.label(
+            d_conn, structure=structure_lab
+        )
+        
+        with ProgressBar(dt=5):
+            labeled_dask.to_zarr(labeled_zarr_path, overwrite=True)
+            
+        num_features = num_features_dask.compute()
+        print(f"      Found {num_features} objects.")
+        
+        # Cleanup Connected
+        _cleanup_registry({'connected': memmap_registry.pop('connected')})
+
+        # --- Stage 5: Size Filtering (Block-wise Remap) ---
+        print(f"    Filtering objects < {min_size_pixels} pixels...")
+        labels_temp_dir = _get_safe_temp_dir(temp_root_path, 'labels_final')
+        labels_path = os.path.join(labels_temp_dir, 'l.dat')
+        final_labels_memmap = np.memmap(
+            labels_path, dtype=np.int32, mode='w+', shape=image.shape
+        )
+        
+        initial_labeled_zarr = zarr.open(labeled_zarr_path, mode='r')
+        d_lbl = da.from_zarr(labeled_zarr_path)
+        
+        print("      Calculating sizes...")
+        counts, bins = da.histogram(
+            d_lbl, bins=num_features + 1, range=[-0.5, num_features + 0.5]
+        )
+        counts_res = counts.compute()
+        
+        valid_indices = np.where(counts_res[1:] >= min_size_pixels)[0] + 1
+        print(f"      Retaining {len(valid_indices)} / {num_features} objects.")
+        
+        lookup = np.zeros(num_features + 1, dtype=np.int32)
+        current_new = 1
+        for old_id in valid_indices:
+            lookup[old_id] = current_new
+            current_new += 1
+            
+        print("      Writing filtered labels...")
+        io_chunks = (2048, 2048)
+        io_gen = _get_chunk_slices_2d(image.shape, io_chunks, overlap=0)
+        
+        for read_sl, write_sl in tqdm(list(io_gen), desc="      Remapping"):
+            block_data = initial_labeled_zarr[read_sl]
+            filtered_block = lookup[block_data]
+            final_labels_memmap[write_sl] = filtered_block
+            
+        final_labels_memmap.flush()
+
+        params_record = {
+            'spacing': spacing_2d,
+            'tubular_scales': tubular_scales,
+            'smooth_sigma': smooth_sigma,
+            'connect_max_gap_physical': connect_max_gap_physical,
+            'min_size_pixels': min_size_pixels,
+            'low_threshold_percentile': low_threshold_percentile,
+            'high_threshold_percentile': high_threshold_percentile
+        }
         return labels_path, labels_temp_dir, segmentation_threshold, params_record
 
     except Exception as e:
         print(f"Error during raw segmentation: {e}")
         traceback.print_exc()
-        cleanup_registry()
+        _cleanup_registry(memmap_registry)
         return None, None, 0.0, {}
 
-
-def cleanup_registry_item(registry, key):
-    """Helper to clean up a specific item from the registry."""
-    if key in registry:
-        mm, path, d = registry.pop(key)
-        if isinstance(mm, np.memmap) and hasattr(mm, '_mmap'):
-            try: mm._mmap.close()
-            except: pass
-        del mm
-        if d and os.path.exists(d):
-            shutil.rmtree(d, ignore_errors=True)
+    finally:
+        # Final cleanup if anything remains in registry
+        _cleanup_registry(memmap_registry)
+        
+        if final_labels_memmap is not None:
+            del final_labels_memmap
+        print("\n  [Step 1] Cleaning up intermediate temp directories...")
+        for d_dir in temp_dirs_to_clean:
+            if d_dir and os.path.exists(d_dir):
+                try:
+                    shutil.rmtree(d_dir, ignore_errors=True)
+                except Exception:
+                    pass
+        gc.collect()

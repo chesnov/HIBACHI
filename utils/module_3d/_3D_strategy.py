@@ -186,9 +186,6 @@ class RamifiedStrategy(ProcessingStrategy):
                     params.get("high_threshold_percentile", 95.0)
                 ),
                 skip_tubular_enhancement=skip_enhancement,
-                soma_preservation_factor=float(
-                    params.get("soma_preservation_factor", 0.0)
-                ),
                 subtract_background_radius=int(
                     params.get("subtract_background_radius", 0)
                 )
@@ -260,7 +257,7 @@ class RamifiedStrategy(ProcessingStrategy):
                     params.get("brightness_cutoff_factor", 1.5)
                 ),
                 min_size_voxels=int(params.get("min_size_voxels", 50)),
-                smoothing_iterations=int(params.get("smoothing_iterations", 1)),
+                hull_closing_radius=int(params.get("hull_closing_radius", 1)),
                 heal_iterations=int(params.get("heal_iterations", 1)),
                 edge_distance_chunk_size_z=int(
                     params.get("edge_distance_chunk_size_z", 32)
