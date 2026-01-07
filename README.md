@@ -41,13 +41,13 @@ An `environment.yaml` file contains all necessary dependencies (Napari, SimpleIT
 ```bash
 # Create the environment from the file
 conda env create -f environment.yaml
-
-# Activate the environment
-conda activate hibachi
 ```
 
 ### 3. Run the Application
 ```bash
+# Activate the environment
+conda activate hibachi
+
 python segment.py
 ```
 
