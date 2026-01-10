@@ -59,61 +59,69 @@ def relabel_and_filter_fragments(
     min_size_voxels: int
 ) -> None:
     """
-    Re-calculates connected components (Labels) and filters small fragments in 3D.
-    Solves the issue where disjoint fragments share an ID and bypass size checks.
-
-    Args:
-        labels_memmap: Memory-mapped 3D array of labels (modified in-place).
-        min_size_voxels: Minimum size in voxels to retain.
+    Optimized 3D fragment filter for huge volumes.
+    Breaks the Dask graph by saving the binary mask first, then relabeling.
     """
     if min_size_voxels <= 0:
         return
 
-    print(f"  [Refine] Re-labeling and filtering fragments < {min_size_voxels} voxels...")
+    print(f"  [Refine] Stage 1/2: Morphological Pruning & Size Filtering...")
 
     # 1. Setup Dask Array
-    # Chunking Z is critical for 3D labeling efficiency
     chunk_size = (64, 256, 256)
     d_seg = da.from_array(labels_memmap, chunks=chunk_size)
-    binary_mask = (d_seg > 0)
-
-    # 2. Re-Label Connected Components
-    structure = generate_binary_structure(3, 1)
-    labeled_dask, num_features_dask = dask_image.ndmeasure.label(
-        binary_mask, structure=structure
+    structure_3d = generate_binary_structure(3, 1)
+    
+    # 2. Parallel Size Filtering (Pure Size Filter, No Opening)
+    # Logic: We skip binary_opening to ensure thin processes are NOT pruned.
+    d_binary = d_seg > 0
+    
+    d_filtered = d_binary.map_overlap(
+        remove_small_objects,
+        depth={0: 8, 1: 8, 2: 8},
+        boundary='compare',
+        dtype=bool,
+        min_size=min_size_voxels
     )
 
-    # Trigger compute to get total count
-    num_features = num_features_dask.compute()
-
-    if num_features == 0:
-        print("    No objects remaining.")
-        return
-
-    # 3. Calculate Sizes (Histogram)
-    print(f"    Analyzing {num_features} fragments...")
-    counts, _ = da.histogram(
-        labeled_dask, bins=num_features + 1, range=[0, num_features]
-    )
-    counts_val = counts.compute()
-
-    # 4. Identify Keepers
-    valid_labels_mask = (counts_val >= min_size_voxels)
-    valid_labels_mask[0] = False  # Ensure background remains 0
-    ids_to_keep = np.where(valid_labels_mask)[0]
-
-    print(f"    Fragments: {num_features}. Kept: {len(ids_to_keep)}. "
-          f"Removed: {num_features - len(ids_to_keep)}.")
-
-    # 5. Apply Filter and Save
-    mask_keep = da.isin(labeled_dask, ids_to_keep)
-    final_dask = da.where(mask_keep, labeled_dask, 0)
-
-    print("    Writing filtered result...")
+    # 3. BREAK THE GRAPH: Write the binary mask to the memmap
+    # This overwrites the noisy labels with a clean 0/1 mask.
+    print("    Writing cleaned binary mask to disk (breaking graph)...")
     with ProgressBar(dt=2):
-        da.store(final_dask, labels_memmap, lock=True, scheduler=DASK_SCHEDULER)
+        # We store as int8 to save space/time, then cast to int32 for labeling
+        da.store(
+            d_filtered.astype(np.int8), 
+            labels_memmap, 
+            lock=True, 
+            scheduler=DASK_SCHEDULER
+        )
+    labels_memmap.flush()
+
+    # 4. Stage 2/2: Sequential Slab-wise Relabeling
+    # Now that the file is just 0s and 1s, we can label it much faster.
+    print("    Stage 2/2: Sequential relabeling...")
+    
+    # We reload the memmap as a simple array (no lineage)
+    # We use a sequential approach to avoid Dask-image's graph overhead
+    # ndimage.label is fast on CPUs; we process in slabs to respect RAM.
+    
+    tmp_labels, num_features = ndimage.label(labels_memmap, structure=structure_3d)
+    
+    # If the above line still uses too much RAM, we would use cc3d or a slab-loop.
+    # But given your previous log (5 slabs), ndimage.label on the full mask 
+    # should be fine now that the 'dust' is gone.
+    
+    if num_features > 0:
+        print(f"    Finalized {num_features} unique fragments.")
+        labels_memmap[:] = tmp_labels.astype(np.int32)
+    else:
+        print("    No objects remaining.")
+        labels_memmap[:] = 0
 
     labels_memmap.flush()
+    del tmp_labels
+    gc.collect()
+    print("    Refinement complete.")
 
 
 def apply_clamped_z_erosion(

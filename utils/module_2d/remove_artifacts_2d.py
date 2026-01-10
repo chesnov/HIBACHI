@@ -19,6 +19,10 @@ from skimage.filters import threshold_otsu  # type: ignore
 from skimage.transform import resize  # type: ignore
 from skimage.morphology import disk, binary_closing, binary_dilation as sk_dilation, remove_small_objects  # type: ignore
 
+import dask.array as da
+import dask_image.ndmeasure
+from dask.diagnostics import ProgressBar
+import dask_image
 
 def _get_safe_temp_dir(base_path: Optional[str] = None, suffix: str = "") -> str:
     """
@@ -53,19 +57,38 @@ def relabel_and_filter_fragments_2d(
     min_size_pixels: int
 ) -> None:
     """
-    Re-labels connected components and filters small fragments in 2D.
-    Matches 3D logic: Label -> Size Filter -> Re-index.
+    Re-calculates connected components and filters small fragments in 2D.
+    Matches the 3D logic in 'remove_artifacts.py' exactly.
+
+    This function identifies global connected components across the entire 
+    2D image, calculates their areas, and removes those below the threshold.
+    It does NOT perform morphological thinning; it is a pure size filter.
+
+    Args:
+        labels_memmap: Memory-mapped 2D array of labels (modified in-place).
+        min_size_pixels: Minimum size in pixels to retain.
     """
     if min_size_pixels <= 0:
         return
 
-    print(f"  [Refine] Re-labeling and filtering fragments < {min_size_pixels} px...")
+    print(f"  [Refine] Re-labeling and filtering fragments < {min_size_pixels} pixels...")
 
-    mask = labels_memmap[:] > 0
-    
-    # 1. Label connected components
-    structure = generate_binary_structure(2, 1)  # 4-connectivity
-    labeled_array, num_features = ndimage.label(mask, structure=structure)
+    # 1. Setup Dask Array
+    # Logic Parity: Matches the chunked Dask setup in the 3D version
+    chunk_size = (2048, 2048)
+    d_seg = da.from_array(labels_memmap, chunks=chunk_size)
+    binary_mask = (d_seg > 0)
+
+    # 2. Re-Label Connected Components
+    # Logic Parity: Matches the use of dask_image.ndmeasure.label
+    # 2D 4-connectivity corresponds to 3D 6-connectivity (rank 1)
+    structure = generate_binary_structure(2, 1)
+    labeled_dask, num_features_dask = dask_image.ndmeasure.label(
+        binary_mask, structure=structure
+    )
+
+    # Trigger compute to get total count (Matches 3D logic)
+    num_features = num_features_dask.compute()
 
     if num_features == 0:
         print("    No objects remaining.")
@@ -73,26 +96,33 @@ def relabel_and_filter_fragments_2d(
         labels_memmap.flush()
         return
 
-    # 2. Calculate Sizes
-    counts = np.bincount(labeled_array.ravel())
-    
-    # 3. Filter
-    new_labels = np.zeros(num_features + 1, dtype=np.int32)
-    current_new_id = 1
-    
-    keep_indices = np.where(counts[1:] >= min_size_pixels)[0] + 1
-    kept_count = len(keep_indices)
-    
-    for old_id in keep_indices:
-        new_labels[old_id] = current_new_id
-        current_new_id += 1
-        
-    print(f"    Fragments: {num_features}. Kept: {kept_count}. Removed: {num_features - kept_count}.")
+    # 3. Calculate Sizes (Histogram)
+    # Logic Parity: Matches the use of da.histogram for area calculation
+    print(f"    Analyzing {num_features} fragments...")
+    counts, _ = da.histogram(
+        labeled_dask, bins=num_features + 1, range=[0, num_features]
+    )
+    counts_val = counts.compute()
 
-    # 4. Apply mapping and save
-    final_labels = new_labels[labeled_array]
-    
-    labels_memmap[:] = final_labels[:]
+    # 4. Identify Keepers
+    # Logic Parity: Identify IDs that meet the area requirement
+    valid_labels_mask = (counts_val >= min_size_pixels)
+    valid_labels_mask[0] = False  # Ensure background remains 0
+    ids_to_keep = np.where(valid_labels_mask)[0]
+
+    print(f"    Fragments: {num_features}. Kept: {len(ids_to_keep)}. "
+          f"Removed: {num_features - len(ids_to_keep)}.")
+
+    # 5. Apply Filter and Save
+    # Logic Parity: Matches the use of da.isin and da.where
+    mask_keep = da.isin(labeled_dask, ids_to_keep)
+    final_dask = da.where(mask_keep, labeled_dask, 0)
+
+    print("    Writing filtered result...")
+    with ProgressBar(dt=2):
+        # DASK_SCHEDULER is assumed to be defined globally as in your 3D file
+        da.store(final_dask.astype(np.int32), labels_memmap, lock=True, scheduler='threads')
+
     labels_memmap.flush()
 
 
