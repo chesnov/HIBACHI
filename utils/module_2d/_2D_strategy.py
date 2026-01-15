@@ -11,6 +11,7 @@ from typing import Dict, List, Any, Optional
 import numpy as np
 import pandas as pd
 import yaml  # type: ignore
+import tifffile as tiff
 from PyQt5.QtWidgets import QMessageBox  # type: ignore
 
 from ..high_level_gui.processing_strategies import ProcessingStrategy, StepDefinition
@@ -22,8 +23,8 @@ try:
     from .soma_extraction_2d import extract_soma_masks_2d
     from .cell_splitting_2d import separate_multi_soma_cells_2d
     from .calculate_features_2d import analyze_segmentation_2d
-    # Import Interaction Analysis from 3D module (assuming generic implementation)
-    from ..module_3d.interaction_analysis import calculate_interaction_metrics
+    from .interaction_analysis_2d import calculate_interaction_metrics_2d
+    from .calculate_features_2d import export_to_fcs # Ensure this is imported for FCS updates
 except ImportError as e:
     print(f"CRITICAL ERROR: Could not import 2D segmentation modules: {e}")
     raise
@@ -188,7 +189,8 @@ class Ramified2DStrategy(ProcessingStrategy):
                 connect_max_gap_physical=connect_max_gap_physical,
                 min_size_pixels=min_size_pixels,
                 low_threshold_percentile=low_threshold_percentile,
-                high_threshold_percentile=high_threshold_percentile
+                high_threshold_percentile=high_threshold_percentile,
+                temp_root_path=self.temp_dir
             )
 
             # Unpack results
@@ -210,6 +212,7 @@ class Ramified2DStrategy(ProcessingStrategy):
                 self._add_layer_safely(
                     viewer, display_data, "Raw Intermediate Segmentation"
                 )
+                del display_data
             return True
 
         except Exception as e:
@@ -407,6 +410,7 @@ class Ramified2DStrategy(ProcessingStrategy):
                 intensity_volume=original_image,
                 soma_mask=cell_bodies_ref,
                 spacing=spacing_yx,
+                memmap_dir=self.temp_dir,
                 min_size_threshold=int(params.get("min_size_threshold", 100)),
                 max_seed_centroid_dist=float(params.get("max_seed_centroid_dist", 20.0)),
                 min_path_intensity_ratio=float(params.get("min_path_intensity_ratio", 0.8)),
@@ -444,107 +448,153 @@ class Ramified2DStrategy(ProcessingStrategy):
         self, viewer, image_stack: Any, params: Dict
     ) -> bool:
         """
-        Step 5: Calculates morphometrics and skeletonizes 2D cells.
-        """
-        print(f"Executing Step 5: Feature Calculation ({self.mode_name})...")
-        files = self.get_checkpoint_files()
-        final_seg_path = files["final_segmentation"]
+        Step 5: Calculates comprehensive morphometrics and skeletonizes 2D cells.
+        
+        This method acts as the high-level orchestrator for the feature 
+        extraction module. It handles:
+        1. Memory-mapped I/O for the final segmentation masks.
+        2. Coordination of physical paths for skeletons and FCS files.
+        3. Invocation of the 2D analysis engine with full precision.
+        4. Persistence of tabular data (CSV) and spatial data (memmaps).
+        5. Napari visualization of the resulting skeletons and connections.
 
-        if not os.path.exists(final_seg_path):
+        Args:
+            viewer: Napari viewer instance for visualization.
+            image_stack: The raw input 2D image (not strictly needed here if 
+                         using intermediate state, but kept for signature parity).
+            params: Dictionary containing user-defined parameters:
+                - calculate_distances: bool, whether to run N x N distance matrix.
+                - calculate_skeletons: bool, whether to run topological analysis.
+                - prune_spurs_le_um: float, length threshold for cleaning skeletons.
+
+        Returns:
+            bool: True if the analysis completed and results were saved, False otherwise.
+        """
+        print(f"\n--- Executing Step 5: Feature Calculation ({self.mode_name}) ---")
+        
+        # 1. PATH INITIALIZATION
+        # Retrieve the central checkpoint registry for file management
+        files = self.get_checkpoint_files()
+        final_seg_path = files.get("final_segmentation")
+        metrics_csv_path = files.get("metrics_df")
+        
+        # Define specific output paths for the new persistent artifacts
+        # We ensure these files land in the correct processed directory
+        skel_dat_path = files.get("skeleton_array")
+        fcs_out_path = os.path.join(self.processed_dir, f"metrics_{self.mode_name}.fcs")
+        dist_matrix_path = files.get("distances_matrix")
+        
+        # Validation: Ensure the previous segmentation step actually exists
+        if not final_seg_path or not os.path.exists(final_seg_path):
+            print(f"  [Error] Final segmentation file not found at: {final_seg_path}")
             return False
 
         final_seg_memmap = None
         try:
+            # 2. DATA PREPARATION
+            # Open the segmentation as a read-only memmap to keep RAM usage low
+            print(f"  [Features] Opening segmentation memmap: {os.path.basename(final_seg_path)}")
             final_seg_memmap = np.memmap(
                 final_seg_path, dtype=np.int32, mode='r', shape=self.image_shape
             )
+            
+            # Extract YX spacing (Handling cases where 3D spacing might be stored)
             spacing_yx = tuple(self.spacing[1:]) if len(self.spacing) == 3 else tuple(self.spacing)
+            print(f"  [Features] Using physical spacing: {spacing_yx} um/px")
 
+            # Retrieve the normalized intensity image from the pipeline state
+            # This is essential for calculating Mean/Max intensity metrics
+            intensity_ref = self.intermediate_state.get('original_volume_ref', image_stack)
+            if intensity_ref is None:
+                print("  [Warn] Normalized intensity image not found in state. Intensity metrics will be skipped.")
+
+            # 3. CORE ANALYSIS EXECUTION
+            # We call the module-level analysis function with all optimization flags enabled
+            print(f"  [Features] Starting analysis engine for {np.max(final_seg_memmap)} objects...")
             metrics_df, detailed_outputs = analyze_segmentation_2d(
                 segmented_array=final_seg_memmap,
+                intensity_image=intensity_ref,
                 spacing_yx=spacing_yx,
+                temp_dir=self.temp_dir,
                 calculate_distances=params.get("calculate_distances", True),
                 calculate_skeletons=params.get("calculate_skeletons", True),
-                return_detailed=True,
+                skeleton_export_path=skel_dat_path,  # Write skeletons to disk to prevent RAM crash
+                fcs_export_path=fcs_out_path,       # Triggers the FCS writer logic
+                return_detailed=True,               # Required to populate the GUI layers
                 prune_spurs_le_um=params.get("prune_spurs_le_um", 0)
             )
 
-            if metrics_df is not None:
-                metrics_df.to_csv(files["metrics_df"], index=False)
+            # 4. TABULAR DATA PERSISTENCE
+            if metrics_df is not None and not metrics_df.empty:
+                metrics_df.to_csv(metrics_csv_path, index=False)
 
-            # Persist Detailed Outputs
+            # 5. DETAILED DATA PERSISTENCE (Coordinate Persistence)
             if detailed_outputs:
-                # 1. Distances
-                dist_matrix = detailed_outputs.get('distance_matrix')
-                if dist_matrix is not None:
-                    dist_matrix.to_csv(files["distances_matrix"])
-                
-                # 2. Points
-                all_points = detailed_outputs.get('all_pairs_points')
-                if all_points is not None:
-                    all_points.to_csv(files["points_matrix"], index=False)
-                
-                # 3. Branches
-                branch_data = detailed_outputs.get('detailed_branches')
-                if branch_data is not None:
-                    branch_data.to_csv(files["branch_data"], index=False)
-                
-                # 4. Skeletons
-                skeleton_array = detailed_outputs.get('skeleton_array')
-                if skeleton_array is not None:
-                    skel_path = files.get("skeleton_array")
-                    skel_memmap = np.memmap(
-                        skel_path, dtype=np.int32, mode='w+', shape=self.image_shape
-                    )
-                    skel_memmap[:] = skeleton_array[:]
-                    self._close_memmap(skel_memmap)
+                # Retrieve the red lines table
+                nn_points = detailed_outputs.get('all_pairs_points')
+                if nn_points is not None and not nn_points.empty:
+                    pts_csv_path = files.get("points_matrix")
+                    print(f"  [Features] Saving nearest neighbor lines to: {os.path.basename(pts_csv_path)}")
+                    nn_points.to_csv(pts_csv_path, index=False)
 
+            # 6. VISUALIZATION (NAPARI)
             if viewer is not None:
-                skel_path = files.get("skeleton_array")
-                if os.path.exists(skel_path):
+                # Load the skeleton back from the persistent disk file we just created
+                # We use 'r' mode to ensure Napari only reads what it needs to display
+                if skel_dat_path and os.path.exists(skel_dat_path):
                     skel_display = np.memmap(
-                        skel_path, dtype=np.int32, mode='r', shape=self.image_shape
+                        skel_dat_path, dtype=np.int32, mode='r', shape=self.image_shape
                     )
                     self._add_layer_safely(
                         viewer, skel_display, "Skeletons", layer_type='labels'
                     )
-                # Visualize connections (simplified 2D logic)
-                if all_points is not None and not all_points.empty:
-                    self._add_neighbor_lines_2d(viewer, all_points)
+                
+                # If distances were calculated, visualize the nearest neighbor connections
+                # We retrieve the filtered points from the detailed output dictionary
+                nn_points = detailed_outputs.get('all_pairs_points')
+                if nn_points is not None and not nn_points.empty:
+                    print(f"  [Features] Plotting {len(nn_points)} neighbor connections in viewer.")
+                    self._add_neighbor_lines_2d(viewer, nn_points)
+
+            print(f"--- Feature Calculation for {self.mode_name} COMPLETE ---")
             return True
 
         except Exception as e:
-            print(f"Error during feature calculation 2D: {e}")
+            print(f"  [Critical Error] Feature calculation failed: {str(e)}")
             traceback.print_exc()
             return False
+            
         finally:
-            self._close_memmap(final_seg_memmap)
+            # Explicitly close the segmentation memmap to release the file lock
+            if final_seg_memmap is not None:
+                self._close_memmap(final_seg_memmap)
+            
+            # Force garbage collection to free up memory before the next strategy step
             gc.collect()
 
     def execute_interaction_analysis(
         self, viewer, image_stack: Any, params: Dict
     ) -> bool:
         """
-        Step 6: Analyses spatial overlap with a secondary 2D channel.
+        Step 6: Analyses spatial overlap with a secondary 2D channel (e.g. Plaques/Vessels).
         """
         print("\n--- Executing Step 6: Multi-Channel Interaction (2D) ---")
         
         target_root_dir = params.get("target_channel_folder")
         if not target_root_dir or not os.path.isdir(target_root_dir):
-            print("Error: Invalid reference directory.")
+            print("  [Error] Invalid reference directory selected.")
             return False
 
-        # Locate corresponding sample
-        sample_folder_name = os.path.basename(
-            os.path.dirname(self.processed_dir)
-        )
+        # 1. LOCATE REFERENCE DATA
+        # Identify the sample name (the folder containing the images)
+        sample_folder_name = os.path.basename(os.path.dirname(self.processed_dir))
         ref_sample_dir = os.path.join(target_root_dir, sample_folder_name)
         
         if not os.path.exists(ref_sample_dir):
-            print(f"Error: Reference sample '{sample_folder_name}' not found.")
+            print(f"  [Error] Reference sample '{sample_folder_name}' not found in target channel.")
             return False
 
-        # Locate processed dir in reference
+        # Find the processed folder inside the reference sample
         ref_processed_dir = None
         for item in os.listdir(ref_sample_dir):
             if "_processed_" in item and os.path.isdir(os.path.join(ref_sample_dir, item)):
@@ -552,66 +602,76 @@ class Ramified2DStrategy(ProcessingStrategy):
                 break
         
         if not ref_processed_dir:
-            print("Error: No processed folder found in reference sample.")
+            print(f"  [Error] Reference sample exists, but has not been processed yet.")
             return False
 
-        # Locate Final Segmentation in Reference
+        # Find the final segmentation mask in the reference channel
         ref_seg_path = None
-        # Check for both .dat and .npy to be robust with older 2D runs
         for f in os.listdir(ref_processed_dir):
-            if f.startswith("final_segmentation") and (f.endswith(".dat") or f.endswith(".npy")):
+            if f.startswith("final_segmentation") and f.endswith(".dat"):
                 ref_seg_path = os.path.join(ref_processed_dir, f)
                 break
         
         if not ref_seg_path:
-            print("Error: Reference segmentation file not found.")
+            print(f"  [Error] final_segmentation.dat not found in {ref_processed_dir}")
             return False
 
         ref_name = os.path.basename(target_root_dir)
-        final_seg_path = self.get_checkpoint_files()["final_segmentation"]
+        print(f"  [Info] Found Reference Mask: {ref_seg_path}")
 
-        # Call the generic calculation function (works for 2D/3D if shape/spacing aligned)
-        primary_df, ref_df, intersection_path = calculate_interaction_metrics(
+        # 2. RUN ANALYSIS
+        final_seg_path = self.get_checkpoint_files()["final_segmentation"]
+        # Extract YX spacing
+        spacing_yx = tuple(self.spacing[1:]) if len(self.spacing) == 3 else tuple(self.spacing)
+
+        primary_df, ref_df, intersection_path = calculate_interaction_metrics_2d(
             primary_mask_path=final_seg_path,
             reference_mask_path=ref_seg_path,
             output_dir=self.processed_dir,
             shape=self.image_shape,
-            spacing=self.spacing,
+            spacing_yx=spacing_yx,
             reference_name=ref_name,
             calculate_distance=params.get("calculate_distance", True),
             calculate_overlap=params.get("calculate_overlap", True)
         )
 
-        # Merge Results
+        # 3. MERGE RESULTS INTO MAIN TABLE
         if not primary_df.empty:
             metrics_path = self.get_checkpoint_files()["metrics_df"]
             if os.path.exists(metrics_path):
                 main_df = pd.read_csv(metrics_path)
+                # Remove previous interaction columns for this specific reference to allow re-runs
                 cols_to_drop = [c for c in main_df.columns if c in primary_df.columns and c != 'label']
                 if cols_to_drop:
                     main_df.drop(columns=cols_to_drop, inplace=True)
                 
                 merged_df = pd.merge(main_df, primary_df, on='label', how='left')
                 merged_df.to_csv(metrics_path, index=False)
-            else:
-                out_csv = os.path.join(self.processed_dir, f"interaction_{ref_name}.csv")
-                primary_df.to_csv(out_csv, index=False)
+                print(f"  [Success] Integrated 2D interaction metrics into metrics_df.csv")
+
+                # Update FCS file
+                fcs_path = os.path.join(self.processed_dir, f"metrics_{self.mode_name}.fcs")
+                export_to_fcs(merged_df, fcs_path)
             
+            # Save the reference-specific coverage stats
             if not ref_df.empty:
                 ref_csv = os.path.join(self.processed_dir, f"interaction_{ref_name}_coverage.csv")
                 ref_df.to_csv(ref_csv, index=False)
+        else:
+            print("  [Warning] No spatial interactions detected.")
 
-        # Save Meta for Viz
+        # 4. PERSIST METADATA FOR VISUALIZATION
         meta_path = self.get_checkpoint_files()["last_interaction_meta"]
         try:
             with open(meta_path, 'w') as f:
                 yaml.dump({
                     'ref_seg_path': ref_seg_path,
+                    'ref_raw_path': os.path.join(ref_sample_dir, f"{sample_folder_name}.tif"),
                     'ref_name': ref_name,
                     'intersection_path': intersection_path
                 }, f)
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"  [Warn] Could not save visualization metadata: {e}")
 
         return True
 
@@ -620,40 +680,35 @@ class Ramified2DStrategy(ProcessingStrategy):
     # =========================================================================
 
     def _add_neighbor_lines_2d(self, viewer, points_df):
-        """Draws lines between closest 2D neighbors."""
+        """Standardized 2D Line Visualization for Nearest Neighbors."""
         if points_df is None or points_df.empty:
             return
         
         lines = []
-        # Expect columns: point_on_self_y, point_on_self_x, etc.
-        # Note: 2D logic in calculate_features might output 'mask1_y', 'mask1_x' depending on implementation.
-        # We try standard names first.
         try:
             for _, row in points_df.iterrows():
-                # Handling generic column names from interaction analysis or feature calc
-                if 'point_on_self_y' in row:
-                    p1 = [row['point_on_self_y'], row['point_on_self_x']]
-                    p2 = [row['point_on_neighbor_y'], row['point_on_neighbor_x']]
-                elif 'mask1_y' in row:
-                    p1 = [row['mask1_y'], row['mask1_x']]
-                    p2 = [row['mask2_y'], row['mask2_x']]
-                else:
-                    continue
+                # Extract and explicitly structure as [Y, X] coordinate pairs
+                p1 = [float(row['point_on_self_y']), float(row['point_on_self_x'])]
+                p2 = [float(row['point_on_neighbor_y']), float(row['point_on_neighbor_x'])]
                 lines.append([p1, p2])
-        except Exception:
+        except Exception as e:
+            print(f"  [Warn] Failed to parse connection lines: {e}")
             return
 
         if lines:
             layer_name = f"Neighbor Connections_{self.mode_name}"
-            if layer_name in viewer.layers:
-                viewer.layers.remove(layer_name)
+            self._remove_layer_safely(viewer, layer_name)
             
-            # Use YX scale (ignore Z scale for 2D view)
+            # Match the display scale of the current project spacing
             display_scale = (self.spacing[1], self.spacing[2]) if len(self.spacing) == 3 else self.spacing
             
             viewer.add_shapes(
-                lines, shape_type='line', edge_color='red', edge_width=1,
-                name=layer_name, scale=display_scale
+                lines, 
+                shape_type='line', 
+                edge_color='red', 
+                edge_width=2, # Increased for better visibility on whole-slide scans
+                name=layer_name, 
+                scale=display_scale
             )
 
     def load_checkpoint_data(self, viewer, checkpoint_step: int):
@@ -709,44 +764,49 @@ class Ramified2DStrategy(ProcessingStrategy):
                 except Exception:
                     pass
         
-        # Step 6 Viz
+        # Step 6 Viz (Interaction Analysis)
         if checkpoint_step >= 6:
             meta_path = files.get("last_interaction_meta")
             if meta_path and os.path.exists(meta_path):
                 try:
                     with open(meta_path, 'r') as f:
                         meta = yaml.safe_load(f)
+                    
                     ref_path = meta.get('ref_seg_path')
+                    ref_raw = meta.get('ref_raw_path')
+                    ref_name = meta.get('ref_name', 'Ref')
                     inter_path = meta.get('intersection_path')
                     
+                    # 2D Scaling Logic (Y, X)
                     display_scale = (self.spacing[1], self.spacing[2]) if len(self.spacing) == 3 else self.spacing
 
+                    # A. Load Reference Mask
                     if ref_path and os.path.exists(ref_path):
-                        # Support .npy for reference if needed
-                        if ref_path.endswith('.npy'):
-                            ref_data = np.load(ref_path)
-                        else:
-                            ref_data = np.memmap(ref_path, dtype=np.int32, mode='r', shape=self.image_shape)
+                        ref_data = np.memmap(ref_path, dtype=np.int32, mode='r', shape=self.image_shape)
                         
+                        # Apply distinct random colors for the reference objects
                         unique_lbls = np.unique(ref_data)
                         unique_lbls = unique_lbls[unique_lbls > 0]
-                        cmap = {}
-                        for lbl in unique_lbls:
-                            h = 0.55 + (0.1 * random.random())
-                            s = 0.4 + (0.4 * random.random())
-                            v = 0.8 + (0.2 * random.random())
-                            r, g, b = colorsys.hsv_to_rgb(h, s, v)
-                            cmap[lbl] = (r, g, b, 1.0)
+                        cmap = {lbl: (*colorsys.hsv_to_rgb(random.random(), 0.6, 0.9), 1.0) for lbl in unique_lbls}
                         
-                        l = viewer.add_labels(ref_data, name=f"Ref: {meta.get('ref_name')}", scale=display_scale)
+                        l = viewer.add_labels(ref_data, name=f"Ref: {ref_name}", scale=display_scale)
                         l.color = cmap
                     
+                    # B. Load Intersection Mask (Where the overlap happens)
                     if inter_path and os.path.exists(inter_path):
-                         int_data = np.memmap(inter_path, dtype=np.int32, mode='r', shape=self.image_shape)
-                         viewer.add_labels(int_data, name="Overlap Regions", scale=display_scale, opacity=0.8)
+                        int_data = np.memmap(inter_path, dtype=np.int32, mode='r', shape=self.image_shape)
+                        viewer.add_labels(int_data, name=f"Overlap ({ref_name})", scale=display_scale, opacity=0.7)
+
+                    # C. Load Reference Raw Intensity (for context)
+                    if ref_raw and os.path.exists(ref_raw):
+                        try:
+                            ref_img = tiff.imread(ref_raw)
+                            viewer.add_image(ref_img, name=f"Ref Intensity ({ref_name})", 
+                                             colormap='magenta', blending='additive', scale=display_scale)
+                        except Exception: pass
 
                 except Exception as e:
-                    print(f"Error loading interaction viz: {e}")
+                    print(f"  [Error] Failed to load 2D interaction visualization: {e}")
 
     def cleanup_step_artifacts(self, viewer, step_number: int):
         """Cleans artifacts for 2D steps."""

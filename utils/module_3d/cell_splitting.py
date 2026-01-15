@@ -513,161 +513,165 @@ def separate_multi_soma_cells(
 
     flush_print(f"  Processing {len(chunk_slices)} chunks...")
 
-    for i, sl in enumerate(tqdm(chunk_slices, desc="Processing Chunks")):
-        seg_chunk = segmentation_mask[sl]
-        int_chunk = intensity_volume[sl]
-        soma_chunk = soma_mask[sl]
+    try:
+        for i, sl in enumerate(tqdm(chunk_slices, desc="Processing Chunks")):
+            seg_chunk = segmentation_mask[sl]
+            int_chunk = intensity_volume[sl]
+            soma_chunk = soma_mask[sl]
 
-        # Use large offsets to avoid ID collisions between chunks initially
-        chunk_offset = (i + 1) * 1_000_000
+            # Use large offsets to avoid ID collisions between chunks initially
+            chunk_offset = (i + 1) * 1_000_000
 
-        res, _, seed_map = _separate_multi_soma_cells_chunk(
-            seg_chunk, int_chunk, soma_chunk,
-            spacing, chunk_offset, multi_soma_labels, **kwargs
-        )
-
-        path = os.path.join(memmap_dir, f"chunk_{i}.npy")
-        np.save(path, res)
-
-        chunk_data[i] = {
-            'path': path,
-            'shape': seg_chunk.shape,
-            'seed_map': seed_map
-        }
-
-        del res, seg_chunk, int_chunk, soma_chunk
-        gc.collect()
-
-    # 3. Seed-Aware Stitching Logic
-    flush_print("  Stitching with Seed Verification...")
-    label_map: Dict[int, int] = {}
-
-    shape_in_chunks = [
-        len(range(0, segmentation_mask.shape[0], chunk_shape[0] - overlap)),
-        len(range(0, segmentation_mask.shape[1], chunk_shape[1] - overlap)),
-        len(range(0, segmentation_mask.shape[2], chunk_shape[2] - overlap))
-    ]
-
-    for i, chunk_slice1 in enumerate(tqdm(chunk_slices, desc="Stitching Analysis")):
-        if i not in chunk_data:
-            continue
-
-        # Determine neighbors
-        cz, cy, cx = np.unravel_index(i, shape_in_chunks)
-        neighbors = []
-        if cz + 1 < shape_in_chunks[0]:
-            neighbors.append(np.ravel_multi_index((cz + 1, cy, cx), shape_in_chunks))
-        if cy + 1 < shape_in_chunks[1]:
-            neighbors.append(np.ravel_multi_index((cz, cy + 1, cx), shape_in_chunks))
-        if cx + 1 < shape_in_chunks[2]:
-            neighbors.append(np.ravel_multi_index((cz, cy, cx + 1), shape_in_chunks))
-
-        data1 = chunk_data[i]
-        res1 = np.load(data1['path'])
-        seeds1_map = data1['seed_map']
-
-        for j in neighbors:
-            if j not in chunk_data:
-                continue
-            data2 = chunk_data[j]
-            chunk_slice2 = chunk_slices[j]
-            res2 = np.load(data2['path'])
-            seeds2_map = data2['seed_map']
-
-            # Calculate overlap slices
-            overlap_slice_global = tuple(
-                slice(max(s1.start, s2.start), min(s1.stop, s2.stop))
-                for s1, s2 in zip(chunk_slice1, chunk_slice2)
+            res, _, seed_map = _separate_multi_soma_cells_chunk(
+                seg_chunk, int_chunk, soma_chunk,
+                spacing, chunk_offset, multi_soma_labels, **kwargs
             )
 
-            local_slice1 = tuple(
-                slice(s.start - cs.start, s.stop - cs.start)
-                for s, cs in zip(overlap_slice_global, chunk_slice1)
-            )
-            local_slice2 = tuple(
-                slice(s.start - cs.start, s.stop - cs.start)
-                for s, cs in zip(overlap_slice_global, chunk_slice2)
-            )
+            path = os.path.join(memmap_dir, f"chunk_{i}_{os.getpid()}.npy")
+            np.save(path, res)
 
-            crop1 = res1[local_slice1]
-            crop2 = res2[local_slice2]
+            chunk_data[i] = {'path': path, 'shape': res.shape, 'seed_map': seed_map}
+            del res # Free RAM immediately
+            gc.collect()
 
-            mask_overlap = (crop1 > 0) & (crop2 > 0)
-            if not np.any(mask_overlap):
+        # 3. Seed-Aware Stitching Logic
+        flush_print("  Stitching with Seed Verification...")
+        label_map: Dict[int, int] = {}
+
+        shape_in_chunks = [
+            len(range(0, segmentation_mask.shape[0], chunk_shape[0] - overlap)),
+            len(range(0, segmentation_mask.shape[1], chunk_shape[1] - overlap)),
+            len(range(0, segmentation_mask.shape[2], chunk_shape[2] - overlap))
+        ]
+
+        for i, chunk_slice1 in enumerate(tqdm(chunk_slices, desc="Stitching Analysis")):
+            if i not in chunk_data:
                 continue
 
-            l1_flat = crop1[mask_overlap]
-            l2_flat = crop2[mask_overlap]
-            stacked = np.vstack((l1_flat, l2_flat))
-            unique_pairs = np.unique(stacked, axis=1).T
+            # Determine neighbors
+            cz, cy, cx = np.unravel_index(i, shape_in_chunks)
+            neighbors = []
+            if cz + 1 < shape_in_chunks[0]:
+                neighbors.append(np.ravel_multi_index((cz + 1, cy, cx), shape_in_chunks))
+            if cy + 1 < shape_in_chunks[1]:
+                neighbors.append(np.ravel_multi_index((cz, cy + 1, cx), shape_in_chunks))
+            if cx + 1 < shape_in_chunks[2]:
+                neighbors.append(np.ravel_multi_index((cz, cy, cx + 1), shape_in_chunks))
 
-            for id1, id2 in unique_pairs:
-                # --- CRITICAL STITCHING LOGIC ---
-                # Retrieve the original soma seeds that generated these segments.
-                s1_set = seeds1_map.get(id1, set())
-                s2_set = seeds2_map.get(id2, set())
+            data1 = chunk_data[i]
+            res1 = np.load(data1['path'])
+            seeds1_map = data1['seed_map']
 
-                # If the sets of original seeds are disjoint, it means these two segments
-                # came from DIFFERENT nuclei. We should NOT merge them, even if they touch.
-                if s1_set and s2_set and s1_set.isdisjoint(s2_set):
+            for j in neighbors:
+                if j not in chunk_data:
+                    continue
+                data2 = chunk_data[j]
+                chunk_slice2 = chunk_slices[j]
+                res2 = np.load(data2['path'])
+                seeds2_map = data2['seed_map']
+
+                # Calculate overlap slices
+                overlap_slice_global = tuple(
+                    slice(max(s1.start, s2.start), min(s1.stop, s2.stop))
+                    for s1, s2 in zip(chunk_slice1, chunk_slice2)
+                )
+
+                local_slice1 = tuple(
+                    slice(s.start - cs.start, s.stop - cs.start)
+                    for s, cs in zip(overlap_slice_global, chunk_slice1)
+                )
+                local_slice2 = tuple(
+                    slice(s.start - cs.start, s.stop - cs.start)
+                    for s, cs in zip(overlap_slice_global, chunk_slice2)
+                )
+
+                crop1 = res1[local_slice1]
+                crop2 = res2[local_slice2]
+
+                mask_overlap = (crop1 > 0) & (crop2 > 0)
+                if not np.any(mask_overlap):
                     continue
 
-                # Otherwise, they share a seed (are the same cell split by chunking), merge them.
-                root1 = label_map.get(id1, id1)
-                root2 = label_map.get(id2, id2)
+                l1_flat = crop1[mask_overlap]
+                l2_flat = crop2[mask_overlap]
+                stacked = np.vstack((l1_flat, l2_flat))
+                unique_pairs = np.unique(stacked, axis=1).T
 
-                if root1 != root2:
-                    target = min(root1, root2)
-                    source = max(root1, root2)
-                    
-                    # Redirect any existing mapping pointing to source
-                    for k, v in list(label_map.items()):
-                        if v == source:
-                            label_map[k] = target
+                for id1, id2 in unique_pairs:
+                    # --- CRITICAL STITCHING LOGIC ---
+                    # Retrieve the original soma seeds that generated these segments.
+                    s1_set = seeds1_map.get(id1, set())
+                    s2_set = seeds2_map.get(id2, set())
 
-                    label_map[source] = target
-                    label_map[root1] = target
-                    label_map[root2] = target
-                    label_map[id1] = target
-                    label_map[id2] = target
+                    # If the sets of original seeds are disjoint, it means these two segments
+                    # came from DIFFERENT nuclei. We should NOT merge them, even if they touch.
+                    if s1_set and s2_set and s1_set.isdisjoint(s2_set):
+                        continue
 
-    # 4. Construct Final Mask
-    final_path = os.path.join(memmap_dir, "stitched.mmp")
-    final_mask = np.memmap(
-        final_path, dtype=np.int32, mode='w+', shape=segmentation_mask.shape
-    )
+                    # Otherwise, they share a seed (are the same cell split by chunking), merge them.
+                    root1 = label_map.get(id1, id1)
+                    root2 = label_map.get(id2, id2)
 
-    flush_print("  Writing stitched result...")
-    for i, sl in enumerate(tqdm(chunk_slices, desc="Writing Result")):
-        if i not in chunk_data:
-            continue
-        path = chunk_data[i]['path']
-        res = np.load(path)
+                    if root1 != root2:
+                        target = min(root1, root2)
+                        source = max(root1, root2)
+                        
+                        # Redirect any existing mapping pointing to source
+                        for k, v in list(label_map.items()):
+                            if v == source:
+                                label_map[k] = target
 
-        uniques = np.unique(res)
-        for u in uniques:
-            if u == 0:
+                        label_map[source] = target
+                        label_map[root1] = target
+                        label_map[root2] = target
+                        label_map[id1] = target
+                        label_map[id2] = target
+
+        # 4. Construct Final Mask
+        final_path = os.path.join(memmap_dir, "stitched.mmp")
+        final_mask = np.memmap(
+            final_path, dtype=np.int32, mode='w+', shape=segmentation_mask.shape
+        )
+
+        flush_print("  Writing stitched result...")
+        for i, sl in enumerate(tqdm(chunk_slices, desc="Writing Result")):
+            if i not in chunk_data:
                 continue
-            if u in label_map:
-                target = label_map[u]
-                if target != u:
-                    res[res == u] = target
+            path = chunk_data[i]['path']
+            res = np.load(path)
 
-        mask_nz = res > 0
-        canvas_view = final_mask[sl]
-        canvas_view[mask_nz] = res[mask_nz]
-        final_mask[sl] = canvas_view
+            uniques = np.unique(res)
+            for u in uniques:
+                if u == 0:
+                    continue
+                if u in label_map:
+                    target = label_map[u]
+                    if target != u:
+                        res[res == u] = target
 
-        os.remove(path)
+            mask_nz = res > 0
+            canvas_view = final_mask[sl]
+            canvas_view[mask_nz] = res[mask_nz]
+            final_mask[sl] = canvas_view
 
-    # Convert to array for final steps (usually fits in RAM if chunks worked)
-    ret = np.array(final_mask)
-    del final_mask
-    if os.path.exists(final_path):
-        os.remove(final_path)
+            os.remove(path)
 
-    flush_print("  Refining (Filling voids + Relabeling)...")
-    ret = fill_internal_voids(ret)
-    ret, _, _ = relabel_sequential(ret)
+        # Convert to array for final steps (usually fits in RAM if chunks worked)
+        ret = np.array(final_mask)
+        del final_mask
+        if os.path.exists(final_path):
+            os.remove(final_path)
 
-    return ret
+        flush_print("  Refining (Filling voids + Relabeling)...")
+        ret = fill_internal_voids(ret)
+        ret, _, _ = relabel_sequential(ret)
+
+        return ret
+    
+    finally:
+        # Emergency cleanup: remove any remaining .npy files in case of crash
+        for i in chunk_data:
+            if os.path.exists(chunk_data[i]['path']):
+                try: os.remove(chunk_data[i]['path'])
+                except: pass
+        gc.collect()

@@ -27,15 +27,12 @@ DASK_SCHEDULER = 'threads'
 
 
 def _get_safe_temp_dir(base_path: Optional[str] = None, suffix: str = "") -> str:
-    """
-    Creates a temporary directory.
-    If base_path is provided, creates 'hibachi_scratch' inside it.
-    Otherwise, creates it in the current working directory.
-    """
+    """Creates a temporary directory strictly inside the provided base_path."""
     if base_path and os.path.isdir(base_path):
         scratch_root = os.path.join(base_path, "hibachi_scratch")
     else:
-        scratch_root = os.path.abspath("hibachi_scratch")
+        # Fallback to system temp instead of current working directory
+        scratch_root = os.path.join(tempfile.gettempdir(), "hibachi_scratch")
     
     os.makedirs(scratch_root, exist_ok=True)
     return tempfile.mkdtemp(prefix=f"step2_{suffix}_", dir=scratch_root)
@@ -591,6 +588,10 @@ def apply_hull_trimming(
             trimmed_labels_memmap = _safe_close_memmap(trimmed_labels_memmap)
         if 'hull_memmap' in locals():
             hull_memmap = _safe_close_memmap(hull_memmap)
+        # Targeted deletion of large 3D arrays
+        for var in ['hull_boundary_for_return', 'eroded_hull', 'core_mask', 'protected_mask']:
+            if var in locals():
+                del locals()[var]
         gc.collect()
         if workflow_temp_dir and os.path.exists(workflow_temp_dir):
             try:

@@ -75,6 +75,9 @@ def _watershed_with_simpleitk(
 
         # 4. Convert back to NumPy
         result_np = sitk.GetArrayFromImage(result_sitk)
+        # Explicitly clear SITK objects to release C++ memory
+        del landscape_sitk, markers_sitk, result_sitk
+        
         # Cast back to original marker dtype
         result_np = result_np.astype(markers.dtype, copy=False)
 
@@ -198,6 +201,8 @@ def distance_transform_edt(
         else:
             dt = np.add.reduce(dt, axis=0)
             dt = np.sqrt(dt)
+
+        del ft # Release the large intermediate int32 array
 
     # Construct Return
     result = []

@@ -53,11 +53,14 @@ class ProcessingStrategy(abc.ABC):
         self.config = config
         self.processed_dir = processed_dir
         os.makedirs(self.processed_dir, exist_ok=True)
+        self.temp_dir = os.path.join(self.processed_dir, "temp_artifacts")
+        os.makedirs(self.temp_dir, exist_ok=True)
 
         self.image_shape = image_shape
         self.spacing = spacing
         self.z_scale_factor = scale_factor
         self.mode_name = self._get_mode_name()
+        self._visibility_cache: Dict[str, bool] = {}
         
         # Dictionary to store runtime state (e.g., calculated thresholds)
         # that needs to pass between steps but isn't strictly config.
@@ -305,10 +308,17 @@ class ProcessingStrategy(abc.ABC):
             layer_type: 'labels', 'image', 'shapes', or 'points'.
             **kwargs: Additional arguments for the viewer.add_* method.
         """
-        if viewer is None:
+        if viewer is None: 
             return
-            
         layer_name = f"{name}_{self.mode_name}"
+
+        if layer_name in viewer.layers:
+            # If the layer exists, remember its current visibility
+            kwargs['visible'] = viewer.layers[layer_name].visible
+            self._visibility_cache[layer_name] = kwargs['visible']
+        elif layer_name in self._visibility_cache:
+            # If the layer is new but we have a cached state, restore it
+            kwargs['visible'] = self._visibility_cache[layer_name]
         
         # Determine dimensionality of data
         spatial_ndim = 2
@@ -375,6 +385,8 @@ class ProcessingStrategy(abc.ABC):
             return
         layer_name = f"{name}_{self.mode_name}"
         if layer_name in viewer.layers:
+            # Save visibility to cache before removing the layer
+            self._visibility_cache[layer_name] = viewer.layers[layer_name].visible
             try:
                 viewer.layers.remove(layer_name)
             except Exception as e:
@@ -399,3 +411,13 @@ class ProcessingStrategy(abc.ABC):
             except Exception as e:
                 print(f"  Failed to delete {file_path}: {e}")
         return False
+    
+    def cleanup_temporary_files(self) -> None:
+        """Removes the localized temp directory and all its non-checkpoint contents."""
+        if os.path.exists(self.temp_dir):
+            import shutil
+            try:
+                gc.collect() # Release handles
+                shutil.rmtree(self.temp_dir)
+            except Exception as e:
+                print(f"Warning: Could not fully clean temp directory: {e}")

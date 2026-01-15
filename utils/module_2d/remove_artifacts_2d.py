@@ -25,15 +25,12 @@ from dask.diagnostics import ProgressBar
 import dask_image
 
 def _get_safe_temp_dir(base_path: Optional[str] = None, suffix: str = "") -> str:
-    """
-    Creates a temporary directory.
-    If base_path is provided, creates 'hibachi_scratch' inside it.
-    Otherwise, creates it in the current working directory.
-    """
+    """Creates a temporary directory strictly inside the provided base_path."""
     if base_path and os.path.isdir(base_path):
         scratch_root = os.path.join(base_path, "hibachi_scratch")
     else:
-        scratch_root = os.path.abspath("hibachi_scratch")
+        # Fallback to system temp instead of current working directory
+        scratch_root = os.path.join(tempfile.gettempdir(), "hibachi_scratch")
     
     os.makedirs(scratch_root, exist_ok=True)
     return tempfile.mkdtemp(prefix=f"step2_2d_{suffix}_", dir=scratch_root)
@@ -415,4 +412,8 @@ def apply_hull_trimming_2d(
     finally:
         if 'trimmed_labels_memmap' in locals():
             _safe_close_memmap(trimmed_labels_memmap)
+        # Targeted Cleanup of heavy intermediate arrays
+        for var in ['hull_mask', 'dist_map', 'protected_mask', 'core_mask', 'is_zero']:
+            if var in locals():
+                del locals()[var]
         gc.collect()

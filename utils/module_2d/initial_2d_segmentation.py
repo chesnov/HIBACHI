@@ -37,12 +37,8 @@ def _init_worker() -> None:
 
 def _get_safe_temp_dir(base_path: Optional[str], suffix: str = "") -> str:
     """Creates a temporary directory in the project folder."""
-    if base_path and os.path.isdir(base_path):
-        scratch_root = os.path.join(base_path, "hibachi_scratch")
-    else:
-        scratch_root = os.path.abspath("hibachi_scratch")
+    scratch_root = base_path if (base_path and os.path.isdir(base_path)) else tempfile.gettempdir()
     
-    os.makedirs(scratch_root, exist_ok=True)
     return tempfile.mkdtemp(prefix=f"step1_2d_{suffix}_", dir=scratch_root)
 
 
@@ -324,9 +320,18 @@ def segment_cells_first_pass_raw_2d(
             final_mm[ws] = lookup[lz[rs]]
         final_mm.flush()
 
+        # Explicitly release master_mm before returning
+        if 'master_mm' in locals():
+            del master_mm
+
         return labels_path, labels_temp_dir, threshold_history.get(tubular_scales[0], 0.0), {'threshold_history': threshold_history}
 
     finally:
-        if final_labels_memmap is not None: del final_labels_memmap
-        for d in temp_dirs_to_clean: shutil.rmtree(d, ignore_errors=True)
+        # Close any local memmap handles to avoid PermissionError on cleanup
+        for var in ['final_mm', 'norm_mm', 'smoothed_mm', 'master_mm', 'input_mm']:
+            if var in locals():
+                del locals()[var]
+        
+        for d in temp_dirs_to_clean:
+            shutil.rmtree(d, ignore_errors=True)
         gc.collect()

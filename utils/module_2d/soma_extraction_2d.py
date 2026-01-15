@@ -256,8 +256,9 @@ def extract_soma_masks_2d(
 
                 del core_mask
             
-            del t_mask, t_int, dt_full_obj
-            if t_idx % 10 == 0: gc.collect()
+            del t_mask, t_int, dt_full_obj, dt_ref
+            if t_idx % 5 == 0: # Increased frequency for huge clumps
+                gc.collect()
 
     # 5. Global Greedy Placement
     # In this Label-First version, we can place per label to save RAM, 
@@ -297,8 +298,13 @@ def extract_soma_masks_2d(
 
         # Update main status
         main_pbar.set_postfix({"Seeds": next_label_id - 1, "RAM": f"{get_ram_usage():.1f}GB"})
-        del label_candidates
-        if lbl_idx % 100 == 0: gc.collect()
+        
+        if 'label_candidates' in locals():
+            label_candidates.clear() # Explicitly empty the list
+            del label_candidates
+        
+        if lbl_idx % 50 == 0: # More frequent GC for 2D batches
+            gc.collect()
 
     t_total = time.time() - t_start_global
     print("\n" + "="*60)

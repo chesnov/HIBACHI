@@ -400,6 +400,8 @@ def extract_soma_masks(
                         process_frag_logic(region.image, region.bbox[:3])
 
                 del core
+                if 'dt_ref' in locals() and dt_ref is not dt_obj:
+                    del dt_ref
 
             del t_mask, t_int, dt_obj
             if t_idx % 5 == 0:
@@ -440,7 +442,9 @@ def extract_soma_masks(
         main_pbar.set_postfix(
             {"Seeds": next_label_id - 1, "RAM": f"{get_ram_usage():.1f}G"}
         )
-        del label_candidates
+        if 'label_candidates' in locals():
+            label_candidates.clear()
+            del label_candidates
         if lbl_idx % 20 == 0:
             gc.collect()
 

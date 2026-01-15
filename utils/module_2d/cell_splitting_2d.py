@@ -377,60 +377,69 @@ def separate_multi_soma_cells_2d(
     chunk_slices = list(_get_chunk_slices_2d(segmentation_mask.shape, chunk_shape, overlap))
     chunk_data = {}
 
-    for i, sl in enumerate(tqdm(chunk_slices, desc="Processing 2D Chunks")):
-        res, _, seed_map = _separate_multi_soma_cells_chunk_2d(
-            segmentation_mask[sl], intensity_volume[sl], soma_mask[sl],
-            spacing, (i + 1) * 1_000_000, multi_soma_labels, **kwargs
-        )
-        path = os.path.join(memmap_dir, f"chunk2d_{i}.npy")
-        np.save(path, res)
-        chunk_data[i] = {'path': path, 'seed_map': seed_map}
+    try:
+        for i, sl in enumerate(tqdm(chunk_slices, desc="Processing 2D Chunks")):
+            res, _, seed_map = _separate_multi_soma_cells_chunk_2d(
+                segmentation_mask[sl], intensity_volume[sl], soma_mask[sl],
+                spacing, (i + 1) * 1_000_000, multi_soma_labels, **kwargs
+            )
+            path = os.path.join(memmap_dir, f"chunk2d_{i}_{os.getpid()}.npy")
+            np.save(path, res)
+            chunk_data[i] = {'path': path, 'seed_map': seed_map}
+            del res
+            gc.collect()
+
+        # 3. Seed-Aware Stitching
+        label_map: Dict[int, int] = {}
+        grid_w = len(range(0, segmentation_mask.shape[1], chunk_shape[1] - overlap))
+
+        for i, sl1 in enumerate(tqdm(chunk_slices, desc="Stitching Analysis")):
+            cy, cx = divmod(i, grid_w)
+            for dy, dx in [(0, 1), (1, 0)]:
+                ny, nx = cy + dy, cx + dx
+                j = ny * grid_w + nx
+                if j >= len(chunk_slices): continue
+
+                sl2 = chunk_slices[j]
+                overlap_g = tuple(slice(max(s1.start, s2.start), min(s1.stop, s2.stop)) for s1, s2 in zip(sl1, sl2))
+                if (overlap_g[0].stop <= overlap_g[0].start) or (overlap_g[1].stop <= overlap_g[1].start): continue
+
+                res1, res2 = np.load(chunk_data[i]['path']), np.load(chunk_data[j]['path'])
+                c1 = res1[tuple(slice(s.start - cs.start, s.stop - cs.start) for s, cs in zip(overlap_g, sl1))]
+                c2 = res2[tuple(slice(s.start - cs.start, s.stop - cs.start) for s, cs in zip(overlap_g, sl2))]
+
+                valid = (c1 > 0) & (c2 > 0)
+                if not np.any(valid): continue
+                pairs = np.unique(np.vstack((c1[valid], c2[valid])), axis=1).T
+                for id1, id2 in pairs:
+                    s1, s2 = chunk_data[i]['seed_map'].get(id1, set()), chunk_data[j]['seed_map'].get(id2, set())
+                    if s1 and s2 and s1.isdisjoint(s2): continue
+                    root1, root2 = label_map.get(id1, id1), label_map.get(id2, id2)
+                    if root1 != root2:
+                        target, source = min(root1, root2), max(root1, root2)
+                        for k, v in list(label_map.items()):
+                            if v == source: label_map[k] = target
+                        label_map[source] = target
+                        label_map[id1] = label_map[id2] = target
+
+        # 4. Final Construction
+        final_mask = np.zeros_like(segmentation_mask, dtype=np.int32)
+        for i, sl in enumerate(tqdm(chunk_slices, desc="Writing Result")):
+            res = np.load(chunk_data[i]['path'])
+            for u in np.unique(res[res > 0]):
+                if u in label_map: res[res == u] = label_map[u]
+            mask_nz = res > 0
+            final_mask[sl][mask_nz] = res[mask_nz]
+            os.remove(chunk_data[i]['path'])
+
+        # 5. Finalize
+        final_mask = ndimage.binary_fill_holes(final_mask > 0).astype(np.int32) * final_mask
+        final_mask, _, _ = relabel_sequential(final_mask)
+        return final_mask
+    finally:
+        # Emergency cleanup: remove any remaining .npy files in case of crash
+        for i in chunk_data:
+            if os.path.exists(chunk_data[i]['path']):
+                try: os.remove(chunk_data[i]['path'])
+                except: pass
         gc.collect()
-
-    # 3. Seed-Aware Stitching
-    label_map: Dict[int, int] = {}
-    grid_w = len(range(0, segmentation_mask.shape[1], chunk_shape[1] - overlap))
-
-    for i, sl1 in enumerate(tqdm(chunk_slices, desc="Stitching Analysis")):
-        cy, cx = divmod(i, grid_w)
-        for dy, dx in [(0, 1), (1, 0)]:
-            ny, nx = cy + dy, cx + dx
-            j = ny * grid_w + nx
-            if j >= len(chunk_slices): continue
-
-            sl2 = chunk_slices[j]
-            overlap_g = tuple(slice(max(s1.start, s2.start), min(s1.stop, s2.stop)) for s1, s2 in zip(sl1, sl2))
-            if (overlap_g[0].stop <= overlap_g[0].start) or (overlap_g[1].stop <= overlap_g[1].start): continue
-
-            res1, res2 = np.load(chunk_data[i]['path']), np.load(chunk_data[j]['path'])
-            c1 = res1[tuple(slice(s.start - cs.start, s.stop - cs.start) for s, cs in zip(overlap_g, sl1))]
-            c2 = res2[tuple(slice(s.start - cs.start, s.stop - cs.start) for s, cs in zip(overlap_g, sl2))]
-
-            valid = (c1 > 0) & (c2 > 0)
-            if not np.any(valid): continue
-            pairs = np.unique(np.vstack((c1[valid], c2[valid])), axis=1).T
-            for id1, id2 in pairs:
-                s1, s2 = chunk_data[i]['seed_map'].get(id1, set()), chunk_data[j]['seed_map'].get(id2, set())
-                if s1 and s2 and s1.isdisjoint(s2): continue
-                root1, root2 = label_map.get(id1, id1), label_map.get(id2, id2)
-                if root1 != root2:
-                    target, source = min(root1, root2), max(root1, root2)
-                    for k, v in list(label_map.items()):
-                        if v == source: label_map[k] = target
-                    label_map[source] = target
-                    label_map[id1] = label_map[id2] = target
-
-    # 4. Final Construction
-    final_mask = np.zeros_like(segmentation_mask, dtype=np.int32)
-    for i, sl in enumerate(tqdm(chunk_slices, desc="Writing Result")):
-        res = np.load(chunk_data[i]['path'])
-        for u in np.unique(res[res > 0]):
-            if u in label_map: res[res == u] = label_map[u]
-        mask_nz = res > 0
-        final_mask[sl][mask_nz] = res[mask_nz]
-        os.remove(chunk_data[i]['path'])
-
-    # 5. Finalize
-    final_mask = ndimage.binary_fill_holes(final_mask > 0).astype(np.int32) * final_mask
-    final_mask, _, _ = relabel_sequential(final_mask)
-    return final_mask

@@ -193,6 +193,30 @@ class DynamicGUIManager(QObject):
             self.log_widget, area="right", name="Process Log"
         )
 
+    def shutdown_and_cleanup(self) -> None:
+        """Forcefully clears all data references and Napari internal buffers."""
+        # 1. Clear Napari layers and buffers first
+        if self.viewer:
+            try:
+                self.viewer.layers.clear() # This drops the actual NumPy/Memmap references in Napari
+            except Exception:
+                pass
+        
+        # 2. Clear strategy and large data references
+        if hasattr(self, 'strategy'):
+            if hasattr(self.strategy, 'intermediate_state'):
+                # Crucial: This dictionary often holds the 'original_volume_ref'
+                self.strategy.intermediate_state.clear() 
+            self.strategy = None
+        
+        self.image_stack = None # Release the memmap object
+        self.viewer = None # Release the Napari viewer object
+        
+        # 3. Double-pass Garbage Collection (often needed for circular Qt references)
+        gc.collect()
+        gc.collect()
+        print("    [RAM] Deep cleanup complete. All heavy references released.")
+
     def _calculate_spacing(self) -> None:
         """Parses spacing from config or defaults to 1.0."""
         is_2d_mode = self.processing_mode.endswith("_2d")
@@ -229,6 +253,7 @@ class DynamicGUIManager(QObject):
 
     def _initialize_layers(self) -> None:
         """Adds the original image to Napari."""
+        self.viewer.layers.clear() 
         layer_name = f"Original stack ({self.processing_mode} mode)"
         if layer_name in self.viewer.layers:
             self.viewer.layers.remove(layer_name)
@@ -608,6 +633,7 @@ class DynamicGUIManager(QObject):
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setWidget(widget)
+        scroll.setMinimumWidth(350) 
         dock = self.viewer.window.add_dock_widget(
             scroll, area="right", name=f"Step: {name}"
         )

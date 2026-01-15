@@ -188,7 +188,8 @@ class RamifiedStrategy(ProcessingStrategy):
                 skip_tubular_enhancement=skip_enhancement,
                 subtract_background_radius=int(
                     params.get("subtract_background_radius", 0)
-                )
+                ),
+                temp_root_path=self.temp_dir
             )
 
             # Unpack results
@@ -263,7 +264,8 @@ class RamifiedStrategy(ProcessingStrategy):
                     params.get("edge_distance_chunk_size_z", 32)
                 ),
                 z_erosion_iterations=int(params.get("z_erosion_iterations", 0)),
-                post_smoothing_iter=int(params.get("post_smoothing_iter", 0))
+                post_smoothing_iter=int(params.get("post_smoothing_iter", 0)),
+                temp_root_path=self.temp_dir
             )
 
             if not temp_dat_path or not os.path.exists(temp_dat_path):
@@ -370,7 +372,8 @@ class RamifiedStrategy(ProcessingStrategy):
                 "absolute_max_thickness_um": float(
                     params.get("absolute_max_thickness_um", 10.0)
                 ),
-                "memmap_final_mask": True
+                "memmap_final_mask": True,
+                "temp_root_path": self.temp_dir
             }
 
             cell_bodies = extract_soma_masks(
@@ -463,6 +466,7 @@ class RamifiedStrategy(ProcessingStrategy):
                 "memmap_dir": os.path.join(
                     self.processed_dir, "sep_multi_soma_temp"
                 ),
+                "memmap_dir": self.temp_dir,
                 "memmap_voxel_threshold": int(
                     params.get("memmap_voxel_threshold", 25_000_000)
                 )

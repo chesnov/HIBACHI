@@ -4,6 +4,7 @@ import sys
 import shutil
 import time
 import traceback
+import gc
 import yaml  # type: ignore
 from xml.etree import ElementTree as ET
 from typing import Dict, Any, List, Optional, Tuple, Union, Callable
@@ -437,6 +438,7 @@ def organize_channel_project(
             z_slices = shape[0] if mem.ndim == 3 else 1
             height, width = shape[-2], shape[-1]
             del mem
+            gc.collect() # Force immediate release during heavy batch organization
         except Exception:
             z_slices, width, height = 1, 1, 1
 
@@ -970,7 +972,7 @@ def interactive_segmentation_with_config(selected_folder: str = None) -> None:
             config = yaml.safe_load(f)
         mode = config.get('mode')
 
-        image_stack = tiff.imread(file_loc)
+        image_stack = tiff.memmap(file_loc, mode='r') 
         viewer = napari.Viewer(title=f"Segmentation: {os.path.basename(selected_folder)}")
 
         qt_window = viewer.window._qt_window
@@ -978,7 +980,7 @@ def interactive_segmentation_with_config(selected_folder: str = None) -> None:
 
         gui_manager = DynamicGUIManager(viewer, config, image_stack, file_loc, mode)
         viewer.window.add_dock_widget(
-            create_back_to_project_button(viewer), area="left", name="Navigation"
+            create_back_to_project_button(viewer, gui_manager), area="left", name="Navigation"
         )
 
         @magicgui(call_button="▶ Next Step / Run Current")
@@ -1049,11 +1051,15 @@ def launch_image_segmentation_tool() -> QApplication:
     return app
 
 
-def create_back_to_project_button(viewer: napari.Viewer) -> QWidget:
+def create_back_to_project_button(viewer: napari.Viewer, gui_manager: Any) -> QWidget:
     """Creates the 'Back to Project List' button widget."""
     def _do():
+        if gui_manager:
+            gui_manager.shutdown_and_cleanup()
         if viewer:
             viewer.close()
+        
+        gc.collect()
         app_state.show_project_view_signal.emit()
 
     btn = QPushButton("Back to Project List")

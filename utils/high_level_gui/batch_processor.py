@@ -128,9 +128,8 @@ class BatchProcessor:
             # 2. Load Image
             try:
                 image_file_path = os.path.join(folder_path, tif_filename)
-                # Use memory mapping if possible, though strategies might load into RAM
-                # For BatchProcessor, standard load is usually safer unless file is massive
-                image_stack = tiff.imread(image_file_path)
+                # Use mmap_mode to prevent full RAM load
+                image_stack = tiff.memmap(image_file_path, mode='r')
             except MemoryError:
                 print(f"  [CRITICAL] Out of Memory loading {tif_filename}. Skipping.")
                 return False
@@ -263,12 +262,15 @@ class BatchProcessor:
 
         finally:
             # Aggressive Cleanup
-            if image_stack is not None:
-                del image_stack
             if strategy_instance is not None:
+                # Explicitly wipe the temp directory defined in the strategy
+                if hasattr(strategy_instance, 'cleanup_temporary_files'):
+                    strategy_instance.cleanup_temporary_files()
                 if hasattr(strategy_instance, 'intermediate_state'):
                     strategy_instance.intermediate_state.clear()
                 del strategy_instance
+            if image_stack is not None:
+                del image_stack
             gc.collect()
 
     def process_all_folders(self, force_restart_all: bool = False) -> Tuple[int, int, int]:

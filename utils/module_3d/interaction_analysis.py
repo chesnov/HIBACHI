@@ -323,7 +323,13 @@ def calculate_interaction_metrics(
         ref_df = ref_stats
 
     # Cleanup
-    del dist_map, indices
+    if intersection_memmap is not None:
+        intersection_memmap.flush()
+        if hasattr(intersection_memmap, '_mmap') and intersection_memmap._mmap:
+            intersection_memmap._mmap.close()
+            
+    # Explicitly clear large arrays (Indices can be 3x the size of the volume)
+    del dist_map, indices, primary_memmap, reference_memmap
     gc.collect()
 
     return pd.DataFrame(primary_results), ref_df, intersection_path
