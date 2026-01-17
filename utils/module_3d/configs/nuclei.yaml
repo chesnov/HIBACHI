@@ -1,4 +1,6 @@
 mode: ramified
+
+# --- Step 1: Raw Segmentation ---
 execute_raw_segmentation_ramified:
   name: Execute Raw Segmentation
   parameters:
@@ -14,12 +16,12 @@ execute_raw_segmentation_ramified:
       value: 2000
       min: 10
       max: 50000
-      step: 10
+      step: 1
     smooth_sigma:
       label: Smooth Sigma (Initial)
       type: float
       value: 1.1
-      min: 0.1
+      min: 0.0
       max: 10.0
       step: 0.1
     low_threshold_percentile:
@@ -43,6 +45,8 @@ execute_raw_segmentation_ramified:
       min: 0.0
       max: 10.0
       step: 0.1
+
+# --- Step 2: Edge Trimming ---
 execute_trim_edges_ramified:
   name: Execute Edge Trimming
   parameters:
@@ -73,7 +77,7 @@ execute_trim_edges_ramified:
       value: 2000
       min: 0
       max: 10000
-      step: 10
+      step: 1
     hull_closing_radius:
       label: Hull closing radius
       type: int
@@ -87,11 +91,13 @@ execute_trim_edges_ramified:
       value: 2
       min: 0
       max: 10
+
+# --- Step 3: Soma Extraction (Finding Seeds) ---
 execute_soma_extraction_ramified:
   name: Execute Soma Extraction
   parameters:
     ratios_to_process:
-      label: Ratios to Process
+      label: Ratios to Process (Peeling; comma-sep floats)
       type: list
       value:
       - 0.2
@@ -105,7 +111,7 @@ execute_soma_extraction_ramified:
       - 0.95
       element_type: float
     intensity_percentiles_to_process:
-      label: Intensity Percentiles
+      label: Intensity Percentiles (Peeling; comma-sep ints)
       type: list
       value:
       - 100.0
@@ -131,19 +137,12 @@ execute_soma_extraction_ramified:
       - 5.0
       - 1.0
       element_type: int
-    min_physical_peak_separation:
-      label: Min Peak Separation (um)
+    smallest_quantile:
+      label: Smallest Quantile (Population stats)
       type: float
-      value: 6.0
-      min: 1.0e-05
-      max: 20.0
-      step: 1.0e-05
-    seeding_min_distance_um:
-      label: Internal Seeding Resolution (um)
-      type: float
-      value: 1.0
-      min: 1.0e-05
-      max: 20.0
+      value: 0.001
+      min: 0.0
+      max: 1.0
       step: 1.0e-05
     min_fragment_size:
       label: Min Seed Size (Voxels)
@@ -152,20 +151,6 @@ execute_soma_extraction_ramified:
       min: 1
       max: 1000000
       step: 1
-    absolute_min_thickness_um:
-      label: Min Absolute Thickness (um)
-      type: float
-      value: 0.0001
-      min: 1.0e-05
-      max: 10.0
-      step: 1.0e-05
-    core_volume_target_factor_upper:
-      label: Soma Vol Factor (Upper)
-      type: float
-      value: 2.0
-      min: 1.0e-06
-      max: 1000.0
-      step: 1.0e-05
     core_volume_target_factor_lower:
       label: Soma Vol Factor (Lower)
       type: float
@@ -173,36 +158,12 @@ execute_soma_extraction_ramified:
       min: 1.0e-05
       max: 1.0
       step: 1.0e-05
-    max_allowed_core_aspect_ratio:
-      label: Max Aspect Ratio
+    core_volume_target_factor_upper:
+      label: Soma Vol Factor (Upper)
       type: float
-      value: 50.0
-      min: 1.0
-      max: 50.0
-      step: 0.1
-    ref_vol_percentile_lower:
-      type: int
-      value: 1
-      min: 0
-      max: 100
-      step: 1
-    ref_vol_percentile_upper:
-      type: int
-      value: 20
-      min: 0
-      max: 100
-      step: 1
-    ref_thickness_percentile_lower:
-      type: int
-      value: 1
-      min: 0
-      max: 100
-      step: 1
-    smallest_quantile:
-      type: float
-      value: 0.001
-      min: 0.0
-      max: 1.0
+      value: 2.0
+      min: 1.0e-05
+      max: 1000.0
       step: 1.0e-05
     erosion_iterations:
       label: Soma Erosion Iterations
@@ -211,36 +172,102 @@ execute_soma_extraction_ramified:
       min: 0
       max: 5
       step: 1
+    min_physical_peak_separation:
+      label: Min Peak Separation (um)
+      type: float
+      value: 6.0
+      min: 1.0e-05
+      max: 20.0
+      step: 1.0e-05
+    ref_vol_percentile_lower:
+      label: Ref Volume Percentile (Lower)
+      type: int
+      value: 1
+      min: 0
+      max: 100
+      step: 1
+    ref_vol_percentile_upper:
+      label: Ref Volume Percentile (Upper)
+      type: int
+      value: 20
+      min: 0
+      max: 100
+      step: 1
+    ref_thickness_percentile_lower:
+      label: Ref Thickness Percentile (Lower)
+      type: int
+      value: 1
+      min: 0
+      max: 100
+      step: 1
+    seeding_min_distance_um:
+      label: Internal Seeding Resolution (um)
+      type: float
+      value: 1.0
+      min: 1.0e-05
+      max: 20.0
+      step: 1.0e-05
+    absolute_min_thickness_um:
+      label: Min Absolute Thickness (um)
+      type: float
+      value: 0.0001
+      min: 1.0e-05
+      max: 10.0
+      step: 1.0e-05
     absolute_max_thickness_um:
+      label: Max Absolute Thickness (um)
       type: float
       value: 50.0
       min: 0.001
       max: 100.0
       step: 0.001
+    max_allowed_core_aspect_ratio:
+      label: Max Aspect Ratio (Elongation)
+      type: float
+      value: 50.0
+      min: 1.0
+      max: 50.0
+      step: 0.1
+
+# --- Step 4: Cell Separation (Splitting Blobs) ---
 execute_cell_separation_ramified:
   name: Execute Cell Separation
   parameters:
-    min_path_intensity_ratio:
-      label: Min Path Intensity Ratio (Merge thresh)
+    min_size_threshold:
+      label: Min Final Cell Size (Voxels)
       type: float
-      value: 5.0
+      value: 500.0
       min: 0.0
-      max: 10.0
-      step: 0.1
-    min_local_intensity_difference:
-      label: Min Local Intensity Diff (Merge thresh)
-      type: float
-      value: 0.0
-      min: -5.0
-      max: 100.0
-      step: 0.1
+      max: 10000000.0
+      step: 1.0
     max_seed_centroid_dist:
       label: Max Seed Merge Distance (um)
       type: float
       value: 0.1
       min: 0.0
-      max: 100.0
+      max: 10000.0
       step: 0.1
+    min_path_intensity_ratio:
+      label: Min Path Intensity Ratio (Merge thresh)
+      type: float
+      value: 5.0
+      min: 0.0
+      max: 100.0
+      step: 0.01
+    min_local_intensity_difference:
+      label: Min Local Intensity Diff (Merge thresh)
+      type: float
+      value: 0.00
+      min: 0.0
+      max: 100.0
+      step: 0.01
+    local_analysis_radius:
+      label: Local Analysis Radius (um)
+      type: int
+      value: 10
+      min: 1
+      max: 1000
+      step: 1
     intensity_weight:
       label: Watershed Intensity Weight
       type: float
@@ -248,20 +275,8 @@ execute_cell_separation_ramified:
       min: 0.0
       max: 10.0
       step: 0.1
-    min_size_threshold:
-      label: Min Final Cell Size (Voxels)
-      type: float
-      value: 500.0
-      min: 0.0
-      max: 10000000.0
-      step: 10.0
-    local_analysis_radius:
-      label: Local Analysis Radius (um)
-      type: int
-      value: 10
-      min: 1
-      max: 100
-      step: 1
+
+# --- Step 5: Feature Calculation ---
 execute_calculate_features_ramified:
   name: Execute Feature Calculation (3D)
   parameters:
@@ -272,9 +287,36 @@ execute_calculate_features_ramified:
       min: 0
       max: 200
       step: 0.01
+    calculate_distances:
+      label: Calculate Distances
+      type: bool
+      value: true
+    calculate_skeletons:
+      label: Calculate Skeletons
+      type: bool
+      value: true
+
+# --- Step 6: Interaction Analysis ---
+execute_interaction_analysis_ramified:
+  name: Execute Interaction Analysis (3D)
+  parameters:
+    target_channel_folder:
+      label: Reference Channel Path (GUI selected)
+      type: str
+      value: ""
+    calculate_distance:
+      label: Calculate Nearest Distances
+      type: bool
+      value: true
+    calculate_overlap:
+      label: Calculate Overlap %
+      type: bool
+      value: true
+
+# --- Global Settings ---
 voxel_dimensions:
   x: 424.27
   y: 424.27
-  z: 89.0
+  z: 167.0
 saved_state:
-  segmentation_threshold: 0.11440354585647583
+  segmentation_threshold: 0.043508924543857574

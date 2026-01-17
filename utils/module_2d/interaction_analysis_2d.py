@@ -19,8 +19,82 @@ import dask_image.ndmeasure
 from dask.diagnostics import ProgressBar
 from scipy import ndimage
 from scipy.ndimage import distance_transform_edt, generate_binary_structure
+from scipy.spatial import cKDTree
 from tqdm import tqdm
+import multiprocessing as mp
 
+def _extract_contours_2d(mask_memmap, labels, shape):
+    """Helper to extract boundary coordinates for a set of labels."""
+    contours = []
+    locs = ndimage.find_objects(mask_memmap)
+    struct = generate_binary_structure(2, 1)
+    for lbl in tqdm(labels, desc="    Extracting Boundaries", leave=False):
+        sl = locs[lbl-1]
+        if sl is None: continue
+        mask = (mask_memmap[sl] == lbl)
+        eroded = ndimage.binary_erosion(mask, structure=struct)
+        y, x = np.where(mask ^ eroded)
+        if len(y) > 0:
+            contours.append(np.column_stack((y + sl[0].start, x + sl[1].start)))
+        else: contours.append(np.array([]))
+    return contours
+
+def _inter_channel_dist_worker_2d(args):
+    """Worker: Calculates distances from one primary object to all reference objects."""
+    prim_idx, prim_contour, ref_contours, spacing_arr = args
+    row = np.full(len(ref_contours), np.inf, dtype=np.float32)
+    if prim_contour.size == 0: return prim_idx, row
+    
+    # Build tree for the primary cell
+    tree = cKDTree(prim_contour * spacing_arr)
+    for j, r_cnt in enumerate(ref_contours):
+        if r_cnt.size > 0:
+            dists, _ = tree.query(r_cnt * spacing_arr, k=1)
+            row[j] = np.min(dists)
+    return prim_idx, row
+
+def calculate_pairwise_distances_2d(primary_memmap, reference_memmap, spacing_yx):
+    """Calculates all pairwise distances and returns a long-format DataFrame."""
+    p_labels = np.unique(primary_memmap[primary_memmap > 0])
+    r_labels = np.unique(reference_memmap[reference_memmap > 0])
+    spacing_arr = np.array(spacing_yx)
+    
+    
+    # 1. Extract Boundaries
+    p_contours = _extract_contours_2d(primary_memmap, p_labels, primary_memmap.shape)
+    r_contours = _extract_contours_2d(reference_memmap, r_labels, reference_memmap.shape)
+    
+    # 2. Parallel Execution
+    n_jobs = max(1, mp.cpu_count() - 1)
+    tasks = [(i, p_contours[i], r_contours, spacing_arr) for i in range(len(p_labels))]
+    
+    all_rows = []
+    with mp.Pool(n_jobs) as pool:
+        for prim_idx, distances in tqdm(pool.imap_unordered(_inter_channel_dist_worker_2d, tasks), 
+                                       total=len(tasks), desc="    Pairwise Distance"):
+            # 'distances' is an array of M distances for Primary Object 'prim_idx'
+            p_label = p_labels[prim_idx]
+            
+            # Create a small temporary dataframe for this specific object
+            df_chunk = pd.DataFrame({
+                'channel_a_label': p_label,
+                'channel_b_label': r_labels,
+                'distance_um': distances
+            })
+            
+            all_rows.append(df_chunk)
+            
+    # Combine all chunks into one large master table
+    if not all_rows:
+        return pd.DataFrame()
+        
+    final_df = pd.concat(all_rows, ignore_index=True)
+    
+    # Explicit Cleanup
+    del p_contours, r_contours, all_rows
+    gc.collect()
+    
+    return final_df
 
 def flush_print(*args: Any, **kwargs: Any) -> None:
     """Standardized wrapper for immediate log flushing."""
@@ -203,6 +277,15 @@ def calculate_interaction_metrics_2d(
         ).reset_index()
         ref_df['ref_total_area_um2'] = ref_df['ref_label'].map(ref_areas).fillna(0) * unit_area
         ref_df['percent_covered'] = (ref_df['total_overlap_area_um2'] / ref_df['ref_total_area_um2'].replace(0, 1)) * 100.0
+
+    # 8. Pairwise Distance Calculation (Long Format)
+    pairwise_df = calculate_pairwise_distances_2d(primary_memmap, reference_memmap, spacing_yx)
+    
+    if not pairwise_df.empty:
+        pairwise_out_path = os.path.join(output_dir, f"pairwise_distances_{reference_name}.csv")
+        # Use compression if the table is very large (thousands of objects)
+        pairwise_df.to_csv(pairwise_out_path, index=False)
+        flush_print(f"  [Success] Pairwise distances saved to: {os.path.basename(pairwise_out_path)}")
 
     # Cleanup
     if intersection_memmap is not None:

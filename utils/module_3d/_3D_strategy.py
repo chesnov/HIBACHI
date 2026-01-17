@@ -353,7 +353,7 @@ class RamifiedStrategy(ProcessingStrategy):
                 "min_physical_peak_separation": float(
                     params.get("min_physical_peak_separation", 7.0)
                 ),
-                "seeding_min_distance_um": params.get("seeding_min_distance_um"),
+                "seeding_min_distance_um": float(params.get("seeding_min_distance_um", 0)),
                 "max_allowed_core_aspect_ratio": float(
                     params.get("max_allowed_core_aspect_ratio", 10.0)
                 ),
@@ -542,6 +542,8 @@ class RamifiedStrategy(ProcessingStrategy):
                 segmented_array=final_seg_memmap,
                 intensity_image=intensity_vol,
                 spacing=self.spacing,
+                calculate_distances=params.get("calculate_distances", True),
+                calculate_skeletons=params.get("calculate_skeletons", True),
                 fcs_export_path=fcs_path,
                 **params,
                 return_detailed=True

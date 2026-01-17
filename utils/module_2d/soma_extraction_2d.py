@@ -53,6 +53,7 @@ def extract_soma_masks_2d(
     ratios_to_process: List[float] = [0.3, 0.4, 0.5, 0.6],
     intensity_percentiles_to_process: List[int] = [100, 90, 80, 70, 60, 50, 40, 30, 20, 10],
     min_physical_peak_separation: float = 5.0,
+    seeding_min_distance_um: Optional[float] = 0.0,
     max_allowed_core_aspect_ratio: float = 10.0,
     ref_vol_percentile_lower: int = 30,
     ref_vol_percentile_upper: int = 70,
@@ -78,8 +79,12 @@ def extract_soma_masks_2d(
         spacing = tuple(float(s) for s in spacing)
 
     min_seed_fragment_area = max(1, min_fragment_size)
-    min_peak_sep_pixels = get_min_distance_pixels_2d(spacing, min_physical_peak_separation)
-    
+    # Internal seeding distance used to split clumped somas
+    if seeding_min_distance_um != 0.0:
+        min_peak_sep_pixels = get_min_distance_pixels_2d(spacing, seeding_min_distance_um)
+    else:
+        min_peak_sep_pixels = get_min_distance_pixels_2d(spacing, min_physical_peak_separation)
+
     # Identify objects (find_objects is much more RAM efficient than regionprops)
     slices = ndimage.find_objects(segmentation_mask)
     valid_labels = [i+1 for i, s in enumerate(slices) if s is not None]

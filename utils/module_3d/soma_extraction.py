@@ -125,7 +125,7 @@ def extract_soma_masks(
     ratios_to_process: List[float] = [0.3, 0.4, 0.5, 0.6],
     intensity_percentiles_to_process: List[int] = [100, 90, 80, 70, 60, 50, 40, 30],
     min_physical_peak_separation: float = 7.0,
-    seeding_min_distance_um: Optional[float] = None,
+    seeding_min_distance_um: Optional[float] = 0.0,
     max_allowed_core_aspect_ratio: float = 10.0,
     ref_vol_percentile_lower: int = 30,
     ref_vol_percentile_upper: int = 70,
@@ -181,7 +181,7 @@ def extract_soma_masks(
     min_seed_vol = max(1, min_fragment_size)
 
     # Internal seeding distance used to split clumped somas
-    if seeding_min_distance_um is not None:
+    if seeding_min_distance_um != 0.0:
         int_peak_sep = get_min_distance_pixels_3d(spacing, seeding_min_distance_um)
     else:
         int_peak_sep = get_min_distance_pixels_3d(spacing, min_physical_peak_separation)

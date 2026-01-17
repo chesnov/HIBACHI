@@ -302,16 +302,13 @@ def apply_hull_trimming_2d(
     edge_trim_distance_threshold: float,
     brightness_cutoff_factor: float,
     min_size_pixels: int,
-    smoothing_iterations: int = 1,
-    heal_iterations: int = 1,
+    hull_closing_radius: int = 10,
     temp_root_path: Optional[str] = None
 ) -> Tuple[Optional[str], Optional[str], Optional[np.ndarray]]:
     """
     Main Entry Point for Step 2 (2D).
     Applies Zero-Edge Trimming, Hull Generation, Edge Trimming, and Size Filtering.
 
-    Args:
-        smoothing_iterations: Mapped to hull_closing_radius (1->10, 2->15, etc).
     """
     print(f"\n--- Applying Hull Generation and Edge Trimming (2D) ---")
     
@@ -330,10 +327,6 @@ def apply_hull_trimming_2d(
     
     trimmed_labels_memmap = None
     hull_boundary_for_return = None
-
-    # Map iterations to radius
-    hull_closing_radius = (max(1, smoothing_iterations) * 5) + 5
-    print(f"  Hull Closing Radius: {hull_closing_radius}")
 
     try:
         # 1. Output Setup

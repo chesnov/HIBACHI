@@ -257,8 +257,7 @@ class Ramified2DStrategy(ProcessingStrategy):
                 edge_trim_distance_threshold=float(params.get("edge_trim_distance_threshold", 2.5)),
                 brightness_cutoff_factor=float(params.get("brightness_cutoff_factor", 1.5)),
                 min_size_pixels=int(params.get("min_size_pixels", 20)),
-                smoothing_iterations=int(params.get("smoothing_iterations", 1)),
-                heal_iterations=int(params.get("heal_iterations", 1))
+                hull_closing_radius=int(params.get("hull_closing_radius", 10))
             )
 
             if not temp_dat_path or not os.path.exists(temp_dat_path):
@@ -344,6 +343,7 @@ class Ramified2DStrategy(ProcessingStrategy):
                 ratios_to_process=params.get("ratios_to_process", [0.3, 0.4, 0.5, 0.6]),
                 intensity_percentiles_to_process=params.get("intensity_percentiles_to_process", [100, 95, 90, 85, 80]),
                 min_physical_peak_separation=float(params.get("min_physical_peak_separation", 3.0)),
+                seeding_min_distance_um=params.getfloat(("seeding_min_distance_um", 0)),
                 max_allowed_core_aspect_ratio=float(params.get("max_allowed_core_aspect_ratio", 5.0)),
                 ref_vol_percentile_lower=int(params.get("ref_vol_percentile_lower", 30)),
                 ref_vol_percentile_upper=int(params.get("ref_vol_percentile_upper", 70)),
@@ -416,7 +416,7 @@ class Ramified2DStrategy(ProcessingStrategy):
                 min_path_intensity_ratio=float(params.get("min_path_intensity_ratio", 0.8)),
                 min_local_intensity_difference=float(params.get("min_local_intensity_difference", 0.05)),
                 local_analysis_radius=float(params.get("local_analysis_radius", 2.0)),
-                max_hole_size=int(params.get("max_hole_size", 0))
+                intensity_weight=float(params.get("intensity_weight", 0.0))
             )
 
             # Persist

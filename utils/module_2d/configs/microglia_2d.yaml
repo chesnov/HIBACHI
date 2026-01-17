@@ -1,37 +1,38 @@
-mode: ramified
-execute_raw_segmentation_ramified:
-  name: Execute Raw Segmentation
+mode: ramified_2d
+
+# --- Step 1: Raw Segmentation ---
+execute_raw_segmentation_ramified_2d:
+  name: Execute Raw Segmentation (2D)
   parameters:
     tubular_scales:
       label: Tubular Scales (comma-sep floats)
       type: list
       value:
-      - 0.5
-      - 0.1
+      - 1.0
       element_type: float
     min_size:
-      label: Minimum Size (Voxels, Raw Seg)
+      label: Minimum Size (Pixels, Raw Seg)
       type: int
-      value: 2000
-      min: 10
-      max: 50000
-      step: 10
+      value: 450
+      min: 1
+      max: 10000
+      step: 1
     smooth_sigma:
       label: Smooth Sigma (Initial)
       type: float
-      value: 1.1
-      min: 0.1
-      max: 10.0
-      step: 0.1
+      value: 0.30
+      min: 0.00
+      max: 10.00
+      step: 0.01
     low_threshold_percentile:
       label: Low Threshold Percentile (Raw Seg)
       type: float
-      value: 97.0
+      value: 94.0
       min: 0.0
       max: 100.0
       step: 0.1
     high_threshold_percentile:
-      label: High Threshold Percentile (Raw Seg)
+      label: High Threshold Percentile (Norm)
       type: float
       value: 100.0
       min: 0.0
@@ -40,12 +41,14 @@ execute_raw_segmentation_ramified:
     connect_max_gap_physical:
       label: Max Connect Gap (um)
       type: float
-      value: 1.0
+      value: 2.0
       min: 0.0
       max: 10.0
       step: 0.1
-execute_trim_edges_ramified:
-  name: Execute Edge Trimming
+
+# --- Step 2: Edge Trimming ---
+execute_trim_edges_ramified_2d:
+  name: Execute Edge Trimming (2D)
   parameters:
     edge_trim_distance_threshold:
       label: Edge Trim Distance (um)
@@ -57,42 +60,38 @@ execute_trim_edges_ramified:
     hull_boundary_thickness_phys:
       label: Hull Boundary Thickness (um)
       type: float
-      value: 2.0
+      value: 0.0
       min: 0.1
       max: 10.0
       step: 0.1
     brightness_cutoff_factor:
       label: Brightness Cutoff Factor
       type: float
-      value: 10.0
+      value: 1.5
       min: 0.0
-      max: 10000000
+      max: 10.0
       step: 0.1
-    min_size_voxels:
-      label: Min Size (Voxels, Post-Trim)
+    min_size_pixels:
+      label: Min Size (Pixels, Post-Trim)
       type: int
-      value: 10
+      value: 120
       min: 0
-      max: 10000
-      step: 10
+      max: 5000
+      step: 5
     hull_closing_radius:
-      label: Hull closing radius
-      type: int
-      value: 1
-      min: 0
-      max: 10000
-      step: 1
-    z_erosion_iterations:
-      label: Z-Anisotropy Correction (Erosion)
-      type: int
-      value: 0
-      min: 0
-      max: 10
-execute_soma_extraction_ramified:
-  name: Execute Soma Extraction
+          label: Hull Smoothing Radius
+          type: int
+          value: 10
+          min: 0
+          max: 10000
+          step: 1
+
+# --- Step 3: Soma Extraction (Finding Seeds) ---
+execute_soma_extraction_ramified_2d:
+  name: Execute Soma Extraction (2D)
   parameters:
     ratios_to_process:
-      label: Ratios to Process (Peeling; comma-sep floats)
+      label: Ratios to Process (Soma extraction; comma-sep floats)
       type: list
       value:
       - 0.3
@@ -101,7 +100,7 @@ execute_soma_extraction_ramified:
       - 0.6
       element_type: float
     intensity_percentiles_to_process:
-      label: Intensity Percentiles (Peeling; comma-sep ints)
+      label: Intensity Percentiles (Soma extraction; comma-sep integers)
       type: list
       value:
       - 99
@@ -127,30 +126,30 @@ execute_soma_extraction_ramified:
       - 1
       element_type: int
     smallest_quantile:
-      label: Smallest Quantile (Population stats)
+      label: Smallest Quantile (Soma extraction)
       type: float
       value: 0.05
       min: 0.0
       max: 1.0
       step: 0.01
     min_fragment_size:
-      label: Min Seed Size (Voxels)
+      label: Min Fragment Size (Pixels)
       type: int
-      value: 100
+      value: 400
       min: 1
       max: 1000000
-      step: 10
+      step: 1
     core_volume_target_factor_lower:
-      label: Soma Vol Factor (Lower)
+      label: Soma Area Factor (Lower)
       type: float
-      value: 0.1
+      value: 1
       min: 0.01
       max: 1.0
       step: 0.01
     core_volume_target_factor_upper:
-      label: Soma Vol Factor (Upper)
+      label: Soma Area Factor (Upper)
       type: float
-      value: 2.0
+      value: 10.0
       min: 1.0
       max: 50.0
       step: 0.1
@@ -164,21 +163,21 @@ execute_soma_extraction_ramified:
     min_physical_peak_separation:
       label: Min Peak Separation (um)
       type: float
-      value: 15.0
+      value: 20.0
       min: 1.0
-      max: 20.0
+      max: 100000
       step: 0.1
     ref_vol_percentile_lower:
-      label: Ref Volume Percentile (Lower)
+      label: Ref Area Percentile (Lower)
       type: int
-      value: 1
+      value: 60
       min: 0
       max: 100
       step: 1
     ref_vol_percentile_upper:
-      label: Ref Volume Percentile (Upper)
+      label: Ref Area Percentile (Upper)
       type: int
-      value: 5
+      value: 100
       min: 0
       max: 100
       step: 1
@@ -190,14 +189,14 @@ execute_soma_extraction_ramified:
       max: 100
       step: 1
     absolute_min_thickness_um:
-      label: Min Absolute Thickness (um)
+      label: Soma Min Thickness (um)
       type: float
       value: 1.5
       min: 0.5
       max: 10.0
       step: 0.1
     absolute_max_thickness_um:
-      label: Max Absolute Thickness (um)
+      label: Soma Max Thickness (um)
       type: float
       value: 10.0
       min: 5.0
@@ -206,38 +205,41 @@ execute_soma_extraction_ramified:
     max_allowed_core_aspect_ratio:
       label: Max Aspect Ratio (Elongation)
       type: float
-      value: 10.0
+      value: 5.0
       min: 1.0
-      max: 50.0
+      max: 20.0
       step: 0.5
-execute_cell_separation_ramified:
-  name: Execute Cell Separation
+    
+
+# --- Step 4: Cell Separation (Splitting Blobs) ---
+execute_cell_separation_ramified_2d:
+  name: Execute Cell Separation (2D)
   parameters:
     min_size_threshold:
-      label: Min Final Cell Size (Voxels)
+      label: Min Final Cell Size (Pixels)
       type: float
-      value: 1000.0
+      value: 100.0
       min: 0.0
       max: 1000000.0
       step: 1.0
     max_seed_centroid_dist:
-      label: Max Seed Merge Distance (um)
+      label: Max Seed Merge Dist (um)
       type: float
       value: 20.0
       min: 0.0
       max: 10000.0
       step: 1.0
     min_path_intensity_ratio:
-      label: Min Path Intensity Ratio (Merge thresh)
+      label: Min Path Intensity Ratio (Merge)
       type: float
-      value: 5.0
+      value: 0.6
       min: 0.0
       max: 100.0
       step: 0.01
     min_local_intensity_difference:
-      label: Min Local Intensity Diff (Merge thresh)
+      label: Min Local Intensity Diff (Merge)
       type: float
-      value: 0.0
+      value: 0.01
       min: 0.0
       max: 100.0
       step: 0.01
@@ -251,12 +253,14 @@ execute_cell_separation_ramified:
     intensity_weight:
       label: Watershed Intensity Weight
       type: float
-      value: 0.0
+      value: 0.5
       min: 0.0
       max: 10.0
       step: 0.1
-execute_calculate_features_ramified:
-  name: Execute Feature Calculation (3D)
+
+# --- Step 5: Feature Calculation ---
+execute_calculate_features_ramified_2d:
+  name: Execute Feature Calculation (2D)
   parameters:
     prune_spurs_le_um:
       label: Prune Skeleton Spurs <= (um)
@@ -265,9 +269,35 @@ execute_calculate_features_ramified:
       min: 0
       max: 200
       step: 0.01
-voxel_dimensions:
-  x: 424.26499999999993
-  y: 424.26499999999993
-  z: 160.0
+    calculate_distances:
+      label: Calculate Distances
+      type: bool
+      value: true
+    calculate_skeletons:
+      label: Calculate Skeletons
+      type: bool
+      value: true
+
+# --- Step 6: Interaction Analysis ---
+execute_interaction_analysis_ramified_2d:
+  name: Execute Interaction Analysis (2D)
+  parameters:
+    target_channel_folder:
+      label: Reference Channel Path (GUI selected)
+      type: str
+      value: ""
+    calculate_distance:
+      label: Calculate Nearest Distances
+      type: bool
+      value: true
+    calculate_overlap:
+      label: Calculate Overlap %
+      type: bool
+      value: true
+
+# --- Global Settings ---
+pixel_dimensions:
+  x: 606.09
+  y: 606.09
 saved_state:
-  segmentation_threshold: 0.03371111806482076
+  segmentation_threshold: 0.015
