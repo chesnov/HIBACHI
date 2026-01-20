@@ -10,8 +10,8 @@ import tifffile as tiff  # type: ignore
 
 # Corrected relative imports
 try:
-    from ..module_3d._3D_strategy import RamifiedStrategy
-    from ..module_2d._2D_strategy import Ramified2DStrategy
+    from ..module_3d._3D_strategy import FluorescenceStrategy
+    from ..module_2d._2D_strategy import Fluorescence2DStrategy
     from .processing_strategies import ProcessingStrategy
 except ImportError as e:
     print(f"Error importing modules in batch_processor.py: {e}")
@@ -32,8 +32,8 @@ class BatchProcessor:
         """
         self.project_manager = project_manager
         self.supported_strategies = {
-            "ramified": RamifiedStrategy,
-            "ramified_2d": Ramified2DStrategy,
+            "fluorescence": FluorescenceStrategy,
+            "fluorescence_2d": Fluorescence2DStrategy,
         }
         print(f"BatchProcessor initialized. Supported modes: {list(self.supported_strategies.keys())}")
 
@@ -97,7 +97,7 @@ class BatchProcessor:
 
         Args:
             folder_path: Path to the specific image folder.
-            target_strategy_key: Processing mode (e.g., 'ramified').
+            target_strategy_key: Processing mode (e.g., 'fluorescence').
             force_restart: If True, deletes previous outputs and runs from Step 1.
 
         Returns:

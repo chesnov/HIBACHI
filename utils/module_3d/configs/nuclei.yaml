@@ -1,7 +1,7 @@
-mode: ramified
+mode: fluorescence
 
 # --- Step 1: Raw Segmentation ---
-execute_raw_segmentation_ramified:
+execute_raw_segmentation_fluorescence:
   name: Execute Raw Segmentation
   parameters:
     tubular_scales:
@@ -47,7 +47,7 @@ execute_raw_segmentation_ramified:
       step: 0.1
 
 # --- Step 2: Edge Trimming ---
-execute_trim_edges_ramified:
+execute_trim_edges_fluorescence:
   name: Execute Edge Trimming
   parameters:
     edge_trim_distance_threshold:
@@ -93,7 +93,7 @@ execute_trim_edges_ramified:
       max: 10
 
 # --- Step 3: Soma Extraction (Finding Seeds) ---
-execute_soma_extraction_ramified:
+execute_soma_extraction_fluorescence:
   name: Execute Soma Extraction
   parameters:
     ratios_to_process:
@@ -230,7 +230,7 @@ execute_soma_extraction_ramified:
       step: 0.1
 
 # --- Step 4: Cell Separation (Splitting Blobs) ---
-execute_cell_separation_ramified:
+execute_cell_separation_fluorescence:
   name: Execute Cell Separation
   parameters:
     min_size_threshold:
@@ -277,7 +277,7 @@ execute_cell_separation_ramified:
       step: 0.1
 
 # --- Step 5: Feature Calculation ---
-execute_calculate_features_ramified:
+execute_calculate_features_fluorescence:
   name: Execute Feature Calculation (3D)
   parameters:
     prune_spurs_le_um:
@@ -297,7 +297,7 @@ execute_calculate_features_ramified:
       value: true
 
 # --- Step 6: Interaction Analysis ---
-execute_interaction_analysis_ramified:
+execute_interaction_analysis_fluorescence:
   name: Execute Interaction Analysis (3D)
   parameters:
     target_channel_folder:

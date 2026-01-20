@@ -76,7 +76,7 @@ class ProcessingStrategy(abc.ABC):
     @abc.abstractmethod
     def _get_mode_name(self) -> str:
         """
-        Returns the unique string identifier for this strategy (e.g., 'ramified').
+        Returns the unique string identifier for this strategy (e.g., 'fluorescence').
         Used for file naming and config lookups.
         """
         pass
@@ -99,7 +99,7 @@ class ProcessingStrategy(abc.ABC):
     def get_config_key(self, step_name: str) -> str:
         """
         Generates the configuration key for a specific step.
-        Example: 'execute_raw_segmentation' -> 'execute_raw_segmentation_ramified'
+        Example: 'execute_raw_segmentation' -> 'execute_raw_segmentation_fluorescence'
 
         Args:
             step_name: The base name of the step method.

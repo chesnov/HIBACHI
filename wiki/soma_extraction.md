@@ -2,7 +2,7 @@
 
 **Corresponding Modules:**
 *   **3D:** `utils/module_3d/soma_extraction.py`
-*   **2D:** `utils/ramified_module_2d/soma_extraction_2d.py`
+*   **2D:** `utils/fluorescence_module_2d/soma_extraction_2d.py`
 
 ## Overview
 This is a **Detection** step, not a segmentation step. Its sole purpose is to identify the "Seed" or "Center" of every distinct cell body (soma) within the binary mask created in Steps 1 & 2.

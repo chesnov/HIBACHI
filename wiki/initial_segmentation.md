@@ -5,7 +5,7 @@
 *   **2D:** `utils/module_2d/initial_2d_segmentation.py`
 
 ## Overview
-The goal of Step 1 is to convert the raw, noisy, grayscale microscopy image into a clean binary mask (Foreground vs. Background). It is specifically designed to detect **ramified structures** (tubular processes) which are often lost by simple thresholding.
+The goal of Step 1 is to convert the raw, noisy, grayscale microscopy image into a clean binary mask (Foreground vs. Background). It is specifically designed to detect **fluorescence structures** (tubular processes) which are often lost by simple thresholding.
 
 ### The Algorithm
 1.  **Preprocessing (Optional):**

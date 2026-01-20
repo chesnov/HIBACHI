@@ -335,8 +335,8 @@ def scan_available_presets() -> Dict[str, Dict[str, str]]:
     """Scans the module directories for available YAML configuration presets."""
     script_dir = os.path.dirname(os.path.abspath(__file__))
     search_locations = [
-        (os.path.join(script_dir, '..', 'module_3d', 'configs'), 'ramified'),
-        (os.path.join(script_dir, '..', 'module_2d', 'configs'), 'ramified_2d')
+        (os.path.join(script_dir, '..', 'module_3d', 'configs'), 'fluorescence'),
+        (os.path.join(script_dir, '..', 'module_2d', 'configs'), 'fluorescence_2d')
     ]
     presets = {}
     

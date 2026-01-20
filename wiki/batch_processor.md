@@ -11,7 +11,7 @@ It acts as a **Headless Controller**: it instantiates the appropriate Strategy (
 
 ### 1. Project Iteration
 *   It asks the `ProjectManager` for a list of valid image folders.
-*   It filters them: checks if the `mode` defined in their `processing_config.yaml` is supported (e.g., `ramified` or `ramified_2d`).
+*   It filters them: checks if the `mode` defined in their `processing_config.yaml` is supported (e.g., `fluorescence` or `fluorescence_2d`).
 
 ### 2. Spacing Normalization
 *   Before processing, it reads the physical dimensions from the config.

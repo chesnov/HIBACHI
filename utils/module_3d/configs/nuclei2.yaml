@@ -1,6 +1,4 @@
 mode: fluorescence
-
-# --- Step 1: Raw Segmentation ---
 execute_raw_segmentation_fluorescence:
   name: Execute Raw Segmentation
   parameters:
@@ -8,28 +6,26 @@ execute_raw_segmentation_fluorescence:
       label: Tubular Scales (comma-sep floats)
       type: list
       value:
-      - 1.0
-      - 1.5
-      - 3.0
+      - 0.0
       element_type: float
     min_size:
       label: Minimum Size (Voxels, Raw Seg)
       type: int
-      value: 1000
+      value: 2000
       min: 10
       max: 50000
-      step: 1
+      step: 10
     smooth_sigma:
       label: Smooth Sigma (Initial)
       type: float
-      value: 0.2
-      min: 0.0
+      value: 1.1
+      min: 0.1
       max: 10.0
       step: 0.1
     low_threshold_percentile:
       label: Low Threshold Percentile (Raw Seg)
       type: float
-      value: 95.0
+      value: 99.0
       min: 0.0
       max: 100.0
       step: 0.1
@@ -43,33 +39,31 @@ execute_raw_segmentation_fluorescence:
     connect_max_gap_physical:
       label: Max Connect Gap (um)
       type: float
-      value: 1.0
+      value: 0.0
       min: 0.0
       max: 10.0
       step: 0.1
-
-# --- Step 2: Edge Trimming ---
 execute_trim_edges_fluorescence:
   name: Execute Edge Trimming
   parameters:
     edge_trim_distance_threshold:
       label: Edge Trim Distance (um)
       type: float
-      value: 4.0
+      value: 0.0
       min: 0.0
       max: 20.0
       step: 0.1
     hull_boundary_thickness_phys:
       label: Hull Boundary Thickness (um)
       type: float
-      value: 1.0
+      value: 2.0
       min: 0.1
       max: 10.0
       step: 0.1
     brightness_cutoff_factor:
       label: Brightness Cutoff Factor
       type: float
-      value: 1000000.0
+      value: 10000000.0
       min: 0.0
       max: 10000000
       step: 0.1
@@ -79,7 +73,7 @@ execute_trim_edges_fluorescence:
       value: 2000
       min: 0
       max: 10000
-      step: 1
+      step: 10
     hull_closing_radius:
       label: Hull closing radius
       type: int
@@ -93,73 +87,76 @@ execute_trim_edges_fluorescence:
       value: 2
       min: 0
       max: 10
-
-# --- Step 3: Soma Extraction (Finding Seeds) ---
 execute_soma_extraction_fluorescence:
   name: Execute Soma Extraction
   parameters:
     ratios_to_process:
-      label: Ratios to Process (Peeling; comma-sep floats)
+      label: Ratios to Process
       type: list
       value:
+      - 0.2
       - 0.3
       - 0.4
       - 0.5
       - 0.6
+      - 0.7
+      - 0.8
+      - 0.9
+      - 0.95
       element_type: float
     intensity_percentiles_to_process:
-      label: Intensity Percentiles (Peeling; comma-sep ints)
+      label: Intensity Percentiles
       type: list
       value:
-      - 99
-      - 95
-      - 90
-      - 85
-      - 80
-      - 75
-      - 70
-      - 65
-      - 60
-      - 55
-      - 50
-      - 45
-      - 40
-      - 35
-      - 30
-      - 25
-      - 20
-      - 15
-      - 10
-      - 5
-      - 1
+      - 100.0
+      - 99.5
+      - 99.0
+      - 95.0
+      - 90.0
+      - 85.0
+      - 80.0
+      - 70.0
+      - 75.0
+      - 60.0
+      - 55.0
+      - 50.0
+      - 45.0
+      - 40.0
+      - 35.0
+      - 30.0
+      - 25.0
+      - 20.0
+      - 15.0
+      - 10.0
+      - 5.0
+      - 1.0
       element_type: int
     smallest_quantile:
-      label: Smallest Quantile (Population stats)
       type: float
-      value: 0.05
+      value: 0.001
       min: 0.0
       max: 1.0
       step: 1.0e-05
     min_fragment_size:
       label: Min Seed Size (Voxels)
       type: int
-      value: 2500
+      value: 10
       min: 1
       max: 1000000
       step: 1
     core_volume_target_factor_lower:
       label: Soma Vol Factor (Lower)
       type: float
-      value: 0.1
+      value: 0.0001
       min: 1.0e-05
       max: 1.0
       step: 1.0e-05
     core_volume_target_factor_upper:
       label: Soma Vol Factor (Upper)
       type: float
-      value: 10.0
-      min: 1.0e-05
-      max: 50.0
+      value: 2.0
+      min: 1.0e-06
+      max: 1000.0
       step: 1.0e-05
     erosion_iterations:
       label: Soma Erosion Iterations
@@ -171,28 +168,25 @@ execute_soma_extraction_fluorescence:
     min_physical_peak_separation:
       label: Min Peak Separation (um)
       type: float
-      value: 7.0
+      value: 6.0
       min: 1.0e-05
       max: 20.0
       step: 1.0e-05
     ref_vol_percentile_lower:
-      label: Ref Volume Percentile (Lower)
       type: int
-      value: 5
+      value: 1
       min: 0
       max: 100
       step: 1
     ref_vol_percentile_upper:
-      label: Ref Volume Percentile (Upper)
       type: int
-      value: 95
+      value: 20
       min: 0
       max: 100
       step: 1
     ref_thickness_percentile_lower:
-      label: Ref Thickness Percentile (Lower)
       type: int
-      value: 5
+      value: 1
       min: 0
       max: 100
       step: 1
@@ -206,113 +200,83 @@ execute_soma_extraction_fluorescence:
     absolute_min_thickness_um:
       label: Min Absolute Thickness (um)
       type: float
-      value: 1.5
+      value: 0.0001
       min: 1.0e-05
       max: 10.0
       step: 1.0e-05
     absolute_max_thickness_um:
-      label: Max Absolute Thickness (um)
       type: float
-      value: 10.0
+      value: 50.0
       min: 0.001
       max: 100.0
       step: 0.001
     max_allowed_core_aspect_ratio:
-      label: Max Aspect Ratio (Elongation)
+      label: Max Aspect Ratio
       type: float
-      value: 10.0
+      value: 50.0
       min: 1.0
       max: 50.0
-      step: 0.5
-
-# --- Step 4: Cell Separation (Splitting Blobs) ---
+      step: 0.1
+    
 execute_cell_separation_fluorescence:
   name: Execute Cell Separation
   parameters:
     min_size_threshold:
-      label: Min Final Cell Size (Voxels)
-      type: float
-      value: 20000.0
-      min: 0.0
-      max: 10000000.0
-      step: 1.0
+        label: Min Final Cell Size (Voxels)
+        type: float
+        value: 500.0
+        min: 0.0
+        max: 10000000.0
+        step: 10.0
     max_seed_centroid_dist:
       label: Max Seed Merge Distance (um)
       type: float
-      value: 20.0
+      value: 0.1
       min: 0.0
-      max: 10000.0
+      max: 100.0
       step: 0.1
     min_path_intensity_ratio:
       label: Min Path Intensity Ratio (Merge thresh)
       type: float
-      value: 0.6
+      value: 5.0
       min: 0.0
-      max: 100.0
-      step: 0.01
+      max: 10.0
+      step: 0.1
     min_local_intensity_difference:
       label: Min Local Intensity Diff (Merge thresh)
       type: float
-      value: 0.01
-      min: 0.0
+      value: 0.0
+      min: -5.0
       max: 100.0
-      step: 0.01
+      step: 0.1
     local_analysis_radius:
       label: Local Analysis Radius (um)
       type: int
       value: 10
       min: 1
-      max: 1000
+      max: 100
       step: 1
     intensity_weight:
       label: Watershed Intensity Weight
       type: float
-      value: 0.0
+      value: 0.1
       min: 0.0
       max: 10.0
       step: 0.1
 
-# --- Step 5: Feature Calculation ---
 execute_calculate_features_fluorescence:
   name: Execute Feature Calculation (3D)
   parameters:
     prune_spurs_le_um:
       label: Prune Skeleton Spurs <= (um)
       type: float
-      value: 6.0
+      value: 20.0
       min: 0
       max: 200
       step: 0.01
-    calculate_distances:
-      label: Calculate Distances
-      type: bool
-      value: true
-    calculate_skeletons:
-      label: Calculate Skeletons
-      type: bool
-      value: true
-
-# --- Step 6: Interaction Analysis ---
-execute_interaction_analysis_fluorescence:
-  name: Execute Interaction Analysis (3D)
-  parameters:
-    target_channel_folder:
-      label: Reference Channel Path (GUI selected)
-      type: str
-      value: ""
-    calculate_distance:
-      label: Calculate Nearest Distances
-      type: bool
-      value: true
-    calculate_overlap:
-      label: Calculate Overlap %
-      type: bool
-      value: true
-
-# --- Global Settings ---
 voxel_dimensions:
   x: 424.27
   y: 424.27
-  z: 167.0
+  z: 89.0
 saved_state:
-  segmentation_threshold: 0.043508924543857574
+  segmentation_threshold: 0.11440354585647583

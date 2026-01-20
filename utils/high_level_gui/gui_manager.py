@@ -17,8 +17,8 @@ import napari  # type: ignore
 
 # --- Relative Imports ---
 try:
-    from ..module_3d._3D_strategy import RamifiedStrategy
-    from ..module_2d._2D_strategy import Ramified2DStrategy
+    from ..module_3d._3D_strategy import FluorescenceStrategy
+    from ..module_2d._2D_strategy import Fluorescence2DStrategy
     from .processing_strategies import ProcessingStrategy
     from .helper_funcs import create_parameter_widget
 except ImportError as e:
@@ -144,8 +144,8 @@ class DynamicGUIManager(QObject):
         # Initialize Strategy
         try:
             strategy_class = {
-                'ramified': RamifiedStrategy,
-                'ramified_2d': Ramified2DStrategy
+                'fluorescence': FluorescenceStrategy,
+                'fluorescence_2d': Fluorescence2DStrategy
             }.get(self.processing_mode)
 
             if not strategy_class:

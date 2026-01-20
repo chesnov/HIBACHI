@@ -2,7 +2,7 @@
 
 **Corresponding Modules:**
 *   **3D:** `utils/module_3d/remove_artifacts.py`
-*   **2D:** `utils/ramified_module_2d/remove_artifacts_2d.py`
+*   **2D:** `utils/fluorescence_module_2d/remove_artifacts_2d.py`
 
 ## Overview
 Microscopy tissue blocks often suffer from the **"Edge Effect"**: the physical cut surface of the tissue can fluoresce brightly due to damage, or contain sheared cell fragments. Standard segmentation algorithms often mistake this edge signal for a massive, continuous cell.

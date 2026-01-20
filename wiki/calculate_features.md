@@ -2,12 +2,12 @@
 
 **Corresponding Modules:**
 *   **3D:** `utils/module_3d/calculate_features_3d.py`
-*   **2D:** `utils/ramified_module_2d/calculate_features_2d.py`
+*   **2D:** `utils/fluorescence_module_2d/calculate_features_2d.py`
 
 ## Overview
 This final step generates biological insights from the segmented images. It processes the labeled mask (from Step 4) and the original intensity image to compute a wide range of morphometric, spatial, and intensity statistics for every single cell.
 
-The results are saved as a CSV (`metrics_df_ramified.csv`) and optionally as an FCS file for flow cytometry software.
+The results are saved as a CSV (`metrics_df_fluorescence.csv`) and optionally as an FCS file for flow cytometry software.
 
 ## Metrics Calculated
 
@@ -74,14 +74,14 @@ Describes the branching complexity of the cell (critical for Microglia activatio
 
 ## 💾 Outputs
 
-### **1. `metrics_df_ramified.csv`**
+### **1. `metrics_df_fluorescence.csv`**
 The master spreadsheet containing one row per cell with all the metrics above.
 
-### **2. `skeleton_array_ramified.dat`**
+### **2. `skeleton_array_fluorescence.dat`**
 A visualizable label mask of the skeletons. Load this in Napari to visually verify if `prune_spurs_le_um` is set correctly.
 
-### **3. `distance_matrix_ramified.csv`** (Optional)
+### **3. `distance_matrix_fluorescence.csv`** (Optional)
 A full matrix containing distances between *every* pair of cells (not just nearest neighbors). Useful for clustering analysis (e.g., Ripley's K).
 
-### **4. `points_matrix_ramified.csv`** (Optional)
+### **4. `points_matrix_fluorescence.csv`** (Optional)
 Contains coordinate pairs used to draw the red "connection lines" in the GUI between nearest neighbors.

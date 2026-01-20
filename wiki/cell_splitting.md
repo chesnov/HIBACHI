@@ -2,7 +2,7 @@
 
 **Corresponding Modules:**
 *   **3D:** `utils/module_3d/cell_splitting.py`
-*   **2D:** `utils/ramified_module_2d/cell_splitting_2d.py`
+*   **2D:** `utils/fluorescence_module_2d/cell_splitting_2d.py`
 
 ## Overview
 This step performs the actual **Instance Segmentation** of touching cells. It takes the binary mask (from Step 2) and the seeds (from Step 3) to partition complex clumps into individual, distinct cells.

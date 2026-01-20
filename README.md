@@ -18,7 +18,7 @@
 <p align="center">
   <img src="assets/example_segmentation.png" alt="HIBACHI Segmentation Example" width="800">
   <br>
-  <em>Figure 1: Automated 3D segmentation of ramified microglia (colored labels) with closest neighbor (red lines) overlay.</em>
+  <em>Figure 1: Automated 3D segmentation of fluorescence microglia (colored labels) with closest neighbor (red lines) overlay.</em>
 </p>
 
 ---

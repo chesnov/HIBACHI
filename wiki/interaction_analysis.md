@@ -70,7 +70,7 @@ Since this step is analytic rather than segmentation-based, "tuning" mostly invo
 
 ## 💾 Outputs
 
-### **1. `metrics_df_ramified.csv` (Updated)**
+### **1. `metrics_df_fluorescence.csv` (Updated)**
 New columns are appended to the main cell metrics file:
 *   `dist_to_nearest_REF_um`: Distance to the reference object.
 *   `overlap_vol_um3_REF`: Volume of intersection.

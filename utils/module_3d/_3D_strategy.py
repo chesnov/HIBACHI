@@ -28,9 +28,9 @@ except ImportError as e:
     raise
 
 
-class RamifiedStrategy(ProcessingStrategy):
+class FluorescenceStrategy(ProcessingStrategy):
     """
-    Orchestrates the 3D segmentation workflow for Ramified Microglia.
+    Orchestrates the 3D segmentation workflow for Fluorescence Microglia.
 
     This strategy manages a 6-step pipeline:
     1. Raw Segmentation (Hessian/Frangi + Thresholding)
@@ -43,7 +43,7 @@ class RamifiedStrategy(ProcessingStrategy):
 
     def _get_mode_name(self) -> str:
         """Returns the unique identifier for this strategy."""
-        return "ramified"
+        return "fluorescence"
 
     def get_step_definitions(self) -> List[StepDefinition]:
         """

@@ -1,7 +1,7 @@
-mode: ramified_2d
+mode: fluorescence_2d
 
 # --- Step 1: Raw Segmentation ---
-execute_raw_segmentation_ramified_2d:
+execute_raw_segmentation_fluorescence_2d:
   name: Execute Raw Segmentation (2D)
   parameters:
     tubular_scales:
@@ -41,13 +41,13 @@ execute_raw_segmentation_ramified_2d:
     connect_max_gap_physical:
       label: Max Connect Gap (um)
       type: float
-      value: 2.0
+      value: 0.0
       min: 0.0
       max: 10.0
       step: 0.1
 
 # --- Step 2: Edge Trimming ---
-execute_trim_edges_ramified_2d:
+execute_trim_edges_fluorescence_2d:
   name: Execute Edge Trimming (2D)
   parameters:
     edge_trim_distance_threshold:
@@ -87,7 +87,7 @@ execute_trim_edges_ramified_2d:
           step: 1
 
 # --- Step 3: Soma Extraction (Finding Seeds) ---
-execute_soma_extraction_ramified_2d:
+execute_soma_extraction_fluorescence_2d:
   name: Execute Soma Extraction (2D)
   parameters:
     ratios_to_process:
@@ -212,7 +212,7 @@ execute_soma_extraction_ramified_2d:
     
 
 # --- Step 4: Cell Separation (Splitting Blobs) ---
-execute_cell_separation_ramified_2d:
+execute_cell_separation_fluorescence_2d:
   name: Execute Cell Separation (2D)
   parameters:
     min_size_threshold:
@@ -259,7 +259,7 @@ execute_cell_separation_ramified_2d:
       step: 0.1
 
 # --- Step 5: Feature Calculation ---
-execute_calculate_features_ramified_2d:
+execute_calculate_features_fluorescence_2d:
   name: Execute Feature Calculation (2D)
   parameters:
     prune_spurs_le_um:
@@ -279,7 +279,7 @@ execute_calculate_features_ramified_2d:
       value: true
 
 # --- Step 6: Interaction Analysis ---
-execute_interaction_analysis_ramified_2d:
+execute_interaction_analysis_fluorescence_2d:
   name: Execute Interaction Analysis (2D)
   parameters:
     target_channel_folder:

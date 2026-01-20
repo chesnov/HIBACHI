@@ -30,9 +30,9 @@ except ImportError as e:
     raise
 
 
-class Ramified2DStrategy(ProcessingStrategy):
+class Fluorescence2DStrategy(ProcessingStrategy):
     """
-    Orchestrates the 2D segmentation workflow for Ramified Microglia.
+    Orchestrates the 2D segmentation workflow for Fluorescence Microglia.
 
     This strategy manages a 6-step pipeline (mirroring the 3D workflow):
     1. Raw Segmentation (Frangi/Sato 2D + Thresholding)
@@ -45,7 +45,7 @@ class Ramified2DStrategy(ProcessingStrategy):
 
     def _get_mode_name(self) -> str:
         """Returns the unique identifier for this strategy."""
-        return "ramified_2d"
+        return "fluorescence_2d"
 
     def get_step_definitions(self) -> List[StepDefinition]:
         """
@@ -343,7 +343,7 @@ class Ramified2DStrategy(ProcessingStrategy):
                 ratios_to_process=params.get("ratios_to_process", [0.3, 0.4, 0.5, 0.6]),
                 intensity_percentiles_to_process=params.get("intensity_percentiles_to_process", [100, 95, 90, 85, 80]),
                 min_physical_peak_separation=float(params.get("min_physical_peak_separation", 3.0)),
-                seeding_min_distance_um=params.getfloat(("seeding_min_distance_um", 0)),
+                seeding_min_distance_um=float(params.get("seeding_min_distance_um", 0)),
                 max_allowed_core_aspect_ratio=float(params.get("max_allowed_core_aspect_ratio", 5.0)),
                 ref_vol_percentile_lower=int(params.get("ref_vol_percentile_lower", 30)),
                 ref_vol_percentile_upper=int(params.get("ref_vol_percentile_upper", 70)),
