@@ -165,7 +165,7 @@ def extract_soma_masks_2d(
         tiles = _generate_2d_tiles(sl, tile_size_threshold)
         label_candidates = []
 
-        # Sub-progress bar for giant microglia clumps
+        # Sub-progress bar for giant cell clumps
         tile_iter = tqdm(tiles, desc=f"  ↳ Clump {lbl}", leave=False, unit="tile", disable=not is_huge)
         
         for t_idx, t in enumerate(tile_iter):

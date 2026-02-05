@@ -1,7 +1,7 @@
 # Segment.py
 
 ## Overview
-`segment.py` serves as the **Entry Point** (Controller) for the 3D Microglia Segmentation Tool. It is the script that users execute to start the application. It does not perform image analysis itself but is responsible for bootstrapping the environment and launching the GUI.
+`segment.py` serves as the **Entry Point** (Controller) for HIBACHI. It is the script that users execute to start the application. It does not perform image analysis itself but is responsible for bootstrapping the environment and launching the GUI.
 
 ## Key Responsibilities
 1.  **Environment Configuration:** Sets operating system variables (like High-DPI scaling for Windows/Linux) to ensure the GUI renders correctly on modern screens.

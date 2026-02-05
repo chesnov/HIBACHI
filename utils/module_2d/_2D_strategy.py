@@ -32,7 +32,7 @@ except ImportError as e:
 
 class Fluorescence2DStrategy(ProcessingStrategy):
     """
-    Orchestrates the 2D segmentation workflow for Fluorescence Microglia.
+    Orchestrates the 2D segmentation workflow for fluorescent cells.
 
     This strategy manages a 6-step pipeline (mirroring the 3D workflow):
     1. Raw Segmentation (Frangi/Sato 2D + Thresholding)

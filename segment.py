@@ -1,6 +1,6 @@
 # --- START OF FILE segment.py ---
 """
-Entry Point for the 3D Microglia Segmentation Tool.
+Entry Point for the 3D Segmentation Tool.
 
 This script acts as the 'Controller' in the application architecture.
 It is responsible for:
@@ -63,7 +63,7 @@ except ImportError:
     print("CRITICAL IMPORT ERROR: Could not import 'launch_image_segmentation_tool'.")
     print("-----------------------------------------------------------------------")
     print("Troubleshooting:")
-    print("1. Ensure you are running this script from the root '3D_microglia_segment' directory.")
+    print("1. Ensure you are running this script from the root 'HIBACHI' directory.")
     print("   Current Working Directory:", os.getcwd())
     print("2. Ensure the 'utils' folder contains an '__init__.py' file.")
     print("3. Check your PYTHONPATH environment variable.")
@@ -106,7 +106,7 @@ def main():
     """
     Main application function. 
     """
-    print("--- Starting 3D Microglia Segmentation Tool ---")
+    print("--- Starting HIBACHI ---")
 
     # Guard for Windows Multiprocessing
     # If this app is ever frozen (PyInstaller) or run on Windows, this prevents 

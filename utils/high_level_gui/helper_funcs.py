@@ -20,8 +20,10 @@ from PyQt5.QtWidgets import (  # type: ignore
     QApplication, QFileDialog, QMessageBox,
     QMainWindow, QVBoxLayout, QHBoxLayout,
     QListWidget, QListWidgetItem, QPushButton,
-    QWidget, QLabel, QInputDialog
+    QWidget, QLabel, QInputDialog, QComboBox
 )
+
+from .relational_engine import RelationalEngine
 
 # --- Optional Import for CZI Support ---
 try:
@@ -664,6 +666,7 @@ class ProjectManager:
     def __init__(self):
         self.project_path: Optional[str] = None
         self.image_folders: List[str] = []
+        self.sample_registry: Dict[str, Dict[str, str]] = {}
 
     def select_project_folder(self) -> Optional[str]:
         self.project_path = QFileDialog.getExistingDirectory(
@@ -730,6 +733,60 @@ class ProjectManager:
             }
         except Exception:
             return {'path': folder_path, 'mode': 'error'}
+        
+    def build_consolidated_sample_registry(self) -> Dict[str, Dict[str, str]]:
+        """
+        Scans the directory containing the current project to find related channels.
+        
+        Returns:
+            Dict mapping Sample_Name -> {Channel_Name: Folder_Path}
+            Example:
+            {
+                "Animal_01_ROI_1": {
+                    "Microglia": "/path/to/Channel_Microglia/Animal_01_ROI_1",
+                    "Plaques": "/path/to/Channel_Plaques/Animal_01_ROI_1"
+                }
+            }
+        """
+        if not self.project_path:
+            return {}
+
+        # 1. Identify the 'Project Root' (The folder containing all Channel projects)
+        parent_dir = os.path.dirname(self.project_path)
+        all_channel_projects = [
+            os.path.join(parent_dir, d) for d in os.listdir(parent_dir)
+            if os.path.isdir(os.path.join(parent_dir, d))
+        ]
+
+        registry = {}
+
+        # 2. Iterate through every Channel Project (e.g., Channel_0_Microglia)
+        for channel_path in all_channel_projects:
+            channel_name = os.path.basename(channel_path)
+            
+            # 3. Look for valid sample folders inside this channel
+            for sample_folder in os.listdir(channel_path):
+                sample_path = os.path.join(channel_path, sample_folder)
+                if not os.path.isdir(sample_path):
+                    continue
+                
+                # Check if it's a valid processing folder (has TIF and YAML)
+                files = os.listdir(sample_path)
+                has_tif = any(f.lower().endswith(('.tif', '.tiff')) for f in files)
+                has_yml = any(f.lower().endswith(('.yaml', '.yml')) for f in files)
+                
+                if has_tif and has_yml:
+                    # Use a 'Clean' name for the sample to handle slight naming mismatches
+                    clean_name = clean_filename_for_matching(sample_folder)
+                    
+                    if clean_name not in registry:
+                        registry[clean_name] = {}
+                    
+                    # Store the actual path mapped to this channel
+                    registry[clean_name][channel_name] = sample_path
+        
+        self.sample_registry = registry
+        return registry
 
 
 class ProjectViewWindow(QMainWindow):
@@ -769,14 +826,27 @@ class ProjectViewWindow(QMainWindow):
         central_widget.setLayout(layout)
         self.setCentralWidget(central_widget)
 
+        self.cross_channel_btn = QPushButton("Open Cross-Channel Analyzer")
+        self.cross_channel_btn.clicked.connect(self.open_cross_channel_analyzer)
+        self.cross_channel_btn.setEnabled(False) # Enable only after project load
+        button_layout.addWidget(self.cross_channel_btn)
+
     def _update_batch_button_state(self) -> None:
         if not BatchProcessor or not self.project_manager.image_folders:
             self.batch_process_all_btn.setEnabled(False)
             return
         self.batch_process_all_btn.setEnabled(True)
 
+    def open_cross_channel_analyzer(self):
+        if not self.project_manager.sample_registry:
+            self.project_manager.build_consolidated_sample_registry()
+            
+        self.analyzer_window = CrossChannelAnalyzerWindow(self.project_manager)
+        self.analyzer_window.show()
+
     def load_project(self) -> None:
         selected_path = self.project_manager.select_project_folder()
+        self.cross_channel_btn.setEnabled(True)
         if not selected_path:
             return
             
@@ -919,6 +989,328 @@ class ProjectViewWindow(QMainWindow):
         else:
             event.ignore()
 
+class CrossChannelAnalyzerWindow(QMainWindow):
+    def __init__(self, project_manager):
+        super().__init__()
+        self.pm = project_manager
+        self.setWindowTitle("Cross-Channel Relational Analyzer")
+        self.setGeometry(150, 150, 1000, 650)
+        
+        main_layout = QHBoxLayout()
+        
+        # --- 1. LEFT PANEL: Channels ---
+        left_panel = QVBoxLayout()
+        self.channel_list = QListWidget()
+        
+        # Safely get channels
+        if not self.pm.sample_registry:
+            self.pm.build_consolidated_sample_registry()
+            
+        first_sample = list(self.pm.sample_registry.keys())[0]
+        channels = sorted(list(self.pm.sample_registry[first_sample].keys()))
+        for ch in channels:
+            item = QListWidgetItem(ch)
+            item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+            item.setCheckState(Qt.Unchecked)
+            self.channel_list.addItem(item)
+        
+        left_panel.addWidget(QLabel("<b>1. Select Input Channels:</b>"))
+        left_panel.addWidget(self.channel_list)
+        
+        # --- 2. MIDDLE PANEL: Recipe List & Controls ---
+        mid_panel = QVBoxLayout()
+        mid_panel.addWidget(QLabel("<b>2. Analysis Recipe (Order Matters):</b>"))
+        
+        recipe_hbox = QHBoxLayout()
+        self.recipe_list = QListWidget()
+        recipe_hbox.addWidget(self.recipe_list)
+        
+        step_controls = QVBoxLayout()
+        self.btn_remove = QPushButton("❌ Remove")
+        self.btn_up = QPushButton("🔼 Up")
+        self.btn_down = QPushButton("🔽 Down")
+        self.btn_clear = QPushButton("🗑️ Clear All")
+        
+        self.btn_remove.clicked.connect(self.remove_step)
+        self.btn_up.clicked.connect(lambda: self.move_step(-1))
+        self.btn_down.clicked.connect(lambda: self.move_step(1))
+        self.btn_clear.clicked.connect(self.clear_recipe)
+        
+        step_controls.addWidget(self.btn_remove)
+        step_controls.addWidget(self.btn_up)
+        step_controls.addWidget(self.btn_down)
+        step_controls.addStretch()
+        step_controls.addWidget(self.btn_clear)
+        recipe_hbox.addLayout(step_controls)
+        
+        mid_panel.addLayout(recipe_hbox)
+        
+        # --- 3. ADD STEP BUTTONS ---
+        add_step_layout = QHBoxLayout()
+        self.btn_intersect = QPushButton("+ Intersection")
+        self.btn_filter = QPushButton("+ Volume Filter")
+        self.btn_dist = QPushButton("+ Distance Analysis")
+        
+        self.btn_intersect.clicked.connect(self.add_intersect_step)
+        self.btn_filter.clicked.connect(self.add_filter_step)
+        self.btn_dist.clicked.connect(self.add_analysis_step)
+        
+        add_step_layout.addWidget(self.btn_intersect)
+        add_step_layout.addWidget(self.btn_filter)
+        add_step_layout.addWidget(self.btn_dist)
+        mid_panel.addLayout(add_step_layout)
+
+        # --- 4. EXECUTION PANEL ---
+        exec_layout = QVBoxLayout()
+        
+        # Sample Selector
+        selector_layout = QHBoxLayout()
+        selector_layout.addWidget(QLabel("Preview Target Sample:"))
+        self.sample_selector = QComboBox()
+        self.sample_selector.addItems(sorted(list(self.pm.sample_registry.keys())))
+        selector_layout.addWidget(self.sample_selector)
+        exec_layout.addLayout(selector_layout)
+
+        self.btn_preview = QPushButton("👁️ Preview Recipe (Napari)")
+        self.btn_preview.setFixedHeight(40)
+        self.btn_preview.clicked.connect(self.preview_recipe)
+        
+        # FIX: Ensure this is defined as self.btn_batch
+        self.btn_batch = QPushButton("🚀 RUN RECIPE ON ALL SAMPLES")
+        self.btn_batch.setFixedHeight(50)
+        self.btn_batch.setStyleSheet("background-color: #2E8B57; color: white; font-weight: bold;")
+        self.btn_batch.clicked.connect(self.run_batch_analysis) # This should now work
+        
+        exec_layout.addWidget(self.btn_preview)
+        exec_layout.addWidget(self.btn_batch)
+        mid_panel.addLayout(exec_layout)
+
+        container = QWidget()
+        main_layout.addLayout(left_panel, 1)
+        main_layout.addLayout(mid_panel, 3)
+        container.setLayout(main_layout)
+        self.setCentralWidget(container)
+        
+        self.recipe_steps = []
+
+    # =========================================================================
+    # RECIPE EDITING METHODS
+    # =========================================================================
+
+    def remove_step(self):
+        row = self.recipe_list.currentRow()
+        if row >= 0:
+            self.recipe_steps.pop(row)
+            self.recipe_list.takeItem(row)
+
+    def move_step(self, direction):
+        """direction: -1 for up, 1 for down"""
+        row = self.recipe_list.currentRow()
+        new_row = row + direction
+        if 0 <= new_row < self.recipe_list.count():
+            # Swap in logic list
+            self.recipe_steps[row], self.recipe_steps[new_row] = \
+                self.recipe_steps[new_row], self.recipe_steps[row]
+            
+            # Swap in UI list
+            item = self.recipe_list.takeItem(row)
+            self.recipe_list.insertItem(new_row, item)
+            self.recipe_list.setCurrentRow(new_row)
+
+    def clear_recipe(self):
+        reply = QMessageBox.question(self, "Confirm", "Clear entire recipe?", QMessageBox.Yes | QMessageBox.No)
+        if reply == QMessageBox.Yes:
+            self.recipe_steps = []
+            self.recipe_list.clear()
+
+    # =========================================================================
+    # ADD STEP METHODS
+    # =========================================================================
+
+    def get_checked_channels(self):
+        return [self.channel_list.item(i).text() for i in range(self.channel_list.count()) 
+                if self.channel_list.item(i).checkState() == Qt.Checked]
+
+    def add_intersect_step(self):
+        checked = self.get_checked_channels()
+        if len(checked) == 2:
+            step = {"type": "intersect", "inputs": checked, "name": f"Overlap: {checked[0]} & {checked[1]}"}
+        elif len(checked) == 1 and self.recipe_steps:
+            step = {"type": "intersect", "inputs": [checked[0], "PREVIOUS_RESULT"], 
+                    "name": f"Overlap: {checked[0]} with previous result"}
+        else:
+            QMessageBox.warning(self, "Error", "Select 2 channels for a new overlap, or 1 channel to intersect with a previous result.")
+            return
+        
+        self.recipe_steps.append(step)
+        self.recipe_list.addItem(step["name"])
+
+    def add_filter_step(self):
+        val, ok = QInputDialog.getDouble(self, "Filter", "Min Volume (um³):", 10.0, 0, 1000000, 2)
+        if ok:
+            step = {"type": "filter", "min_vol": val, "name": f"Filter: Keep objects > {val} um³"}
+            self.recipe_steps.append(step)
+            self.recipe_list.addItem(step["name"])
+
+    def add_analysis_step(self):
+        checked = self.get_checked_channels()
+        if not checked:
+            QMessageBox.warning(self, "Error", "Check a channel to use as a distance reference.")
+            return
+        
+        for ch in checked:
+            step = {"type": "analyze", "target": ch, "name": f"Analyze relationship with {ch}"}
+            self.recipe_steps.append(step)
+            self.recipe_list.addItem(step["name"])
+
+    def preview_recipe(self):
+        if not self.recipe_steps:
+            QMessageBox.information(self, "Info", "Recipe is empty.")
+            return
+
+        # 1. Get the user-selected sample
+        sample_name = self.sample_selector.currentText()
+        sample_data = self.pm.sample_registry[sample_name]
+        
+        # 2. Setup Viewer
+        viewer = napari.Viewer(title=f"Cross-Channel Preview: {sample_name}")
+        
+        # Predefined colormaps for raw channels
+        colormaps = ['cyan', 'magenta', 'yellow', 'green', 'red', 'blue']
+        
+        # 3. Load Raw Data and Segmentation for EVERY channel in this sample
+        shape = None
+        spacing = (1.0, 1.0, 1.0)
+        
+        for i, (ch_name, ch_path) in enumerate(sample_data.items()):
+            # Find files
+            tif_file = next((os.path.join(ch_path, f) for f in os.listdir(ch_path) if f.lower().endswith(('.tif', '.tiff'))), None)
+            dat_file = RelationalEngine._find_dat(ch_path)
+            
+            # Fetch metadata from the first valid channel we find
+            if shape is None and tif_file:
+                with tiff.TiffFile(tif_file) as tif:
+                    shape = tif.series[0].shape
+                # Try to get spacing from strategy config
+                meta, _ = get_sample_metadata(ch_path)
+                if meta:
+                    # Very simple spacing calc: total_um / pixels
+                    # (Note: In a production version, we use the exact strategy spacing)
+                    spacing = (meta.get('z', 1.0)/shape[0], meta.get('y', 1.0)/shape[1], meta.get('x', 1.0)/shape[2]) if len(shape)==3 else (meta.get('y', 1.0)/shape[0], meta.get('x', 1.0)/shape[1])
+
+            # Add Raw Intensity
+            if tif_file:
+                raw_img = tiff.imread(tif_file)
+                cmap = colormaps[i % len(colormaps)]
+                viewer.add_image(raw_img, name=f"Raw: {ch_name}", colormap=cmap, blending='additive', opacity=0.5)
+
+            # Add Segmentation Labels (Semi-transparent)
+            if dat_file:
+                seg_data = np.memmap(dat_file, dtype=np.int32, mode='r', shape=shape)
+                viewer.add_labels(seg_data, name=f"Seg: {ch_name}", opacity=0.3)
+
+        # 4. Execute Relational Recipe
+        temp_dir = os.path.join(list(sample_data.values())[0], "relational_preview_temp")
+        os.makedirs(temp_dir, exist_ok=True)
+        
+        # Run calculation
+        derived_results = RelationalEngine.run_recipe(
+            sample_name, self.pm.sample_registry, self.recipe_steps, 
+            temp_dir, shape, spacing
+        )
+
+        # 5. Add Derived Results (High Opacity Labels)
+        for res in derived_results:
+            data = np.memmap(res['path'], dtype=np.int32, mode='r', shape=shape)
+            viewer.add_labels(data, name=f"DERIVED: {res['name']}")
+
+        # Final Adjustments
+        if len(shape) == 3:
+            viewer.dims.ndisplay = 3
+            # Set scale to handle anisotropy if 3D
+            # (Napari scale is z_scale, y_scale, x_scale)
+            # Use spacing[0]/spacing[2] for z-scale factor
+            z_scale = spacing[0]/spacing[2] if len(spacing)==3 else 1.0
+            for layer in viewer.layers:
+                layer.scale = (z_scale, 1, 1)
+
+    def run_batch_analysis(self):
+        if not self.recipe_steps:
+            return
+
+        # 1. Ask for an Analysis Name (to create a subfolder)
+        analysis_name, ok = QInputDialog.getText(self, "Batch Run", "Enter name for this analysis:")
+        if not ok or not analysis_name:
+            return
+
+        # 2. Setup root results folder
+        project_root = os.path.dirname(self.pm.project_path)
+        batch_out_dir = os.path.join(project_root, "RELATIONAL_ANALYSIS", analysis_name)
+        os.makedirs(batch_out_dir, exist_ok=True)
+
+        # 3. Save the recipe itself for reproducibility
+        with open(os.path.join(batch_out_dir, "recipe.yaml"), 'w') as f:
+            yaml.dump(self.recipe_steps, f)
+
+        # 4. Process all samples
+        samples = sorted(list(self.pm.sample_registry.keys()))
+        total = len(samples)
+        
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        print(f"\n{'='*60}\nSTARTING RELATIONAL BATCH: {analysis_name}\n{'='*60}")
+        
+        try:
+            for i, s_name in enumerate(samples):
+                print(f"Processing {i+1}/{total}: {s_name}...")
+                sample_data = self.pm.sample_registry[s_name]
+                
+                # Fetch shape/spacing from the first channel of the sample
+                first_ch = list(sample_data.values())[0]
+                tif_path = next(os.path.join(first_ch, f) for f in os.listdir(first_ch) if f.lower().endswith(('.tif', '.tiff')))
+                
+                with tiff.TiffFile(tif_path) as tif:
+                    shape = tif.series[0].shape
+                
+                # Retrieve spacing from strategy (fallback to 1.0)
+                meta, _ = get_sample_metadata(first_ch)
+                # Simple spacing calc
+                if len(shape) == 3:
+                    spacing = (meta.get('z', 1.0)/shape[0], meta.get('y', 1.0)/shape[1], meta.get('x', 1.0)/shape[2])
+                else:
+                    spacing = (meta.get('y', 1.0)/shape[0], meta.get('x', 1.0)/shape[1])
+
+                # Sample-specific output folder
+                sample_out = os.path.join(batch_out_dir, s_name)
+                
+                # EXECUTE ENGINE
+                RelationalEngine.run_recipe(
+                    s_name, self.pm.sample_registry, self.recipe_steps,
+                    sample_out, shape, spacing
+                )
+
+            QApplication.restoreOverrideCursor()
+            QMessageBox.information(self, "Success", f"Batch Complete!\nResults saved to: {batch_out_dir}")
+            print(f"\n{'='*60}\nBATCH FINISHED\n{'='*60}")
+
+        except Exception as e:
+            QApplication.restoreOverrideCursor()
+            print(f"FATAL ERROR IN BATCH: {e}")
+            traceback.print_exc()
+            QMessageBox.critical(self, "Batch Error", str(e))
+
+        # 5. Create Master Summary Table
+        all_csvs = []
+        for s_name in samples:
+            csv_p = os.path.join(batch_out_dir, s_name, f"{s_name}_relational_results.csv")
+            if os.path.exists(csv_p):
+                df = pd.read_csv(csv_p)
+                df['sample_name'] = s_name
+                all_csvs.append(df)
+        
+        if all_csvs:
+            master_df = pd.concat(all_csvs, ignore_index=True)
+            master_df.to_csv(os.path.join(batch_out_dir, "MASTER_RELATIONAL_RESULTS.csv"), index=False)
+            print("Successfully generated MASTER_RELATIONAL_RESULTS.csv")
 
 def _check_if_last_window() -> None:
     """Checks if the project window is closed; if so, quits the app."""
@@ -1070,3 +1462,18 @@ def create_back_to_project_button(viewer: napari.Viewer, gui_manager: Any) -> QW
     l.addWidget(btn)
     l.setContentsMargins(5, 5, 5, 5)
     return w
+
+def get_sample_metadata(folder_path):
+    """Retrieves shape and spacing from the YAML in a project folder."""
+    for f in os.listdir(folder_path):
+        if f.endswith(('.yaml', '.yml')):
+            with open(os.path.join(folder_path, f), 'r') as file:
+                cfg = yaml.safe_load(file)
+                mode = cfg.get('mode', '')
+                is_2d = mode.endswith('_2d')
+                dim_key = 'pixel_dimensions' if is_2d else 'voxel_dimensions'
+                dims = cfg.get(dim_key, {'x':1, 'y':1, 'z':1})
+                # Note: We'd need actual pixel counts to calculate spacing, 
+                # but for preview, we can often rely on the Strategy to provide this.
+                return dims, mode
+    return None, None

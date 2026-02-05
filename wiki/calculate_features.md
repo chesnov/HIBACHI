@@ -29,7 +29,7 @@ Statistics derived from the raw image within the cell mask:
 *   **Contact Points:** The specific coordinates $(X, Y, Z)$ where the two cells are closest.
 
 ### 4. Ramification (Skeletonization)
-Describes the branching complexity of the cell (critical for Microglia activation states).
+Describes the branching complexity of the cell.
 *   **Algorithm:** Uses `skimage` to thin the cell to 1 pixel width and `skan` to analyze the graph topology.
 *   **Metrics:**
     *   **True Branches:** Number of biological branches.
