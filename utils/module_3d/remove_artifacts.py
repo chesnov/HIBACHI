@@ -189,7 +189,8 @@ def generate_tight_hull_stack(
     cell_mask: np.ndarray,
     temp_dir: str,
     hull_closing_radius: int = 10,
-    downsample_factor: int = 4
+    downsample_factor: int = 4,
+    otsu_scale_factor: float = 0.8
 ) -> np.memmap:
     """
     Generates a solid 'Shrink-Wrap' hull around the tissue block.
@@ -212,8 +213,7 @@ def generate_tight_hull_stack(
             log_thresh = threshold_otsu(log_pixels)
         except:
             log_thresh = 0
-        # Use 0.8 factor to avoid noise floor but capture dim tissue
-        tissue_thresh = (np.expm1(log_thresh)) * 0.8
+        tissue_thresh = (np.expm1(log_thresh)) * otsu_scale_factor
     else:
         tissue_thresh = 0
         
@@ -479,6 +479,7 @@ def apply_hull_trimming(
     edge_distance_chunk_size_z: int = 32,
     z_erosion_iterations: int = 0,
     post_smoothing_iter: int = 0,
+    otsu_scale_factor: float = 0.8,
     temp_root_path: Optional[str] = None
 ) -> Tuple[Optional[str], Optional[str], Optional[np.ndarray]]:
     """
@@ -522,8 +523,10 @@ def apply_hull_trimming(
             # B. Generate Hull
             hull_memmap = generate_tight_hull_stack(
                 original_volume, trimmed_labels_memmap,
-                workflow_temp_dir, hull_closing_radius=hull_closing_radius, 
-                downsample_factor=4
+                workflow_temp_dir, 
+                hull_closing_radius=hull_closing_radius, 
+                downsample_factor=4,
+                otsu_scale_factor=otsu_scale_factor
             )
 
             # C. Threshold Recalc

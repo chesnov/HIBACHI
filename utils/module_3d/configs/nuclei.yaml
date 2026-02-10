@@ -91,6 +91,12 @@ execute_trim_edges_fluorescence:
       value: 2
       min: 0
       max: 10
+    otsu_scale_factor:
+      label: Otsu scale factor (hull-finding)
+      type: float
+      value: 0.8
+      min: 0.0
+      max: 10.0
 
 # --- Step 3: Soma Extraction (Finding Seeds) ---
 execute_soma_extraction_fluorescence:

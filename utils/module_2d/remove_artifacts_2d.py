@@ -127,7 +127,8 @@ def generate_tight_hull_2d(
     image: np.ndarray,
     cell_mask: np.ndarray,
     hull_closing_radius: int = 10,
-    downsample_factor: int = 4
+    downsample_factor: int = 4,
+    otsu_scale_factor: float = 0.8
 ) -> np.ndarray:
     """
     Generates a solid 'Shrink-Wrap' hull around the tissue slice.
@@ -148,7 +149,7 @@ def generate_tight_hull_2d(
         except:
             log_thresh = 0
         # Use 0.8 factor to match 3D logic
-        tissue_thresh = (np.expm1(log_thresh)) * 0.8
+        tissue_thresh = (np.expm1(log_thresh)) * otsu_scale_factor
     else:
         tissue_thresh = 0
 
@@ -303,6 +304,7 @@ def apply_hull_trimming_2d(
     brightness_cutoff_factor: float,
     min_size_pixels: int,
     hull_closing_radius: int = 10,
+    otsu_scale_factor: float = 0.8,
     temp_root_path: Optional[str] = None
 ) -> Tuple[Optional[str], Optional[str], Optional[np.ndarray]]:
     """
@@ -349,7 +351,8 @@ def apply_hull_trimming_2d(
             hull_mask = generate_tight_hull_2d(
                 original_image, trimmed_labels_memmap, 
                 hull_closing_radius=hull_closing_radius,
-                downsample_factor=4
+                downsample_factor=4,
+                otsu_scale_factor=otsu_scale_factor 
             )
 
             # C. Recalculate Threshold

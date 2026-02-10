@@ -30,7 +30,7 @@ except ImportError as e:
 
 class FluorescenceStrategy(ProcessingStrategy):
     """
-    Orchestrates the 3D segmentation workflow for Fluorescence Microglia.
+    Orchestrates the 3D segmentation workflow for Fluorescent cells.
 
     This strategy manages a 6-step pipeline:
     1. Raw Segmentation (Hessian/Frangi + Thresholding)
@@ -265,6 +265,7 @@ class FluorescenceStrategy(ProcessingStrategy):
                 ),
                 z_erosion_iterations=int(params.get("z_erosion_iterations", 0)),
                 post_smoothing_iter=int(params.get("post_smoothing_iter", 0)),
+                otsu_scale_factor=float(params.get("otsu_scale_factor", 0.8)),
                 temp_root_path=self.temp_dir
             )
 

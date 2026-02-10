@@ -257,7 +257,8 @@ class Fluorescence2DStrategy(ProcessingStrategy):
                 edge_trim_distance_threshold=float(params.get("edge_trim_distance_threshold", 2.5)),
                 brightness_cutoff_factor=float(params.get("brightness_cutoff_factor", 1.5)),
                 min_size_pixels=int(params.get("min_size_pixels", 20)),
-                hull_closing_radius=int(params.get("hull_closing_radius", 10))
+                hull_closing_radius=int(params.get("hull_closing_radius", 10)),
+                otsu_scale_factor=float(params.get("otsu_scale_factor", 0.8))
             )
 
             if not temp_dat_path or not os.path.exists(temp_dat_path):
