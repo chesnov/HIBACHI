@@ -5,11 +5,18 @@
 This module quantifies spatial relationships between two 2D segmentation layers.
 It is logically identical to the 3D version, allowing for direct statistical 
 comparison of proximity and overlap metrics across dimensions.
+
+Features:
+- Informative, biologically explicit column naming.
+- Bridge coordinate discovery for visual connection lines.
+- Bi-directional coverage stats (Primary-in-Partner vs Partner-occupied-by-Primary).
+- Memory-efficient processing via memmaps and Dask.
 """
 
 import os
 import sys
 import gc
+import traceback
 from typing import Tuple, Optional, Dict, List, Any, Union
 
 import numpy as np
@@ -23,8 +30,28 @@ from scipy.spatial import cKDTree
 from tqdm import tqdm
 import multiprocessing as mp
 
+def flush_print(*args: Any, **kwargs: Any) -> None:
+    """Standardized wrapper for immediate log flushing to console."""
+    print(*args, **kwargs)
+    sys.stdout.flush()
+
+def _safe_load_memmap(
+    path: str,
+    shape: Tuple[int, int],
+    dtype: type = np.int32,
+    mode: str = 'r'
+) -> Optional[np.memmap]:
+    """Safely loads a 2D numpy memmap file with error handling."""
+    if not os.path.exists(path):
+        return None
+    try:
+        return np.memmap(path, dtype=dtype, mode=mode, shape=shape)
+    except Exception as e:
+        print(f"Error loading memmap {path}: {e}")
+        return None
+
 def _extract_contours_2d(mask_memmap, labels, shape):
-    """Helper to extract boundary coordinates for a set of labels."""
+    """Helper to extract boundary coordinates for a set of labels for pairwise distance."""
     contours = []
     locs = ndimage.find_objects(mask_memmap)
     struct = generate_binary_structure(2, 1)
@@ -40,7 +67,7 @@ def _extract_contours_2d(mask_memmap, labels, shape):
     return contours
 
 def _inter_channel_dist_worker_2d(args):
-    """Worker: Calculates distances from one primary object to all reference objects."""
+    """Worker: Calculates distances from one primary object to all partner objects."""
     prim_idx, prim_contour, ref_contours, spacing_arr = args
     row = np.full(len(ref_contours), np.inf, dtype=np.float32)
     if prim_contour.size == 0: return prim_idx, row
@@ -53,12 +80,11 @@ def _inter_channel_dist_worker_2d(args):
             row[j] = np.min(dists)
     return prim_idx, row
 
-def calculate_pairwise_distances_2d(primary_memmap, reference_memmap, spacing_yx):
+def calculate_pairwise_distances_2d(primary_memmap, reference_memmap, spacing_yx, partner_name):
     """Calculates all pairwise distances and returns a long-format DataFrame."""
     p_labels = np.unique(primary_memmap[primary_memmap > 0])
     r_labels = np.unique(reference_memmap[reference_memmap > 0])
     spacing_arr = np.array(spacing_yx)
-    
     
     # 1. Extract Boundaries
     p_contours = _extract_contours_2d(primary_memmap, p_labels, primary_memmap.shape)
@@ -72,51 +98,21 @@ def calculate_pairwise_distances_2d(primary_memmap, reference_memmap, spacing_yx
     with mp.Pool(n_jobs) as pool:
         for prim_idx, distances in tqdm(pool.imap_unordered(_inter_channel_dist_worker_2d, tasks), 
                                        total=len(tasks), desc="    Pairwise Distance"):
-            # 'distances' is an array of M distances for Primary Object 'prim_idx'
             p_label = p_labels[prim_idx]
-            
-            # Create a small temporary dataframe for this specific object
             df_chunk = pd.DataFrame({
-                'channel_a_label': p_label,
-                'channel_b_label': r_labels,
-                'distance_um': distances
+                'primary_id': p_label,
+                f'id_{partner_name}': r_labels,
+                f'dist_um_{partner_name}': distances
             })
-            
             all_rows.append(df_chunk)
             
-    # Combine all chunks into one large master table
     if not all_rows:
         return pd.DataFrame()
         
     final_df = pd.concat(all_rows, ignore_index=True)
-    
-    # Explicit Cleanup
     del p_contours, r_contours, all_rows
     gc.collect()
-    
     return final_df
-
-def flush_print(*args: Any, **kwargs: Any) -> None:
-    """Standardized wrapper for immediate log flushing."""
-    print(*args, **kwargs)
-    sys.stdout.flush()
-
-
-def _safe_load_memmap(
-    path: str,
-    shape: Tuple[int, int],
-    dtype: type = np.int32,
-    mode: str = 'r'
-) -> Optional[np.memmap]:
-    """Safely loads a 2D numpy memmap file."""
-    if not os.path.exists(path):
-        return None
-    try:
-        return np.memmap(path, dtype=dtype, mode=mode, shape=shape)
-    except Exception as e:
-        print(f"Error loading memmap {path}: {e}")
-        return None
-
 
 def calculate_interaction_metrics_2d(
     primary_mask_path: str,
@@ -124,27 +120,22 @@ def calculate_interaction_metrics_2d(
     output_dir: str,
     shape: Tuple[int, int],
     spacing_yx: Tuple[float, float],
-    reference_name: str,
+    primary_name: str,    # Descriptive name of derived mask (e.g. Neurons_in_Aggregates)
+    partner_name: str,    # Descriptive name of reference channel (e.g. Microglia)
     calculate_distance: bool = True,
     calculate_overlap: bool = True
 ) -> Tuple[pd.DataFrame, pd.DataFrame, Optional[str]]:
     """
-    Calculates proximity and overlap between Primary and Reference 2D objects.
-
-    Args:
-        primary_mask_path: Path to .dat file for primary segmentation.
-        reference_mask_path: Path to .dat file for reference segmentation.
-        output_dir: Directory for results.
-        shape: (Y, X) dimensions.
-        spacing_yx: (dy, dx) in microns.
-        reference_name: Name of partner (e.g. 'Plaque' or 'Vessel').
-        
-    Returns:
-        - primary_df: Per-cell interaction stats.
-        - ref_df: Per-reference object coverage stats.
-        - intersection_path: Path to the labeled intersection mask.
+    Calculates spatial relationships between Primary and Partner 2D objects.
+    
+    Metrics include: 
+    - Area of overlap
+    - % of Primary inside Partner
+    - % of Partner occupied by Primary
+    - Edge-to-edge Euclidean distances
+    - Source/Target Bridge coordinates for visualization
     """
-    flush_print(f"--- Starting 2D Interaction Analysis vs '{reference_name}' ---")
+    flush_print(f"--- Starting 2D Interaction Analysis: '{primary_name}' vs '{partner_name}' ---")
 
     # 1. Load Data
     primary_memmap = _safe_load_memmap(primary_mask_path, shape)
@@ -153,32 +144,31 @@ def calculate_interaction_metrics_2d(
     if primary_memmap is None or reference_memmap is None:
         raise FileNotFoundError("Could not load 2D segmentation masks.")
 
-    # 2. Reference Accumulators
+    # 2. Partner Accumulators
     ref_areas = {}
     ref_interactions = []
     unit_area = spacing_yx[0] * spacing_yx[1]
 
     if calculate_overlap:
-        flush_print("  Calculating areas of reference objects...")
+        flush_print(f"  Calculating areas of {partner_name} objects...")
         u, c = np.unique(reference_memmap, return_counts=True)
         ref_areas = dict(zip(u, c))
         if 0 in ref_areas: del ref_areas[0]
 
-    # 3. Intersection Mask
+    # 3. Setup Intersection Mask
     intersection_path = None
     intersection_memmap = None
     if calculate_overlap:
-        intersection_path = os.path.join(output_dir, f"intersection_{reference_name}.dat")
+        intersection_path = os.path.join(output_dir, f"intersection_{partner_name}.dat")
         intersection_memmap = np.memmap(intersection_path, dtype=np.int32, mode='w+', shape=shape)
 
-    # 4. Distance Mapping (EDT)
+    # 4. Setup Distance Map (EDT)
     dist_map = None
     indices = None
     if calculate_distance:
-        flush_print(f"  Calculating 2D Distance Transform to nearest {reference_name}...")
+        flush_print(f"  Calculating 2D Distance Transform to nearest {partner_name}...")
         try:
             ref_binary_inverted = (reference_memmap == 0)
-            # spacing_yx handles anisotropy (e.g. non-square pixels)
             dist_map, indices = distance_transform_edt(
                 ref_binary_inverted, sampling=spacing_yx, return_indices=True
             )
@@ -188,12 +178,13 @@ def calculate_interaction_metrics_2d(
             calculate_distance = False
 
     # 5. Iterate Primary Objects
+    flush_print(f"  Analyzing {primary_name} interactions...")
     object_slices = ndimage.find_objects(primary_memmap)
     labels = np.unique(primary_memmap)
     labels = labels[labels > 0]
     primary_results = []
 
-    for lbl in tqdm(labels, desc=f"    Analyzing {reference_name} proximity"):
+    for lbl in tqdm(labels, desc=f"    Scanning {partner_name}"):
         idx = lbl - 1
         if idx >= len(object_slices) or object_slices[idx] is None: continue
 
@@ -202,90 +193,118 @@ def calculate_interaction_metrics_2d(
         crop_r = reference_memmap[sl]
         row = {'label': lbl}
 
-        # --- Overlap Logic ---
+        # --- Overlap Logic (2D) ---
         if calculate_overlap:
             intersect_mask = mask_p & (crop_r > 0)
             overlap_px = np.count_nonzero(intersect_mask)
             
             if overlap_px > 0 and intersection_memmap is not None:
-                intersection_memmap[sl][intersect_mask] = 1
+                current_int_view = intersection_memmap[sl]
+                current_int_view[intersect_mask] = 1
+                intersection_memmap[sl] = current_int_view
 
             total_px_p = np.count_nonzero(mask_p)
-            row[f'overlap_area_um2_{reference_name}'] = overlap_px * unit_area
-            row[f'overlap_fraction_{reference_name}'] = overlap_px / total_px_p if total_px_p > 0 else 0
-            row[f'overlaps_any_{reference_name}'] = (overlap_px > 0)
+            
+            # Bi-directional Stat: Area of Primary inside Partner
+            row[f'overlap_area_with_{partner_name}_um2'] = overlap_px * unit_area
+            
+            # Bi-directional Stat: % of this Primary contained by Partner
+            row[f'pct_of_this_{primary_name}_inside_{partner_name}'] = \
+                (overlap_px / total_px_p) * 100.0 if total_px_p > 0 else 0.0
+            
+            row[f'is_touching_{partner_name}'] = (overlap_px > 0)
 
             dom_id = 0
-            dom_px_intersect = 0
             if overlap_px > 0:
                 overlap_ids, overlap_counts = np.unique(crop_r[intersect_mask], return_counts=True)
                 for o_id, o_count in zip(overlap_ids, overlap_counts):
                     if o_id == 0: continue
-                    ref_interactions.append({'ref_label': o_id, 'overlap_area': o_count * unit_area, 'primary_label': lbl})
+                    ref_interactions.append({
+                        'ref_label': o_id, 
+                        'overlap_area': o_count * unit_area, 
+                        'primary_label': lbl
+                    })
                 
                 valid = np.where(overlap_ids > 0)[0]
                 if valid.size > 0:
                     dom_idx = valid[np.argmax(overlap_counts[valid])]
                     dom_id = overlap_ids[dom_idx]
-                    dom_px_intersect = overlap_counts[dom_idx]
 
-            row[f'dominant_overlap_id_{reference_name}'] = dom_id
-            if dom_id > 0 and dom_id in ref_areas:
-                row[f'overlap_fraction_of_partner_{reference_name}'] = dom_px_intersect / ref_areas[dom_id]
-            else:
-                row[f'overlap_fraction_of_partner_{reference_name}'] = 0.0
+            row[f'dominant_partner_id_{partner_name}'] = dom_id
 
-        # --- Distance Logic ---
-        if calculate_distance and dist_map is not None:
+        # --- Distance Logic (2D) ---
+        if calculate_distance and dist_map is not None and indices is not None:
             dist_crop = dist_map[sl]
             if np.any(mask_p):
                 min_dist = np.min(dist_crop[mask_p])
-                row[f'dist_to_nearest_{reference_name}_um'] = min_dist
+                row[f'dist_um_{partner_name}'] = min_dist
                 
-                # Find ID of the nearest neighbor
                 local_mins = np.argwhere((dist_crop == min_dist) & mask_p)
                 if local_mins.size > 0:
-                    y_g, x_g = (local_mins[0][0] + sl[0].start, local_mins[0][1] + sl[1].start)
-                    nearest_y = int(indices[0, y_g, x_g])
-                    nearest_x = int(indices[1, y_g, x_g])
-                    row[f'nearest_{reference_name}_id'] = reference_memmap[nearest_y, nearest_x]
+                    local_src = local_mins[0]
+                    global_src = tuple(l_c + s.start for l_c, s in zip(local_src, sl))
+                    
+                    indexer = (slice(None),) + global_src
+                    global_target = tuple(int(c) for c in indices[indexer])
+                    
+                    row[f'nearest_id_{partner_name}'] = reference_memmap[global_target]
+                    
+                    # Store bridge coordinates for Napari Red Lines
+                    row[f'src_y_{partner_name}'] = global_src[0]
+                    row[f'src_x_{partner_name}'] = global_src[1]
+                    row[f'tgt_y_{partner_name}'] = global_target[0]
+                    row[f'tgt_x_{partner_name}'] = global_target[1]
+                else:
+                    row[f'nearest_id_{partner_name}'] = 0
             else:
-                row[f'dist_to_nearest_{reference_name}_um'] = np.nan
-                row[f'nearest_{reference_name}_id'] = 0
+                row[f'dist_um_{partner_name}'] = np.nan
+                row[f'nearest_id_{partner_name}'] = 0
 
         primary_results.append(row)
 
     # 6. Post-Process Intersection (Unique Labeling)
     if calculate_overlap and intersection_memmap is not None:
-        flush_print("  Unique labeling of 2D overlap regions...")
+        flush_print(f"  Unique labeling of 2D overlap regions between {primary_name} and {partner_name}...")
         intersection_memmap.flush()
         d_int = da.from_array(intersection_memmap, chunks=(4096, 4096))
-        # 8-connectivity for 2D
         labeled_int, _ = dask_image.ndmeasure.label(d_int, structure=np.ones((3, 3)))
         with ProgressBar(dt=2):
-            da.store(labeled_int, intersection_memmap, lock=True)
+            da.store(labeled_int.astype(np.int32), intersection_memmap, lock=True)
         intersection_memmap.flush()
 
-    # 7. Aggregate Reference Stats
+    # 7. Aggregate Partner Coverage Stats (Partner View)
     ref_df = pd.DataFrame()
     if ref_interactions:
+        flush_print(f"  Aggregating coverage stats for {partner_name}...")
         inter_df = pd.DataFrame(ref_interactions)
-        ref_df = inter_df.groupby('ref_label').agg(
-            total_overlap_area_um2=('overlap_area', 'sum'),
-            interacting_cell_count=('primary_label', 'nunique'),
-            interacting_labels=('primary_label', lambda x: list(x))
-        ).reset_index()
-        ref_df['ref_total_area_um2'] = ref_df['ref_label'].map(ref_areas).fillna(0) * unit_area
-        ref_df['percent_covered'] = (ref_df['total_overlap_area_um2'] / ref_df['ref_total_area_um2'].replace(0, 1)) * 100.0
+        grp = inter_df.groupby('ref_label')
 
-    # 8. Pairwise Distance Calculation (Long Format)
-    pairwise_df = calculate_pairwise_distances_2d(primary_memmap, reference_memmap, spacing_yx)
-    
+        ref_stats = grp.agg(
+            overlap_area_um2=('overlap_area', 'sum'),
+            touching_count=('primary_label', 'nunique'),
+            touching_ids=('primary_label', lambda x: list(x))
+        ).reset_index()
+
+        ref_stats = ref_stats.rename(columns={
+            'ref_label': f'id_{partner_name}',
+            'overlap_area_um2': f'total_area_of_{primary_name}_inside_this_{partner_name}',
+            'touching_count': f'count_of_unique_{primary_name}_touching_this_{partner_name}',
+            'touching_ids': f'list_of_{primary_name}_ids_touching_this_{partner_name}'
+        })
+
+        partner_total_area = ref_stats[f'id_{partner_name}'].map(ref_areas).fillna(0) * unit_area
+        ref_stats[f'total_area_of_this_{partner_name}'] = partner_total_area
+        
+        ref_stats[f'pct_of_{partner_name}_occupied_by_{primary_name}'] = \
+            (ref_stats[f'total_area_of_{primary_name}_inside_this_{partner_name}'] / partner_total_area.replace(0, 1)) * 100.0
+
+        ref_df = ref_stats
+
+    # 8. Pairwise Distance Calculation
+    pairwise_df = calculate_pairwise_distances_2d(primary_memmap, reference_memmap, spacing_yx, partner_name)
     if not pairwise_df.empty:
-        pairwise_out_path = os.path.join(output_dir, f"pairwise_distances_{reference_name}.csv")
-        # Use compression if the table is very large (thousands of objects)
+        pairwise_out_path = os.path.join(output_dir, f"pairwise_distances_{partner_name}.csv")
         pairwise_df.to_csv(pairwise_out_path, index=False)
-        flush_print(f"  [Success] Pairwise distances saved to: {os.path.basename(pairwise_out_path)}")
 
     # Cleanup
     if intersection_memmap is not None:

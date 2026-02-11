@@ -72,10 +72,6 @@ class FluorescenceStrategy(ProcessingStrategy):
             {
                 "method": "execute_calculate_features",
                 "artifact": "metrics_df"
-            },
-            {
-                "method": "execute_interaction_analysis",
-                "artifact": None  # Optional/Repeatable step
             }
         ]
 
@@ -594,127 +590,6 @@ class FluorescenceStrategy(ProcessingStrategy):
         finally:
             self._close_memmap(final_seg_memmap)
             gc.collect()
-
-    def execute_interaction_analysis(
-        self, viewer, image_stack: Any, params: Dict
-    ) -> bool:
-        """
-        Step 6: Analyses spatial overlap with a secondary channel (e.g. Plaques).
-        """
-        print("\n--- Executing Step 6: Multi-Channel Interaction ---")
-
-        target_root_dir = params.get("target_channel_folder")
-        if not target_root_dir or not os.path.isdir(target_root_dir):
-            print("Error: Invalid reference directory.")
-            return False
-
-        # Locate corresponding sample in reference folder
-        sample_folder_name = os.path.basename(
-            os.path.dirname(self.processed_dir)
-        )
-        ref_sample_dir = os.path.join(target_root_dir, sample_folder_name)
-
-        if not os.path.exists(ref_sample_dir):
-            raise FileNotFoundError(
-                f"Reference sample '{sample_folder_name}' not found in target."
-            )
-
-        ref_processed_dir = None
-        for item in os.listdir(ref_sample_dir):
-            if "_processed_" in item and os.path.isdir(
-                os.path.join(ref_sample_dir, item)
-            ):
-                ref_processed_dir = os.path.join(ref_sample_dir, item)
-                break
-
-        if not ref_processed_dir:
-            raise FileNotFoundError(
-                f"No '_processed_' folder found inside {ref_sample_dir}."
-            )
-
-        ref_seg_path = None
-        for f in os.listdir(ref_processed_dir):
-            if f.startswith("final_segmentation") and f.endswith(".dat"):
-                ref_seg_path = os.path.join(ref_processed_dir, f)
-                break
-
-        if not ref_seg_path:
-            raise FileNotFoundError(
-                f"No 'final_segmentation.dat' found in {ref_processed_dir}"
-            )
-
-        print(f"  Found Reference Mask: {ref_seg_path}")
-        ref_name = os.path.basename(target_root_dir)
-
-        # Execute Calculation
-        final_seg_path = self.get_checkpoint_files()["final_segmentation"]
-        
-        primary_df, ref_df, intersection_path = calculate_interaction_metrics(
-            primary_mask_path=final_seg_path,
-            reference_mask_path=ref_seg_path,
-            output_dir=self.processed_dir,
-            shape=self.image_shape,
-            spacing=self.spacing,
-            reference_name=ref_name,
-            calculate_distance=params.get("calculate_distance", True),
-            calculate_overlap=params.get("calculate_overlap", True)
-        )
-
-        # Merge results into metrics dataframe
-        if not primary_df.empty:
-            metrics_path = self.get_checkpoint_files()["metrics_df"]
-            if os.path.exists(metrics_path):
-                main_df = pd.read_csv(metrics_path)
-                # Drop existing interaction cols to avoid dupes
-                cols_to_drop = [
-                    c for c in main_df.columns
-                    if c in primary_df.columns and c != 'label'
-                ]
-                if cols_to_drop:
-                    main_df.drop(columns=cols_to_drop, inplace=True)
-
-                merged_df = pd.merge(
-                    main_df, primary_df, on='label', how='left'
-                )
-                merged_df.to_csv(metrics_path, index=False)
-                print(f"  Merged {len(primary_df.columns)-1} columns into CSV.")
-
-                fcs_path = os.path.join(
-                    self.processed_dir, f"metrics_{self.mode_name}.fcs"
-                )
-                if os.path.exists(fcs_path):
-                    export_to_fcs(merged_df, fcs_path)
-            else:
-                out_csv = os.path.join(
-                    self.processed_dir, f"interaction_{ref_name}.csv"
-                )
-                primary_df.to_csv(out_csv, index=False)
-
-            if not ref_df.empty:
-                ref_csv = os.path.join(
-                    self.processed_dir, f"interaction_{ref_name}_coverage.csv"
-                )
-                ref_df.to_csv(ref_csv, index=False)
-                print(f"  Saved Reference Coverage Stats: {ref_csv}")
-        else:
-            print("  Warning: No interactions found.")
-
-        # Persist Visualization Metadata
-        meta_path = self.get_checkpoint_files()["last_interaction_meta"]
-        try:
-            with open(meta_path, 'w') as f:
-                yaml.dump({
-                    'ref_seg_path': ref_seg_path,
-                    'ref_raw_path': os.path.join(
-                        ref_sample_dir, f"{sample_folder_name}.tif"
-                    ),
-                    'ref_name': ref_name,
-                    'intersection_path': intersection_path
-                }, f)
-        except Exception:
-            pass
-
-        return True
 
     # =========================================================================
     # VISUALIZATION & HELPERS

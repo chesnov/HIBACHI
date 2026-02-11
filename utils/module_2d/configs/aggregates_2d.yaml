@@ -273,21 +273,6 @@ execute_calculate_features_fluorescence_2d:
       label: Calculate Skeletons
       type: bool
       value: true
-execute_interaction_analysis_fluorescence_2d:
-  name: Execute Interaction Analysis (2D)
-  parameters:
-    target_channel_folder:
-      label: Reference Channel Path (GUI selected)
-      type: str
-      value: ''
-    calculate_distance:
-      label: Calculate Nearest Distances
-      type: bool
-      value: true
-    calculate_overlap:
-      label: Calculate Overlap %
-      type: bool
-      value: true
 pixel_dimensions:
   x: 848.5301811026361
   y: 848.5301811026361

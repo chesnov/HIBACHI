@@ -74,10 +74,6 @@ class Fluorescence2DStrategy(ProcessingStrategy):
             {
                 "method": "execute_calculate_features",
                 "artifact": "metrics_df"
-            },
-            {
-                "method": "execute_interaction_analysis",
-                "artifact": None
             }
         ]
 
@@ -572,109 +568,6 @@ class Fluorescence2DStrategy(ProcessingStrategy):
             
             # Force garbage collection to free up memory before the next strategy step
             gc.collect()
-
-    def execute_interaction_analysis(
-        self, viewer, image_stack: Any, params: Dict
-    ) -> bool:
-        """
-        Step 6: Analyses spatial overlap with a secondary 2D channel (e.g. Plaques/Vessels).
-        """
-        print("\n--- Executing Step 6: Multi-Channel Interaction (2D) ---")
-        
-        target_root_dir = params.get("target_channel_folder")
-        if not target_root_dir or not os.path.isdir(target_root_dir):
-            print("  [Error] Invalid reference directory selected.")
-            return False
-
-        # 1. LOCATE REFERENCE DATA
-        # Identify the sample name (the folder containing the images)
-        sample_folder_name = os.path.basename(os.path.dirname(self.processed_dir))
-        ref_sample_dir = os.path.join(target_root_dir, sample_folder_name)
-        
-        if not os.path.exists(ref_sample_dir):
-            print(f"  [Error] Reference sample '{sample_folder_name}' not found in target channel.")
-            return False
-
-        # Find the processed folder inside the reference sample
-        ref_processed_dir = None
-        for item in os.listdir(ref_sample_dir):
-            if "_processed_" in item and os.path.isdir(os.path.join(ref_sample_dir, item)):
-                ref_processed_dir = os.path.join(ref_sample_dir, item)
-                break
-        
-        if not ref_processed_dir:
-            print(f"  [Error] Reference sample exists, but has not been processed yet.")
-            return False
-
-        # Find the final segmentation mask in the reference channel
-        ref_seg_path = None
-        for f in os.listdir(ref_processed_dir):
-            if f.startswith("final_segmentation") and f.endswith(".dat"):
-                ref_seg_path = os.path.join(ref_processed_dir, f)
-                break
-        
-        if not ref_seg_path:
-            print(f"  [Error] final_segmentation.dat not found in {ref_processed_dir}")
-            return False
-
-        ref_name = os.path.basename(target_root_dir)
-        print(f"  [Info] Found Reference Mask: {ref_seg_path}")
-
-        # 2. RUN ANALYSIS
-        final_seg_path = self.get_checkpoint_files()["final_segmentation"]
-        # Extract YX spacing
-        spacing_yx = tuple(self.spacing[1:]) if len(self.spacing) == 3 else tuple(self.spacing)
-
-        primary_df, ref_df, intersection_path = calculate_interaction_metrics_2d(
-            primary_mask_path=final_seg_path,
-            reference_mask_path=ref_seg_path,
-            output_dir=self.processed_dir,
-            shape=self.image_shape,
-            spacing_yx=spacing_yx,
-            reference_name=ref_name,
-            calculate_distance=params.get("calculate_distance", True),
-            calculate_overlap=params.get("calculate_overlap", True)
-        )
-
-        # 3. MERGE RESULTS INTO MAIN TABLE
-        if not primary_df.empty:
-            metrics_path = self.get_checkpoint_files()["metrics_df"]
-            if os.path.exists(metrics_path):
-                main_df = pd.read_csv(metrics_path)
-                # Remove previous interaction columns for this specific reference to allow re-runs
-                cols_to_drop = [c for c in main_df.columns if c in primary_df.columns and c != 'label']
-                if cols_to_drop:
-                    main_df.drop(columns=cols_to_drop, inplace=True)
-                
-                merged_df = pd.merge(main_df, primary_df, on='label', how='left')
-                merged_df.to_csv(metrics_path, index=False)
-                print(f"  [Success] Integrated 2D interaction metrics into metrics_df.csv")
-
-                # Update FCS file
-                fcs_path = os.path.join(self.processed_dir, f"metrics_{self.mode_name}.fcs")
-                export_to_fcs(merged_df, fcs_path)
-            
-            # Save the reference-specific coverage stats
-            if not ref_df.empty:
-                ref_csv = os.path.join(self.processed_dir, f"interaction_{ref_name}_coverage.csv")
-                ref_df.to_csv(ref_csv, index=False)
-        else:
-            print("  [Warning] No spatial interactions detected.")
-
-        # 4. PERSIST METADATA FOR VISUALIZATION
-        meta_path = self.get_checkpoint_files()["last_interaction_meta"]
-        try:
-            with open(meta_path, 'w') as f:
-                yaml.dump({
-                    'ref_seg_path': ref_seg_path,
-                    'ref_raw_path': os.path.join(ref_sample_dir, f"{sample_folder_name}.tif"),
-                    'ref_name': ref_name,
-                    'intersection_path': intersection_path
-                }, f)
-        except Exception as e:
-            print(f"  [Warn] Could not save visualization metadata: {e}")
-
-        return True
 
     # =========================================================================
     # VISUALIZATION & HELPERS

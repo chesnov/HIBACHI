@@ -1133,14 +1133,37 @@ class CrossChannelAnalyzerWindow(QMainWindow):
 
     def add_intersect_step(self):
         checked = self.get_checked_channels()
-        if len(checked) == 2:
-            step = {"type": "intersect", "inputs": checked, "name": f"Overlap: {checked[0]} & {checked[1]}"}
-        elif len(checked) == 1 and self.recipe_steps:
-            step = {"type": "intersect", "inputs": [checked[0], "PREVIOUS_RESULT"], 
-                    "name": f"Overlap: {checked[0]} with previous result"}
-        else:
-            QMessageBox.warning(self, "Error", "Select 2 channels for a new overlap, or 1 channel to intersect with a previous result.")
+        if not (len(checked) == 2 or (len(checked) == 1 and self.recipe_steps)):
+            QMessageBox.warning(self, "Error", "Select channels for intersection.")
             return
+
+        # NEW: Ask for Labeling Mode
+        modes = {
+            "Binary (All overlaps = ID 1)": "binary",
+            "Connected Components (Every fragment unique)": "connected",
+            "Inherit Parent A (Keep IDs of first channel)": "parent_a",
+            "Inherit Parent B (Keep IDs of second channel)": "parent_b"
+        }
+        
+        mode_display, ok = QInputDialog.getItem(
+            self, "Intersection Mode", 
+            "How should the resulting overlap mask be labeled?", 
+            list(modes.keys()), 0, False
+        )
+        
+        if not ok: return
+        label_mode = modes[mode_display]
+
+        if len(checked) == 2:
+            step = {
+                "type": "intersect", "inputs": checked, "label_mode": label_mode,
+                "name": f"Overlap ({label_mode}): {checked[0]} & {checked[1]}"
+            }
+        else:
+            step = {
+                "type": "intersect", "inputs": [checked[0], "PREVIOUS_RESULT"], "label_mode": label_mode,
+                "name": f"Overlap ({label_mode}): {checked[0]} with previous"
+            }
         
         self.recipe_steps.append(step)
         self.recipe_list.addItem(step["name"])
@@ -1168,11 +1191,25 @@ class CrossChannelAnalyzerWindow(QMainWindow):
             QMessageBox.information(self, "Info", "Recipe is empty.")
             return
 
-        # 1. Get the user-selected sample
+        # 1. Ask for a name to make this a "Single Run"
+        analysis_name, ok = QInputDialog.getText(
+            self, "Single Sample Run", 
+            "Enter a name for this analysis (files will be saved):",
+            text="Preview_Run"
+        )
+        if not ok or not analysis_name: return
+
         sample_name = self.sample_selector.currentText()
         sample_data = self.pm.sample_registry[sample_name]
         
         # 2. Setup Viewer
+        # Setup permanent path for this sample's relational results
+        project_root = os.path.dirname(self.pm.project_path)
+        sample_out_dir = os.path.join(
+            project_root, "RELATIONAL_ANALYSIS", analysis_name, sample_name
+        )
+        os.makedirs(sample_out_dir, exist_ok=True)
+
         viewer = napari.Viewer(title=f"Cross-Channel Preview: {sample_name}")
         
         # Predefined colormaps for raw channels
@@ -1214,13 +1251,17 @@ class CrossChannelAnalyzerWindow(QMainWindow):
         os.makedirs(temp_dir, exist_ok=True)
         
         # Run calculation
-        derived_results = RelationalEngine.run_recipe(
+        derived_masks, metrics_df = RelationalEngine.run_recipe(
             sample_name, self.pm.sample_registry, self.recipe_steps, 
-            temp_dir, shape, spacing
+            sample_out_dir, shape, spacing
         )
 
+        # Add the Red Proximity Lines
+        if metrics_df is not None:
+            self._draw_proximity_bridges(viewer, metrics_df, shape, spacing)
+
         # 5. Add Derived Results (High Opacity Labels)
-        for res in derived_results:
+        for res in derived_masks:
             data = np.memmap(res['path'], dtype=np.int32, mode='r', shape=shape)
             viewer.add_labels(data, name=f"DERIVED: {res['name']}")
 
@@ -1233,6 +1274,55 @@ class CrossChannelAnalyzerWindow(QMainWindow):
             z_scale = spacing[0]/spacing[2] if len(spacing)==3 else 1.0
             for layer in viewer.layers:
                 layer.scale = (z_scale, 1, 1)
+
+    def _draw_proximity_bridges(self, viewer, df, shape, spacing):
+        """
+        Parses the metrics dataframe for Source/Target coordinates and draws 
+        red connection lines (bridges) between interacting biological objects.
+        """
+        # Identify which partners were analyzed (e.g., 'Microglia', 'Neurons')
+        # We find them by looking for the biological suffixes in the coordinate columns
+        partners = [c.replace('src_y_', '') for c in df.columns if c.startswith('src_y_')]
+        
+        is_3d = (len(shape) == 3)
+        
+        # Calculate visualization scale (handles anisotropy)
+        z_scale = spacing[0] / spacing[-1] if is_3d else 1.0
+        display_scale = (z_scale, 1, 1) if is_3d else (1, 1)
+
+        for p in partners:
+            lines = []
+            for _, row in df.iterrows():
+                # Only draw a bridge if a nearest neighbor was successfully found (not NaN)
+                if pd.notna(row.get(f'dist_um_{p}')):
+                    try:
+                        if is_3d:
+                            # Extract 3D Bridge: [Z, Y, X]
+                            src = [row[f'src_z_{p}'], row[f'src_y_{p}'], row[f'src_x_{p}']]
+                            tgt = [row[f'tgt_z_{p}'], row[f'tgt_y_{p}'], row[f'tgt_x_{p}']]
+                        else:
+                            # Extract 2D Bridge: [Y, X]
+                            src = [row[f'src_y_{p}'], row[f'src_x_{p}']]
+                            tgt = [row[f'tgt_y_{p}'], row[f'tgt_x_{p}']]
+                        
+                        lines.append([src, tgt])
+                    except KeyError:
+                        # Skip if this specific partner doesn't have coordinates in the table
+                        continue
+            
+            if lines:
+                # Add the 'Red Lines' as a Shapes layer
+                viewer.add_shapes(
+                    lines, 
+                    shape_type='line', 
+                    edge_color='red', 
+                    edge_width=2 if not is_3d else 1, # Thicker for 2D visibility
+                    name=f"Bridges to {p}", 
+                    scale=display_scale,
+                    blending='additive'
+                )
+        
+        print(f"  [Visualizer] Plotted connection bridges for partners: {partners}")
 
     def run_batch_analysis(self):
         if not self.recipe_steps:

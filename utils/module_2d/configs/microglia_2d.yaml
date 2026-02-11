@@ -284,23 +284,6 @@ execute_calculate_features_fluorescence_2d:
       type: bool
       value: true
 
-# --- Step 6: Interaction Analysis ---
-execute_interaction_analysis_fluorescence_2d:
-  name: Execute Interaction Analysis (2D)
-  parameters:
-    target_channel_folder:
-      label: Reference Channel Path (GUI selected)
-      type: str
-      value: ""
-    calculate_distance:
-      label: Calculate Nearest Distances
-      type: bool
-      value: true
-    calculate_overlap:
-      label: Calculate Overlap %
-      type: bool
-      value: true
-
 # --- Global Settings ---
 pixel_dimensions:
   x: 606.09

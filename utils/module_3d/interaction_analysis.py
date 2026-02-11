@@ -53,49 +53,49 @@ def calculate_interaction_metrics(
     output_dir: str,
     shape: Tuple[int, ...],
     spacing: Tuple[float, ...],
-    reference_name: str,
+    primary_name: str,    # Descriptive name of the masks being analyzed (e.g. Agg_in_Neur)
+    partner_name: str,    # Descriptive name of the reference channel (e.g. Microglia)
     calculate_distance: bool = True,
     calculate_overlap: bool = True
 ) -> Tuple[pd.DataFrame, pd.DataFrame, Optional[str]]:
     """
-    Calculates spatial relationships between Primary cells and Reference objects.
-    Supports both 2D and 3D data.
+    Calculates spatial relationships between Primary cells and Partner objects.
+    Supports both 2D and 3D data, but optimized for 3D volumes.
 
     Metrics:
-    1. Overlap Volume/Area (intersection).
-    2. Overlap Fraction (relative to primary and partner).
-    3. Nearest Neighbor Distance (Primary edge to Reference edge).
+    1. Overlap Volume (intersection).
+    2. Overlap Fraction (Bi-directional: Primary-in-Partner and Partner-occupied-by-Primary).
+    3. Nearest Neighbor Distance (Primary edge to Partner edge).
+    4. Bridge Coordinates (Source and Target points for visual 'red lines').
 
     Args:
         primary_mask_path: Path to .dat file for primary segmentation.
-        reference_mask_path: Path to .dat file for reference segmentation.
-        output_dir: Directory to save the intersection mask.
-        shape: Dimensions of the arrays (e.g. (Z,Y,X) or (Y,X)).
-        spacing: Physical spacing (e.g. (1.0, 0.5, 0.5)).
-        reference_name: Label string for the reference (e.g., 'Plaque').
-        calculate_distance: Whether to compute distance transforms.
+        reference_mask_path: Path to .dat file for partner segmentation.
+        output_dir: Directory to save the intersection mask and csvs.
+        shape: Dimensions of the arrays (Z, Y, X).
+        spacing: Physical spacing (dz, dy, dx).
+        primary_name: Biological name of the primary objects.
+        partner_name: Biological name of the partner objects.
+        calculate_distance: Whether to compute distance transforms and bridge lines.
         calculate_overlap: Whether to compute intersection metrics.
 
     Returns:
         Tuple containing:
-        - primary_df (pd.DataFrame): Interaction stats for each primary cell.
-        - ref_df (pd.DataFrame): Coverage stats for reference objects.
+        - primary_df (pd.DataFrame): Interaction stats for each primary object.
+        - ref_df (pd.DataFrame): Coverage stats for partner objects.
         - intersection_path (str): Path to the labeled intersection mask file.
     """
-    flush_print(f"--- Starting Interaction Analysis vs '{reference_name}' ---")
+    flush_print(f"--- Starting Interaction Analysis: '{primary_name}' vs '{partner_name}' ---")
 
     ndim = len(shape)
     
-    # 0. Spacing Adaptation (Handle 2D shape with 3D spacing inputs)
-    # Some 2D workflows pass spacing as (1.0, dy, dx) for (Y, X) shape.
+    # 0. Spacing Adaptation
     edt_spacing = spacing
     if len(spacing) != ndim:
         if len(spacing) > ndim:
-            # Take last N dimensions (e.g. [1, y, x] -> [y, x])
             edt_spacing = spacing[-ndim:]
             print(f"  Adapted spacing for {ndim}D: {edt_spacing}")
         else:
-            # Fallback
             edt_spacing = tuple(1.0 for _ in range(ndim))
 
     # 1. Load Data
@@ -105,19 +105,19 @@ def calculate_interaction_metrics(
     if primary_memmap is None or reference_memmap is None:
         raise FileNotFoundError("Could not load segmentation masks.")
 
-    # 2. Setup Reference Volumes & Accumulators
+    # 2. Setup Partner Volumes & Accumulators
     ref_volumes = {}
-    ref_interactions = []  # List of dicts for reference stats
+    ref_interactions = []  # List of dicts for partner-view stats
 
     if calculate_overlap:
-        flush_print("  Calculating volumes/areas of reference objects...")
+        flush_print(f"  Calculating volumes of {partner_name} objects...")
         try:
             u, c = np.unique(reference_memmap, return_counts=True)
             ref_volumes = dict(zip(u, c))
             if 0 in ref_volumes:
                 del ref_volumes[0]
         except MemoryError:
-            flush_print("    Warning: Reference mask too large for global stats.")
+            flush_print(f"    Warning: {partner_name} mask too large for global stats.")
 
     # 3. Setup Intersection Mask
     intersection_path = None
@@ -125,7 +125,7 @@ def calculate_interaction_metrics(
 
     if calculate_overlap:
         intersection_path = os.path.join(
-            output_dir, f"intersection_{reference_name}.dat"
+            output_dir, f"intersection_{partner_name}.dat"
         )
         intersection_memmap = np.memmap(
             intersection_path, dtype=np.int32, mode='w+', shape=shape
@@ -136,11 +136,9 @@ def calculate_interaction_metrics(
     indices = None
 
     if calculate_distance:
-        flush_print("  Calculating Distance Transform of Reference Channel...")
+        flush_print(f"  Calculating Distance Transform to nearest {partner_name}...")
         try:
-            # Create binary mask of reference (inverted for EDT)
-            # True = Background (calculate distance to nearest foreground)
-            # False = Foreground (distance 0)
+            # Create binary mask of partner (inverted for EDT)
             ref_binary_inverted = (reference_memmap == 0)
             
             dt_tuple = distance_transform_edt(
@@ -149,7 +147,7 @@ def calculate_interaction_metrics(
                 return_indices=True
             )
             dist_map = dt_tuple[0].astype(np.float32)
-            indices = dt_tuple[1]  # Shape: (ndim, *shape)
+            indices = dt_tuple[1]  # Shape: (ndim, Z, Y, X)
             
             del ref_binary_inverted
         except MemoryError:
@@ -157,19 +155,16 @@ def calculate_interaction_metrics(
             calculate_distance = False
 
     # 5. Iterate Primary Objects
-    flush_print("  Analyzing object interactions...")
+    flush_print(f"  Analyzing {primary_name} interactions...")
 
     object_slices = ndimage.find_objects(primary_memmap)
     labels = np.unique(primary_memmap)
     labels = labels[labels > 0]
 
     primary_results = []
-    
-    # Unit volume/area based on full spacing vector
-    # (Use original spacing to preserve e.g. Z-depth if 2D was passed as flat 3D)
     unit_vol = np.prod(spacing)
 
-    for lbl in tqdm(labels, desc=f"    Scanning {reference_name}"):
+    for lbl in tqdm(labels, desc=f"    Scanning {partner_name}"):
         idx = lbl - 1
         if idx >= len(object_slices) or object_slices[idx] is None:
             continue
@@ -180,145 +175,131 @@ def calculate_interaction_metrics(
 
         row = {'label': lbl}
 
-        # --- A. Overlap Metrics ---
+        # --- A. Overlap Metrics (3D) ---
         if calculate_overlap:
-            # Intersection in local crop
             intersect_mask = mask_p & (crop_r > 0)
             overlap_vox = np.count_nonzero(intersect_mask)
 
-            # Write to Intersection Map
+            # Mark intersection for Napari
             if overlap_vox > 0 and intersection_memmap is not None:
                 current_int_view = intersection_memmap[sl]
-                # Mark intersection (binary 1 for now)
                 current_int_view[intersect_mask] = 1
                 intersection_memmap[sl] = current_int_view
 
             total_vox_p = np.count_nonzero(mask_p)
-            overlap_frac_p = (overlap_vox / total_vox_p) if total_vox_p > 0 else 0.0
-
-            row[f'overlap_vol_um3_{reference_name}'] = overlap_vox * unit_vol
-            row[f'overlap_fraction_{reference_name}'] = overlap_frac_p
-            row[f'overlaps_any_{reference_name}'] = (overlap_vox > 0)
-
-            # Identify partners
-            dom_id = 0
-            dom_vox_intersect = 0
             
+            # Bi-directional Stat: Volume of Primary inside Partner
+            row[f'overlap_vol_with_{partner_name}_um3'] = overlap_vox * unit_vol
+            
+            # Bi-directional Stat: % of this Primary contained by Partner
+            row[f'pct_of_this_{primary_name}_inside_{partner_name}'] = \
+                (overlap_vox / total_vox_p) * 100.0 if total_vox_p > 0 else 0.0
+            
+            row[f'is_touching_{partner_name}'] = (overlap_vox > 0)
+
+            # Identify partner IDs for aggregation
+            dom_id = 0
             if overlap_vox > 0:
                 overlap_ids, overlap_counts = np.unique(
                     crop_r[intersect_mask], return_counts=True
                 )
                 
-                # Record detailed interactions
+                # Store interactions for coverage_stats.csv
                 for o_id, o_count in zip(overlap_ids, overlap_counts):
                     if o_id == 0: continue
                     ref_interactions.append({
-                        'ref_label': o_id,
-                        'overlap_vol': o_count * unit_vol,
+                        'ref_label': o_id, 
+                        'overlap_vol': o_count * unit_vol, 
                         'primary_label': lbl
                     })
 
-                # Find dominant partner
+                # Find dominant partner ID
                 valid_indices = np.where(overlap_ids > 0)[0]
                 if valid_indices.size > 0:
                     dom_idx = valid_indices[np.argmax(overlap_counts[valid_indices])]
                     dom_id = overlap_ids[dom_idx]
-                    dom_vox_intersect = overlap_counts[dom_idx]
 
-            row[f'dominant_overlap_id_{reference_name}'] = dom_id
+            row[f'dominant_partner_id_{partner_name}'] = dom_id
 
-            # Fraction of Partner Covered by this Cell
-            if dom_id > 0 and dom_id in ref_volumes:
-                total_vox_r = ref_volumes[dom_id]
-                row[f'overlap_fraction_of_partner_{reference_name}'] = \
-                    dom_vox_intersect / total_vox_r
-            else:
-                row[f'overlap_fraction_of_partner_{reference_name}'] = 0.0
-
-        # --- B. Distance Metrics ---
+        # --- B. Distance Metrics (3D) ---
         if calculate_distance and dist_map is not None and indices is not None:
             dist_crop = dist_map[sl]
-
             if np.any(mask_p):
                 # 1. Minimum Distance
                 min_dist = np.min(dist_crop[mask_p])
-                row[f'dist_to_nearest_{reference_name}_um'] = min_dist
+                row[f'dist_um_{partner_name}'] = min_dist
 
-                # 2. Identify Nearest Neighbor ID
-                # Find local coordinates of minimum
+                # 2. Identify Bridge Coordinates (Source and Target)
                 local_mins = np.argwhere((dist_crop == min_dist) & mask_p)
-                
                 if local_mins.size > 0:
-                    local_min = local_mins[0]
-                    # Convert to global coordinates
-                    global_coords = tuple(
-                        local_c + s.start for local_c, s in zip(local_min, sl)
-                    )
+                    local_src = local_mins[0]
+                    global_src = tuple(l_c + s.start for l_c, s in zip(local_src, sl))
                     
-                    try:
-                        # indices array shape: (ndim, dim1, dim2...)
-                        # Use tuple indexing to fetch nearest point coords
-                        indexer = (slice(None),) + global_coords
-                        nearest_point_flat = indices[indexer]
-                        nearest_point = tuple(int(c) for c in nearest_point_flat)
-                        
-                        nearest_id = reference_memmap[nearest_point]
-                        row[f'nearest_{reference_name}_id'] = nearest_id
-                    except Exception:
-                        row[f'nearest_{reference_name}_id'] = 0
+                    # Target: Exact pixel on the partner mask
+                    indexer = (slice(None),) + global_src
+                    global_target = tuple(int(c) for c in indices[indexer])
+                    
+                    row[f'nearest_id_{partner_name}'] = reference_memmap[global_target]
+                    
+                    # Coordinates for Napari Bridge Lines
+                    row[f'src_z_{partner_name}'] = global_src[0]
+                    row[f'src_y_{partner_name}'] = global_src[1]
+                    row[f'src_x_{partner_name}'] = global_src[2]
+                    row[f'tgt_z_{partner_name}'] = global_target[0]
+                    row[f'tgt_y_{partner_name}'] = global_target[1]
+                    row[f'tgt_x_{partner_name}'] = global_target[2]
                 else:
-                    row[f'nearest_{reference_name}_id'] = 0
+                    row[f'nearest_id_{partner_name}'] = 0
             else:
-                row[f'dist_to_nearest_{reference_name}_um'] = np.nan
-                row[f'nearest_{reference_name}_id'] = 0
+                row[f'dist_um_{partner_name}'] = np.nan
+                row[f'nearest_id_{partner_name}'] = 0
 
         primary_results.append(row)
 
     # 6. Post-Process Intersection Mask (Unique Labeling)
     if calculate_overlap and intersection_memmap is not None:
-        flush_print("  Labeling overlap regions...")
+        flush_print(f"  Labeling unique overlap regions between {primary_name} and {partner_name}...")
         intersection_memmap.flush()
 
-        # Chunk size heuristic: smaller chunks for 3D, larger for 2D
         dask_chunks = (64, 256, 256) if ndim == 3 else (4096, 4096)
-        
         d_int = da.from_array(intersection_memmap, chunks=dask_chunks)
-        
-        # Structure for full connectivity (8-conn for 2D, 26-conn for 3D)
         s = generate_binary_structure(ndim, ndim)
 
         labeled_int, num_features = dask_image.ndmeasure.label(d_int, structure=s)
 
-        flush_print("  Writing unique overlap IDs to disk...")
         with ProgressBar(dt=2):
-            da.store(labeled_int, intersection_memmap, lock=True)
+            da.store(labeled_int.astype(np.int32), intersection_memmap, lock=True)
 
         intersection_memmap.flush()
 
-    # 7. Aggregate Reference Stats
+    # 7. Aggregate Partner Coverage Stats (Partner View)
     ref_df = pd.DataFrame()
     if ref_interactions:
-        flush_print("  Aggregating Reference Coverage Stats...")
+        flush_print(f"  Aggregating coverage stats for {partner_name}...")
         inter_df = pd.DataFrame(ref_interactions)
-
         grp = inter_df.groupby('ref_label')
 
         ref_stats = grp.agg(
-            total_overlap_vol_um3=('overlap_vol', 'sum'),
-            interacting_cell_count=('primary_label', 'nunique'),
-            interacting_labels=('primary_label', lambda x: list(x))
+            overlap_vol_um3=('overlap_vol', 'sum'),
+            touching_count=('primary_label', 'nunique'),
+            touching_ids=('primary_label', lambda x: list(x))
         ).reset_index()
 
-        # Calculate % Covered
-        ref_stats['ref_total_vol_um3'] = \
-            ref_stats['ref_label'].map(ref_volumes).fillna(0) * unit_vol
-            
-        ref_stats['percent_covered'] = (
-            ref_stats['total_overlap_vol_um3'] / 
-            ref_stats['ref_total_vol_um3'].replace(0, 1) # Avoid div/0
-        ) * 100.0
+        # Biologically Explicit Naming
+        ref_stats = ref_stats.rename(columns={
+            'ref_label': f'id_{partner_name}',
+            'overlap_vol_um3': f'total_vol_of_{primary_name}_inside_this_{partner_name}',
+            'touching_count': f'count_of_unique_{primary_name}_touching_this_{partner_name}',
+            'touching_ids': f'list_of_{primary_name}_ids_touching_this_{partner_name}'
+        })
+
+        # Calculate Percentages
+        partner_total_vol = ref_stats[f'id_{partner_name}'].map(ref_volumes).fillna(0) * unit_vol
+        ref_stats[f'total_vol_of_this_{partner_name}'] = partner_total_vol
         
-        ref_stats['percent_covered'] = ref_stats['percent_covered'].clip(upper=100.0)
+        # Calculation: How much of the Partner (e.g. Neuron) is filled with Primary (e.g. Aggregates)
+        ref_stats[f'pct_of_{partner_name}_occupied_by_{primary_name}'] = \
+            (ref_stats[f'total_vol_of_{primary_name}_inside_this_{partner_name}'] / partner_total_vol.replace(0, 1)) * 100.0
 
         ref_df = ref_stats
 
@@ -328,7 +309,6 @@ def calculate_interaction_metrics(
         if hasattr(intersection_memmap, '_mmap') and intersection_memmap._mmap:
             intersection_memmap._mmap.close()
             
-    # Explicitly clear large arrays (Indices can be 3x the size of the volume)
     del dist_map, indices, primary_memmap, reference_memmap
     gc.collect()
 
