@@ -312,14 +312,23 @@ class ProcessingStrategy(abc.ABC):
             return
         layer_name = f"{name}_{self.mode_name}"
 
+        # Handle Visibility: 
+        # We must avoid initializing layers as invisible (visible=False) because 
+        # it can cause Napari to skip slice initialization, leading to 
+        # dimensionality mismatch errors in _update_thumbnail (ndi.zoom).
+        
+        target_visibility = True # Default to visible
+        if 'visible' in kwargs:
+            target_visibility = kwargs.pop('visible') # Extract and remove from kwargs
+
         if layer_name in viewer.layers:
             # If the layer exists, remember its current visibility
-            kwargs['visible'] = viewer.layers[layer_name].visible
-            self._visibility_cache[layer_name] = kwargs['visible']
+            target_visibility = viewer.layers[layer_name].visible
+            self._visibility_cache[layer_name] = target_visibility
         elif layer_name in self._visibility_cache:
             # If the layer is new but we have a cached state, restore it
-            kwargs['visible'] = self._visibility_cache[layer_name]
-        
+            target_visibility = self._visibility_cache[layer_name]
+
         # Determine dimensionality of data
         spatial_ndim = 2
         if hasattr(data, 'ndim'):
@@ -349,15 +358,22 @@ class ProcessingStrategy(abc.ABC):
         # Update existing layer or add new one
         if layer_name not in viewer.layers:
             try:
+                # Add layer (defaulting to visible=True implicitly by removing kwarg)
+                new_layer = None
                 if layer_type == 'labels':
-                    viewer.add_labels(data, name=layer_name, **kwargs)
+                    new_layer = viewer.add_labels(data, name=layer_name, **kwargs)
                 elif layer_type == 'image':
-                    viewer.add_image(data, name=layer_name, **kwargs)
+                    new_layer = viewer.add_image(data, name=layer_name, **kwargs)
                 elif layer_type == 'shapes':
                     if len(data) > 0:
-                        viewer.add_shapes(data, name=layer_name, **kwargs)
+                        new_layer = viewer.add_shapes(data, name=layer_name, **kwargs)
                 elif layer_type == 'points':
-                    viewer.add_points(data, name=layer_name, **kwargs)
+                    new_layer = viewer.add_points(data, name=layer_name, **kwargs)
+                
+                # Apply visibility AFTER creation to ensure initialization logic runs
+                if new_layer is not None:
+                    new_layer.visible = target_visibility
+
             except Exception as e:
                 print(f"Error adding layer {layer_name}: {e}")
         else:

@@ -56,67 +56,87 @@ def relabel_and_filter_fragments(
     min_size_voxels: int
 ) -> None:
     """
-    Optimized 3D fragment filter for huge volumes.
-    Breaks the Dask graph by saving the binary mask first, then relabeling.
+    Refined 3D fragment filter.
+    Uses dask-image to perform GLOBAL connected component labeling and size filtering
+    in an out-of-core manner (scalable to RAM).
     """
     if min_size_voxels <= 0:
         return
 
-    print(f"  [Refine] Stage 1/2: Morphological Pruning & Size Filtering...")
+    print(f"  [Refine] Global Labeling & Size Filtering (Min: {min_size_voxels} voxels)...")
 
-    # 1. Setup Dask Array
-    chunk_size = (64, 256, 256)
+    # 1. Setup Dask Array (Out-of-Core)
+    # Use reasonable chunks to fit in laptop RAM (e.g. ~100MB chunks)
+    # (128, 256, 256) of int32 is roughly 32MB per chunk, very safe for laptops.
+    chunk_size = (128, 256, 256)
     d_seg = da.from_array(labels_memmap, chunks=chunk_size)
+    
+    # 2. Binarize (Virtual)
+    binary_mask = (d_seg > 0)
+
+    # 3. Global Connected Components
+    # dask_image handles the stitching of chunks to resolve global labels without
+    # loading the full brain into RAM.
+    print("    Resolving global connectivity (this may take a while)...")
     structure_3d = generate_binary_structure(3, 1)
     
-    # 2. Parallel Size Filtering (Pure Size Filter, No Opening)
-    # Logic: We skip binary_opening to ensure thin processes are NOT pruned.
-    d_binary = d_seg > 0
-    
-    d_filtered = d_binary.map_overlap(
-        remove_small_objects,
-        depth={0: 8, 1: 8, 2: 8},
-        boundary='compare',
-        dtype=bool,
-        min_size=min_size_voxels
+    # This builds the graph but doesn't compute yet
+    labeled_dask, num_features_dask = dask_image.ndmeasure.label(
+        binary_mask, structure=structure_3d
     )
 
-    # 3. BREAK THE GRAPH: Write the binary mask to the memmap
-    # This overwrites the noisy labels with a clean 0/1 mask.
-    print("    Writing cleaned binary mask to disk (breaking graph)...")
-    with ProgressBar(dt=2):
-        # We store as int8 to save space/time, then cast to int32 for labeling
+    # Compute total features to set up histogram
+    # This triggers the first pass of the graph
+    num_features = num_features_dask.compute()
+    
+    if num_features == 0:
+        print("    No objects found.")
+        labels_memmap[:] = 0
+        labels_memmap.flush()
+        return
+
+    print(f"    Found {num_features} unique objects. Analyzing sizes...")
+
+    # 4. Global Size Histogram
+    # dask.histogram computes volume of every label index globally
+    counts, _ = da.histogram(
+        labeled_dask, bins=num_features + 1, range=[0, num_features]
+    )
+    counts_val = counts.compute()
+
+    # 5. Identify Valid Labels
+    # Create a boolean mask of IDs to keep based on total global volume
+    valid_mask = (counts_val >= min_size_voxels)
+    valid_mask[0] = False # Background is 0
+    
+    # Convert to array of IDs for isin()
+    ids_to_keep = np.where(valid_mask)[0]
+    
+    removed_count = num_features - len(ids_to_keep)
+    print(f"    Removing {removed_count} small artifacts. Keeping {len(ids_to_keep)} objects.")
+
+    if len(ids_to_keep) == 0:
+         labels_memmap[:] = 0
+         labels_memmap.flush()
+         return
+
+    # 6. Apply Filter & Write Back
+    # dask.isin creates a boolean mask where pixels belong to valid IDs
+    # da.where preserves the Label ID if valid, else 0
+    mask_keep = da.isin(labeled_dask, ids_to_keep)
+    final_dask = da.where(mask_keep, labeled_dask, 0)
+
+    print("    Writing filtered segmentation to disk...")
+    with ProgressBar(dt=5):
+        # lock=True ensures thread safety when writing to the memmap
         da.store(
-            d_filtered.astype(np.int8), 
+            final_dask.astype(np.int32), 
             labels_memmap, 
             lock=True, 
             scheduler=DASK_SCHEDULER
         )
-    labels_memmap.flush()
-
-    # 4. Stage 2/2: Sequential Slab-wise Relabeling
-    # Now that the file is just 0s and 1s, we can label it much faster.
-    print("    Stage 2/2: Sequential relabeling...")
-    
-    # We reload the memmap as a simple array (no lineage)
-    # We use a sequential approach to avoid Dask-image's graph overhead
-    # ndimage.label is fast on CPUs; we process in slabs to respect RAM.
-    
-    tmp_labels, num_features = ndimage.label(labels_memmap, structure=structure_3d)
-    
-    # If the above line still uses too much RAM, we would use cc3d or a slab-loop.
-    # But given your previous log (5 slabs), ndimage.label on the full mask 
-    # should be fine now that the 'dust' is gone.
-    
-    if num_features > 0:
-        print(f"    Finalized {num_features} unique fragments.")
-        labels_memmap[:] = tmp_labels.astype(np.int32)
-    else:
-        print("    No objects remaining.")
-        labels_memmap[:] = 0
 
     labels_memmap.flush()
-    del tmp_labels
     gc.collect()
     print("    Refinement complete.")
 

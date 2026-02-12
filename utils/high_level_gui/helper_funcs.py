@@ -186,35 +186,74 @@ class MetadataExtractor:
     def extract_channel_to_tiff(src_path: str, dest_path: str, channel_idx: int) -> None:
         """Extracts a channel and preserves the spatial resolution tags."""
         try:
-            # Read original metadata to preserve it
-            source_meta = MetadataExtractor.read_tiff_metadata(src_path)
+            ext = os.path.splitext(src_path)[1].lower()
+            ch_data = None
+            source_meta = {'x': 1.0, 'y': 1.0, 'z': 1.0}
+
+            # --- BRANCH 1: CZI FILES ---
+            if ext == '.czi' and HAS_CZI:
+                # 1. Get Metadata specifically for CZI
+                source_meta = MetadataExtractor.get_czi_metadata(src_path)
+                
+                # 2. Extract Data using aicspylibczi
+                try:
+                    czi = CziFile(src_path)
+                    # Read specific channel. explicit T=0 ensures we get a volume, not a 4D hyperstack if time exists
+                    # This returns (data, list_of_dims). Data usually has shape (1, 1, Z, Y, X) or similar.
+                    data, dims = czi.read_image(C=channel_idx)
+                    ch_data = np.squeeze(data)
+                except Exception as czi_e:
+                    print(f"    CZI Read Error: {czi_e}")
+                    return
+
+            # --- BRANCH 2: TIFF FILES ---
+            elif ext in ['.tif', '.tiff']:
+                # 1. Get Metadata specifically for TIFF
+                source_meta = MetadataExtractor.read_tiff_metadata(src_path)
+                
+                # 2. Extract Data using tifffile
+                vol = tiff.imread(src_path)
+                
+                # Handle ImageJ Hyperstacks (Z vs C vs T)
+                if vol.ndim == 3:
+                    # Differentiate (C,Y,X) from (Z,Y,X)
+                    # Heuristic: Channels usually < 10, Z usually < Y/X
+                    if vol.shape[0] < 10 and vol.shape[0] < vol.shape[1]: 
+                        ch_data = vol[channel_idx]
+                    else: 
+                        # Assumes single channel Z-stack
+                        ch_data = vol
+                elif vol.ndim == 4:
+                    # Usually (C, Z, Y, X) or (Z, C, Y, X). 
+                    # Simplistic assumption: Smallest dim is C.
+                    if vol.shape[0] < vol.shape[1]: # (C, Z, Y, X)
+                        ch_data = vol[channel_idx]
+                    else: # (Z, C, Y, X)
+                        ch_data = vol[:, channel_idx, :, :]
+                else:
+                    ch_data = vol
             
-            vol = tiff.imread(src_path)
-            if vol.ndim == 3:
-                # Differentiate (C,Y,X) from (Z,Y,X)
-                if vol.shape[0] < 10 and vol.shape[0] < vol.shape[1]: ch_data = vol[channel_idx]
-                else: ch_data = vol
-            elif vol.ndim == 4:
-                if vol.shape[0] < vol.shape[1]: ch_data = vol[channel_idx]
-                else: ch_data = vol[:, channel_idx, :, :]
             else:
-                ch_data = vol
+                print(f"    Unsupported file type for extraction: {ext}")
+                return
 
-            # Calculate the resolution tags for the new file (pixels per micron)
-            # tifffile expects (numerator, denominator) or a float for resolution
-            res_x = 1.0 / source_meta['x']
-            res_y = 1.0 / source_meta['y']
+            # --- COMMON: SAVE TO DISK ---
+            if ch_data is not None:
+                # Calculate resolution for ImageJ/Fiji (pixels per unit)
+                # If meta is 1.0 (default), res is 1.0
+                res_x = 1.0 / source_meta['x'] if source_meta['x'] > 0 else 1.0
+                res_y = 1.0 / source_meta['y'] if source_meta['y'] > 0 else 1.0
 
-            # Save with resolution metadata (ResolutionUnit 3 = Centimeter, 1 = None)
-            # We use 1 (None) to match your source files but provide the correct px/um density
-            tiff.imwrite(
-                dest_path, ch_data, 
-                photometric='minisblack',
-                resolution=(res_x, res_y),
-                metadata={'unit': 'micron', 'spacing': source_meta['z']}
-            )
+                tiff.imwrite(
+                    dest_path, ch_data, 
+                    photometric='minisblack',
+                    resolution=(res_x, res_y),
+                    metadata={'unit': 'micron', 'spacing': source_meta['z']}
+                )
+
         except Exception as e:
             print(f"Extraction failed for {os.path.basename(src_path)}: {e}")
+            traceback.print_exc()
 
     @staticmethod
     def get_czi_metadata(path: str) -> Dict[str, Union[float, bool]]:

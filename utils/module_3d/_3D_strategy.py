@@ -517,6 +517,12 @@ class FluorescenceStrategy(ProcessingStrategy):
         print(f"Executing Step 5: Feature Calculation...")
         files = self.get_checkpoint_files()
         final_seg_path = files["final_segmentation"]
+        
+        # 1. SETUP PATHS
+        skel_dat_path = files.get("skeleton_array")
+        metrics_csv_path = files.get("metrics_df")
+        fcs_path = os.path.join(self.processed_dir, f"metrics_{self.mode_name}.fcs")
+        pts_csv_path = files.get("points_matrix")
 
         if not os.path.exists(final_seg_path):
             return False
@@ -531,49 +537,33 @@ class FluorescenceStrategy(ProcessingStrategy):
             intensity_vol = self.intermediate_state.get(
                 'original_volume_ref', image_stack
             )
-            fcs_path = os.path.join(
-                self.processed_dir, f"metrics_{self.mode_name}.fcs"
-            )
 
+            # 2. CALL ANALYSIS
             metrics_df, detailed_outputs = analyze_segmentation(
                 segmented_array=final_seg_memmap,
                 intensity_image=intensity_vol,
                 spacing=self.spacing,
+                temp_dir=self.temp_dir,
                 calculate_distances=params.get("calculate_distances", True),
                 calculate_skeletons=params.get("calculate_skeletons", True),
+                skeleton_export_path=skel_dat_path,
                 fcs_export_path=fcs_path,
-                **params,
-                return_detailed=True
+                return_detailed=True,
+                prune_spurs_le_um=params.get("prune_spurs_le_um", 0.0)
             )
 
             if metrics_df is not None:
-                metrics_df.to_csv(files["metrics_df"], index=False)
-
-            # Persist Skeleton
-            skeleton_array = detailed_outputs.get('skeleton_array')
-            if skeleton_array is not None:
-                skeleton_path = files.get("skeleton_array")
-                skel_memmap = np.memmap(
-                    skeleton_path, dtype=skeleton_array.dtype, mode='w+',
-                    shape=skeleton_array.shape
-                )
-                skel_memmap[:] = skeleton_array[:]
-                self._close_memmap(skel_memmap)
-                del skeleton_array
-                if 'skeleton_array' in detailed_outputs:
-                    del detailed_outputs['skeleton_array']
-                gc.collect()
+                metrics_df.to_csv(metrics_csv_path, index=False)
 
             # Persist Neighbor Points
             points_df = detailed_outputs.get('all_pairs_points')
             if points_df is not None and not points_df.empty:
-                points_df.to_csv(files["points_matrix"], index=False)
+                points_df.to_csv(pts_csv_path, index=False)
 
             if viewer is not None:
-                skeleton_path = files.get("skeleton_array")
-                if os.path.exists(skeleton_path):
+                if skel_dat_path and os.path.exists(skel_dat_path):
                     skel_display = np.memmap(
-                        skeleton_path, dtype=np.int32, mode='r',
+                        skel_dat_path, dtype=np.int32, mode='r',
                         shape=self.image_shape
                     )
                     self._add_layer_safely(
