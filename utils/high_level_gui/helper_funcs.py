@@ -20,7 +20,8 @@ from PyQt5.QtWidgets import (  # type: ignore
     QApplication, QFileDialog, QMessageBox,
     QMainWindow, QVBoxLayout, QHBoxLayout,
     QListWidget, QListWidgetItem, QPushButton,
-    QWidget, QLabel, QInputDialog, QComboBox
+    QWidget, QLabel, QInputDialog, QComboBox,
+    QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView
 )
 
 from .relational_engine import RelationalEngine
@@ -282,6 +283,95 @@ class MetadataExtractor:
 # GUI PARAMETER WIDGETS
 # =============================================================================
 
+class ScalesTableWidget(QWidget):
+    """
+    A unified table to manage Scales, Low Thresholds, and High Thresholds together.
+    Returns a list of dicts: [{'scale': 1.0, 'low': 95.0, 'high': 100.0}, ...]
+    """
+    valueChanged = pyqtSignal(object)
+
+    def __init__(self, initial_value: List[Dict[str, float]], label: str = ""):
+        super().__init__()
+        self.layout = QVBoxLayout(self)
+        self.layout.setContentsMargins(0, 0, 0, 0)
+        
+        # Controls
+        btn_layout = QHBoxLayout()
+        self.lbl = QLabel(label)
+        self.btn_add = QPushButton("+")
+        self.btn_add.setFixedWidth(30)
+        self.btn_rem = QPushButton("-")
+        self.btn_rem.setFixedWidth(30)
+        
+        self.btn_add.clicked.connect(self.add_row)
+        self.btn_rem.clicked.connect(self.remove_row)
+        
+        btn_layout.addWidget(self.lbl)
+        btn_layout.addStretch()
+        btn_layout.addWidget(self.btn_add)
+        btn_layout.addWidget(self.btn_rem)
+        self.layout.addLayout(btn_layout)
+
+        # Table
+        self.table = QTableWidget()
+        self.table.setColumnCount(3)
+        self.table.setHorizontalHeaderLabels(["Scale", "Low %", "High %"])
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table.setMinimumHeight(150)
+        self.table.itemChanged.connect(self._emit_change)
+        self.layout.addWidget(self.table)
+        
+        # Populate
+        self.set_value(initial_value)
+
+    def set_value(self, data: List[Dict[str, float]]):
+        self.table.blockSignals(True)
+        self.table.setRowCount(0)
+        if isinstance(data, list):
+            for row_idx, item in enumerate(data):
+                if isinstance(item, dict):
+                    self.table.insertRow(row_idx)
+                    self._set_item(row_idx, 0, item.get('scale', 1.0))
+                    self._set_item(row_idx, 1, item.get('low', 95.0))
+                    self._set_item(row_idx, 2, item.get('high', 100.0))
+        self.table.blockSignals(False)
+
+    def _set_item(self, row, col, val):
+        item = QTableWidgetItem(str(val))
+        self.table.setItem(row, col, item)
+
+    def add_row(self):
+        r = self.table.rowCount()
+        self.table.insertRow(r)
+        self._set_item(r, 0, 1.0)
+        self._set_item(r, 1, 95.0)
+        self._set_item(r, 2, 100.0)
+        self._emit_change()
+
+    def remove_row(self):
+        r = self.table.currentRow()
+        if r >= 0:
+            self.table.removeRow(r)
+            self._emit_change()
+
+    def _emit_change(self):
+        data = []
+        for r in range(self.table.rowCount()):
+            try:
+                s = float(self.table.item(r, 0).text())
+                l = float(self.table.item(r, 1).text())
+                h = float(self.table.item(r, 2).text())
+                data.append({'scale': s, 'low': l, 'high': h})
+            except (ValueError, AttributeError):
+                pass 
+        self.valueChanged.emit(data)
+
+    @property
+    def native(self):
+        return self
+    
+
 def create_parameter_widget(
     param_name: str,
     param_config: Dict[str, Any],
@@ -293,6 +383,13 @@ def create_parameter_widget(
     widget = None
 
     try:
+        if param_type == "scale_table":
+            initial_val = param_config.get("value", [])
+            widget = ScalesTableWidget(initial_val, label)
+            widget.valueChanged.connect(callback)
+            # IMPORTANT: Return early because this is a custom Qt widget, not MagicGUI
+            return widget
+        
         if param_type == "list":
             initial_list = param_config.get("value", [])
             if not isinstance(initial_list, list):

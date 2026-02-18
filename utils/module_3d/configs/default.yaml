@@ -4,14 +4,13 @@ mode: fluorescence
 execute_raw_segmentation_fluorescence:
   name: Execute Raw Segmentation
   parameters:
-    tubular_scales:
-      label: Tubular Scales (comma-sep floats)
-      type: list
+    scale_profiles:
+      label: Tubularity Profiles
+      type: scale_table
       value:
-      - 1.0
-      - 1.5
-      - 3.0
-      element_type: float
+        - {scale: 1.0, low: 95.0, high: 99.0}
+        - {scale: 1.5, low: 98.0, high: 100.0}
+        - {scale: 3.0, low: 98.0, high: 100.0}
     min_size:
       label: Minimum Size (Voxels, Raw Seg)
       type: int
@@ -25,20 +24,6 @@ execute_raw_segmentation_fluorescence:
       value: 0.2
       min: 0.0
       max: 10.0
-      step: 0.1
-    low_threshold_percentile:
-      label: Low Threshold Percentile (Raw Seg)
-      type: float
-      value: 95.0
-      min: 0.0
-      max: 100.0
-      step: 0.1
-    high_threshold_percentile:
-      label: High Threshold Percentile (Raw Seg)
-      type: float
-      value: 100.0
-      min: 0.0
-      max: 100.0
       step: 0.1
     connect_max_gap_physical:
       label: Max Connect Gap (um)

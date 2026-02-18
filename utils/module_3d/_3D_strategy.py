@@ -158,14 +158,31 @@ class FluorescenceStrategy(ProcessingStrategy):
         temp_raw_labels_dir = None
 
         try:
-            # Parse parameters
-            tubular_scales = params.get("tubular_scales", [0.8, 1.0, 1.5, 2.0])
+            # --- 1. PARAMETER PARSING ---
+            # Check if we are using the new Table Widget (scale_profiles)
+            if "scale_profiles" in params:
+                profiles = params["scale_profiles"]
+                # Unpack the list of dicts into parallel lists
+                tubular_scales = [p['scale'] for p in profiles]
+                low_thresh_input = [p['low'] for p in profiles]
+                high_thresh_input = [p['high'] for p in profiles]
+            else:
+                # Fallback to legacy behavior (separate lists or scalars)
+                tubular_scales = params.get("tubular_scales", [0.8, 1.0, 1.5, 2.0])
+                
+                def _get_thresh(key, default):
+                    val = params.get(key, default)
+                    return [float(x) for x in val] if isinstance(val, list) else float(val)
+
+                low_thresh_input = _get_thresh("low_threshold_percentile", 25.0)
+                high_thresh_input = _get_thresh("high_threshold_percentile", 95.0)
+
             # Check for special 'skip' signal in scales
             skip_enhancement = (
                 len(tubular_scales) == 1 and tubular_scales[0] == 0.0
             )
 
-            # Call logic
+            # --- 2. CALL LOGIC ---
             result = segment_cells_first_pass_raw(
                 volume=image_stack,
                 spacing=self.spacing,
@@ -175,12 +192,9 @@ class FluorescenceStrategy(ProcessingStrategy):
                     params.get("connect_max_gap_physical", 1.0)
                 ),
                 min_size_voxels=int(params.get("min_size", 2000)),
-                low_threshold_percentile=float(
-                    params.get("low_threshold_percentile", 25.0)
-                ),
-                high_threshold_percentile=float(
-                    params.get("high_threshold_percentile", 95.0)
-                ),
+                # Use the variables prepared above
+                low_threshold_percentile=low_thresh_input,
+                high_threshold_percentile=high_thresh_input,
                 skip_tubular_enhancement=skip_enhancement,
                 subtract_background_radius=int(
                     params.get("subtract_background_radius", 0)

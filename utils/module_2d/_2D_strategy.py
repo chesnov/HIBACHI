@@ -162,21 +162,33 @@ class Fluorescence2DStrategy(ProcessingStrategy):
         temp_raw_labels_dir = None
 
         try:
-            # Parse parameters
-            tubular_scales = params.get("tubular_scales", [0.8, 1.0, 1.5, 2.0])
+            # --- 1. PARAMETER PARSING ---
+            # Check if we are using the new Table Widget (scale_profiles)
+            if "scale_profiles" in params:
+                profiles = params["scale_profiles"]
+                # Unpack the list of dicts into parallel lists
+                tubular_scales = [p['scale'] for p in profiles]
+                low_threshold_percentile = [p['low'] for p in profiles]
+                high_threshold_percentile = [p['high'] for p in profiles]
+            else:
+                # Fallback to legacy behavior
+                tubular_scales = params.get("tubular_scales", [0.8, 1.0, 1.5, 2.0])
+
+                def _get_thresh(key, default):
+                    val = params.get(key, default)
+                    return [float(x) for x in val] if isinstance(val, list) else float(val)
+
+                low_threshold_percentile = _get_thresh("low_threshold_percentile", 98.0)
+                high_threshold_percentile = _get_thresh("high_threshold_percentile", 100.0)
+
+            # Standard params
             min_size_pixels = int(params.get("min_size", 100))
             smooth_sigma = float(params.get("smooth_sigma", 1.0))
-            low_threshold_percentile = float(
-                params.get("low_threshold_percentile", 98.0)
-            )
-            high_threshold_percentile = float(
-                params.get("high_threshold_percentile", 100.0)
-            )
             connect_max_gap_physical = float(
                 params.get("connect_max_gap_physical", 1.0)
             )
 
-            # Call logic
+            # --- 2. CALL LOGIC ---
             result = segment_cells_first_pass_raw_2d(
                 image=image_stack,
                 spacing=self.spacing,

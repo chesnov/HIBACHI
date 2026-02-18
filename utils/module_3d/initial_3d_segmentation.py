@@ -249,8 +249,8 @@ def segment_cells_first_pass_raw(
     smooth_sigma: float = 0.5,
     connect_max_gap_physical: float = 1.0,
     min_size_voxels: int = 50,
-    low_threshold_percentile: float = 25.0,
-    high_threshold_percentile: float = 95.0,
+    low_threshold_percentile: Union[float, List[float]] = 25.0,
+    high_threshold_percentile: Union[float, List[float]] = 95.0,
     skip_tubular_enhancement: bool = False,
     subtract_background_radius: int = 0,
     temp_root_path: Optional[str] = None,
@@ -258,6 +258,21 @@ def segment_cells_first_pass_raw(
 ) -> Tuple[Optional[str], Optional[str], float, Dict[str, Any]]:
     """Step 1: Raw Segmentation (Independent Smoothing + Threshold-then-OR)."""
     print(f"\n--- Step 1: Raw Segmentation (Strict Independence Mode) ---")
+    n_scales = len(tubular_scales)
+    
+    if isinstance(low_threshold_percentile, (int, float)):
+        low_thresh_list = [float(low_threshold_percentile)] * n_scales
+    else:
+        low_thresh_list = [float(x) for x in low_threshold_percentile]
+
+    if isinstance(high_threshold_percentile, (int, float)):
+        high_thresh_list = [float(high_threshold_percentile)] * n_scales
+    else:
+        high_thresh_list = [float(x) for x in high_threshold_percentile]
+
+    if len(low_thresh_list) != n_scales or len(high_thresh_list) != n_scales:
+        raise ValueError("low/high_threshold_percentile lists must match length of tubular_scales.")
+
     temp_dirs_to_clean, threshold_history = [], {}
     final_labels_memmap = None
 
@@ -267,10 +282,14 @@ def segment_cells_first_pass_raw(
             norm_dir = _get_safe_temp_dir(temp_root_path, 'normalize'); temp_dirs_to_clean.append(norm_dir)
             norm_path = os.path.join(norm_dir, 'norm.dat')
             norm_mm = np.memmap(norm_path, dtype=np.float32, mode='w+', shape=volume.shape)
-            
+            global_high_p = max(high_thresh_list)
+
             z_stats = {}
+            # Dynamic stride: 16 for large XY, denser for small XY
+            stride_xy = max(1, min(16, min(volume.shape[1:]) // 128))
+            
             for read_sl, _ in tqdm(list(_get_chunk_slices(volume.shape, (64, 512, 512))), desc="    Sampling"):
-                sub = volume[read_sl][:, ::16, ::16]
+                sub = volume[read_sl][:, ::stride_xy, ::stride_xy]
                 for i in range(sub.shape[0]):
                     vals = sub[i].ravel(); vals = vals[vals > 0]
                     if vals.size > 0:
@@ -280,7 +299,7 @@ def segment_cells_first_pass_raw(
             
             ideal = np.ones(volume.shape[0])
             z_indices = np.arange(volume.shape[0])
-            hp = np.array([np.percentile(z_stats[z], high_threshold_percentile) if z in z_stats else np.nan for z in z_indices])
+            hp = np.array([np.percentile(z_stats[z], global_high_p) if z in z_stats else np.nan for z in z_indices])
             if np.any(~np.isnan(hp)):
                 valid = ~np.isnan(hp); p = np.poly1d(np.polyfit(z_indices[valid], hp[valid], 2))
                 ideal = np.maximum(p(z_indices), np.nanpercentile(hp, 10))
@@ -317,14 +336,16 @@ def segment_cells_first_pass_raw(
         rv = [math.ceil((connect_max_gap_physical/2)/s) if s>1e-9 else 0 for s in spacing]
         struct = np.ones(tuple(max(1, 2*r+1) for r in rv), dtype=bool)
 
-        for scale in tubular_scales:
-            with SimpleTimer(f"Scale sigma={scale}"):
+        for i, scale in enumerate(tubular_scales):
+            current_low_p = low_thresh_list[i]
+            
+            with SimpleTimer(f"Scale sigma={scale} (p{current_low_p})"):
                 if scale == 0:
-                    # Pass-through: uses the same smoothed intensity data
+                    # Pass-through
                     enh_mm = smoothed_mm
                     enh_dir = None
                 else:
-                    # Vesselness: enhancement run on the same smoothed intensity data
+                    # Vesselness
                     enh_mm, _, enh_dir = enhance_tubular_structures_blocked(
                         smoothed_mm, scales=[scale], spacing=spacing,
                         skip_tubular_enhancement=skip_tubular_enhancement,
@@ -332,10 +353,16 @@ def segment_cells_first_pass_raw(
                     )
                 
                 # Independent Thresholding Pass
-                samples = enh_mm[::4, ::16, ::16].ravel(); samples = samples[samples > 1e-7]
-                thresh = float(np.percentile(samples, low_threshold_percentile)) if samples.size > 1000 else 1e9
+                # Dynamic strides based on dimensions
+                stride_z = max(1, min(4, volume.shape[0] // 32))
+                stride_xy = max(1, min(16, min(volume.shape[1:]) // 128))
+                
+                samples = enh_mm[::stride_z, ::stride_xy, ::stride_xy].ravel(); samples = samples[samples > 1e-7]
+                
+                # Use current_low_p instead of global low_threshold_percentile
+                thresh = float(np.percentile(samples, current_low_p)) if samples.size > 1000 else 1e9
                 thresh = max(thresh, 1e-5); threshold_history[scale] = thresh
-                print(f"      [Scale {scale}] Isolated Threshold: {thresh:.6f}")
+                print(f"      [Scale {scale}] Isolated Threshold (p{current_low_p}): {thresh:.6f}")
 
                 # Binary Creation, Closing, and OR-ing
                 if thresh < 1e6:

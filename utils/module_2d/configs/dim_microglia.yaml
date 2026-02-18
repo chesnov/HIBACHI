@@ -1,6 +1,4 @@
 mode: fluorescence_2d
-
-# --- Step 1: Raw Segmentation ---
 execute_raw_segmentation_fluorescence_2d:
   name: Execute Raw Segmentation (2D)
   parameters:
@@ -8,7 +6,12 @@ execute_raw_segmentation_fluorescence_2d:
       label: Tubularity Profiles
       type: scale_table
       value:
-        - {scale: 1.0, low: 94.0, high: 100.0}
+      - scale: 0.0
+        low: 99.6
+        high: 100.0
+      - scale: 1.0
+        low: 96.0
+        high: 100.0
     min_size:
       label: Minimum Size (Pixels, Raw Seg)
       type: int
@@ -19,9 +22,9 @@ execute_raw_segmentation_fluorescence_2d:
     smooth_sigma:
       label: Smooth Sigma (Initial)
       type: float
-      value: 0.30
-      min: 0.00
-      max: 10.00
+      value: 0.1
+      min: 0.0
+      max: 10.0
       step: 0.01
     connect_max_gap_physical:
       label: Max Connect Gap (um)
@@ -30,8 +33,6 @@ execute_raw_segmentation_fluorescence_2d:
       min: 0.0
       max: 10.0
       step: 0.1
-
-# --- Step 2: Edge Trimming ---
 execute_trim_edges_fluorescence_2d:
   name: Execute Edge Trimming (2D)
   parameters:
@@ -64,20 +65,18 @@ execute_trim_edges_fluorescence_2d:
       max: 5000
       step: 5
     hull_closing_radius:
-          label: Hull Smoothing Radius
-          type: int
-          value: 10
-          min: 0
-          max: 10000
-          step: 1
+      label: Hull Smoothing Radius
+      type: int
+      value: 10
+      min: 0
+      max: 10000
+      step: 1
     otsu_scale_factor:
       label: Otsu scale factor (hull-finding)
       type: float
       value: 0.8
       min: 0.0
       max: 10.0
-
-# --- Step 3: Soma Extraction (Finding Seeds) ---
 execute_soma_extraction_fluorescence_2d:
   name: Execute Soma Extraction (2D)
   parameters:
@@ -161,14 +160,14 @@ execute_soma_extraction_fluorescence_2d:
     ref_vol_percentile_lower:
       label: Ref Area Percentile (Lower)
       type: int
-      value: 60
+      value: 1
       min: 0
       max: 100
       step: 1
     ref_vol_percentile_upper:
       label: Ref Area Percentile (Upper)
       type: int
-      value: 100
+      value: 20
       min: 0
       max: 100
       step: 1
@@ -200,9 +199,6 @@ execute_soma_extraction_fluorescence_2d:
       min: 1.0
       max: 20.0
       step: 0.5
-    
-
-# --- Step 4: Cell Separation (Splitting Blobs) ---
 execute_cell_separation_fluorescence_2d:
   name: Execute Cell Separation (2D)
   parameters:
@@ -248,8 +244,6 @@ execute_cell_separation_fluorescence_2d:
       min: 0.0
       max: 10.0
       step: 0.1
-
-# --- Step 5: Feature Calculation ---
 execute_calculate_features_fluorescence_2d:
   name: Execute Feature Calculation (2D)
   parameters:
@@ -268,10 +262,8 @@ execute_calculate_features_fluorescence_2d:
       label: Calculate Skeletons
       type: bool
       value: true
-
-# --- Global Settings ---
 pixel_dimensions:
-  x: 606.09
-  y: 606.09
+  x: 848.5301811026361
+  y: 848.5301811026361
 saved_state:
-  segmentation_threshold: 0.015
+  segmentation_threshold: 0.09279785305261612

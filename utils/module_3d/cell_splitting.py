@@ -444,6 +444,84 @@ def fill_internal_voids(segmentation_mask: np.ndarray) -> np.ndarray:
     return segmentation_mask
 
 
+def _reassign_disconnected_islands(
+    segmentation: np.ndarray, 
+    soma_mask: np.ndarray
+) -> np.ndarray:
+    """
+    Post-processing: Detects labels that have split into disconnected fragments
+    due to chunking boundaries. 
+    - Keeps the fragment containing the true soma seed.
+    - Reassigns 'orphan' fragments to their largest touching neighbor.
+    """
+    flush_print("  [Refine] Checking for disconnected satellite fragments...")
+    
+    # Get bounding boxes for all objects
+    objs = ndimage.find_objects(segmentation)
+    
+    # 6-connectivity (faces) for defining "connected"
+    struct = ndimage.generate_binary_structure(3, 1)
+    
+    # Dilation struct for finding neighbors
+    dilate_struct = ndimage.generate_binary_structure(3, 1)
+
+    for idx, sl in enumerate(tqdm(objs, desc="Reassigning Islands")):
+        if sl is None: continue
+        label_id = idx + 1
+        
+        # Pad slice by 1 pixel to see neighbors
+        sl_pad = tuple(slice(max(0, s.start-1), min(d, s.stop+1)) 
+                       for s, d in zip(sl, segmentation.shape))
+        
+        # Working views (modifying target_view modifies the main array)
+        target_view = segmentation[sl_pad]
+        local_soma = soma_mask[sl_pad]
+        
+        # Mask of the current object within this crop
+        obj_mask = (target_view == label_id)
+        
+        # Label connected components of this single object
+        labeled_frags, num_frags = ndimage.label(obj_mask, structure=struct)
+        
+        # If the object is a single piece, we are good
+        if num_frags <= 1:
+            continue
+            
+        # Analyze fragments
+        for i in range(1, num_frags + 1):
+            frag_mask = (labeled_frags == i)
+            
+            # 1. Does this fragment contain a seed?
+            # We check if any pixel in the fragment overlaps with ANY seed in the soma mask
+            # (Assumes soma mask matches the seeds used for separation)
+            has_seed = np.any(local_soma[frag_mask] > 0)
+            
+            if has_seed:
+                continue # This is the main body, keep it.
+            
+            # 2. It's an orphan/satellite. Find neighbors.
+            # Dilate the fragment slightly to touch surroundings
+            dilated_frag = ndimage.binary_dilation(frag_mask, structure=dilate_struct)
+            
+            # Identify neighbors under the dilated mask (ignoring Self and Background)
+            neighbor_ids = target_view[dilated_frag]
+            neighbor_ids = neighbor_ids[(neighbor_ids != 0) & (neighbor_ids != label_id)]
+            
+            if neighbor_ids.size > 0:
+                # Find the neighbor we touch the most
+                # (bincount is faster than unique for integers)
+                counts = np.bincount(neighbor_ids)
+                best_neighbor = np.argmax(counts)
+                
+                # Reassign this fragment to that neighbor
+                target_view[frag_mask] = best_neighbor
+            else:
+                # Floating debris (touches nothing). Delete.
+                target_view[frag_mask] = 0
+
+    return segmentation
+
+
 # =============================================================================
 # Main Coordinator
 # =============================================================================
@@ -535,8 +613,25 @@ def separate_multi_soma_cells(
             gc.collect()
 
         # 3. Seed-Aware Stitching Logic
-        flush_print("  Stitching with Seed Verification...")
+        flush_print("  Stitching with Transitive Seed Verification...")
         label_map: Dict[int, int] = {}
+        
+        # Global registry of seeds for every label ID
+        # We must aggregate this first to track seeds as they merge
+        global_seed_lookup = {}
+        for idx, data in chunk_data.items():
+            global_seed_lookup.update(data['seed_map'])
+
+        # Dynamic tracker: Maps 'Root Label' -> 'Set of Seeds in this merged group'
+        # We use a helper to resolve current seeds for any label
+        def get_group_seeds(lbl_id):
+            root = label_map.get(lbl_id, lbl_id)
+            # If we haven't tracked this root explicitly yet, fallback to initial lookup
+            if root not in group_seeds_cache:
+                return global_seed_lookup.get(root, set())
+            return group_seeds_cache[root]
+
+        group_seeds_cache = {}
 
         shape_in_chunks = [
             len(range(0, segmentation_mask.shape[0], chunk_shape[0] - overlap)),
@@ -548,7 +643,7 @@ def separate_multi_soma_cells(
             if i not in chunk_data:
                 continue
 
-            # Determine neighbors
+            # Determine neighbors (same as before)
             cz, cy, cx = np.unravel_index(i, shape_in_chunks)
             neighbors = []
             if cz + 1 < shape_in_chunks[0]:
@@ -558,17 +653,14 @@ def separate_multi_soma_cells(
             if cx + 1 < shape_in_chunks[2]:
                 neighbors.append(np.ravel_multi_index((cz, cy, cx + 1), shape_in_chunks))
 
-            data1 = chunk_data[i]
-            res1 = np.load(data1['path'])
-            seeds1_map = data1['seed_map']
+            res1 = np.load(chunk_data[i]['path'])
 
             for j in neighbors:
                 if j not in chunk_data:
                     continue
-                data2 = chunk_data[j]
+                
                 chunk_slice2 = chunk_slices[j]
-                res2 = np.load(data2['path'])
-                seeds2_map = data2['seed_map']
+                res2 = np.load(chunk_data[j]['path'])
 
                 # Calculate overlap slices
                 overlap_slice_global = tuple(
@@ -592,40 +684,50 @@ def separate_multi_soma_cells(
                 if not np.any(mask_overlap):
                     continue
 
-                l1_flat = crop1[mask_overlap]
-                l2_flat = crop2[mask_overlap]
-                stacked = np.vstack((l1_flat, l2_flat))
+                stacked = np.vstack((crop1[mask_overlap], crop2[mask_overlap]))
                 unique_pairs = np.unique(stacked, axis=1).T
 
                 for id1, id2 in unique_pairs:
-                    # --- CRITICAL STITCHING LOGIC ---
-                    # Retrieve the original soma seeds that generated these segments.
-                    s1_set = seeds1_map.get(id1, set())
-                    s2_set = seeds2_map.get(id2, set())
-
-                    # If the sets of original seeds are disjoint, it means these two segments
-                    # came from DIFFERENT nuclei. We should NOT merge them, even if they touch.
-                    if s1_set and s2_set and s1_set.isdisjoint(s2_set):
-                        continue
-
-                    # Otherwise, they share a seed (are the same cell split by chunking), merge them.
                     root1 = label_map.get(id1, id1)
                     root2 = label_map.get(id2, id2)
 
-                    if root1 != root2:
-                        target = min(root1, root2)
-                        source = max(root1, root2)
-                        
-                        # Redirect any existing mapping pointing to source
-                        for k, v in list(label_map.items()):
-                            if v == source:
-                                label_map[k] = target
+                    if root1 == root2:
+                        continue
 
-                        label_map[source] = target
-                        label_map[root1] = target
-                        label_map[root2] = target
-                        label_map[id1] = target
-                        label_map[id2] = target
+                    # We check the seeds of the *Roots*, not the fragments.
+                    # This catches the case where an "Empty" fragment has already 
+                    # been merged into "Cell A", acquiring "Seed A".
+                    s1_set = get_group_seeds(root1)
+                    s2_set = get_group_seeds(root2)
+
+                    # If both groups have known seeds, and they don't overlap -> CONFLICT.
+                    if s1_set and s2_set and s1_set.isdisjoint(s2_set):
+                        continue # Do not merge Cell A and Cell B
+
+                    # Otherwise, merge is safe (or involves an untagged bridge)
+                    target = min(root1, root2)
+                    source = max(root1, root2)
+                    
+                    # Update Map
+                    label_map[source] = target
+                    label_map[root1] = target
+                    label_map[root2] = target
+                    
+                    # Update Cache: Union of seeds
+                    new_seeds = s1_set.union(s2_set)
+                    # If we just merged a phantom fragment into a cell, 
+                    # the phantom fragment effectively 'gains' that cell's seed.
+                    group_seeds_cache[target] = new_seeds
+                    
+                    # Redirect source's cache to target (cleanup)
+                    if source in group_seeds_cache:
+                        del group_seeds_cache[source]
+                    
+                    # Path compression for existing mappings
+                    # (Optional optimization, but good for deep chains)
+                    keys_to_update = [k for k, v in label_map.items() if v == source]
+                    for k in keys_to_update:
+                        label_map[k] = target
 
         # 4. Construct Final Mask
         final_path = os.path.join(memmap_dir, "stitched.mmp")
@@ -661,6 +763,8 @@ def separate_multi_soma_cells(
         del final_mask
         if os.path.exists(final_path):
             os.remove(final_path)
+
+        ret = _reassign_disconnected_islands(ret, soma_mask)
 
         flush_print("  Refining (Filling voids + Relabeling)...")
         ret = fill_internal_voids(ret)

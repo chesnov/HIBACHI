@@ -213,6 +213,54 @@ def _build_adjacency_graph_for_cell_2d(
 
     return nodes, edges
 
+def _reassign_disconnected_islands_2d(
+    segmentation: np.ndarray, 
+    soma_mask: np.ndarray
+) -> np.ndarray:
+    """
+    Post-processing (2D): Detects disconnected satellite fragments.
+    Keeps the fragment with the seed; reassigns orphans to neighbors.
+    """
+    flush_print("  [Refine] Checking for disconnected satellite fragments (2D)...")
+    objs = ndimage.find_objects(segmentation)
+    struct = ndimage.generate_binary_structure(2, 1)
+    dilate_struct = ndimage.generate_binary_structure(2, 1)
+
+    for idx, sl in enumerate(tqdm(objs, desc="Reassigning Islands")):
+        if sl is None: continue
+        label_id = idx + 1
+        
+        sl_pad = tuple(slice(max(0, s.start-1), min(d, s.stop+1)) 
+                       for s, d in zip(sl, segmentation.shape))
+        
+        target_view = segmentation[sl_pad]
+        local_soma = soma_mask[sl_pad]
+        
+        obj_mask = (target_view == label_id)
+        labeled_frags, num_frags = ndimage.label(obj_mask, structure=struct)
+        
+        if num_frags <= 1: continue
+            
+        for i in range(1, num_frags + 1):
+            frag_mask = (labeled_frags == i)
+            # Check for seed strictly inside
+            has_seed = np.any(local_soma[frag_mask] > 0)
+            
+            if has_seed: continue 
+            
+            # Reassign to largest touching neighbor
+            dilated_frag = ndimage.binary_dilation(frag_mask, structure=dilate_struct)
+            neighbor_ids = target_view[dilated_frag]
+            neighbor_ids = neighbor_ids[(neighbor_ids != 0) & (neighbor_ids != label_id)]
+            
+            if neighbor_ids.size > 0:
+                counts = np.bincount(neighbor_ids)
+                target_view[frag_mask] = np.argmax(counts)
+            else:
+                target_view[frag_mask] = 0
+
+    return segmentation
+
 
 # =============================================================================
 # Worker Function
@@ -318,12 +366,21 @@ def _separate_multi_soma_cells_chunk_2d(
             if num_cc > 1:
                 for i in range(1, num_cc + 1):
                     frag_mask = (cc_labels == i)
-                    if not np.any(markers[frag_mask] > 0):
+                    
+                    has_seed = np.any(markers[frag_mask] > 0)
+                    if not has_seed:
+                        frag_dilated = binary_dilation(frag_mask, footprint=disk(2))
+                        touching_seeds = np.unique(local_soma[frag_dilated])
+                        has_seed = np.any(np.isin(touching_seeds, seeds_in_crop))
+
+                    if not has_seed:
                         dilated = binary_dilation(frag_mask, footprint=dilation_struct)
                         neighbors = final_local_mask[dilated & (final_local_mask != 0) & (final_local_mask != uid)]
                         if neighbors.size > 0:
                             n_ids, n_counts = np.unique(neighbors, return_counts=True)
                             final_local_mask[frag_mask] = n_ids[np.argmax(n_counts)]
+                        elif min_size_thresh > 0 and np.sum(frag_mask) < min_size_thresh:
+                            final_local_mask[frag_mask] = 0
 
         final_local_mask_clean, _, _ = relabel_sequential(final_local_mask)
         chunk_view = chunk_result[bbox_padded]
@@ -390,7 +447,21 @@ def separate_multi_soma_cells_2d(
             gc.collect()
 
         # 3. Seed-Aware Stitching
+        flush_print("  Stitching with Transitive Seed Verification...")
         label_map: Dict[int, int] = {}
+        
+        # Build global lookup
+        global_seed_lookup = {}
+        for idx, data in chunk_data.items():
+            global_seed_lookup.update(data['seed_map'])
+            
+        group_seeds_cache = {}
+        def get_group_seeds(lbl_id):
+            root = label_map.get(lbl_id, lbl_id)
+            if root not in group_seeds_cache:
+                return global_seed_lookup.get(root, set())
+            return group_seeds_cache[root]
+
         grid_w = len(range(0, segmentation_mask.shape[1], chunk_shape[1] - overlap))
 
         for i, sl1 in enumerate(tqdm(chunk_slices, desc="Stitching Analysis")):
@@ -411,30 +482,49 @@ def separate_multi_soma_cells_2d(
                 valid = (c1 > 0) & (c2 > 0)
                 if not np.any(valid): continue
                 pairs = np.unique(np.vstack((c1[valid], c2[valid])), axis=1).T
+                
                 for id1, id2 in pairs:
-                    s1, s2 = chunk_data[i]['seed_map'].get(id1, set()), chunk_data[j]['seed_map'].get(id2, set())
-                    if s1 and s2 and s1.isdisjoint(s2): continue
                     root1, root2 = label_map.get(id1, id1), label_map.get(id2, id2)
-                    if root1 != root2:
-                        target, source = min(root1, root2), max(root1, root2)
-                        for k, v in list(label_map.items()):
-                            if v == source: label_map[k] = target
-                        label_map[source] = target
-                        label_map[id1] = label_map[id2] = target
+                    if root1 == root2: continue
+
+                    # Transitive Check
+                    s1_set = get_group_seeds(root1)
+                    s2_set = get_group_seeds(root2)
+                    if s1_set and s2_set and s1_set.isdisjoint(s2_set): continue
+
+                    # Merge
+                    target, source = min(root1, root2), max(root1, root2)
+                    for k, v in list(label_map.items()):
+                        if v == source: label_map[k] = target
+                    label_map[source] = target
+                    label_map[id1] = label_map[id2] = target
+                    
+                    # Update seeds
+                    new_seeds = s1_set.union(s2_set)
+                    group_seeds_cache[target] = new_seeds
+                    if source in group_seeds_cache: del group_seeds_cache[source]
 
         # 4. Final Construction
         final_mask = np.zeros_like(segmentation_mask, dtype=np.int32)
         for i, sl in enumerate(tqdm(chunk_slices, desc="Writing Result")):
             res = np.load(chunk_data[i]['path'])
-            for u in np.unique(res[res > 0]):
-                if u in label_map: res[res == u] = label_map[u]
+            uniques = np.unique(res)
+            for u in uniques:
+                if u > 0 and u in label_map:
+                    target = label_map[u]
+                    if target != u: res[res == u] = target
             mask_nz = res > 0
             final_mask[sl][mask_nz] = res[mask_nz]
             os.remove(chunk_data[i]['path'])
 
         # 5. Finalize
+        # Fix satellite islands (chunk boundary artifacts)
+        final_mask = _reassign_disconnected_islands_2d(final_mask, soma_mask)
+        
+        # Standard cleanup
         final_mask = ndimage.binary_fill_holes(final_mask > 0).astype(np.int32) * final_mask
         final_mask, _, _ = relabel_sequential(final_mask)
+        
         return final_mask
     finally:
         # Emergency cleanup: remove any remaining .npy files in case of crash
