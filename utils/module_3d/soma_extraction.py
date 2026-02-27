@@ -117,19 +117,12 @@ def extract_soma_masks(
     segmentation_mask: np.ndarray,
     intensity_image: np.ndarray,
     spacing: Optional[Tuple[float, float, float]],
-    smallest_quantile: int = 25,
     min_fragment_size: int = 30,
-    core_volume_target_factor_lower: float = 0.1,
-    core_volume_target_factor_upper: float = 10.0,
     erosion_iterations: int = 0,
     ratios_to_process: List[float] = [0.3, 0.4, 0.5, 0.6],
     intensity_percentiles_to_process: List[int] = [100, 90, 80, 70, 60, 50, 40, 30],
     min_physical_peak_separation: float = 7.0,
-    seeding_min_distance_um: Optional[float] = 0.0,
     max_allowed_core_aspect_ratio: float = 10.0,
-    ref_vol_percentile_lower: int = 30,
-    ref_vol_percentile_upper: int = 70,
-    ref_thickness_percentile_lower: int = 1,
     absolute_min_thickness_um: float = 1.5,
     absolute_max_thickness_um: float = 10.0,
     memmap_dir: Optional[str] = "ramiseg_temp_memmap",
@@ -180,11 +173,8 @@ def extract_soma_masks(
     spacing = tuple(float(s) for s in spacing)
     min_seed_vol = max(1, min_fragment_size)
 
-    # Internal seeding distance used to split clumped somas
-    if seeding_min_distance_um != 0.0:
-        int_peak_sep = get_min_distance_pixels_3d(spacing, seeding_min_distance_um)
-    else:
-        int_peak_sep = get_min_distance_pixels_3d(spacing, min_physical_peak_separation)
+    # Consolidated peak separation used for both global deduplication and internal splitting
+    int_peak_sep = get_min_distance_pixels_3d(spacing, min_physical_peak_separation)
 
     # Find labels via slices (efficient bounding boxes)
     slices = ndimage.find_objects(segmentation_mask)
@@ -192,54 +182,19 @@ def extract_soma_masks(
     if not valid_labels:
         return np.zeros_like(segmentation_mask, dtype=np.int32)
 
-    # 2. Population Analysis
-    print(f"Analyzing {len(valid_labels)} labels for population statistics...")
-    volumes = []
-    # Use a sample for speed if there are many labels
-    sample_indices = valid_labels if len(valid_labels) < 400 else valid_labels[::5]
-    for lbl in sample_indices:
-        sl = slices[lbl - 1]
-        volumes.append(np.sum(segmentation_mask[sl] == lbl))
+    # 2. Absolute Mode Initialization & Profiling
+    print(f"  Absolute Mode Enforced: Processing {len(valid_labels)} labels...")
+    print(f"  Thresh: Min Volume = {min_seed_vol} voxels")
+    print(f"  Thresh: Thickness = [{absolute_min_thickness_um:.2f} - {absolute_max_thickness_um:.2f}] µm")
+    print(f"  Thresh: Peak Separation = {min_physical_peak_separation:.2f} µm")
 
-    volumes = np.array(volumes)
-    vol_p_low = np.percentile(volumes, ref_vol_percentile_lower)
-    vol_p_high = np.percentile(volumes, ref_vol_percentile_upper)
-
-    # Identify "target" volume of a typical soma
-    target_median_vol = np.median(
-        volumes[volumes <= np.percentile(volumes, smallest_quantile)]
-    )
-    min_accepted_core_vol = max(
-        min_seed_vol, target_median_vol * core_volume_target_factor_lower
-    )
-    max_accepted_core_vol = target_median_vol * core_volume_target_factor_upper
-
-    # Calculate thickness from a subset of the population
-    max_thicknesses_um = []
-    ref_labels = [
-        lbl
-        for i, lbl in enumerate(sample_indices)
-        if vol_p_low < volumes[i] <= vol_p_high
-    ]
-    if len(ref_labels) < 5:
-        ref_labels = valid_labels[:30]
-
-    for lbl in ref_labels[:30]:
-        sl = slices[lbl - 1]
-        m = segmentation_mask[sl] == lbl
-        dt = ndimage.distance_transform_edt(m, sampling=spacing)
-        max_thicknesses_um.append(np.max(dt))
-
-    if max_thicknesses_um:
-        calc_min_thick = np.percentile(max_thicknesses_um, ref_thickness_percentile_lower)
-        min_accepted_thick = max(absolute_min_thickness_um, calc_min_thick)
-    else:
-        min_accepted_thick = absolute_min_thickness_um
-
-    min_accepted_thick = min(min_accepted_thick, absolute_max_thickness_um - 0.1)
-
-    print(f"  Thresh: Volume [{min_accepted_core_vol:.1f}-{max_accepted_core_vol:.1f}]")
-    print(f"  Thresh: Thick [{min_accepted_thick:.2f}-{absolute_max_thickness_um:.2f}]")
+    diag_stats = {
+        "cores_evaluated": 0,
+        "cores_too_small": 0,
+        "thickness_rejected": 0,
+        "aspect_ratio_rejected": 0,
+        "spatial_overlap_rejected": 0
+    }
 
     # 3. Output Initialization
     # restored Orchestrator compatibility: explicitly checking memmap_dir and filename
@@ -336,7 +291,9 @@ def extract_soma_masks(
                 # Island detection via connected components
                 labeled_core, n = ndimage.label(core)
                 for region in regionprops(labeled_core):
+                    diag_stats["cores_evaluated"] += 1
                     if region.area < min_seed_vol:
+                        diag_stats["cores_too_small"] += 1
                         continue
 
                     # Local Watershed Splitting for clumped peaks
@@ -352,9 +309,10 @@ def extract_soma_masks(
                         tile_coords = local_coords + sub_off
                         g_coords = tile_coords + offset
 
-                        # Thickness check (Max inscribed radius)
+                        # Absolute Thickness check (Max inscribed radius)
                         max_thick = np.max(dt_ref[tuple(tile_coords.T)])
-                        if not (min_accepted_thick <= max_thick <= absolute_max_thickness_um):
+                        if not (absolute_min_thickness_um <= max_thick <= absolute_max_thickness_um):
+                            diag_stats["thickness_rejected"] += 1
                             return
 
                         # 3D PCA elongation check
@@ -368,6 +326,7 @@ def extract_soma_masks(
                                     and (math.sqrt(ev[0]) / math.sqrt(ev[2]))
                                     > max_allowed_core_aspect_ratio
                                 ):
+                                    diag_stats["aspect_ratio_rejected"] += 1
                                     return
                             except Exception:
                                 pass
@@ -415,28 +374,24 @@ def extract_soma_masks(
                 coords = cand["coords"]
                 cent_phys = np.mean(coords, axis=0) * np.array(spacing)
 
-                # KDTree Proximity Check (O(log N))
-                if spatial_index is not None:
-                    dist, _ = spatial_index.query(cent_phys, k=1)
-                    if dist < min_physical_peak_separation:
+                # Robust Physical Proximity Check
+                if all_placed_centroids:
+                    # Calculate distance to all previously placed centroids
+                    dists = np.linalg.norm(np.array(all_placed_centroids) - cent_phys, axis=1)
+                    if np.min(dists) < min_physical_peak_separation:
+                        diag_stats["spatial_overlap_rejected"] += 1
                         continue
 
                 # Pixel Overlap Check
                 idx_tuple = tuple(coords.T)
                 if np.any(final_seed_mask[idx_tuple] > 0):
+                    diag_stats["spatial_overlap_rejected"] += 1
                     continue
 
                 # Place Seed
                 final_seed_mask[idx_tuple] = next_label_id
                 next_label_id += 1
                 all_placed_centroids.append(cent_phys)
-
-                # Periodically rebuild spatial index for efficiency
-                if len(all_placed_centroids) % 500 == 0:
-                    spatial_index = KDTree(all_placed_centroids)
-
-            if all_placed_centroids:
-                spatial_index = KDTree(all_placed_centroids)
 
         # Main Progress Update
         main_pbar.set_postfix(
@@ -451,8 +406,15 @@ def extract_soma_masks(
     t_total = time.time() - t_start_global
     print("\n" + "=" * 60)
     print("3D EXTRACTION COMPLETE")
-    print(f"  Total Somas: {next_label_id - 1}")
+    print(f"  Total Somas Placed: {next_label_id - 1}")
     print(f"  Execution Time: {t_total/60:.2f} mins")
+    print("-" * 60)
+    print("  DIAGNOSTICS (Absolute Mode Tracking):")
+    print(f"    Total Core Fragments Evaluated: {diag_stats['cores_evaluated']}")
+    print(f"    Rejected -> Too Small:          {diag_stats['cores_too_small']}")
+    print(f"    Rejected -> Thickness Bound:    {diag_stats['thickness_rejected']}")
+    print(f"    Rejected -> Aspect Ratio:       {diag_stats['aspect_ratio_rejected']}")
+    print(f"    Rejected -> Spatial Overlap:    {diag_stats['spatial_overlap_rejected']}")
     print("=" * 60 + "\n")
 
     # Final cleanup and persistence

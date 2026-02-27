@@ -116,13 +116,6 @@ execute_soma_extraction_fluorescence_2d:
       - 5
       - 1
       element_type: int
-    smallest_quantile:
-      label: Smallest Quantile (Soma extraction)
-      type: float
-      value: 0.05
-      min: 0.0
-      max: 1.0
-      step: 0.01
     min_fragment_size:
       label: Min Fragment Size (Pixels)
       type: int
@@ -130,20 +123,6 @@ execute_soma_extraction_fluorescence_2d:
       min: 1
       max: 1000000
       step: 1
-    core_volume_target_factor_lower:
-      label: Soma Area Factor (Lower)
-      type: float
-      value: 1
-      min: 0.01
-      max: 1.0
-      step: 0.01
-    core_volume_target_factor_upper:
-      label: Soma Area Factor (Upper)
-      type: float
-      value: 10.0
-      min: 1.0
-      max: 50.0
-      step: 0.1
     erosion_iterations:
       label: Soma Erosion Iterations
       type: int
@@ -158,27 +137,6 @@ execute_soma_extraction_fluorescence_2d:
       min: 1.0
       max: 100000
       step: 0.1
-    ref_vol_percentile_lower:
-      label: Ref Area Percentile (Lower)
-      type: int
-      value: 60
-      min: 0
-      max: 100
-      step: 1
-    ref_vol_percentile_upper:
-      label: Ref Area Percentile (Upper)
-      type: int
-      value: 100
-      min: 0
-      max: 100
-      step: 1
-    ref_thickness_percentile_lower:
-      label: Ref Thickness Percentile (Lower)
-      type: int
-      value: 5
-      min: 0
-      max: 100
-      step: 1
     absolute_min_thickness_um:
       label: Soma Min Thickness (um)
       type: float

@@ -344,21 +344,14 @@ class Fluorescence2DStrategy(ProcessingStrategy):
                 segmentation_mask=trimmed_labels_memmap,
                 intensity_image=original_image,
                 spacing=spacing_yx,
-                smallest_quantile=float(params.get("smallest_quantile", 0.05)),
                 min_fragment_size=int(params.get("min_fragment_size", 20)),
-                core_volume_target_factor_lower=float(params.get("core_volume_target_factor_lower", 0.1)),
-                core_volume_target_factor_upper=float(params.get("core_volume_target_factor_upper", 10.0)),
                 erosion_iterations=int(params.get("erosion_iterations", 0)),
                 ratios_to_process=params.get("ratios_to_process", [0.3, 0.4, 0.5, 0.6]),
                 intensity_percentiles_to_process=params.get("intensity_percentiles_to_process", [100, 95, 90, 85, 80]),
-                min_physical_peak_separation=float(params.get("min_physical_peak_separation", 3.0)),
-                seeding_min_distance_um=float(params.get("seeding_min_distance_um", 0)),
+                min_physical_peak_separation=float(params.get("min_physical_peak_separation", 6.0)),
                 max_allowed_core_aspect_ratio=float(params.get("max_allowed_core_aspect_ratio", 5.0)),
-                ref_vol_percentile_lower=int(params.get("ref_vol_percentile_lower", 30)),
-                ref_vol_percentile_upper=int(params.get("ref_vol_percentile_upper", 70)),
-                ref_thickness_percentile_lower=int(params.get("ref_thickness_percentile_lower", 1)),
                 absolute_min_thickness_um=float(params.get("absolute_min_thickness_um", 0.5)),
-                absolute_max_thickness_um=float(params.get("absolute_max_thickness_um", 5.0))
+                absolute_max_thickness_um=float(params.get("absolute_max_thickness_um", 15.0))
             )
 
             # Persist

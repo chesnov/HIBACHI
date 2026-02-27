@@ -122,12 +122,6 @@ execute_soma_extraction_fluorescence:
       - 5.0
       - 1.0
       element_type: int
-    smallest_quantile:
-      type: float
-      value: 0.001
-      min: 0.0
-      max: 1.0
-      step: 1.0e-05
     min_fragment_size:
       label: Min Seed Size (Voxels)
       type: int
@@ -135,20 +129,6 @@ execute_soma_extraction_fluorescence:
       min: 1
       max: 1000000
       step: 1
-    core_volume_target_factor_lower:
-      label: Soma Vol Factor (Lower)
-      type: float
-      value: 0.0001
-      min: 1.0e-05
-      max: 1.0
-      step: 1.0e-05
-    core_volume_target_factor_upper:
-      label: Soma Vol Factor (Upper)
-      type: float
-      value: 2.0
-      min: 1.0e-06
-      max: 1000.0
-      step: 1.0e-05
     erosion_iterations:
       label: Soma Erosion Iterations
       type: int
@@ -160,31 +140,6 @@ execute_soma_extraction_fluorescence:
       label: Min Peak Separation (um)
       type: float
       value: 6.0
-      min: 1.0e-05
-      max: 20.0
-      step: 1.0e-05
-    ref_vol_percentile_lower:
-      type: int
-      value: 1
-      min: 0
-      max: 100
-      step: 1
-    ref_vol_percentile_upper:
-      type: int
-      value: 20
-      min: 0
-      max: 100
-      step: 1
-    ref_thickness_percentile_lower:
-      type: int
-      value: 1
-      min: 0
-      max: 100
-      step: 1
-    seeding_min_distance_um:
-      label: Internal Seeding Resolution (um)
-      type: float
-      value: 1.0
       min: 1.0e-05
       max: 20.0
       step: 1.0e-05

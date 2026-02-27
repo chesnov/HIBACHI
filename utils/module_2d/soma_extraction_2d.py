@@ -45,19 +45,12 @@ def extract_soma_masks_2d(
     segmentation_mask: np.ndarray,
     intensity_image: np.ndarray,
     spacing: Tuple[float, float],
-    smallest_quantile: float = 0.25,
     min_fragment_size: int = 15,
-    core_volume_target_factor_lower: float = 0.1,
-    core_volume_target_factor_upper: float = 10.0,
     erosion_iterations: int = 0,
     ratios_to_process: List[float] = [0.3, 0.4, 0.5, 0.6],
     intensity_percentiles_to_process: List[int] = [100, 90, 80, 70, 60, 50, 40, 30, 20, 10],
     min_physical_peak_separation: float = 5.0,
-    seeding_min_distance_um: Optional[float] = 0.0,
     max_allowed_core_aspect_ratio: float = 10.0,
-    ref_vol_percentile_lower: int = 30,
-    ref_vol_percentile_upper: int = 70,
-    ref_thickness_percentile_lower: int = 1,
     absolute_min_thickness_um: float = 1.0,
     absolute_max_thickness_um: float = 7.0,
     tile_size_threshold: int = 2048,
@@ -69,7 +62,7 @@ def extract_soma_masks_2d(
     """
     t_start_global = time.time()
     print("\n" + "="*60)
-    print("SOMA EXTRACTION: STARTING")
+    print("2D SOMA EXTRACTION: STARTING")
     print("="*60)
     
     # 1. Parameter Validation & Setup
@@ -79,11 +72,9 @@ def extract_soma_masks_2d(
         spacing = tuple(float(s) for s in spacing)
 
     min_seed_fragment_area = max(1, min_fragment_size)
-    # Internal seeding distance used to split clumped somas
-    if seeding_min_distance_um != 0.0:
-        min_peak_sep_pixels = get_min_distance_pixels_2d(spacing, seeding_min_distance_um)
-    else:
-        min_peak_sep_pixels = get_min_distance_pixels_2d(spacing, min_physical_peak_separation)
+    
+    # Consolidated peak separation used for both global deduplication and internal splitting
+    min_peak_sep_pixels = get_min_distance_pixels_2d(spacing, min_physical_peak_separation)
 
     # Identify objects (find_objects is much more RAM efficient than regionprops)
     slices = ndimage.find_objects(segmentation_mask)
@@ -91,44 +82,19 @@ def extract_soma_masks_2d(
     if not valid_labels: 
         return np.zeros_like(segmentation_mask, dtype=np.int32)
 
-    # 2. Population Analysis
-    print(f"Analyzing {len(valid_labels)} objects for population statistics...")
-    areas = []
-    # Sample objects for area statistics
-    sample_indices = valid_labels if len(valid_labels) < 500 else valid_labels[::5]
-    for lbl in sample_indices:
-        sl = slices[lbl-1]
-        areas.append(np.sum(segmentation_mask[sl] == lbl))
-    
-    areas = np.array(areas)
-    vol_p_low = np.percentile(areas, ref_vol_percentile_lower)
-    vol_p_high = np.percentile(areas, ref_vol_percentile_upper)
-    
-    target_median_area = np.median(areas[areas <= np.percentile(areas, smallest_quantile*100)])
-    min_accepted_core_area = max(min_seed_fragment_area, target_median_area * core_volume_target_factor_lower)
-    max_accepted_core_area = target_median_area * core_volume_target_factor_upper
+    # 2. Absolute Mode Initialization & Profiling
+    print(f"  Absolute Mode Enforced: Processing {len(valid_labels)} labels...")
+    print(f"  Thresh: Min Area = {min_seed_fragment_area} pixels")
+    print(f"  Thresh: Thickness = [{absolute_min_thickness_um:.2f} - {absolute_max_thickness_um:.2f}] µm")
+    print(f"  Thresh: Peak Separation = {min_physical_peak_separation:.2f} µm")
 
-    # Thickness Analysis on reference population
-    max_thicknesses_um = []
-    ref_labels = [lbl for i, lbl in enumerate(sample_indices) if vol_p_low < areas[i] <= vol_p_high]
-    if len(ref_labels) < 5: ref_labels = valid_labels[:50]
-    
-    for lbl in ref_labels[:50]:
-        sl = slices[lbl-1]
-        m = (segmentation_mask[sl] == lbl)
-        dt = ndimage.distance_transform_edt(m, sampling=spacing)
-        max_thicknesses_um.append(np.max(dt))
-    
-    if max_thicknesses_um:
-        calc_min = np.percentile(max_thicknesses_um, ref_thickness_percentile_lower)
-        min_accepted_thick = max(absolute_min_thickness_um, calc_min)
-    else:
-        min_accepted_thick = absolute_min_thickness_um
-    
-    min_accepted_thick = min(min_accepted_thick, absolute_max_thickness_um - 0.1)
-    
-    print(f"  Thresh: Area [{min_accepted_core_area:.1f}-{max_accepted_core_area:.1f}]")
-    print(f"  Thresh: Thick [{min_accepted_thick:.2f}-{absolute_max_thickness_um:.2f}]")
+    diag_stats = {
+        "cores_evaluated": 0,
+        "cores_too_small": 0,
+        "thickness_rejected": 0,
+        "aspect_ratio_rejected": 0,
+        "spatial_overlap_rejected": 0
+    }
 
     # 3. Output Mask Initialization
     if memmap_output_path:
@@ -213,7 +179,10 @@ def extract_soma_masks_2d(
                 # Fragment Extraction using vectorized regionprops
                 labeled_core, num_cores = ndimage.label(core_mask)
                 for region in regionprops(labeled_core):
-                    if region.area < min_seed_fragment_area: continue
+                    diag_stats["cores_evaluated"] += 1
+                    if region.area < min_seed_fragment_area:
+                        diag_stats["cores_too_small"] += 1
+                        continue
                     
                     # Local Watershed Splitting for fused somas
                     frag_crop = region.image
@@ -225,23 +194,27 @@ def extract_soma_masks_2d(
                         tile_local_coords = local_coords + sub_off
                         g_coords = tile_local_coords + offset
                         
-                        # Use parent DT for thickness validation
+                        # Absolute Thickness check (Max inscribed radius)
                         max_thick = np.max(dt_ref[tuple(tile_local_coords.T)])
-                        if not (min_accepted_thick <= max_thick <= absolute_max_thickness_um): 
+                        if not (absolute_min_thickness_um <= max_thick <= absolute_max_thickness_um):
+                            diag_stats["thickness_rejected"] += 1
                             return
 
                         # Aspect Ratio Check (PCA)
                         if m.sum() > 5:
-                            pca = PCA(n_components=2).fit(local_coords * np.array(spacing))
-                            ev = np.sort(np.abs(pca.explained_variance_))[::-1]
-                            if ev[1] > 1e-12 and (math.sqrt(ev[0]) / math.sqrt(ev[1])) > max_allowed_core_aspect_ratio: 
-                                return
+                            try:
+                                pca = PCA(n_components=2).fit(local_coords * np.array(spacing))
+                                ev = np.sort(np.abs(pca.explained_variance_))[::-1]
+                                if ev[1] > 1e-12 and (math.sqrt(ev[0]) / math.sqrt(ev[1])) > max_allowed_core_aspect_ratio:
+                                    diag_stats["aspect_ratio_rejected"] += 1
+                                    return
+                            except Exception:
+                                pass
 
                         # Tile Boundary Logic: Centroid must be in target box to avoid duplicates
                         cent = np.mean(g_coords, axis=0)
                         if t['target'][0] <= cent[0] < t['target'][2] and t['target'][1] <= cent[1] < t['target'][3]:
                             # SCORE PRECENDENCE: We store the strat score. 
-                            # Sorting later will ensure strat score wins over area.
                             label_candidates.append({
                                 'coords': g_coords, 
                                 'area': m.sum(), 
@@ -278,28 +251,25 @@ def extract_soma_masks_2d(
                 coords = cand['coords']
                 cent_phys = np.mean(coords, axis=0) * np.array(spacing)
                 
-                # Check Global Conflict (Physical Proximity)
-                if spatial_index is not None:
-                    dist, _ = spatial_index.query(cent_phys, k=1)
-                    if dist < min_physical_peak_separation: 
+                # Robust Physical Proximity Check
+                if all_placed_centroids:
+                    # Calculate distance to all previously placed centroids
+                    dists = np.linalg.norm(np.array(all_placed_centroids) - cent_phys, axis=1)
+                    if np.min(dists) < min_physical_peak_separation:
+                        diag_stats["spatial_overlap_rejected"] += 1
                         continue
 
                 # Check Global Conflict (Pixel overlap)
                 idx_tuple = tuple(coords.T)
-                if np.any(final_seed_mask[idx_tuple] > 0): 
+                if np.any(final_seed_mask[idx_tuple] > 0):
+                    diag_stats["spatial_overlap_rejected"] += 1
                     continue
 
                 # Placement
                 final_seed_mask[idx_tuple] = next_label_id
                 next_label_id += 1
                 all_placed_centroids.append(cent_phys)
-                
-                # Rebuild spatial index periodically
-                if len(all_placed_centroids) % 500 == 0:
-                    spatial_index = KDTree(all_placed_centroids)
-            
-            if all_placed_centroids: 
-                spatial_index = KDTree(all_placed_centroids)
+        
 
         # Update main status
         main_pbar.set_postfix({"Seeds": next_label_id - 1, "RAM": f"{get_ram_usage():.1f}GB"})
@@ -313,9 +283,16 @@ def extract_soma_masks_2d(
 
     t_total = time.time() - t_start_global
     print("\n" + "="*60)
-    print(f"EXTRACTION COMPLETE")
-    print(f"  Total Somas: {next_label_id - 1}")
+    print("2D EXTRACTION COMPLETE")
+    print(f"  Total Somas Placed: {next_label_id - 1}")
     print(f"  Execution Time: {t_total/60:.2f} mins")
+    print("-" * 60)
+    print("  DIAGNOSTICS (Absolute Mode Tracking):")
+    print(f"    Total Core Fragments Evaluated: {diag_stats['cores_evaluated']}")
+    print(f"    Rejected -> Too Small:          {diag_stats['cores_too_small']}")
+    print(f"    Rejected -> Thickness Bound:    {diag_stats['thickness_rejected']}")
+    print(f"    Rejected -> Aspect Ratio:       {diag_stats['aspect_ratio_rejected']}")
+    print(f"    Rejected -> Spatial Overlap:    {diag_stats['spatial_overlap_rejected']}")
     print("="*60 + "\n")
     
     if isinstance(final_seed_mask, np.memmap): 
