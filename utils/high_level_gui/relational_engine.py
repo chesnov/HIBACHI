@@ -118,7 +118,9 @@ class RelationalEngine:
         # 1. Biological Name Mapping
         name_registry = {}
         for ch_key in sample_channels.keys():
-            variety = ch_key.split('_')[-1] # "Channel_0_Microglia" -> "Microglia"
+            # Update this line to use split('_', 2) to prevent naming collisions
+            parts = ch_key.split('_', 2) 
+            variety = parts[-1] if len(parts) > 2 else ch_key
             name_registry[ch_key] = variety
 
         last_mask_path = None
@@ -134,7 +136,14 @@ class RelationalEngine:
             step_type = step['type']
             step_out_path = os.path.join(out_dir, f"step_{i}_{step_type}.dat")
 
-            if step_type == "intersect":
+            if step_type == "primary":
+                target_ch = step['target']
+                last_mask_path = RelationalEngine._find_dat(sample_channels.get(target_ch))
+                last_mask_name = name_registry.get(target_ch, "Primary")
+                if last_mask_path:
+                    results_to_viz.append({"name": last_mask_name, "path": last_mask_path})
+
+            elif step_type == "intersect":
                 inputs = step['inputs']
                 path_a = RelationalEngine._find_dat(sample_channels.get(inputs[0]))
                 name_a = name_registry.get(inputs[0], "A")

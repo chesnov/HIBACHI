@@ -1183,14 +1183,17 @@ class CrossChannelAnalyzerWindow(QMainWindow):
         
         # --- 3. ADD STEP BUTTONS ---
         add_step_layout = QHBoxLayout()
+        self.btn_primary = QPushButton("+ Set Primary")
         self.btn_intersect = QPushButton("+ Intersection")
         self.btn_filter = QPushButton("+ Volume Filter")
         self.btn_dist = QPushButton("+ Distance Analysis")
         
+        self.btn_primary.clicked.connect(self.add_primary_step)
         self.btn_intersect.clicked.connect(self.add_intersect_step)
         self.btn_filter.clicked.connect(self.add_filter_step)
         self.btn_dist.clicked.connect(self.add_analysis_step)
         
+        add_step_layout.addWidget(self.btn_primary)
         add_step_layout.addWidget(self.btn_intersect)
         add_step_layout.addWidget(self.btn_filter)
         add_step_layout.addWidget(self.btn_dist)
@@ -1211,13 +1214,17 @@ class CrossChannelAnalyzerWindow(QMainWindow):
         self.btn_preview.setFixedHeight(40)
         self.btn_preview.clicked.connect(self.preview_recipe)
         
-        # FIX: Ensure this is defined as self.btn_batch
+        self.btn_load_prev = QPushButton("📂 Load Previous Analysis for Sample")
+        self.btn_load_prev.setFixedHeight(40)
+        self.btn_load_prev.clicked.connect(self.load_previous_analysis)
+        
         self.btn_batch = QPushButton("🚀 RUN RECIPE ON ALL SAMPLES")
         self.btn_batch.setFixedHeight(50)
         self.btn_batch.setStyleSheet("background-color: #2E8B57; color: white; font-weight: bold;")
-        self.btn_batch.clicked.connect(self.run_batch_analysis) # This should now work
+        self.btn_batch.clicked.connect(self.run_batch_analysis)
         
         exec_layout.addWidget(self.btn_preview)
+        exec_layout.addWidget(self.btn_load_prev)
         exec_layout.addWidget(self.btn_batch)
         mid_panel.addLayout(exec_layout)
 
@@ -1266,6 +1273,16 @@ class CrossChannelAnalyzerWindow(QMainWindow):
     def get_checked_channels(self):
         return [self.channel_list.item(i).text() for i in range(self.channel_list.count()) 
                 if self.channel_list.item(i).checkState() == Qt.Checked]
+    
+    def add_primary_step(self):
+        checked = self.get_checked_channels()
+        if len(checked) != 1:
+            QMessageBox.warning(self, "Error", "Select exactly ONE channel to set as the primary mask.")
+            return
+        ch = checked[0]
+        step = {"type": "primary", "target": ch, "name": f"Set Primary: {ch}"}
+        self.recipe_steps.append(step)
+        self.recipe_list.addItem(step["name"])
 
     def add_intersect_step(self):
         checked = self.get_checked_channels()
@@ -1407,6 +1424,90 @@ class CrossChannelAnalyzerWindow(QMainWindow):
             # Set scale to handle anisotropy if 3D
             # (Napari scale is z_scale, y_scale, x_scale)
             # Use spacing[0]/spacing[2] for z-scale factor
+            z_scale = spacing[0]/spacing[2] if len(spacing)==3 else 1.0
+            for layer in viewer.layers:
+                layer.scale = (z_scale, 1, 1)
+
+    def load_previous_analysis(self):
+        project_root = os.path.dirname(self.pm.project_path)
+        rel_dir = os.path.join(project_root, "RELATIONAL_ANALYSIS")
+        
+        if not os.path.exists(rel_dir):
+            QMessageBox.warning(self, "Not Found", "No RELATIONAL_ANALYSIS folder found.")
+            return
+
+        # Find existing analysis folders
+        analyses =[d for d in os.listdir(rel_dir) if os.path.isdir(os.path.join(rel_dir, d))]
+        if not analyses:
+            QMessageBox.information(self, "Info", "No previous analyses found.")
+            return
+
+        # Prompt user to select an analysis run
+        analysis_name, ok = QInputDialog.getItem(
+            self, "Load Analysis", "Select previous analysis to load:", analyses, 0, False
+        )
+        if not ok or not analysis_name:
+            return
+
+        sample_name = self.sample_selector.currentText()
+        sample_out_dir = os.path.join(rel_dir, analysis_name, sample_name)
+
+        if not os.path.exists(sample_out_dir):
+            QMessageBox.warning(self, "Not Found", f"No data found for sample '{sample_name}' in analysis '{analysis_name}'.")
+            return
+
+        sample_data = self.pm.sample_registry[sample_name]
+        
+        # Setup Viewer
+        viewer = napari.Viewer(title=f"Loaded Analysis: {analysis_name} | {sample_name}")
+        colormaps = ['cyan', 'magenta', 'yellow', 'green', 'red', 'blue']
+        
+        shape = None
+        spacing = (1.0, 1.0, 1.0)
+
+        # 1. Load Raw Data and Base Segmentation (identical to preview function)
+        for i, (ch_name, ch_path) in enumerate(sample_data.items()):
+            tif_file = next((os.path.join(ch_path, f) for f in os.listdir(ch_path) if f.lower().endswith(('.tif', '.tiff'))), None)
+            dat_file = RelationalEngine._find_dat(ch_path)
+            
+            if shape is None and tif_file:
+                with tiff.TiffFile(tif_file) as tif:
+                    shape = tif.series[0].shape
+                meta, _ = get_sample_metadata(ch_path)
+                if meta:
+                    spacing = (meta.get('z', 1.0)/shape[0], meta.get('y', 1.0)/shape[1], meta.get('x', 1.0)/shape[2]) if len(shape)==3 else (meta.get('y', 1.0)/shape[0], meta.get('x', 1.0)/shape[1])
+
+            if tif_file:
+                raw_img = tiff.imread(tif_file)
+                cmap = colormaps[i % len(colormaps)]
+                viewer.add_image(raw_img, name=f"Raw: {ch_name}", colormap=cmap, blending='additive', opacity=0.5)
+
+            if dat_file:
+                seg_data = np.memmap(dat_file, dtype=np.int32, mode='r', shape=shape)
+                viewer.add_labels(seg_data, name=f"Seg: {ch_name}", opacity=0.3)
+
+        # 2. Load Derived Masks (.dat files from the analysis output folder)
+        derived_files =[f for f in os.listdir(sample_out_dir) if f.endswith('.dat')]
+        for f in derived_files:
+            dat_path = os.path.join(sample_out_dir, f)
+            try:
+                data = np.memmap(dat_path, dtype=np.int32, mode='r', shape=shape)
+                viewer.add_labels(data, name=f"DERIVED: {f.replace('.dat', '')}")
+            except Exception as e:
+                print(f"Could not load {f}: {e}")
+
+        # 3. Load Metrics & Draw Bridges
+        csv_path = os.path.join(sample_out_dir, f"{sample_name}_relational_metrics.csv")
+        if os.path.exists(csv_path):
+            try:
+                df = pd.read_csv(csv_path)
+                self._draw_proximity_bridges(viewer, df, shape, spacing)
+            except Exception as e:
+                print(f"Could not draw bridges: {e}")
+
+        # 4. Final Viewport Adjustments
+        if shape and len(shape) == 3:
+            viewer.dims.ndisplay = 3
             z_scale = spacing[0]/spacing[2] if len(spacing)==3 else 1.0
             for layer in viewer.layers:
                 layer.scale = (z_scale, 1, 1)

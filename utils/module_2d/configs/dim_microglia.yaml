@@ -9,13 +9,13 @@ execute_raw_segmentation_fluorescence_2d:
       - scale: 0.0
         low: 99.6
         high: 100.0
-      - scale: 1.0
-        low: 96.0
+      - scale: 1.5
+        low: 98.5
         high: 100.0
     min_size:
       label: Minimum Size (Pixels, Raw Seg)
       type: int
-      value: 450
+      value: 400
       min: 1
       max: 10000
       step: 1
@@ -118,7 +118,7 @@ execute_soma_extraction_fluorescence_2d:
     min_fragment_size:
       label: Min Fragment Size (Pixels)
       type: int
-      value: 400
+      value: 500
       min: 1
       max: 1000000
       step: 1
@@ -163,7 +163,7 @@ execute_cell_separation_fluorescence_2d:
     min_size_threshold:
       label: Min Final Cell Size (Pixels)
       type: float
-      value: 100.0
+      value: 400.0
       min: 0.0
       max: 1000000.0
       step: 1.0
@@ -177,7 +177,7 @@ execute_cell_separation_fluorescence_2d:
     min_path_intensity_ratio:
       label: Min Path Intensity Ratio (Merge)
       type: float
-      value: 0.6
+      value: 0.5
       min: 0.0
       max: 100.0
       step: 0.01
