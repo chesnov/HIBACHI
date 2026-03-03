@@ -809,6 +809,7 @@ class ProjectManager:
             None, "Select Project Root Folder", ""
         )
         if self.project_path:
+            self.sample_registry.clear()
             self._find_valid_image_folders()
         return self.project_path
 
@@ -974,8 +975,7 @@ class ProjectViewWindow(QMainWindow):
         self.batch_process_all_btn.setEnabled(True)
 
     def open_cross_channel_analyzer(self):
-        if not self.project_manager.sample_registry:
-            self.project_manager.build_consolidated_sample_registry()
+        self.project_manager.build_consolidated_sample_registry()
             
         self.analyzer_window = CrossChannelAnalyzerWindow(self.project_manager)
         self.analyzer_window.show()
@@ -1183,16 +1183,22 @@ class CrossChannelAnalyzerWindow(QMainWindow):
         
         # --- 3. ADD STEP BUTTONS ---
         add_step_layout = QHBoxLayout()
+        
+        self.btn_synth = QPushButton("🧬 Generate Synthetic Channel")
+        self.btn_synth.setStyleSheet("background-color: #8A2BE2; color: white;") # Purple
+        
         self.btn_primary = QPushButton("+ Set Primary")
         self.btn_intersect = QPushButton("+ Intersection")
         self.btn_filter = QPushButton("+ Volume Filter")
         self.btn_dist = QPushButton("+ Distance Analysis")
         
+        self.btn_synth.clicked.connect(self.open_synthetic_dialog)
         self.btn_primary.clicked.connect(self.add_primary_step)
         self.btn_intersect.clicked.connect(self.add_intersect_step)
         self.btn_filter.clicked.connect(self.add_filter_step)
         self.btn_dist.clicked.connect(self.add_analysis_step)
         
+        add_step_layout.addWidget(self.btn_synth)
         add_step_layout.addWidget(self.btn_primary)
         add_step_layout.addWidget(self.btn_intersect)
         add_step_layout.addWidget(self.btn_filter)
@@ -1283,6 +1289,14 @@ class CrossChannelAnalyzerWindow(QMainWindow):
         step = {"type": "primary", "target": ch, "name": f"Set Primary: {ch}"}
         self.recipe_steps.append(step)
         self.recipe_list.addItem(step["name"])
+
+    def open_synthetic_dialog(self):
+        try:
+            from .synthetic_engine import SyntheticDataDialog
+            dialog = SyntheticDataDialog(self.pm, self)
+            dialog.exec_()
+        except ImportError as e:
+            QMessageBox.critical(self, "Error", f"Failed to load synthetic engine:\n{e}")
 
     def add_intersect_step(self):
         checked = self.get_checked_channels()
