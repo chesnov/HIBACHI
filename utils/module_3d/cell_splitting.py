@@ -315,21 +315,41 @@ def _separate_multi_soma_cells_chunk(
 
         # A. Seeded Watershed
         # Use SimpleITK helper for speed/memory efficiency
-        dt = distance_transform_edt(local_mask, sampling=spacing)
-        landscape = -dt
-        intensity_weight = kwargs.get('intensity_weight', 0.5)
-
-        if intensity_weight > 0:
-            norm_int = (local_intensity - local_intensity.min()) / \
-                       (local_intensity.max() - local_intensity.min() + 1e-6)
-            landscape += (norm_int * intensity_weight * dt.max())
-
+        
+        # First, generate the markers (seeds)
         markers = np.zeros_like(local_mask, dtype=np.int32)
         for idx, s_id in enumerate(seeds_in_crop):
             markers[local_soma == s_id] = idx + 1
 
+        # ---- NEW ROBUST LANDSCAPE GENERATION ----
+        # 1. Base distance from seeds 
+        # (This guarantees every seed starts at EXACTLY 0 elevation, eliminating the unequal basin flaw)
+        d_seeds = distance_transform_edt(markers == 0, sampling=spacing)
+
+        # 2. Geometric thickness 
+        # (dt is large in cell centers, and drops near boundaries and thin necks)
+        dt = distance_transform_edt(local_mask, sampling=spacing)
+        
+        # 3. Calculate local expansion "speed"
+        # Water expands faster in thick regions and slows down drastically in thin necks.
+        # Adding a small epsilon prevents division by zero in the background.
+        speed = dt + 1e-5
+        
+        # 4. Modulate speed by intensity
+        intensity_weight = kwargs.get('intensity_weight', 0.5)
+        if intensity_weight > 0:
+            norm_int = (local_intensity - local_intensity.min()) / \
+                       (local_intensity.max() - local_intensity.min() + 1e-6)
+            # Brighter areas speed up expansion; dark areas slow it down
+            speed = speed * (1.0 + intensity_weight * norm_int)
+
+        # 5. Final Landscape: Time = Distance / Speed
+        landscape = d_seeds / speed
+        # -----------------------------------------
+
         ws_local = _watershed_with_simpleitk(landscape, markers)
         ws_local[~local_mask] = 0
+
 
         # B. Graph-Based Merging
         nodes, edges = _build_adjacency_graph_for_cell(

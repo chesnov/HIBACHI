@@ -322,19 +322,33 @@ def _separate_multi_soma_cells_chunk_2d(
             soma_props[s_id] = {'mean_intensity': mean_i}
 
         # Seeded Watershed with Intensity Weight (3D Logic)
-        dt = distance_transform_edt(local_mask, sampling=spacing)
-        landscape = -dt
-        intensity_weight = kwargs.get('intensity_weight', 0.5)
-
-        if intensity_weight > 0:
-            norm_int = (local_intensity - local_intensity.min()) / \
-                       (local_intensity.max() - local_intensity.min() + 1e-6)
-            landscape += (norm_int * intensity_weight * dt.max())
-
+        # 1. First, generate the markers (seeds)
         markers = np.zeros_like(local_mask, dtype=np.int32)
         for idx, s_id in enumerate(seeds_in_crop):
             markers[local_soma == s_id] = idx + 1
 
+        # 2. Base distance from seeds (guarantees all seeds start at elevation 0)
+        d_seeds = distance_transform_edt(markers == 0, sampling=spacing)
+
+        # 3. Geometric thickness
+        dt = distance_transform_edt(local_mask, sampling=spacing)
+        
+        # 4. Calculate local expansion "speed"
+        # Water expands faster in thick regions and slows down in thin necks
+        speed = dt + 1e-5
+        
+        # 5. Modulate speed by intensity
+        intensity_weight = kwargs.get('intensity_weight', 0.5)
+        if intensity_weight > 0:
+            norm_int = (local_intensity - local_intensity.min()) / \
+                       (local_intensity.max() - local_intensity.min() + 1e-6)
+            # Brighter areas speed up expansion; dark boundaries slow it down
+            speed = speed * (1.0 + intensity_weight * norm_int)
+
+        # 6. Final Landscape: Time = Distance / Speed
+        landscape = d_seeds / speed
+
+        # 7. Execute 2D watershed
         ws_local = watershed(landscape, markers, mask=local_mask)
 
         # Graph-Based Merging
