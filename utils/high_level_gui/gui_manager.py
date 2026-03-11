@@ -195,6 +195,13 @@ class DynamicGUIManager(QObject):
 
     def shutdown_and_cleanup(self) -> None:
         """Forcefully clears all data references and Napari internal buffers."""
+        # Safely terminate the background worker if it's running
+        if getattr(self, 'worker', None) and self.worker.isRunning():
+            print("    [Thread] Stopping background worker...")
+            self.worker.quit()
+            self.worker.wait()
+            self.worker = None
+
         # 1. Clear Napari layers and buffers first
         if self.viewer:
             try:
@@ -367,6 +374,11 @@ class DynamicGUIManager(QObject):
         Triggers execution of the current step in a background thread.
         Handles UI locking, log redirection, and parameter validation.
         """
+        # ---> NEW: Prevent overwriting an active thread (Double-click protection)
+        if getattr(self, 'worker', None) and self.worker.isRunning():
+            print("A processing step is already running. Ignoring click.")
+            return
+
         step_index = self.current_step["value"]
         if step_index >= self.num_steps:
             return

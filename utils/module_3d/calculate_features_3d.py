@@ -53,6 +53,10 @@ def flush_print(*args: Any, **kwargs: Any) -> None:
 # the massive RAM overhead of pickling data to worker threads.
 _ALL_SURFACES: List[np.ndarray] = []
 
+def _init_shared_surfaces(surfaces: List[np.ndarray]) -> None:
+    """Initializer for spawn-based multiprocessing (macOS/Windows)."""
+    global _ALL_SURFACES
+    _ALL_SURFACES = surfaces
 
 # =============================================================================
 # 1. DISTANCE QUANTIFICATION (Two-Pass High-Precision System)
@@ -152,6 +156,11 @@ def shortest_distance(
             )))
 
     n_valid = len(_ALL_SURFACES)
+    
+    # Fast exit if objects shrunk to 0 during erosion
+    if n_valid <= 1:
+        _ALL_SURFACES = []
+        return pd.DataFrame(), pd.DataFrame()
 
     # --- 2. Pass 1: Disk-Backed Matrix ---
     # Redirect to the project-specific temp_dir to keep system temp clean
@@ -162,8 +171,15 @@ def shortest_distance(
     dist_mat_mm[:] = np.inf
     np.fill_diagonal(dist_mat_mm, 0)
 
+    # Configure pool to safely share surfaces on macOS/Windows ('spawn'), 
+    # while preserving RAM-saving Copy-on-Write on Linux ('fork')
+    pool_kwargs = {}
+    if mp.get_start_method() != 'fork':
+        pool_kwargs['initializer'] = _init_shared_surfaces
+        pool_kwargs['initargs'] = (_ALL_SURFACES,)
+
     tasks = [(i, n_valid, spacing_arr) for i in range(n_valid)]
-    with mp.Pool(n_jobs) as pool:
+    with mp.Pool(n_jobs, **pool_kwargs) as pool:
         for i, row_results in tqdm(pool.imap_unordered(_calculate_row_distances_worker_3d, tasks), 
                                   total=n_valid, desc="    Distance Pass 1/2"):
             dist_mat_mm[i, i+1:] = row_results
@@ -178,7 +194,7 @@ def shortest_distance(
         if not np.isinf(row[j]):
             winning_pairs.append((labels[i], labels[j], i, j, spacing_arr))
 
-    with mp.Pool(n_jobs) as pool:
+    with mp.Pool(n_jobs, **pool_kwargs) as pool:
         points_list = list(tqdm(pool.imap_unordered(_extract_winning_points_worker_3d, winning_pairs),
                                total=len(winning_pairs), desc="    Distance Pass 2/2"))
 

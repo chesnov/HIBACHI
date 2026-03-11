@@ -52,6 +52,11 @@ def flush_print(*args: Any, **kwargs: Any) -> None:
 # Used to share contour coordinates with worker processes without pickling.
 _ALL_CONTOURS: List[np.ndarray] = []
 
+def _init_shared_contours(contours: List[np.ndarray]) -> None:
+    """Initializer for spawn-based multiprocessing (macOS/Windows)."""
+    global _ALL_CONTOURS
+    _ALL_CONTOURS = contours
+
 
 # =============================================================================
 # 1. DISTANCE QUANTIFICATION (Two-Pass High-Precision System)
@@ -155,6 +160,11 @@ def shortest_distance_2d(
     n_valid = len(actual_labels)
     flush_print(f"[PROFILE DIST] Found {n_valid} valid masks with contours.")
 
+    # Fast exit if objects shrunk to 0 during erosion
+    if n_valid <= 1:
+        _ALL_CONTOURS = []
+        return pd.DataFrame(), pd.DataFrame()
+
     # --- Stage 2: Pass 1 (Memory-Mapped Distance Matrix) ---
     # Use the project-specific temp_dir if provided, otherwise system temp
     target_dir = temp_dir if (temp_dir and os.path.isdir(temp_dir)) else tempfile.gettempdir()
@@ -164,8 +174,15 @@ def shortest_distance_2d(
     dist_mat_mm[:] = np.inf
     np.fill_diagonal(dist_mat_mm, 0)
 
+    # Configure pool to safely share contours on macOS/Windows ('spawn'), 
+    # while preserving RAM-saving Copy-on-Write on Linux ('fork')
+    pool_kwargs = {}
+    if mp.get_start_method() != 'fork':
+        pool_kwargs['initializer'] = _init_shared_contours
+        pool_kwargs['initargs'] = (_ALL_CONTOURS,)
+
     tasks = [(i, n_valid, spacing_arr) for i in range(n_valid)]
-    with mp.Pool(n_jobs) as pool:
+    with mp.Pool(n_jobs, **pool_kwargs) as pool:
         for i, row_results in tqdm(pool.imap_unordered(_calculate_row_distances_worker_2d, tasks),
                                   total=n_valid, desc="    Distance Pass 1/2"):
             dist_mat_mm[i, i + 1:] = row_results
@@ -180,7 +197,7 @@ def shortest_distance_2d(
         if not np.isinf(row[j]):
             winning_pairs.append((actual_labels[i], actual_labels[j], i, j, spacing_arr))
 
-    with mp.Pool(n_jobs) as pool:
+    with mp.Pool(n_jobs, **pool_kwargs) as pool:
         points_list = list(tqdm(pool.imap_unordered(_extract_winning_points_worker_2d, winning_pairs),
                                total=len(winning_pairs), desc="    Distance Pass 2/2"))
 
