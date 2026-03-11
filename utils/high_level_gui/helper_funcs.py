@@ -1712,17 +1712,6 @@ def interactive_segmentation_with_config(selected_folder: str = None) -> None:
         qt_window.destroyed.connect(_handle_napari_close)
 
         gui_manager = DynamicGUIManager(viewer, config, image_stack, file_loc, mode)
-
-        # ---> NEW: Ensure cleanup runs if the user clicks the "X" on the Napari window
-        @viewer.events.closing.connect
-        def _cleanup_on_close(event):
-            print("Closing Napari. Triggering cleanup...")
-            gui_manager.shutdown_and_cleanup()
-
-        viewer.window.add_dock_widget(
-            create_back_to_project_button(viewer, gui_manager), area="left", name="Navigation"
-        )
-        
         viewer.window.add_dock_widget(
             create_back_to_project_button(viewer, gui_manager), area="left", name="Navigation"
         )
