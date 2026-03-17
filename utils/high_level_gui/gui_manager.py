@@ -103,7 +103,8 @@ class DynamicGUIManager(QObject):
         config: Dict[str, Any],
         image_stack: np.ndarray,
         file_loc: str,
-        processing_mode: str
+        processing_mode: str,
+        project_manager: Any = None,
     ):
         super().__init__()
         self.viewer = viewer
@@ -112,6 +113,7 @@ class DynamicGUIManager(QObject):
         self.image_stack = image_stack
         self.file_loc = file_loc
         self.processing_mode = processing_mode
+        self.project_manager = project_manager
 
         # UI State
         self.current_widgets: Dict[QDockWidget, QScrollArea] = {}

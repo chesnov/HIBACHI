@@ -221,6 +221,13 @@ def _prune_internal_artifacts_2d(skeleton_binary: np.ndarray) -> np.ndarray:
     """
     Refined Artifact Pruner: Ensures 1-pixel width without eating branches.
     Targets diagonal 2x2 elbow blocks that cause spur regrowth.
+
+    Only degree-2 pixels (exactly 2 neighbours) are candidates for removal.
+    Degree-1 pixels are endpoints — never touched.
+    Degree-3+ pixels are junctions — never touched.  Removing a junction when
+    its neighbours happen to be diagonally adjacent (8-connected) would pass the
+    local connectivity test yet leave three branches connected only corner-to-
+    corner, producing visually disjointed skeletons.
     """
     pruned = skeleton_binary.copy().astype(np.uint8)
     kernel = np.array([[1, 1, 1], [1, 0, 1], [1, 1, 1]], dtype=np.uint8)
@@ -229,7 +236,7 @@ def _prune_internal_artifacts_2d(skeleton_binary: np.ndarray) -> np.ndarray:
         changed = False
         candidates = np.argwhere(pruned == 1)
         for y, x in candidates:
-            if ndi.convolve(pruned, kernel, mode='constant', cval=0)[y, x] < 2:
+            if ndi.convolve(pruned, kernel, mode='constant', cval=0)[y, x] != 2:
                 continue
 
             y0, y1, x0, x1 = max(0, y-1), min(pruned.shape[0], y+2), max(0, x-1), min(pruned.shape[1], x+2)

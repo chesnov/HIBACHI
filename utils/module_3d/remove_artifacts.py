@@ -204,6 +204,143 @@ def apply_clamped_z_erosion(
     _safe_close_memmap(fp)
 
 
+def _find_largest_hull_component_slice_graph(hull_memmap: np.memmap) -> None:
+    """
+    Finds and keeps only the largest connected 3D component of a boolean hull
+    memmap using a Z-slice connectivity graph.
+
+    Replaces the full-volume dask_image CCA which hangs on data that exceeds
+    RAM, as dask-image's label algorithm must stitch chunk boundaries
+    sequentially and scales poorly with both volume size and chunk count.
+
+    This implementation is exact (no approximation) and requires at most two
+    adjacent Z-slices in memory at any time — O(Z) I/O regardless of XY size.
+
+    Algorithm:
+      Pass 1 — Iterate Z slices.  For each slice run scipy.ndimage.label (fast
+               single-thread C code on one 2D array).  Feed overlapping
+               component pairs from adjacent slices into a Union-Find
+               structure, accumulating voxel counts at each root.
+      Identify the root with the highest total voxel count.
+      Pass 2 — Re-derive 2D labels per slice (identical assignment because
+               ndimage.label is deterministic / raster-scan).  Zero out any
+               component whose Union-Find root is not the largest.
+
+    Logical equivalence with 2D pipeline:
+      generate_tight_hull_2d already uses scipy.ndimage.label on the
+      downsampled 2D hull — i.e. a single-slice degenerate case of this exact
+      algorithm.  Both pipelines keep the largest connected hull component and
+      remove stray artifacts; only the dimensionality and working resolution
+      differ.
+    """
+    total_z = hull_memmap.shape[0]
+
+    # 8-connectivity in 2D: more permissive than 4-connectivity, avoids
+    # artificially splitting diagonal hull features into separate components.
+    structure_2d = np.ones((3, 3), dtype=bool)
+
+    # ── Union-Find ────────────────────────────────────────────────────────────
+    # Nodes are (z, local_label_id) tuples — globally unique per component.
+    parent: dict = {}   # node → parent node (itself when root)
+    uf_size: dict = {}  # root node → accumulated voxel count (valid at roots only)
+
+    def _find(x):
+        """Path-compressing find with halving."""
+        root = x
+        while parent.get(root, root) != root:
+            root = parent[root]
+        curr = x
+        while curr != root:
+            nxt = parent[curr]
+            parent[curr] = root
+            curr = nxt
+        return root
+
+    def _union(x, y):
+        """Union by size: smaller root is merged into larger."""
+        rx, ry = _find(x), _find(y)
+        if rx == ry:
+            return
+        if uf_size.get(rx, 0) < uf_size.get(ry, 0):
+            rx, ry = ry, rx
+        parent[ry] = rx
+        uf_size[rx] = uf_size.get(rx, 0) + uf_size.get(ry, 0)
+
+    def _register(node, count):
+        if node not in parent:
+            parent[node] = node
+            uf_size[node] = count
+
+    # ── Pass 1: Build inter-slice connectivity graph ──────────────────────────
+    print("    [SliceGraph] Pass 1: building inter-slice connectivity...")
+    prev_labeled = None
+
+    for z in tqdm(range(total_z), desc="    SliceGraph Pass 1"):
+        hull_slice = hull_memmap[z]
+        if not np.any(hull_slice):
+            prev_labeled = None
+            continue
+
+        labeled, n = ndimage.label(hull_slice, structure=structure_2d)
+
+        for lid in range(1, n + 1):
+            _register((z, lid), int(np.count_nonzero(labeled == lid)))
+
+        if prev_labeled is not None:
+            # Pixels where both slices are foreground share a Z-face — the
+            # corresponding component IDs must be connected in 3D.
+            overlap = (prev_labeled > 0) & (labeled > 0)
+            if np.any(overlap):
+                for pid, cid in set(zip(prev_labeled[overlap].tolist(),
+                                        labeled[overlap].tolist())):
+                    _union((z - 1, pid), (z, cid))
+
+        prev_labeled = labeled
+
+    if not parent:
+        return  # Hull is entirely empty
+
+    # ── Find the largest 3D root ──────────────────────────────────────────────
+    distinct_roots = {_find(n) for n in parent}
+
+    if len(distinct_roots) == 1:
+        print("    [SliceGraph] Hull is already a single component — nothing to remove.")
+        return
+
+    # uf_size is only reliable at roots: non-roots had their counts absorbed
+    # into the root during union and their uf_size entries are stale.
+    root_sizes = {r: uf_size.get(r, 0) for r in distinct_roots}
+    largest_root = max(root_sizes, key=root_sizes.__getitem__)
+    n_components = len(distinct_roots)
+    print(f"    [SliceGraph] {n_components} 3D components found. "
+          f"Largest: {root_sizes[largest_root]} voxels. "
+          f"Removing {n_components - 1} disjoint artifact(s).")
+
+    # ── Pass 2: Zero out non-largest components ───────────────────────────────
+    print("    [SliceGraph] Pass 2: removing disjoint artifacts...")
+    removed = 0
+
+    for z in tqdm(range(total_z), desc="    SliceGraph Pass 2"):
+        hull_slice = hull_memmap[z].copy()
+        if not np.any(hull_slice):
+            continue
+
+        labeled, n = ndimage.label(hull_slice, structure=structure_2d)
+        modified = False
+
+        for lid in range(1, n + 1):
+            if _find((z, lid)) != largest_root:
+                mask = (labeled == lid)
+                hull_slice[mask] = False
+                removed += int(np.count_nonzero(mask))
+                modified = True
+
+        if modified:
+            hull_memmap[z] = hull_slice
+
+    print(f"    [SliceGraph] Done. Removed {removed} artifact voxels.")
+
+
 def generate_tight_hull_stack(
     volume: np.ndarray,
     cell_mask: np.ndarray,
@@ -285,28 +422,12 @@ def generate_tight_hull_stack(
     hull_memmap.flush()
 
     # 3. Filter: Keep ONLY Largest 3D Component
-    # Essential for removing floating artifacts (tile corners, dust)
+    # Essential for removing floating artifacts (tile corners, dust).
+    # Uses Z-slice graph instead of full-volume dask CCA — see docstring of
+    # _find_largest_hull_component_slice_graph for rationale.
     print("    Filtering disjoint hull artifacts (Keeping Largest Component)...")
-    
-    d_hull = da.from_array(hull_memmap, chunks=(64, 256, 256))
-    structure_3d = generate_binary_structure(3, 1)
-    
-    labeled_hull, num_features = dask_image.ndmeasure.label(d_hull, structure=structure_3d)
-    n_feat = num_features.compute()
-    
-    if n_feat > 1:
-        counts, _ = da.histogram(labeled_hull, bins=n_feat+1, range=[0, n_feat])
-        counts_res = counts.compute()
-        counts_res[0] = 0  # Ignore background
-        
-        largest_label = np.argmax(counts_res)
-        print(f"    Keeping Label {largest_label} (Size {counts_res[largest_label]}).")
-        
-        # Overwrite with mask of only largest component
-        final_dask = (labeled_hull == largest_label)
-        with ProgressBar(dt=2):
-            da.store(final_dask, hull_memmap, lock=True, scheduler=DASK_SCHEDULER)
-            
+    _find_largest_hull_component_slice_graph(hull_memmap)
+
     hull_memmap.flush()
     return hull_memmap
 
@@ -385,8 +506,9 @@ def trim_edges_with_core_protection(
     print("  [EdgeTrim] Trimming with Core Protection...")
 
     total_z = labels_memmap.shape[0]
+    spacing_yx = (spacing[1], spacing[2])  # YX only — see note below
 
-    print("    Calculating global distance map...")
+    print("    Calculating distance map (2D per slice)...")
     dist_map_path = os.path.join(
         os.path.dirname(labels_memmap.filename), 'dist_map.dat'
     )
@@ -394,40 +516,28 @@ def trim_edges_with_core_protection(
         dist_map_path, dtype=np.float32, mode='w+', shape=labels_memmap.shape
     )
 
-    rows, cols = labels_memmap.shape[1], labels_memmap.shape[2]
-    slice_bytes = rows * cols * 4
-    target_ram = 1024**3
-    edt_chunk_z = max(10, min(100, int(target_ram / slice_bytes)))
-    edt_overlap = int(30 / spacing[0]) + 5
+    # Compute EDT slice-by-slice in 2D rather than as a chunked 3D operation.
+    #
+    # Rationale: this function trims lateral XY edge artifacts — cells near
+    # the tissue boundary in the XY plane.  For those cells the nearest hull
+    # boundary point is always in the same Z slice, so 2D and 3D EDT produce
+    # identical distances.  Cells near the top/bottom Z surfaces are handled
+    # separately by apply_clamped_z_erosion and are not the target here.
+    #
+    # The old approach computed a 3D EDT over overlapping Z chunks.  The overlap
+    # was int(30 / spacing[0]) + 5, which for fine Z spacings (e.g. 0.5 µm)
+    # gave 65 slices of overlap.  For a 20038×20038 XY image (1.6 GB per slice)
+    # this forced each EDT call to allocate >200 GB — causing the hang.
+    #
+    # 2D per-slice EDT uses at most two slices of memory at any time (~3 GB
+    # for a 20038×20038 image), matching the memory profile of the 2D pipeline
+    # which calls distance_transform_edt(hull_mask, sampling=spacing) on the
+    # full 2D hull in one shot.
+    for z in tqdm(range(total_z), desc="    Distance Transform"):
+        dist_memmap[z] = distance_transform_edt(
+            hull_memmap[z], sampling=spacing_yx
+        ).astype(np.float32)
 
-    for z in tqdm(range(0, total_z, edt_chunk_z), desc="    Distance Transform"):
-        z0 = max(0, z - edt_overlap)
-        z1 = min(total_z, z + edt_chunk_z + edt_overlap)
-        hull_chunk = hull_memmap[z0:z1]
-        
-        # Z-Padding Fix for Top/Bottom Surfaces
-        pad_top = (z0 == 0)
-        pad_bottom = (z1 == total_z)
-        
-        if pad_top or pad_bottom:
-            pad_width = ((int(pad_top), int(pad_bottom)), (0, 0), (0, 0))
-            hull_chunk_padded = np.pad(
-                hull_chunk, pad_width, mode='constant', constant_values=0
-            )
-            dt_chunk_padded = distance_transform_edt(
-                hull_chunk_padded, sampling=spacing
-            )
-            start_idx = 1 if pad_top else 0
-            end_idx = -1 if pad_bottom else None
-            dt_chunk = dt_chunk_padded[start_idx:end_idx]
-        else:
-            dt_chunk = distance_transform_edt(hull_chunk, sampling=spacing)
-        
-        w_start = z - z0
-        w_end = w_start + min(z + edt_chunk_z, total_z) - z
-        dist_memmap[z:min(z + edt_chunk_z, total_z)] = \
-            dt_chunk[w_start:w_end].astype(np.float32)
-            
     dist_memmap.flush()
 
     # 2. Protection & Filter

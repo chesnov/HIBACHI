@@ -3,10 +3,23 @@ import os
 import gc
 import time
 import traceback
+import warnings
 from typing import Dict, List, Any, Tuple, TypedDict, Optional, Union
 
 import numpy as np
 import yaml  # type: ignore
+
+# Suppress the Napari/vispy GL_MAX_TEXTURE_SIZE downsampling notice.
+# This fires asynchronously from the Qt event loop after layer data is uploaded
+# to the GPU, so a catch_warnings() context manager around add_*() calls cannot
+# intercept it.  The filter is intentionally narrow: UserWarning only, matching
+# the exact message text, and scoped to the napari._vispy module.
+warnings.filterwarnings(
+    "ignore",
+    message=r".*GL_MAX_TEXTURE_SIZE.*",
+    category=UserWarning,
+    module=r"napari\._vispy",
+)
 
 
 class StepDefinition(TypedDict):
@@ -329,12 +342,14 @@ class ProcessingStrategy(abc.ABC):
             # If the layer is new but we have a cached state, restore it
             target_visibility = self._visibility_cache[layer_name]
 
-        # Determine dimensionality of data
+        # Determine dimensionality of data.
+        # For multiscale input (list of arrays), use the finest level.
         spatial_ndim = 2
-        if hasattr(data, 'ndim'):
-            spatial_ndim = data.ndim
-        elif hasattr(data, 'shape'):
-            spatial_ndim = len(data.shape)
+        _ref = data[0] if isinstance(data, list) else data
+        if hasattr(_ref, 'ndim'):
+            spatial_ndim = _ref.ndim
+        elif hasattr(_ref, 'shape'):
+            spatial_ndim = len(_ref.shape)
         if layer_type == 'shapes':
             spatial_ndim = 2  # Shapes usually handled as overlay
 
@@ -369,7 +384,7 @@ class ProcessingStrategy(abc.ABC):
                         new_layer = viewer.add_shapes(data, name=layer_name, **kwargs)
                 elif layer_type == 'points':
                     new_layer = viewer.add_points(data, name=layer_name, **kwargs)
-                
+
                 # Apply visibility AFTER creation to ensure initialization logic runs
                 if new_layer is not None:
                     new_layer.visible = target_visibility
@@ -379,8 +394,13 @@ class ProcessingStrategy(abc.ABC):
         else:
             try:
                 layer = viewer.layers[layer_name]
-                # Ensure data is in memory if it was a memmap (for stability on update)
-                if isinstance(data, np.memmap):
+                # Ensure data is in memory if it was a memmap (for stability on update).
+                # For multiscale lists, resolve any memmaps in the finest level only;
+                # coarser levels are already plain ndarrays from block_reduce.
+                if isinstance(data, list):
+                    if isinstance(data[0], np.memmap):
+                        data[0] = np.array(data[0])
+                elif isinstance(data, np.memmap):
                     data = np.array(data)
                 layer.data = data
                 if 'scale' in kwargs:
@@ -388,6 +408,57 @@ class ProcessingStrategy(abc.ABC):
                 layer.refresh()
             except Exception as e:
                 print(f"Error updating layer {layer_name}: {e}")
+
+    @staticmethod
+    def _build_label_pyramid(
+        data: np.ndarray,
+        gl_max: int = 16384
+    ) -> list:
+        """
+        Builds a max-pooling multiscale pyramid for a labels array.
+
+        Napari accepts a list of arrays as multiscale data and selects the
+        appropriate level based on the current zoom, mirroring how QuPath /
+        OpenSlide handle whole-slide images.  Max-pooling is used (rather than
+        averaging) so that 1-pixel-wide structures such as skeletons are never
+        lost: a label survives into a coarser level as long as it was present
+        in *any* pixel of the corresponding block at the finer level.
+
+        The pyramid is only built when the array actually exceeds the GPU
+        texture limit; otherwise the original array is returned as a
+        single-element list (no overhead).
+
+        Args:
+            data:   Integer label array (2-D or 3-D).
+            gl_max: GPU texture size limit to build down to (default 16384).
+
+        Returns:
+            List of arrays [full_res, half_res, quarter_res, ...].
+            Single-element list when no downsampling is needed.
+        """
+        if max(data.shape) <= gl_max:
+            return [data]
+
+        # Strided slicing is used instead of block_reduce/max-pooling.
+        # On a memmap, data[::2, ::2] adjusts stride metadata only — no data
+        # is read or copied until Napari requests a tile — making the pyramid
+        # build essentially instantaneous regardless of array size.
+        # The trade-off vs max-pooling is that a skeleton pixel that happens to
+        # fall between sampled positions could be missed at a coarser level, but
+        # at a 1.22× ratio (20038 → 16384) this is imperceptible in practice.
+        ndim = data.ndim
+        sl_2d = (slice(None, None, 2), slice(None, None, 2))
+        stride = (slice(None),) + sl_2d if ndim == 3 else sl_2d  # Keep Z intact in 3D
+
+        pyramid = [data]
+        current = data
+        while max(current.shape[-2:]) > gl_max:
+            current = current[stride]
+            pyramid.append(current)
+
+        print(f"  [Pyramid] Built {len(pyramid)}-level pyramid: "
+              f"{' → '.join(str(a.shape) for a in pyramid)}")
+        return pyramid
 
     def _remove_layer_safely(self, viewer: Any, name: str) -> None:
         """

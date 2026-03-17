@@ -532,23 +532,35 @@ class Fluorescence2DStrategy(ProcessingStrategy):
 
             # 5. DETAILED DATA PERSISTENCE (Coordinate Persistence)
             if detailed_outputs:
-                # Retrieve the red lines table
+                # 5a. Full N×N pairwise distance matrix
+                dist_df = detailed_outputs.get('distance_matrix')
+                if dist_df is not None and not dist_df.empty:
+                    print(f"  [Features] Saving pairwise distance matrix to: {os.path.basename(dist_matrix_path)}")
+                    dist_df.to_csv(dist_matrix_path, index=True)
+
+                # 5b. Nearest-neighbour connection coordinates (red lines in viewer)
                 nn_points = detailed_outputs.get('all_pairs_points')
                 if nn_points is not None and not nn_points.empty:
                     pts_csv_path = files.get("points_matrix")
                     print(f"  [Features] Saving nearest neighbor lines to: {os.path.basename(pts_csv_path)}")
                     nn_points.to_csv(pts_csv_path, index=False)
 
+                # 5c. Per-branch skan statistics
+                branch_df = detailed_outputs.get('detailed_branches')
+                if branch_df is not None and not branch_df.empty:
+                    branch_csv_path = files.get("branch_data")
+                    print(f"  [Features] Saving branch data to: {os.path.basename(branch_csv_path)}")
+                    branch_df.to_csv(branch_csv_path, index=False)
+
             # 6. VISUALIZATION (NAPARI)
             if viewer is not None:
-                # Load the skeleton back from the persistent disk file we just created
-                # We use 'r' mode to ensure Napari only reads what it needs to display
                 if skel_dat_path and os.path.exists(skel_dat_path):
                     skel_display = np.memmap(
                         skel_dat_path, dtype=np.int32, mode='r', shape=self.image_shape
                     )
                     self._add_layer_safely(
-                        viewer, skel_display, "Skeletons", layer_type='labels'
+                        viewer, self._build_label_pyramid(skel_display),
+                        "Skeletons", layer_type='labels'
                     )
                 
                 # If distances were calculated, visualize the nearest neighbor connections
@@ -654,7 +666,16 @@ class Fluorescence2DStrategy(ProcessingStrategy):
         if checkpoint_step >= 4:
             load_and_add("final_segmentation", "Final segmentation")
         if checkpoint_step >= 5:
-            load_and_add("skeleton_array", "Skeletons", layer_type='labels')
+            path = files.get("skeleton_array")
+            if path and os.path.exists(path):
+                try:
+                    skel_data = np.memmap(path, dtype=np.int32, mode='r', shape=self.image_shape)
+                    self._add_layer_safely(
+                        viewer, self._build_label_pyramid(skel_data),
+                        "Skeletons", layer_type='labels'
+                    )
+                except Exception as e:
+                    print(f"Error loading skeleton: {e}")
             pts_path = files.get("points_matrix")
             if pts_path and os.path.exists(pts_path):
                 try:

@@ -796,6 +796,141 @@ class ApplicationState(QObject):
 app_state = ApplicationState()
 
 
+# =============================================================================
+# Config Template Application
+# =============================================================================
+
+def apply_template_config_to_project(
+    template_yaml_path: str,
+    project_manager: Any,
+    target_mode: Optional[str] = None
+) -> Dict[str, Any]:
+    """
+    Applies a template YAML config to every matching image folder in a project.
+
+    Merges strategies:
+    - All ``execute_*`` parameter blocks are taken wholesale from the template.
+    - ``voxel_dimensions`` / ``pixel_dimensions`` are preserved from each image's
+      own YAML so physical calibration is never overwritten.
+    - ``mode`` is preserved from each folder's existing value.
+    - For folders that already have a processed config (Config 2), ``saved_state``
+      (e.g. auto-detected thresholds) is also preserved so a partial run can still
+      be resumed after the template swap.
+
+    Args:
+        template_yaml_path: Absolute path to the source ``.yaml`` template file.
+        project_manager:    A ``ProjectManager`` instance with populated
+                            ``image_folders`` and ``get_image_details()``.
+        target_mode:        If given, only folders whose ``mode`` field matches
+                            this string are updated.  If ``None``, the mode is
+                            taken from the template itself and used as the filter.
+
+    Returns:
+        dict with keys ``success``, ``failed``, ``skipped``, ``updated_folders``.
+    """
+    try:
+        with open(template_yaml_path, 'r') as fh:
+            template: Dict[str, Any] = yaml.safe_load(fh) or {}
+    except Exception as exc:
+        raise ValueError(f"Cannot read template file: {exc}") from exc
+
+    effective_filter_mode = target_mode or template.get('mode')
+
+    results: Dict[str, Any] = {
+        'success': 0, 'failed': 0, 'skipped': 0, 'updated_folders': []
+    }
+
+    for folder_path in project_manager.image_folders:
+        details = project_manager.get_image_details(folder_path)
+        folder_name = os.path.basename(folder_path)
+
+        # Skip broken or missing-file folders
+        if details.get('mode') == 'error' or not details.get('yaml_file'):
+            results['skipped'] += 1
+            continue
+
+        folder_mode = details.get('mode', 'unknown')
+
+        # Mode filtering — only apply to folders that match the template's mode
+        if effective_filter_mode and folder_mode not in ('unknown', effective_filter_mode):
+            results['skipped'] += 1
+            continue
+
+        yaml_path = os.path.join(folder_path, details['yaml_file'])
+
+        # ── Config 1: main YAML in the image folder ────────────────────────
+        try:
+            with open(yaml_path, 'r') as fh:
+                current_main: Dict[str, Any] = yaml.safe_load(fh) or {}
+        except Exception:
+            results['failed'] += 1
+            continue
+
+        merged_main: Dict[str, Any] = {}
+
+        # Take every execute_* block from the template
+        for key, val in template.items():
+            if key.startswith('execute_'):
+                merged_main[key] = val
+
+        # Preserve per-image physical calibration (never overwrite with template values)
+        for dim_key in ('voxel_dimensions', 'pixel_dimensions'):
+            if dim_key in current_main:
+                merged_main[dim_key] = current_main[dim_key]
+            elif dim_key in template:
+                # Fallback: use template dimensions only if the image has none
+                merged_main[dim_key] = template[dim_key]
+
+        # Keep the folder's existing mode; use template mode only as a last resort
+        merged_main['mode'] = (
+            folder_mode if folder_mode != 'unknown'
+            else template.get('mode', 'unknown')
+        )
+
+        try:
+            with open(yaml_path, 'w') as fh:
+                yaml.safe_dump(merged_main, fh, default_flow_style=False, sort_keys=False)
+        except Exception:
+            results['failed'] += 1
+            continue
+
+        # ── Config 2: processed config inside *_processed_* sub-folder ────
+        tif_file = details.get('tif_file')
+        if tif_file:
+            basename = os.path.splitext(tif_file)[0]
+            effective_mode = merged_main['mode']
+            proc_dir = os.path.join(
+                folder_path, f"{basename}_processed_{effective_mode}"
+            )
+            proc_config_path = os.path.join(
+                proc_dir, f"processing_config_{effective_mode}.yaml"
+            )
+
+            if os.path.exists(proc_config_path):
+                try:
+                    with open(proc_config_path, 'r') as fh:
+                        existing_proc: Dict[str, Any] = yaml.safe_load(fh) or {}
+
+                    merged_proc = dict(merged_main)
+
+                    # Preserve image-specific computed values (e.g. auto-threshold)
+                    if 'saved_state' in existing_proc:
+                        merged_proc['saved_state'] = existing_proc['saved_state']
+
+                    with open(proc_config_path, 'w') as fh:
+                        yaml.safe_dump(
+                            merged_proc, fh, default_flow_style=False, sort_keys=False
+                        )
+                except Exception:
+                    # Non-critical: failure here doesn't fail the whole folder
+                    pass
+
+        results['success'] += 1
+        results['updated_folders'].append(folder_name)
+
+    return results
+
+
 class ProjectManager:
     """Handles folder selection and validation of image projects."""
     
@@ -968,11 +1103,22 @@ class ProjectViewWindow(QMainWindow):
         self.cross_channel_btn.setEnabled(False) # Enable only after project load
         button_layout.addWidget(self.cross_channel_btn)
 
+        self.set_config_btn = QPushButton("⚙ Set New Channel Config…")
+        self.set_config_btn.setToolTip(
+            "Choose a YAML config template and apply its processing parameters\n"
+            "to every image in the project (image dimensions are preserved)."
+        )
+        self.set_config_btn.clicked.connect(self.set_channel_config)
+        self.set_config_btn.setEnabled(False)  # Enable only after project load
+        button_layout.addWidget(self.set_config_btn)
+
     def _update_batch_button_state(self) -> None:
         if not BatchProcessor or not self.project_manager.image_folders:
             self.batch_process_all_btn.setEnabled(False)
+            self.set_config_btn.setEnabled(False)
             return
         self.batch_process_all_btn.setEnabled(True)
+        self.set_config_btn.setEnabled(True)
 
     def open_cross_channel_analyzer(self):
         self.project_manager.build_consolidated_sample_registry()
@@ -1100,7 +1246,7 @@ class ProjectViewWindow(QMainWindow):
         folder = item.data(Qt.UserRole)
         if folder:
             self.hide()
-            interactive_segmentation_with_config(folder)
+            interactive_segmentation_with_config(folder, project_manager=self.project_manager)
 
     def run_batch_processing_all_compatible(self) -> None:
         if not self.batch_process_all_btn.isEnabled():
@@ -1113,6 +1259,70 @@ class ProjectViewWindow(QMainWindow):
             processor = BatchProcessor(self.project_manager)
             processor.process_all_folders(force_restart_all=False)
             QMessageBox.information(self, "Done", "Batch processing complete.")
+
+    def set_channel_config(self) -> None:
+        """Opens a file dialog to pick a template YAML and applies it to all folders."""
+        template_path, _ = QFileDialog.getOpenFileName(
+            self, "Select Config Template", "",
+            "YAML Files (*.yaml *.yml);;All Files (*)"
+        )
+        if not template_path:
+            return
+
+        # Preview what mode the template targets
+        try:
+            with open(template_path, 'r') as fh:
+                template_preview = yaml.safe_load(fh) or {}
+            template_mode = template_preview.get('mode', 'unknown')
+            execute_keys = [k for k in template_preview if k.startswith('execute_')]
+        except Exception as exc:
+            QMessageBox.critical(self, "Error", f"Could not read template:\n{exc}")
+            return
+
+        total = len(self.project_manager.image_folders)
+        reply = QMessageBox.question(
+            self,
+            "Apply Config Template",
+            f"Template:  {os.path.basename(template_path)}\n"
+            f"Mode:      {template_mode}\n"
+            f"Steps:     {len(execute_keys)}\n\n"
+            f"Apply to all {total} image folder(s) in the project?\n\n"
+            f"• Processing parameters will be replaced.\n"
+            f"• Image dimensions are always preserved.\n"
+            f"• Folders with a different mode will be skipped.\n"
+            f"• Existing computed state (e.g. thresholds) is preserved.",
+            QMessageBox.Yes | QMessageBox.No
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            results = apply_template_config_to_project(
+                template_path, self.project_manager
+            )
+        except Exception as exc:
+            QApplication.restoreOverrideCursor()
+            QMessageBox.critical(self, "Error", f"Config application failed:\n{exc}")
+            return
+        QApplication.restoreOverrideCursor()
+
+        summary = (
+            f"Config template applied.\n\n"
+            f"Updated : {results['success']}\n"
+            f"Skipped : {results['skipped']}  (different mode or invalid)\n"
+            f"Failed  : {results['failed']}\n"
+        )
+        if results['updated_folders']:
+            preview = results['updated_folders'][:8]
+            summary += "\nUpdated folders:\n" + "\n".join(f"  \u2022 {n}" for n in preview)
+            if len(results['updated_folders']) > 8:
+                summary += f"\n  \u2026 and {len(results['updated_folders']) - 8} more"
+
+        if results['failed'] > 0:
+            QMessageBox.warning(self, "Partial Success", summary)
+        else:
+            QMessageBox.information(self, "Done", summary)
 
     def closeEvent(self, event: QCloseEvent) -> None:
         reply = QMessageBox.question(
@@ -1675,7 +1885,7 @@ def _handle_napari_close() -> None:
     QTimer.singleShot(100, _check_if_last_window)
 
 
-def interactive_segmentation_with_config(selected_folder: str = None) -> None:
+def interactive_segmentation_with_config(selected_folder: str = None, project_manager=None) -> None:
     """Launches Napari with the DynamicGUIManager for a single sample."""
     try:
         from .gui_manager import DynamicGUIManager
@@ -1711,7 +1921,8 @@ def interactive_segmentation_with_config(selected_folder: str = None) -> None:
         qt_window = viewer.window._qt_window
         qt_window.destroyed.connect(_handle_napari_close)
 
-        gui_manager = DynamicGUIManager(viewer, config, image_stack, file_loc, mode)
+        gui_manager = DynamicGUIManager(viewer, config, image_stack, file_loc, mode,
+                                        project_manager=project_manager)
         viewer.window.add_dock_widget(
             create_back_to_project_button(viewer, gui_manager), area="left", name="Navigation"
         )
@@ -1787,13 +1998,33 @@ def launch_image_segmentation_tool() -> QApplication:
 def create_back_to_project_button(viewer: napari.Viewer, gui_manager: Any) -> QWidget:
     """Creates the 'Back to Project List' button widget."""
     def _do():
+        # 1. Release all heavy data references before touching the window.
         if gui_manager:
             gui_manager.shutdown_and_cleanup()
-        if viewer:
-            viewer.close()
-        
+
         gc.collect()
+
+        # 2. Show the project view BEFORE closing Napari.  On macOS the app
+        #    quits if the window count ever hits zero, so we must have a
+        #    visible window in place first.
         app_state.show_project_view_signal.emit()
+
+        # 3. Close the Napari window.  viewer.close() is unreliable on macOS
+        #    (the QMainWindow may stay visible).  We grab the underlying Qt
+        #    window directly, mark it for deletion, and defer the actual
+        #    close to the next event-loop tick so the project view has time
+        #    to appear before the window count changes.
+        if viewer:
+            try:
+                qt_win = viewer.window._qt_window
+                qt_win.setAttribute(Qt.WA_DeleteOnClose, True)
+                QTimer.singleShot(0, qt_win.close)
+            except Exception:
+                # Fallback for any future Napari API change
+                try:
+                    viewer.close()
+                except Exception:
+                    pass
 
     btn = QPushButton("Back to Project List")
     btn.clicked.connect(_do)

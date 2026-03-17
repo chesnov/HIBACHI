@@ -520,6 +520,8 @@ class FluorescenceStrategy(ProcessingStrategy):
         metrics_csv_path = files.get("metrics_df")
         fcs_path = os.path.join(self.processed_dir, f"metrics_{self.mode_name}.fcs")
         pts_csv_path = files.get("points_matrix")
+        dist_csv_path = files.get("distances_matrix")
+        branch_csv_path = files.get("branch_data")
 
         if not os.path.exists(final_seg_path):
             return False
@@ -552,10 +554,22 @@ class FluorescenceStrategy(ProcessingStrategy):
             if metrics_df is not None:
                 metrics_df.to_csv(metrics_csv_path, index=False)
 
-            # Persist Neighbor Points
+            # Persist full N×N pairwise distance matrix
+            dist_df = detailed_outputs.get('distance_matrix')
+            if dist_df is not None and not dist_df.empty:
+                print(f"  Saving pairwise distance matrix to: {os.path.basename(dist_csv_path)}")
+                dist_df.to_csv(dist_csv_path, index=True)
+
+            # Persist nearest-neighbour connection coordinates
             points_df = detailed_outputs.get('all_pairs_points')
             if points_df is not None and not points_df.empty:
                 points_df.to_csv(pts_csv_path, index=False)
+
+            # Persist per-branch skan statistics
+            branch_df = detailed_outputs.get('detailed_branches')
+            if branch_df is not None and not branch_df.empty:
+                print(f"  Saving branch data to: {os.path.basename(branch_csv_path)}")
+                branch_df.to_csv(branch_csv_path, index=False)
 
             if viewer is not None:
                 if skel_dat_path and os.path.exists(skel_dat_path):
@@ -564,7 +578,8 @@ class FluorescenceStrategy(ProcessingStrategy):
                         shape=self.image_shape
                     )
                     self._add_layer_safely(
-                        viewer, skel_display, "Skeletons", layer_type='labels'
+                        viewer, self._build_label_pyramid(skel_display),
+                        "Skeletons", layer_type='labels'
                     )
                 if points_df is not None and not points_df.empty:
                     self._add_neighbor_lines(viewer, points_df)
@@ -645,7 +660,16 @@ class FluorescenceStrategy(ProcessingStrategy):
         if checkpoint_step >= 4:
             load_and_add("final_segmentation", "Final segmentation")
         if checkpoint_step >= 5:
-            load_and_add("skeleton_array", "Skeletons", layer_type='labels')
+            path = files.get("skeleton_array")
+            if path and os.path.exists(path):
+                try:
+                    skel_data = np.memmap(path, dtype=np.int32, mode='r', shape=self.image_shape)
+                    self._add_layer_safely(
+                        viewer, self._build_label_pyramid(skel_data),
+                        "Skeletons", layer_type='labels'
+                    )
+                except Exception as e:
+                    print(f"Error loading skeleton: {e}")
             pts_path = files.get("points_matrix")
             if pts_path and os.path.exists(pts_path):
                 try:
