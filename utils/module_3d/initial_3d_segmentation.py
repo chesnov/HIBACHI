@@ -296,13 +296,45 @@ def segment_cells_first_pass_raw(
                         idx = read_sl[0].start + i
                         if idx not in z_stats: z_stats[idx] = []
                         z_stats[idx].extend(vals[:5000])
-            
-            ideal = np.ones(volume.shape[0])
+
             z_indices = np.arange(volume.shape[0])
             hp = np.array([np.percentile(z_stats[z], global_high_p) if z in z_stats else np.nan for z in z_indices])
+
+            ideal = np.ones(volume.shape[0])
             if np.any(~np.isnan(hp)):
-                valid = ~np.isnan(hp); p = np.poly1d(np.polyfit(z_indices[valid], hp[valid], 2))
-                ideal = np.maximum(p(z_indices), np.nanpercentile(hp, 10))
+                valid = ~np.isnan(hp)
+                p = np.poly1d(np.polyfit(z_indices[valid], hp[valid], 2))
+                raw_ideal = p(z_indices)
+
+                # Amplification cap: the polynomial correction should not amplify
+                # any slice by more than max_amplification relative to the median
+                # correction in the "good" central region of the stack.
+                #
+                # At the Z extremes the polynomial value is small (dim tissue),
+                # so dividing by it would amplify both signal AND noise, which
+                # is why edge slices oversegment.  Capping the amplification
+                # keeps edge slices relatively dim — their per-scale threshold
+                # samples stay low and noise there does not cross the threshold
+                # that was calibrated on the bright middle slices.
+                #
+                # max_amplification = 3.0  means an edge slice is never boosted
+                # more than 3× relative to the median-brightness slice.
+                # Increase toward 5.0 if you have thick samples with genuine
+                # cells right at the edge; decrease toward 2.0 for thin sections
+                # where the extreme slices are mostly out-of-focus background.
+                max_amplification = 3.0
+                hp_valid = hp[valid]
+                median_hp = float(np.median(hp_valid))
+                amp_floor = median_hp / max_amplification  # divisor floor
+
+                # Also apply the original 10th-percentile absolute floor to
+                # prevent division by near-zero in completely dark volumes.
+                abs_floor = np.nanpercentile(hp, 10)
+
+                ideal = np.maximum(raw_ideal, max(amp_floor, abs_floor))
+                print(f"    Normalization: median brightness={median_hp:.2f}, "
+                      f"amp floor={amp_floor:.2f} (≤{max_amplification:.0f}× boost), "
+                      f"abs floor={abs_floor:.2f}")
 
             for read_sl, _ in tqdm(list(_get_chunk_slices(volume.shape, (64, 512, 512))), desc="    Applying"):
                 factors = ideal[read_sl[0].start:read_sl[0].stop][:, np.newaxis, np.newaxis]
