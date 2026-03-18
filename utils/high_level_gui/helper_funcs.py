@@ -1975,6 +1975,49 @@ def interactive_segmentation_with_config(selected_folder: str = None, project_ma
         )
         update_navigation_buttons()
 
+        # --- ROI / Sub-region panel ---
+        roi_container = QWidget()
+        roi_layout = QVBoxLayout()
+        roi_container.setLayout(roi_layout)
+        roi_layout.setContentsMargins(5, 5, 5, 5)
+        roi_layout.setSpacing(4)
+
+        roi_header = QLabel("Sub-region (ROI)")
+        roi_header.setStyleSheet(
+            "font-weight: bold; font-size: 11px; color: #aaa; padding-top: 4px;"
+        )
+        roi_layout.addWidget(roi_header)
+
+        btn_draw = QPushButton("✏  Draw ROI")
+        btn_draw.setToolTip(
+            "Add a polygon layer to draw a sub-region.\n"
+            "Click to add vertices, double-click to close."
+        )
+        btn_draw.clicked.connect(gui_manager.draw_roi)
+        roi_layout.addWidget(btn_draw)
+
+        btn_confirm = QPushButton("✓  Confirm ROI")
+        btn_confirm.setToolTip(
+            "Crop to the drawn polygon and process only that region.\n"
+            "Parameters tuned here can be transferred to the full image\n"
+            "via 'Set New Channel Config' in the Project View."
+        )
+        btn_confirm.clicked.connect(gui_manager.confirm_roi)
+        roi_layout.addWidget(btn_confirm)
+
+        btn_clear = QPushButton("✗  Clear ROI")
+        btn_clear.setToolTip(
+            "Remove the ROI layer.\n"
+            "If an ROI session is active, offers to return to full-image mode.\n"
+            "Existing ROI outputs are kept on disk."
+        )
+        btn_clear.clicked.connect(gui_manager.clear_roi)
+        roi_layout.addWidget(btn_clear)
+
+        viewer.window.add_dock_widget(
+            roi_container, area="left", name="ROI / Sub-region"
+        )
+
     except Exception as e:
         QMessageBox.critical(None, "Error", str(e))
         app_state.show_project_view_signal.emit()
