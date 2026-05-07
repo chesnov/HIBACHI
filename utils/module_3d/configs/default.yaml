@@ -4,13 +4,26 @@ mode: fluorescence
 execute_raw_segmentation_fluorescence:
   name: Execute Raw Segmentation
   parameters:
-    scale_profiles:
-      label: Tubularity Profiles
+    use_absolute_thresholds:
+      label: "Threshold Mode: Use Absolute Intensity (Disable Percentiles)"
+      type: bool
+      value: false
+
+    scale_profiles_percentile:
+      label: Tubularity Profiles (Percentiles)
       type: scale_table
       value:
         - {scale: 1.0, low: 95.0, high: 99.0}
         - {scale: 1.5, low: 98.0, high: 100.0}
         - {scale: 3.0, low: 98.0, high: 100.0}
+        
+    scale_profiles_absolute:
+      label: Tubularity Profiles (Absolute [0.0 - 1.0])
+      type: scale_table_absolute
+      value:
+        - {scale: 1.0, low: 0.02, high: 1.0}
+        - {scale: 1.5, low: 0.03, high: 1.0}
+        - {scale: 3.0, low: 0.03, high: 1.0}
     min_size:
       label: Minimum Size (Voxels, Raw Seg)
       type: int

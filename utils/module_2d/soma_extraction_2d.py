@@ -24,8 +24,22 @@ except ImportError:
         return 0.0
 
 def get_min_distance_pixels_2d(spacing: Tuple[float, float], physical_distance: float) -> int:
+    """
+    Calculates minimum distance in pixels for peak detection.
+
+    Uses the minimum in-plane resolution (YX) to determine the pixel separation
+    required to satisfy a physical distance requirement.
+
+    Args:
+        spacing: Pixel spacing (Y, X).
+        physical_distance: Desired minimum separation in physical units (um).
+
+    Returns:
+        int: Minimum distance in pixels (minimum of 3).
+    """
     min_spacing = min(spacing)
-    if min_spacing <= 1e-6: return 3
+    if min_spacing <= 1e-6:
+        return 3
     return max(3, int(round(physical_distance / min_spacing)))
 
 def _generate_2d_tiles(bbox: Tuple[slice, slice], tile_size: int = 2048, padding: int = 40):
@@ -45,19 +59,27 @@ def extract_soma_masks_2d(
     segmentation_mask: np.ndarray,
     intensity_image: np.ndarray,
     spacing: Tuple[float, float],
-    min_fragment_size: int = 15,
+    min_fragment_size: int = 30,
     erosion_iterations: int = 0,
     ratios_to_process: List[float] = [0.3, 0.4, 0.5, 0.6],
-    intensity_percentiles_to_process: List[int] = [100, 90, 80, 70, 60, 50, 40, 30, 20, 10],
-    min_physical_peak_separation: float = 5.0,
+    intensity_percentiles_to_process: List[int] = [100, 90, 80, 70, 60, 50, 40, 30],
+    min_physical_peak_separation: float = 7.0,
     max_allowed_core_aspect_ratio: float = 10.0,
-    absolute_min_thickness_um: float = 1.0,
-    absolute_max_thickness_um: float = 7.0,
+    absolute_min_thickness_um: float = 1.5,
+    absolute_max_thickness_um: float = 10.0,
     tile_size_threshold: int = 2048,
-    memmap_output_path: Optional[str] = None
+    pixel_area_threshold: int = 4_000_000,
+    memmap_output_path: Optional[str] = None,
+    **kwargs,
 ) -> np.ndarray:
     """
-    Refactored Memory-Efficient 2D Soma Extraction with Label-First Processing.
+    Memory-Efficient 2D Soma Extraction with Label-First Processing.
+
+    Logically equivalent to the 3D implementation (extract_soma_masks). All
+    morphological checks, recovery paths, and placement logic mirror the 3D
+    version exactly; only dimensionality-specific calls differ (2D DT, 2D PCA,
+    2D tile generation).
+
     STRICT LOGIC PRESERVATION: Higher percentiles/ratios always take precedence.
     """
     t_start_global = time.time()
@@ -71,10 +93,13 @@ def extract_soma_masks_2d(
     else:
         spacing = tuple(float(s) for s in spacing)
 
-    min_seed_fragment_area = max(1, min_fragment_size)
-    
+    min_seed_vol = max(1, min_fragment_size)
+
     # Consolidated peak separation used for both global deduplication and internal splitting
-    min_peak_sep_pixels = get_min_distance_pixels_2d(spacing, min_physical_peak_separation)
+    int_peak_sep = get_min_distance_pixels_2d(spacing, min_physical_peak_separation)
+
+    # Dynamic tile padding: ensure context covers at least one soma radius + buffer
+    tile_padding = int(absolute_max_thickness_um / min(spacing) + 2)
 
     # Identify objects (find_objects is much more RAM efficient than regionprops)
     slices = ndimage.find_objects(segmentation_mask)
@@ -84,7 +109,7 @@ def extract_soma_masks_2d(
 
     # 2. Absolute Mode Initialization & Profiling
     print(f"  Absolute Mode Enforced: Processing {len(valid_labels)} labels...")
-    print(f"  Thresh: Min Area = {min_seed_fragment_area} pixels")
+    print(f"  Thresh: Min Volume = {min_seed_vol} pixels")
     print(f"  Thresh: Thickness = [{absolute_min_thickness_um:.2f} - {absolute_max_thickness_um:.2f}] µm")
     print(f"  Thresh: Peak Separation = {min_physical_peak_separation:.2f} µm")
 
@@ -107,29 +132,32 @@ def extract_soma_masks_2d(
     all_placed_centroids = []
     spatial_index: Optional[KDTree] = None
 
-    # Define Strategies with STRICT priority scores
-    # We add (val / 1000) to the score to ensure higher percentiles/ratios always rank higher
+    # 4. Strategy Definitions
+    # Strategies are ordered by Strict Priority Score (higher score = wins overlap).
+    # We add (val / 1000) to the score to ensure higher percentiles/ratios always rank higher.
     strategies = []
-    for p in sorted(intensity_percentiles_to_process, reverse=True): 
+    for p in sorted(intensity_percentiles_to_process, reverse=True):
         strategies.append({'type': 'Int', 'val': p, 'score': 2.0 + (p / 1000.0)})
-    for r in sorted(ratios_to_process, reverse=True): 
-        # For ratios, higher ratio = smaller core = more specific. 
-        # Note: ratios_to_process is usually [0.3, 0.4, 0.5, 0.6]
+    for r in sorted(ratios_to_process, reverse=True):
         strategies.append({'type': 'DT', 'val': r, 'score': r + (r / 1000.0)})
-    
-    # Sort strategies globally so that when we process a label, we check them in order
+
     strategies.sort(key=lambda x: x['score'], reverse=True)
 
-    # 4. Main Processing (Label-by-Label)
+    # 5. Main Processing (Label-by-Label)
     main_pbar = tqdm(valid_labels, desc="Total Labels", unit="label", dynamic_ncols=True)
-    
+
     for lbl_idx, lbl in enumerate(main_pbar):
         sl = slices[lbl-1]
         h, w = sl[0].stop - sl[0].start, sl[1].stop - sl[1].start
-        is_huge = (h > tile_size_threshold or w > tile_size_threshold)
-        
-        tiles = _generate_2d_tiles(sl, tile_size_threshold)
+        is_huge = (h * w) > pixel_area_threshold
+
+        tiles = _generate_2d_tiles(sl, tile_size_threshold, padding=tile_padding)
         label_candidates = []
+
+        # Per-label deduplication list: prevents two seeds from the same merged
+        # object being placed too close. Cross-label deduplication is handled
+        # by the pixel-overlap check below.
+        label_placed_peaks: List = []
 
         # Sub-progress bar for giant cell clumps
         tile_iter = tqdm(tiles, desc=f"  ↳ Clump {lbl}", leave=False, unit="tile", disable=not is_huge)
@@ -137,14 +165,113 @@ def extract_soma_masks_2d(
         for t_idx, t in enumerate(tile_iter):
             p0, p1 = t['pad'][0:2], t['pad'][2:4]
             t_mask = (segmentation_mask[p0[0]:p1[0], p0[1]:p1[1]] == lbl)
-            if not np.any(t_mask): continue
+            if not np.any(t_mask):
+                continue
             
             t_int = intensity_image[p0[0]:p1[0], p0[1]:p1[1]]
             offset = np.array([p0[0], p0[1]])
             
             # Context-wide distance transform (computed once per tile)
-            dt_full_obj = ndimage.distance_transform_edt(t_mask, sampling=spacing)
-            max_dt_val = np.max(dt_full_obj)
+            dt_obj = ndimage.distance_transform_edt(t_mask, sampling=spacing)
+            max_dt_val = np.max(dt_obj)
+
+            def process_frag_logic(mask_arr, sub_off):
+                """Checks morphological validity and converts to global coords."""
+                local_coords = np.argwhere(mask_arr)
+                tile_coords = local_coords + sub_off
+                g_coords = tile_coords + offset
+
+                # Thickness: max inscribed radius sampled from the full-object DT.
+                # Always use dt_obj (the full label DT) regardless of which strategy
+                # generated this fragment — matches 3D logic exactly.
+                dt_vals = dt_obj[tuple(tile_coords.T)]
+                max_thick = np.max(dt_vals)
+
+                # Lower bound: hard rejection — fragment is too thin regardless of
+                # how it is sub-sampled.
+                if max_thick < absolute_min_thickness_um:
+                    diag_stats["thickness_rejected"] += 1
+                    return
+
+                # Upper bound: rather than discarding the whole fragment, attempt to
+                # recover a sub-kernel — the pixels whose inscribed-circle radius is
+                # within the accepted thickness window.  This preserves somas that
+                # have already been selected from a neighbouring strategy while still
+                # honouring the morphological constraint at the kernel level.
+                if max_thick > absolute_max_thickness_um:
+                    min_allowed_dt = max_thick - absolute_max_thickness_um
+                    within_upper = dt_vals >= min_allowed_dt
+
+                    if not np.any(within_upper):
+                        diag_stats["thickness_rejected"] += 1
+                        return
+
+                    sub_dt_vals = dt_vals[within_upper]
+
+                    # Effective thickness is the internal radius from the new
+                    # boundary to the peak.
+                    effective_thickness = np.max(sub_dt_vals) - np.min(sub_dt_vals)
+                    if effective_thickness < absolute_min_thickness_um:
+                        diag_stats["thickness_rejected"] += 1
+                        return
+
+                    # Narrow all coordinate arrays to the valid sub-kernel pixels.
+                    local_coords = local_coords[within_upper]
+                    tile_coords  = tile_coords[within_upper]
+                    g_coords     = g_coords[within_upper]
+                    dt_vals      = sub_dt_vals
+                    max_thick    = np.max(sub_dt_vals)
+                    sub_min      = local_coords.min(axis=0)
+                    sub_shape    = local_coords.max(axis=0) - sub_min + 1
+                    mask_arr     = np.zeros(sub_shape, dtype=bool)
+                    mask_arr[tuple((local_coords - sub_min).T)] = True
+                    local_coords = local_coords - sub_min
+
+                # DT peak pixel — nucleus geometric centre regardless of strategy.
+                peak_idx = int(np.argmax(dt_vals))
+                peak_coord_g = g_coords[peak_idx]
+
+                # 2D PCA elongation check
+                if mask_arr.sum() > 10:
+                    try:
+                        coords_phys = local_coords * np.array(spacing)
+                        pca = PCA(n_components=2).fit(coords_phys)
+                        ev = np.sort(np.abs(pca.explained_variance_))[::-1]
+                        if (
+                            ev[1] > 1e-12
+                            and (math.sqrt(ev[0]) / math.sqrt(ev[1]))
+                            > max_allowed_core_aspect_ratio
+                        ):
+                            # Recovery: shave off elongated tails (lower DT pixels)
+                            # to isolate the roughly-circular peak region.
+                            core_threshold = max_thick - (absolute_min_thickness_um * 0.5)
+                            valid_core = dt_vals >= core_threshold
+
+                            if np.sum(valid_core) < min_seed_vol:
+                                diag_stats["aspect_ratio_rejected"] += 1
+                                return
+
+                            # Update coordinates to represent only the recovered core.
+                            g_coords = g_coords[valid_core]
+                            mask_arr = valid_core  # 1D bool; mask_arr.sum() = new count
+                    except Exception:
+                        pass
+
+                # Tiling check: centroid must fall inside this tile's target box
+                # to prevent duplicate detections across overlapping tiles.
+                cent = np.mean(g_coords, axis=0)
+                if (
+                    t['target'][0] <= cent[0] < t['target'][2]
+                    and t['target'][1] <= cent[1] < t['target'][3]
+                ):
+                    label_candidates.append({
+                        'coords': g_coords.astype(np.int32),
+                        'peak_coord': peak_coord_g,
+                        'vol': mask_arr.sum(),
+                        'score': strat['score'],
+                        'strat_name': f"{strat['type']}_{strat['val']}",
+                        'frag_max_thick': max_thick,
+                    })
 
             # Strategy loop with Early Stopping
             for strat in strategies:
@@ -157,128 +284,112 @@ def extract_soma_masks_2d(
 
                 if strat['type'] == 'DT':
                     thresh = max_dt_val * strat['val']
-                    if thresh <= 0: continue
-                    core_mask = (dt_full_obj >= thresh) & t_mask
-                    dt_ref = dt_full_obj
+                    if thresh <= 0:
+                        continue
+                    core = (dt_obj >= thresh) & t_mask
+                    dt_ref = dt_obj
                 else:
                     # Intensity Percentile Strategy
                     vals = t_int[t_mask]
-                    if vals.size == 0: continue
-                    core_mask = (t_int >= np.percentile(vals, strat['val'])) & t_mask
+                    if vals.size == 0:
+                        continue
+                    core = (t_int >= np.percentile(vals, strat['val'])) & t_mask
                     # Recalculate local DT for intensity peaks
-                    dt_ref = ndimage.distance_transform_edt(core_mask, sampling=spacing)
+                    dt_ref = ndimage.distance_transform_edt(core, sampling=spacing)
 
-                # Early Stopping: If core is already too small for this priority, it won't yield somas
-                if np.sum(core_mask) < min_seed_fragment_area:
-                    continue 
+                # Early Stopping: skip if core is already too small
+                if np.sum(core) < min_seed_vol:
+                    continue
 
                 if erosion_iterations > 0:
-                    core_mask = ndimage.binary_erosion(core_mask, iterations=erosion_iterations)
-                    if not np.any(core_mask): continue
+                    core = ndimage.binary_erosion(core, iterations=erosion_iterations)
+                    if not np.any(core):
+                        continue
 
                 # Fragment Extraction using vectorized regionprops
-                labeled_core, num_cores = ndimage.label(core_mask)
+                labeled_core, num_cores = ndimage.label(core)
                 for region in regionprops(labeled_core):
                     diag_stats["cores_evaluated"] += 1
-                    if region.area < min_seed_fragment_area:
+                    if region.area < min_seed_vol:
                         diag_stats["cores_too_small"] += 1
                         continue
-                    
+
                     # Local Watershed Splitting for fused somas
                     frag_crop = region.image
                     frag_dt = ndimage.distance_transform_edt(frag_crop, sampling=spacing)
-                    peaks = peak_local_max(frag_dt, min_distance=min_peak_sep_pixels, labels=frag_crop)
-
-                    def process_frag_logic(m, sub_off):
-                        local_coords = np.argwhere(m)
-                        tile_local_coords = local_coords + sub_off
-                        g_coords = tile_local_coords + offset
-                        
-                        # Absolute Thickness check (Max inscribed radius)
-                        max_thick = np.max(dt_ref[tuple(tile_local_coords.T)])
-                        if not (absolute_min_thickness_um <= max_thick <= absolute_max_thickness_um):
-                            diag_stats["thickness_rejected"] += 1
-                            return
-
-                        # Aspect Ratio Check (PCA)
-                        if m.sum() > 5:
-                            try:
-                                pca = PCA(n_components=2).fit(local_coords * np.array(spacing))
-                                ev = np.sort(np.abs(pca.explained_variance_))[::-1]
-                                if ev[1] > 1e-12 and (math.sqrt(ev[0]) / math.sqrt(ev[1])) > max_allowed_core_aspect_ratio:
-                                    diag_stats["aspect_ratio_rejected"] += 1
-                                    return
-                            except Exception:
-                                pass
-
-                        # Tile Boundary Logic: Centroid must be in target box to avoid duplicates
-                        cent = np.mean(g_coords, axis=0)
-                        if t['target'][0] <= cent[0] < t['target'][2] and t['target'][1] <= cent[1] < t['target'][3]:
-                            # SCORE PRECENDENCE: We store the strat score. 
-                            label_candidates.append({
-                                'coords': g_coords, 
-                                'area': m.sum(), 
-                                'score': strat['score']
-                            })
+                    peaks = peak_local_max(frag_dt, min_distance=int_peak_sep, labels=frag_crop)
 
                     if len(peaks) > 1:
                         markers = np.zeros(frag_crop.shape, dtype=np.int32)
-                        for idx, pk in enumerate(peaks): markers[pk[0], pk[1]] = idx + 1
+                        for idx, pk in enumerate(peaks):
+                            markers[pk[0], pk[1]] = idx + 1
                         ws = watershed(-frag_dt, markers, mask=frag_crop)
                         for ws_id in range(1, len(peaks) + 1):
                             m_ws = (ws == ws_id)
-                            if m_ws.sum() >= min_seed_fragment_area: 
+                            if m_ws.sum() >= min_seed_vol:
                                 process_frag_logic(m_ws, region.bbox[:2])
                     else:
                         process_frag_logic(region.image, region.bbox[:2])
 
-                del core_mask
-            
-            del t_mask, t_int, dt_full_obj, dt_ref
-            if t_idx % 5 == 0: # Increased frequency for huge clumps
+                del core
+                if 'dt_ref' in locals() and dt_ref is not dt_obj:
+                    del dt_ref
+
+            del t_mask, t_int, dt_obj
+            if t_idx % 5 == 0:
                 gc.collect()
 
-    # 5. Global Greedy Placement
-    # In this Label-First version, we can place per label to save RAM, 
-    # but we must ensure candidate priority within the label.
+        # 6. Placement (Greedy based on Priority and Spatial Separation)
         if label_candidates:
-            # SORTING IS CRITICAL HERE:
-            # 1. Primary: Strategy Score (Highest percentile wins)
-            # 2. Secondary: Area (If percentile is same, larger soma wins - though usually percentiles are unique now)
-            label_candidates.sort(key=lambda x: (x['score'], x['area']), reverse=True)
-            
+            # SORTING IS CRITICAL:
+            # 1. Primary:   Strategy Score (highest percentile wins)
+            # 2. Secondary: Volume (if score ties, larger soma wins)
+            label_candidates.sort(key=lambda x: (x['score'], x['vol']), reverse=True)
+
             for cand in label_candidates:
                 coords = cand['coords']
-                cent_phys = np.mean(coords, axis=0) * np.array(spacing)
-                
-                # Robust Physical Proximity Check
-                if all_placed_centroids:
-                    # Calculate distance to all previously placed centroids
-                    dists = np.linalg.norm(np.array(all_placed_centroids) - cent_phys, axis=1)
-                    if np.min(dists) < min_physical_peak_separation:
+                peak_phys = cand['peak_coord'] * np.array(spacing)
+
+                # Within-label proximity gate: prevents two seeds from the same
+                # merged clump being placed too close together.
+                if label_placed_peaks:
+                    dists = np.linalg.norm(
+                        np.array(label_placed_peaks) - peak_phys, axis=1
+                    )
+                    min_dist = np.min(dists)
+                    if min_dist < min_physical_peak_separation:
                         diag_stats["spatial_overlap_rejected"] += 1
                         continue
+                    else:
+                        # --- THE TRAP: multiple somas placed within one label ---
+                        print(
+                            f"\n  [TRAP] Label {lbl} got MULTIPLE somas!"
+                            f"\n    -> New Edge/Extra Soma: Strategy {cand.get('strat_name', 'Unknown')}, "
+                            f"Vol {cand['vol']}, Thick {cand.get('frag_max_thick', 0):.1f}"
+                            f"\n    -> Distance to nearest existing soma: {min_dist:.1f} µm "
+                            f"(Limit is {min_physical_peak_separation:.1f} µm)"
+                        )
 
-                # Check Global Conflict (Pixel overlap)
+                # Pixel Overlap Check (cross-label deduplication)
                 idx_tuple = tuple(coords.T)
                 if np.any(final_seed_mask[idx_tuple] > 0):
                     diag_stats["spatial_overlap_rejected"] += 1
                     continue
 
-                # Placement
+                # Place Seed
                 final_seed_mask[idx_tuple] = next_label_id
                 next_label_id += 1
-                all_placed_centroids.append(cent_phys)
-        
+                label_placed_peaks.append(peak_phys)
+                all_placed_centroids.append(peak_phys)
 
         # Update main status
         main_pbar.set_postfix({"Seeds": next_label_id - 1, "RAM": f"{get_ram_usage():.1f}GB"})
-        
+
         if 'label_candidates' in locals():
-            label_candidates.clear() # Explicitly empty the list
+            label_candidates.clear()
             del label_candidates
-        
-        if lbl_idx % 50 == 0: # More frequent GC for 2D batches
+
+        if lbl_idx % 20 == 0:
             gc.collect()
 
     t_total = time.time() - t_start_global
@@ -294,8 +405,8 @@ def extract_soma_masks_2d(
     print(f"    Rejected -> Aspect Ratio:       {diag_stats['aspect_ratio_rejected']}")
     print(f"    Rejected -> Spatial Overlap:    {diag_stats['spatial_overlap_rejected']}")
     print("="*60 + "\n")
-    
-    if isinstance(final_seed_mask, np.memmap): 
+
+    if isinstance(final_seed_mask, np.memmap):
         final_seed_mask.flush()
-    
+
     return final_seed_mask

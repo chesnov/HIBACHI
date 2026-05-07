@@ -290,7 +290,7 @@ class ScalesTableWidget(QWidget):
     """
     valueChanged = pyqtSignal(object)
 
-    def __init__(self, initial_value: List[Dict[str, float]], label: str = ""):
+    def __init__(self, initial_value: List[Dict[str, float]], label: str = "", is_absolute: bool = False):
         super().__init__()
         self.layout = QVBoxLayout(self)
         self.layout.setContentsMargins(0, 0, 0, 0)
@@ -315,7 +315,8 @@ class ScalesTableWidget(QWidget):
         # Table
         self.table = QTableWidget()
         self.table.setColumnCount(3)
-        self.table.setHorizontalHeaderLabels(["Scale", "Low %", "High %"])
+        self.table.setHorizontalHeaderLabels(["Scale", "Low Val", "High Val"] if is_absolute else ["Scale", "Low %", "High %"]
+        )
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.table.setMinimumHeight(150)
@@ -383,11 +384,18 @@ def create_parameter_widget(
     widget = None
 
     try:
-        if param_type == "scale_table":
-            initial_val = param_config.get("value", [])
-            widget = ScalesTableWidget(initial_val, label)
+        # --- Handle Percentile Table ---
+        if param_type == "scale_table" or param_type == "scale_table_percentile":
+            initial_val = param_config.get("value",[])
+            widget = ScalesTableWidget(initial_val, label, is_absolute=False)
             widget.valueChanged.connect(callback)
-            # IMPORTANT: Return early because this is a custom Qt widget, not MagicGUI
+            return widget
+        
+        # --- Handle Absolute Table ---
+        elif param_type == "scale_table_absolute":
+            initial_val = param_config.get("value",[])
+            widget = ScalesTableWidget(initial_val, label, is_absolute=True)
+            widget.valueChanged.connect(callback)
             return widget
         
         if param_type == "list":

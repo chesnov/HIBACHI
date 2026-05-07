@@ -251,6 +251,7 @@ def segment_cells_first_pass_raw(
     min_size_voxels: int = 50,
     low_threshold_percentile: Union[float, List[float]] = 25.0,
     high_threshold_percentile: Union[float, List[float]] = 95.0,
+    threshold_mode: str = "Percentile",
     skip_tubular_enhancement: bool = False,
     subtract_background_radius: int = 0,
     temp_root_path: Optional[str] = None,
@@ -282,64 +283,55 @@ def segment_cells_first_pass_raw(
             norm_dir = _get_safe_temp_dir(temp_root_path, 'normalize'); temp_dirs_to_clean.append(norm_dir)
             norm_path = os.path.join(norm_dir, 'norm.dat')
             norm_mm = np.memmap(norm_path, dtype=np.float32, mode='w+', shape=volume.shape)
-            global_high_p = max(high_thresh_list)
-
-            z_stats = {}
-            # Dynamic stride: 16 for large XY, denser for small XY
-            stride_xy = max(1, min(16, min(volume.shape[1:]) // 128))
             
-            for read_sl, _ in tqdm(list(_get_chunk_slices(volume.shape, (64, 512, 512))), desc="    Sampling"):
-                sub = volume[read_sl][:, ::stride_xy, ::stride_xy]
-                for i in range(sub.shape[0]):
-                    vals = sub[i].ravel(); vals = vals[vals > 0]
-                    if vals.size > 0:
-                        idx = read_sl[0].start + i
-                        if idx not in z_stats: z_stats[idx] = []
-                        z_stats[idx].extend(vals[:5000])
+            if threshold_mode == "Absolute":
+                # Convert to[0, 1] based on bit depth to stabilize Frangi/Sato filters
+                norm_factor = 1.0
+                if np.issubdtype(volume.dtype, np.integer):
+                    norm_factor = float(np.iinfo(volume.dtype).max)
+                
+                print(f"    Normalization skipped for Percentiles, but scaling by DType Max ({norm_factor}) to [0, 1] range.")
+                for read_sl, _ in tqdm(list(_get_chunk_slices(volume.shape, (64, 512, 512))), desc="    Applying"):
+                    norm_mm[read_sl] = volume[read_sl].astype(np.float32) / norm_factor
+                norm_mm.flush()
+            else:
+                # ORIGINAL PERCENTILE NORMALIZATION LOGIC REMAINS HERE
+                global_high_p = max(high_thresh_list)
+                
+                z_stats = {}
+                stride_xy = max(1, min(16, min(volume.shape[1:]) // 128))
+                
+                for read_sl, _ in tqdm(list(_get_chunk_slices(volume.shape, (64, 512, 512))), desc="    Sampling"):
+                    sub = volume[read_sl][:, ::stride_xy, ::stride_xy]
+                    for i in range(sub.shape[0]):
+                        vals = sub[i].ravel(); vals = vals[vals > 0]
+                        if vals.size > 0:
+                            idx = read_sl[0].start + i
+                            if idx not in z_stats: z_stats[idx] = []
+                            z_stats[idx].extend(vals[:5000])
 
-            z_indices = np.arange(volume.shape[0])
-            hp = np.array([np.percentile(z_stats[z], global_high_p) if z in z_stats else np.nan for z in z_indices])
+                z_indices = np.arange(volume.shape[0])
+                hp = np.array([np.percentile(z_stats[z], global_high_p) if z in z_stats else np.nan for z in z_indices])
 
-            ideal = np.ones(volume.shape[0])
-            if np.any(~np.isnan(hp)):
-                valid = ~np.isnan(hp)
-                p = np.poly1d(np.polyfit(z_indices[valid], hp[valid], 2))
-                raw_ideal = p(z_indices)
+                ideal = np.ones(volume.shape[0])
+                if np.any(~np.isnan(hp)):
+                    valid = ~np.isnan(hp)
+                    p = np.poly1d(np.polyfit(z_indices[valid], hp[valid], 2))
+                    raw_ideal = p(z_indices)
+                    max_amplification = 3.0
+                    hp_valid = hp[valid]
+                    median_hp = float(np.median(hp_valid))
+                    amp_floor = median_hp / max_amplification
+                    abs_floor = np.nanpercentile(hp, 10)
+                    ideal = np.maximum(raw_ideal, max(amp_floor, abs_floor))
+                    print(f"    Normalization: median brightness={median_hp:.2f}, "
+                          f"amp floor={amp_floor:.2f} (≤{max_amplification:.0f}× boost), "
+                          f"abs floor={abs_floor:.2f}")
 
-                # Amplification cap: the polynomial correction should not amplify
-                # any slice by more than max_amplification relative to the median
-                # correction in the "good" central region of the stack.
-                #
-                # At the Z extremes the polynomial value is small (dim tissue),
-                # so dividing by it would amplify both signal AND noise, which
-                # is why edge slices oversegment.  Capping the amplification
-                # keeps edge slices relatively dim — their per-scale threshold
-                # samples stay low and noise there does not cross the threshold
-                # that was calibrated on the bright middle slices.
-                #
-                # max_amplification = 3.0  means an edge slice is never boosted
-                # more than 3× relative to the median-brightness slice.
-                # Increase toward 5.0 if you have thick samples with genuine
-                # cells right at the edge; decrease toward 2.0 for thin sections
-                # where the extreme slices are mostly out-of-focus background.
-                max_amplification = 3.0
-                hp_valid = hp[valid]
-                median_hp = float(np.median(hp_valid))
-                amp_floor = median_hp / max_amplification  # divisor floor
-
-                # Also apply the original 10th-percentile absolute floor to
-                # prevent division by near-zero in completely dark volumes.
-                abs_floor = np.nanpercentile(hp, 10)
-
-                ideal = np.maximum(raw_ideal, max(amp_floor, abs_floor))
-                print(f"    Normalization: median brightness={median_hp:.2f}, "
-                      f"amp floor={amp_floor:.2f} (≤{max_amplification:.0f}× boost), "
-                      f"abs floor={abs_floor:.2f}")
-
-            for read_sl, _ in tqdm(list(_get_chunk_slices(volume.shape, (64, 512, 512))), desc="    Applying"):
-                factors = ideal[read_sl[0].start:read_sl[0].stop][:, np.newaxis, np.newaxis]
-                norm_mm[read_sl] = volume[read_sl].astype(np.float32) / np.where(factors > 1e-9, factors, 1.0)
-            norm_mm.flush()
+                for read_sl, _ in tqdm(list(_get_chunk_slices(volume.shape, (64, 512, 512))), desc="    Applying"):
+                    factors = ideal[read_sl[0].start:read_sl[0].stop][:, np.newaxis, np.newaxis]
+                    norm_mm[read_sl] = volume[read_sl].astype(np.float32) / np.where(factors > 1e-9, factors, 1.0)
+                norm_mm.flush()
 
         # --- Stage 1.2: Independent 3D Smoothing ---
         # This makes smooth_sigma a fixed preprocessing step for all scales (including scale=0)
@@ -385,16 +377,18 @@ def segment_cells_first_pass_raw(
                     )
                 
                 # Independent Thresholding Pass
-                # Dynamic strides based on dimensions
                 stride_z = max(1, min(4, volume.shape[0] // 32))
                 stride_xy = max(1, min(16, min(volume.shape[1:]) // 128))
                 
-                samples = enh_mm[::stride_z, ::stride_xy, ::stride_xy].ravel(); samples = samples[samples > 1e-7]
-                
-                # Use current_low_p instead of global low_threshold_percentile
-                thresh = float(np.percentile(samples, current_low_p)) if samples.size > 1000 else 1e9
-                thresh = max(thresh, 1e-5); threshold_history[scale] = thresh
-                print(f"      [Scale {scale}] Isolated Threshold (p{current_low_p}): {thresh:.6f}")
+                if threshold_mode == "Absolute":
+                    thresh = current_low_p
+                    thresh = max(thresh, 1e-5); threshold_history[scale] = thresh
+                    print(f"      [Scale {scale}] Absolute Threshold: {thresh:.6f}")
+                else:
+                    samples = enh_mm[::stride_z, ::stride_xy, ::stride_xy].ravel(); samples = samples[samples > 1e-7]
+                    thresh = float(np.percentile(samples, current_low_p)) if samples.size > 1000 else 1e9
+                    thresh = max(thresh, 1e-5); threshold_history[scale] = thresh
+                    print(f"      [Scale {scale}] Isolated Threshold (p{current_low_p}): {thresh:.6f}")
 
                 # Binary Creation, Closing, and OR-ing
                 if thresh < 1e6:

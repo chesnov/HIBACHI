@@ -14,7 +14,7 @@ from PyQt5.QtWidgets import (  # type: ignore
     QMessageBox, QWidget, QVBoxLayout, QScrollArea, QLabel,
     QTextEdit, QProgressBar, QApplication, QPushButton, QFileDialog, QDockWidget
 )
-from PyQt5.QtCore import QThread, pyqtSignal, QObject, Qt  # type: ignore
+from PyQt5.QtCore import QThread, pyqtSignal, QObject, Qt, QTimer  # type: ignore
 from PyQt5.QtGui import QTextCursor  # type: ignore
 import napari  # type: ignore
 
@@ -1229,6 +1229,7 @@ class DynamicGUIManager(QObject):
         """Generates parameter widgets for the given step."""
         self.clear_current_widgets()
         self.parameter_values = {}
+        self.current_step_method = step_method_name # Store for dynamic refresh
         
         config_key = self.strategy.get_config_key(step_method_name)
         step_display = self.step_display_names.get(step_method_name, step_method_name)
@@ -1249,20 +1250,27 @@ class DynamicGUIManager(QObject):
         scroll_l.addWidget(lbl)
 
         if isinstance(parameters, dict):
+            # Check if Absolute mode is enabled
+            is_absolute = False
+            if "use_absolute_thresholds" in parameters:
+                is_absolute = bool(parameters["use_absolute_thresholds"].get("value", False))
+
             for pname, pconf in parameters.items():
+                # Mutually exclusive parameter filtering
+                if pname in["scale_profiles", "scale_profiles_percentile"] and is_absolute:
+                    continue
+                if pname == "scale_profiles_absolute" and not is_absolute:
+                    continue
+
                 try:
-                    # Create callback closure
                     cb = lambda val, k=config_key, p=pname: self.parameter_changed(k, p, val)
-                    
-                    # Create widget using helper
                     w = create_parameter_widget(pname, pconf, cb)
                     if w: 
                         scroll_l.addWidget(w.native)
                         self.parameter_values[pname] = pconf.get('value')
                 except Exception:
                     pass
-        
-        # Log is persistent, so we don't add it here
+
         self._dock_widget(scroll_w, step_display)
 
     def create_interaction_widgets(self, step_display: str, config_key: str) -> None:
@@ -1341,6 +1349,11 @@ class DynamicGUIManager(QObject):
         try:
             self.config[config_key]["parameters"][param_name]["value"] = value
             self.parameter_values[param_name] = value
+
+            # If the threshold mode toggle was flipped, trigger a deferred redraw 
+            # to swap the tables without crashing the PyQT event loop
+            if param_name == "use_absolute_thresholds":
+                QTimer.singleShot(0, lambda: self.create_step_widgets(self.current_step_method))
         except Exception:
             pass
 

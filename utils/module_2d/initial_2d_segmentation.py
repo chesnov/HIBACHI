@@ -208,6 +208,7 @@ def segment_cells_first_pass_raw_2d(
     min_size_pixels: int = 50,
     low_threshold_percentile: Union[float, List[float]] = 95.0,
     high_threshold_percentile: Union[float, List[float]] = 100.0,
+    threshold_mode: str = "Percentile",
     skip_tubular_enhancement: bool = False,
     subtract_background_radius: int = 0,
     temp_root_path: Optional[str] = None,
@@ -241,22 +242,29 @@ def segment_cells_first_pass_raw_2d(
             norm_path = os.path.join(norm_dir, 'norm.dat')
             norm_mm = np.memmap(norm_path, dtype=np.float32, mode='w+', shape=image.shape)
             
-            # Use MAX high percentile
-            global_high_p = max(high_thresh_list)
-
-            # Dynamic stride: 8 for large images, denser for small inputs
-            norm_stride = max(1, min(8, min(image.shape) // 256))
-            samples = image[::norm_stride, ::norm_stride].ravel(); samples = samples[samples > 0]
-            
-            # Use global_high_p
-            high_val = np.percentile(samples, global_high_p) if samples.size > 0 else 1.0
-            high_val = max(high_val, 1e-9)
-            print(f"    Normalization Max (p{global_high_p}): {high_val:.2f}")
-
             chunk_gen = list(_get_chunk_slices_2d(image.shape, (2048, 2048), overlap=0))
-            for read_sl, _ in tqdm(chunk_gen, desc="    Applying"):
-                norm_mm[read_sl] = image[read_sl].astype(np.float32) / high_val
-            norm_mm.flush()
+            
+            if threshold_mode == "Absolute":
+                norm_factor = 1.0
+                if np.issubdtype(image.dtype, np.integer):
+                    norm_factor = float(np.iinfo(image.dtype).max)
+                    
+                print(f"    Normalization skipped for Percentiles, but scaling by DType Max ({norm_factor}) to [0, 1] range.")
+                for read_sl, _ in tqdm(chunk_gen, desc="    Applying"):
+                    norm_mm[read_sl] = image[read_sl].astype(np.float32) / norm_factor
+                norm_mm.flush()
+            else:
+                # ORIGINAL PERCENTILE NORMALIZATION LOGIC REMAINS HERE
+                global_high_p = max(high_thresh_list)
+                norm_stride = max(1, min(8, min(image.shape) // 256))
+                samples = image[::norm_stride, ::norm_stride].ravel(); samples = samples[samples > 0]
+                high_val = np.percentile(samples, global_high_p) if samples.size > 0 else 1.0
+                high_val = max(high_val, 1e-9)
+                print(f"    Normalization Max (p{global_high_p}): {high_val:.2f}")
+
+                for read_sl, _ in tqdm(chunk_gen, desc="    Applying"):
+                    norm_mm[read_sl] = image[read_sl].astype(np.float32) / high_val
+                norm_mm.flush()
 
         # --- Global 2D Smoothing (Preprocessing) ---
         smoothed_mm = norm_mm
@@ -299,14 +307,16 @@ def segment_cells_first_pass_raw_2d(
                     )
                 
                 # Independent Thresholding
-                # Dynamic stride: 16 for large images, denser for small inputs
-                stride = max(1, min(16, min(image.shape) // 128))
-                samples = enh_mm[::stride, ::stride].ravel(); samples = samples[samples > 1e-7]
-                
-                # Use current_low_p
-                thresh = float(np.percentile(samples, current_low_p)) if samples.size > 1000 else 1e9
-                thresh = max(thresh, 1e-5); threshold_history[scale] = thresh
-                print(f"      [Scale {scale}] Isolated Threshold (p{current_low_p}): {thresh:.6f}")
+                if threshold_mode == "Absolute":
+                    thresh = current_low_p
+                    thresh = max(thresh, 1e-5); threshold_history[scale] = thresh
+                    print(f"      [Scale {scale}] Absolute Threshold: {thresh:.6f}")
+                else:
+                    stride = max(1, min(16, min(image.shape) // 128))
+                    samples = enh_mm[::stride, ::stride].ravel(); samples = samples[samples > 1e-7]
+                    thresh = float(np.percentile(samples, current_low_p)) if samples.size > 1000 else 1e9
+                    thresh = max(thresh, 1e-5); threshold_history[scale] = thresh
+                    print(f"      [Scale {scale}] Isolated Threshold (p{current_low_p}): {thresh:.6f}")
 
                 if thresh < 1e6:
                     enh_dask = da.from_array(enh_mm, chunks=(4096, 4096))

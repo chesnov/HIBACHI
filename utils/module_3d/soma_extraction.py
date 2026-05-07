@@ -238,6 +238,11 @@ def extract_soma_masks(
         )
         label_candidates = []
 
+        # Per-label deduplication list (Fix 1 from previous iteration):
+        # prevents two seeds from the same merged object being placed too close.
+        # Cross-label deduplication is handled by the pixel-overlap check.
+        label_placed_peaks: List = []
+
         tile_pbar = tqdm(
             tiles, desc=f"  ↳ Clump {lbl}", leave=False, unit="tile", disable=not is_huge
         )
@@ -252,6 +257,103 @@ def extract_soma_masks(
             offset = np.array([z0, y0, x0])
             dt_obj = ndimage.distance_transform_edt(t_mask, sampling=spacing)
             max_dt_val = np.max(dt_obj)
+
+            def process_frag_logic(mask_arr, sub_off):
+                """Checks morphological validity and converts to global coords."""
+                local_coords = np.argwhere(mask_arr)
+                tile_coords = local_coords + sub_off
+                g_coords = tile_coords + offset
+
+                # Thickness: max inscribed radius in the full object (Fix 1)
+                dt_vals = dt_obj[tuple(tile_coords.T)]
+                max_thick = np.max(dt_vals)
+
+                # Lower bound is a hard rejection: the fragment is too thin regardless
+                # of how it is sub-sampled, so discard immediately.
+                if max_thick < absolute_min_thickness_um:
+                    diag_stats["thickness_rejected"] += 1
+                    return
+
+                # Upper bound: rather than discarding the whole fragment, attempt to
+                # recover a sub-kernel — the voxels whose inscribed-sphere radius is
+                # within the accepted thickness window.  This preserves somas that have
+                # already been selected from a neighbouring strategy while still
+                # honouring the morphological constraint at the kernel level.
+                if max_thick > absolute_max_thickness_um:
+                    # Keep the inner core, discard the periphery
+                    min_allowed_dt = max_thick - absolute_max_thickness_um
+                    within_upper = dt_vals >= min_allowed_dt
+                    
+                    if not np.any(within_upper):
+                        diag_stats["thickness_rejected"] += 1
+                        return
+                    
+                    sub_dt_vals = dt_vals[within_upper]
+                    
+                    # Effective thickness is the internal radius from the new boundary to the peak
+                    effective_thickness = np.max(sub_dt_vals) - np.min(sub_dt_vals)
+                    if effective_thickness < absolute_min_thickness_um:
+                        diag_stats["thickness_rejected"] += 1
+                        return
+                        
+                    # Narrow all coordinate arrays to the valid sub-kernel voxels.
+                    local_coords = local_coords[within_upper]
+                    tile_coords  = tile_coords[within_upper]
+                    g_coords     = g_coords[within_upper]
+                    dt_vals      = sub_dt_vals
+                    max_thick    = np.max(sub_dt_vals)  # keeps the true peak value intact
+                    sub_min      = local_coords.min(axis=0)
+                    sub_shape    = local_coords.max(axis=0) - sub_min + 1
+                    mask_arr     = np.zeros(sub_shape, dtype=bool)
+                    mask_arr[tuple((local_coords - sub_min).T)] = True
+                    local_coords = local_coords - sub_min
+
+                # DT peak voxel — nucleus geometric centre regardless of strategy
+                peak_idx = int(np.argmax(dt_vals))
+                peak_coord_g = g_coords[peak_idx]          # global voxel coords
+
+                # 3D PCA elongation check (unchanged)
+                if mask_arr.sum() > 10:
+                    try:
+                        coords_phys = local_coords * np.array(spacing)
+                        pca = PCA(n_components=3).fit(coords_phys)
+                        ev = np.sort(np.abs(pca.explained_variance_))[::-1]
+                        if (
+                            ev[2] > 1e-12
+                            and (math.sqrt(ev[0]) / math.sqrt(ev[2]))
+                            > max_allowed_core_aspect_ratio
+                        ):
+                            # Recovery: Shave off elongated tails (lower DT voxels) to isolate the spherical peak
+                            core_threshold = max_thick - (absolute_min_thickness_um * 0.5)
+                            valid_core = dt_vals >= core_threshold
+                            
+                            if np.sum(valid_core) < min_seed_vol:
+                                diag_stats["aspect_ratio_rejected"] += 1
+                                return
+                            
+                            # Update coordinates and mask to represent only the recovered solid core
+                            g_coords = g_coords[valid_core]
+                            mask_arr = valid_core  # Simplifies to a 1D bool, mask_arr.sum() safely computes the new volume
+                    except Exception:
+                        pass
+
+                # Tiling check: use mean centroid (unchanged)
+                cent = np.mean(g_coords, axis=0)
+                if (
+                    t["target"][0] <= cent[0] < t["target"][3]
+                    and t["target"][1] <= cent[1] < t["target"][4]
+                    and t["target"][2] <= cent[2] < t["target"][5]
+                ):
+                    label_candidates.append(
+                        {
+                            "coords": g_coords.astype(np.int32),
+                            "peak_coord": peak_coord_g,    # Fix 2
+                            "vol": mask_arr.sum(),
+                            "score": strat["score"],
+                            "strat_name": f"{strat['type']}_{strat['val']}", # NEW
+                            "frag_max_thick": max_thick                      # NEW
+                        }
+                    )
 
             # Strategy Loop with Early Stopping
             for strat in strategies:
@@ -303,49 +405,6 @@ def extract_soma_masks(
                         frag_dt, min_distance=int_peak_sep, labels=frag_crop
                     )
 
-                    def process_frag_logic(mask_arr, sub_off):
-                        """Checks morphological validity and converts to global coords."""
-                        local_coords = np.argwhere(mask_arr)
-                        tile_coords = local_coords + sub_off
-                        g_coords = tile_coords + offset
-
-                        # Absolute Thickness check (Max inscribed radius)
-                        max_thick = np.max(dt_ref[tuple(tile_coords.T)])
-                        if not (absolute_min_thickness_um <= max_thick <= absolute_max_thickness_um):
-                            diag_stats["thickness_rejected"] += 1
-                            return
-
-                        # 3D PCA elongation check
-                        if mask_arr.sum() > 10:
-                            try:
-                                coords_phys = local_coords * np.array(spacing)
-                                pca = PCA(n_components=3).fit(coords_phys)
-                                ev = np.sort(np.abs(pca.explained_variance_))[::-1]
-                                if (
-                                    ev[2] > 1e-12
-                                    and (math.sqrt(ev[0]) / math.sqrt(ev[2]))
-                                    > max_allowed_core_aspect_ratio
-                                ):
-                                    diag_stats["aspect_ratio_rejected"] += 1
-                                    return
-                            except Exception:
-                                pass
-
-                        # Tiling check: ensure centroid falls in responsible target tile
-                        cent = np.mean(g_coords, axis=0)
-                        if (
-                            t["target"][0] <= cent[0] < t["target"][3]
-                            and t["target"][1] <= cent[1] < t["target"][4]
-                            and t["target"][2] <= cent[2] < t["target"][5]
-                        ):
-                            label_candidates.append(
-                                {
-                                    "coords": g_coords.astype(np.int32),
-                                    "vol": mask_arr.sum(),
-                                    "score": strat["score"],
-                                }
-                            )
-
                     if len(peaks) > 1:
                         markers = np.zeros(frag_crop.shape, dtype=np.int32)
                         for idx, pk in enumerate(peaks):
@@ -372,17 +431,26 @@ def extract_soma_masks(
             label_candidates.sort(key=lambda x: (x["score"], x["vol"]), reverse=True)
             for cand in label_candidates:
                 coords = cand["coords"]
-                cent_phys = np.mean(coords, axis=0) * np.array(spacing)
+                peak_phys = cand["peak_coord"] * np.array(spacing)
 
-                # Robust Physical Proximity Check
-                if all_placed_centroids:
-                    # Calculate distance to all previously placed centroids
-                    dists = np.linalg.norm(np.array(all_placed_centroids) - cent_phys, axis=1)
-                    if np.min(dists) < min_physical_peak_separation:
+                # Within-label proximity gate
+                if label_placed_peaks:
+                    dists = np.linalg.norm(
+                        np.array(label_placed_peaks) - peak_phys, axis=1
+                    )
+                    min_dist = np.min(dists)
+                    if min_dist < min_physical_peak_separation:
                         diag_stats["spatial_overlap_rejected"] += 1
                         continue
+                    else:
+                        # --- THE TRAP: We are placing multiple somas in one label! ---
+                        print(
+                            f"\n  [TRAP] Label {lbl} got MULTIPLE somas!"
+                            f"\n    -> New Edge/Extra Soma: Strategy {cand.get('strat_name', 'Unknown')}, Vol {cand['vol']}, Thick {cand.get('frag_max_thick', 0):.1f}"
+                            f"\n    -> Distance to nearest existing soma: {min_dist:.1f} µm (Limit is {min_physical_peak_separation:.1f} µm)"
+                        )
 
-                # Pixel Overlap Check
+                # Pixel Overlap Check (cross-label deduplication)
                 idx_tuple = tuple(coords.T)
                 if np.any(final_seed_mask[idx_tuple] > 0):
                     diag_stats["spatial_overlap_rejected"] += 1
@@ -391,7 +459,8 @@ def extract_soma_masks(
                 # Place Seed
                 final_seed_mask[idx_tuple] = next_label_id
                 next_label_id += 1
-                all_placed_centroids.append(cent_phys)
+                label_placed_peaks.append(peak_phys)
+                all_placed_centroids.append(peak_phys)
 
         # Main Progress Update
         main_pbar.set_postfix(

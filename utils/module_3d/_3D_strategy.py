@@ -159,23 +159,24 @@ class FluorescenceStrategy(ProcessingStrategy):
 
         try:
             # --- 1. PARAMETER PARSING ---
-            # Check if we are using the new Table Widget (scale_profiles)
-            if "scale_profiles" in params:
-                profiles = params["scale_profiles"]
-                # Unpack the list of dicts into parallel lists
-                tubular_scales = [p['scale'] for p in profiles]
-                low_thresh_input = [p['low'] for p in profiles]
-                high_thresh_input = [p['high'] for p in profiles]
-            else:
-                # Fallback to legacy behavior (separate lists or scalars)
-                tubular_scales = params.get("tubular_scales", [0.8, 1.0, 1.5, 2.0])
-                
-                def _get_thresh(key, default):
-                    val = params.get(key, default)
-                    return [float(x) for x in val] if isinstance(val, list) else float(val)
+            # Extract toggle state
+            is_absolute = params.get("use_absolute_thresholds", False)
+            threshold_mode = "Absolute" if is_absolute else "Percentile"
 
-                low_thresh_input = _get_thresh("low_threshold_percentile", 25.0)
-                high_thresh_input = _get_thresh("high_threshold_percentile", 95.0)
+            # Route to the appropriate table
+            if is_absolute and "scale_profiles_absolute" in params:
+                profiles = params["scale_profiles_absolute"]
+            elif not is_absolute and "scale_profiles_percentile" in params:
+                profiles = params["scale_profiles_percentile"]
+            elif "scale_profiles" in params:
+                # Fallback to legacy behavior
+                profiles = params["scale_profiles"]
+            else:
+                profiles =[{"scale": 1.0, "low": 95.0, "high": 100.0}]
+
+            tubular_scales = [p['scale'] for p in profiles]
+            low_thresh_input = [p['low'] for p in profiles]
+            high_thresh_input = [p['high'] for p in profiles]
 
             # Check for special 'skip' signal in scales
             skip_enhancement = (
@@ -195,6 +196,7 @@ class FluorescenceStrategy(ProcessingStrategy):
                 # Use the variables prepared above
                 low_threshold_percentile=low_thresh_input,
                 high_threshold_percentile=high_thresh_input,
+                threshold_mode=threshold_mode,
                 skip_tubular_enhancement=skip_enhancement,
                 subtract_background_radius=int(
                     params.get("subtract_background_radius", 0)

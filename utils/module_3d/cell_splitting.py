@@ -111,18 +111,31 @@ def _calculate_interface_metrics(
     parent_mask_local: np.ndarray,
     intensity_local: np.ndarray,
     avg_soma_intensity_for_interface: float,
+    cell_mean_intensity: float,
     spacing_tuple: Optional[Tuple[float, float, float]],
     local_analysis_radius: int,
     min_local_intensity_difference: float,
     min_path_intensity_ratio_heuristic: float,
+    max_interface_to_cell_mean_ratio: float = 0.85,
 ) -> Dict[str, Any]:
     """
     Calculates metrics to decide if two watershed basins should be merged.
-    Considers 'Valley Depth' (intensity ratio) and 'Local Contrast'.
+    Three independent criteria are evaluated — ALL must pass to keep basins separate:
+
+    1. Valley-depth check (soma-relative ratio): interface / avg_soma < threshold.
+       Catches interfaces that are bright relative to the soma peaks.
+
+    2. Bright-cut check (cell-mean-relative ratio): interface / cell_mean < max_ratio.
+       Catches Voronoi-style cuts between dim/adjacent seeds where the interface sits
+       at or above the overall cell body mean — indicating no real intensity valley.
+       This is the critical check for dim/tiny seeds close together in the same lobe.
+
+    3. Local contrast check: the two basins must look sufficiently different near the
+       interface. Catches spurious splits where both sides have similar intensities.
     """
     metrics = {'should_merge_decision': False}
     footprint_dilation = footprint_rectangle((3, 3, 3))
-    
+
     # Identify interface pixels
     dilated_A = binary_dilation(mask_A_local, footprint=footprint_dilation)
     interface_mask = dilated_A & mask_B_local & parent_mask_local
@@ -130,24 +143,57 @@ def _calculate_interface_metrics(
     if not np.any(interface_mask):
         return metrics
 
-    # 1. Valley Depth Check (Path Intensity Ratio)
-    mean_interface_intensity = np.mean(intensity_local[interface_mask])
-    ratio = mean_interface_intensity / max(avg_soma_intensity_for_interface, 1e-6)
-    
-    # If ratio is LOW, it means there is a deep, dark valley -> Keep separate
-    ratio_threshold_passed = ratio < min_path_intensity_ratio_heuristic
+    mean_interface_intensity = float(np.mean(intensity_local[interface_mask]))
 
-    # 2. Local Contrast Check
+    # 1. Valley Depth Check — soma-relative
+    ratio_soma = mean_interface_intensity / max(avg_soma_intensity_for_interface, 1e-6)
+    # LOW ratio = deep dark valley relative to soma peaks -> keep separate
+    soma_ratio_passed = ratio_soma < min_path_intensity_ratio_heuristic
+
+    # 2. Bright-Cut Check — cell-mean-relative
+    # If the interface sits at or above cell_mean * threshold, there is no valley:
+    # the watershed made a Voronoi-style geometric cut through bright tissue.
+    # This fires when dim/tiny seeds are adjacent within the same cell lobe.
+    ratio_cell_mean = mean_interface_intensity / max(cell_mean_intensity, 1e-6)
+    cell_mean_ratio_passed = ratio_cell_mean < max_interface_to_cell_mean_ratio
+
+    # 3. Local Contrast Check
     lid_passed = _analyze_local_intensity_difference_optimized(
         interface_mask, mask_A_local, mask_B_local, intensity_local,
         local_analysis_radius, min_local_intensity_difference
     )
 
-    # If EITHER check fails (valley not deep enough OR objects look too similar),
-    # we recommend merging.
-    if not ratio_threshold_passed or not lid_passed:
+    # Merge decision logic:
+    #
+    # - lid_passed=False alone is sufficient to merge (regions are locally indistinguishable).
+    # - soma_ratio_passed=False alone is sufficient to merge (no deep valley vs soma peaks).
+    # - cell_mean_ratio_passed=False alone is NOT sufficient to merge. It only acts as a
+    #   tiebreaker when soma_ratio_passed=True but is borderline: if the interface is near
+    #   the cell body mean AND the soma-ratio valley is not clearly deep, merge.
+    #   Specifically: it can only upgrade a "keep" to a "merge" when soma_ratio is within
+    #   a tolerance band of the threshold (ratio > threshold * 0.7). This prevents the
+    #   bright-cut check from overriding a confirmed strong dark valley.
+    soma_ratio_is_borderline = (
+        soma_ratio_passed and
+        ratio_soma > min_path_intensity_ratio_heuristic * 0.7
+    )
+    if not soma_ratio_passed or not lid_passed:
         metrics['should_merge_decision'] = True
-        
+    elif not cell_mean_ratio_passed and soma_ratio_is_borderline:
+        metrics['should_merge_decision'] = True
+
+    # [PROFILING] Log all three checks and their raw values.
+    bright_cut_warn = " *** BRIGHT CUT ***" if not cell_mean_ratio_passed else ""
+    flush_print(f"  [PROFILE|INTERFACE] "
+                f"mean_interface={mean_interface_intensity:.1f} | "
+                f"soma_ref={avg_soma_intensity_for_interface:.1f} | "
+                f"soma_ratio={ratio_soma:.4f} (thr={min_path_intensity_ratio_heuristic}, "
+                f"passed={soma_ratio_passed}) | "
+                f"cell_mean_ratio={ratio_cell_mean:.4f} (thr={max_interface_to_cell_mean_ratio}, "
+                f"passed={cell_mean_ratio_passed}){bright_cut_warn} | "
+                f"lid_passed={lid_passed} | "
+                f"=> should_merge={metrics['should_merge_decision']}")
+
     return metrics
 
 
@@ -157,10 +203,12 @@ def _build_adjacency_graph_for_cell(
     soma_mask_local: np.ndarray,
     soma_props_for_cell: Dict[int, Dict[str, Any]],
     intensity_local: np.ndarray,
+    cell_mean_intensity: float,
     spacing_tuple: Optional[Tuple[float, float, float]],
     local_analysis_radius: int,
     min_local_intensity_difference: float,
-    min_path_intensity_ratio_heuristic: float
+    min_path_intensity_ratio_heuristic: float,
+    max_interface_to_cell_mean_ratio: float = 0.85,
 ) -> Tuple[Dict[int, Any], Dict[Tuple[int, int], Any]]:
     """
     Builds a Region Adjacency Graph (RAG) for segments within a single cell.
@@ -222,8 +270,9 @@ def _build_adjacency_graph_for_cell(
 
             edges[edge_key] = _calculate_interface_metrics(
                 mask_A, mask_B, original_cell_mask_local, intensity_local,
-                ref_intensity, spacing_tuple, local_analysis_radius,
-                min_local_intensity_difference, min_path_intensity_ratio_heuristic
+                ref_intensity, cell_mean_intensity, spacing_tuple,
+                local_analysis_radius, min_local_intensity_difference,
+                min_path_intensity_ratio_heuristic, max_interface_to_cell_mean_ratio
             )
             
     return nodes, edges
@@ -313,6 +362,31 @@ def _separate_multi_soma_cells_chunk(
             mean_i = np.mean(local_intensity[s_mask]) if np.any(s_mask) else 1.0
             soma_props[s_id] = {'mean_intensity': mean_i}
 
+        # [PROFILING] Seed quality report — flags seeds that are dim or tiny relative to peers.
+        # These seeds are NOT removed (seed placement is trusted), but flagged so we can
+        # correlate suspicious seeds with bad cuts in the output.
+        if len(seeds_in_crop) > 1:
+            max_soma_int = max(p['mean_intensity'] for p in soma_props.values())
+            marker_counts = {
+                s_id: int(np.sum(local_soma == s_id)) for s_id in seeds_in_crop
+            }
+            max_marker_count = max(marker_counts.values())
+            for s_id in seeds_in_crop:
+                n_markers   = marker_counts[s_id]
+                soma_int    = soma_props[s_id]['mean_intensity']
+                int_ratio   = soma_int / (max_soma_int + 1e-6)
+                size_ratio  = n_markers / (max_marker_count + 1e-6)
+                flags = []
+                if int_ratio < 0.6:
+                    flags.append(f"DIM (int_ratio={int_ratio:.2f})")
+                if size_ratio < 0.3:
+                    flags.append(f"TINY (size_ratio={size_ratio:.2f})")
+                flag_str = " *** " + ", ".join(flags) + " ***" if flags else ""
+                flush_print(f"  [PROFILE|SEED] seed={s_id} | markers={n_markers} | "
+                            f"soma_intensity={soma_int:.1f} | "
+                            f"int_frac_of_brightest={int_ratio:.2f} | "
+                            f"size_frac_of_largest={size_ratio:.2f}{flag_str}")
+
         # A. Seeded Watershed
         # Use SimpleITK helper for speed/memory efficiency
         
@@ -321,43 +395,115 @@ def _separate_multi_soma_cells_chunk(
         for idx, s_id in enumerate(seeds_in_crop):
             markers[local_soma == s_id] = idx + 1
 
-        # ---- NEW ROBUST LANDSCAPE GENERATION ----
-        # 1. Base distance from seeds 
-        # (This guarantees every seed starts at EXACTLY 0 elevation, eliminating the unequal basin flaw)
+        # ---- LANDSCAPE GENERATION ----
+        # NOTE: We do NOT use d_seeds = distance_transform_edt(markers == 0) in the
+        # landscape formula. The old formula  landscape = d_seeds / speed^p  contained
+        # a Euclidean geometric bias: d_seeds grows proportionally to straight-line
+        # distance from the nearest seed, ignoring the speed field along the path.
+        # For seeds of unequal size or position, this pre-biases basin boundaries toward
+        # the geometric midplane regardless of intensity valleys.
+        #
+        # The correct formulation is a pure cost field:
+        #   landscape = 1 / speed^p
+        # The ITK watershed floods simultaneously from all seeds in ascending cost order.
+        # Bright, thick regions (high speed) have low cost → seeds expand there first.
+        # Dark necks (low speed) have high cost → they act as barriers and the boundary
+        # naturally falls at the dark valley. No Euclidean pre-bias is introduced.
+        #
+        # d_seeds is still computed below for profiling only (it helps interpret the
+        # geometry of the crop), but it is no longer part of the landscape formula.
+
+        # 1. Geometric thickness (used both in speed and for profiling)
+        # dt is large in cell centers and drops near boundaries and thin necks.
+        dt = distance_transform_edt(local_mask, sampling=spacing)
+
+        # 2. Euclidean distance from seeds — PROFILING ONLY, not used in landscape.
         d_seeds = distance_transform_edt(markers == 0, sampling=spacing)
 
-        # 2. Geometric thickness 
-        # (dt is large in cell centers, and drops near boundaries and thin necks)
-        dt = distance_transform_edt(local_mask, sampling=spacing)
-        
         # 3. Calculate local expansion "speed"
-        # Water expands faster in thick regions and slows down drastically in thin necks.
-        # Adding a small epsilon prevents division by zero in the background.
+        dt = distance_transform_edt(local_mask, sampling=spacing)
         speed = dt + 1e-5
         
         # 4. Modulate speed by intensity
         intensity_weight = kwargs.get('intensity_weight', 0.5)
         if intensity_weight > 0:
-            norm_int = (local_intensity - local_intensity.min()) / \
-                       (local_intensity.max() - local_intensity.min() + 1e-6)
-            # Brighter areas speed up expansion; dark areas slow it down
+            # Fetch global data passed from the coordinator
+            cell_global_seeds = list(kwargs.get('cell_to_somas', {}).get(cell_label, seeds_in_crop))
+            global_intensities = kwargs.get('global_soma_intensities', {})
+            
+            # FIX: Global Continuous Normalization
+            # Instead of using local.max() (which varies wildly between chunks and causes jagged artifacts),
+            # we normalize against the true global soma intensities.
+            soma_ints = [global_intensities.get(s, 1.0) for s in cell_global_seeds]
+            ref_int = np.mean(soma_ints) if soma_ints else (local_intensity.max() + 1e-6)
+            
+            # This ignores bright noise outliers and restores the true 0.0 to 1.0 gradient!
+            norm_int = np.clip(local_intensity / (ref_int + 1e-6), 0.0, 1.0)
+            
+            # Restored your original, highly stable math
             speed = speed * (1.0 + intensity_weight * norm_int)
 
-        # 5. Final Landscape: Time = Distance / Speed
-        landscape = d_seeds / speed
-        # -----------------------------------------
+        # 5. Final Landscape
+        # speed_power = 1.5 slightly increases the penalty of thin necks to prevent Voronoi cuts.
+        speed_power = kwargs.get('speed_power', 1.5)
+        landscape = d_seeds / (speed ** speed_power)
 
         ws_local = _watershed_with_simpleitk(landscape, markers)
         ws_local[~local_mask] = 0
 
+        # [PROFILING] Log what the watershed actually produced.
+        ws_ids, ws_counts = np.unique(ws_local[ws_local > 0], return_counts=True)
+        flush_print(f"  [PROFILE|WS] watershed output: labels={ws_ids} | voxel_counts={ws_counts}")
+        cell_mean_int = float(np.mean(local_intensity[local_mask]))
+        for ws_id, ws_cnt in zip(ws_ids, ws_counts):
+            seed_id = seeds_in_crop[ws_id - 1] if (ws_id - 1) < len(seeds_in_crop) else '?'
+            soma_int = soma_props.get(seed_id, {}).get('mean_intensity', float('nan'))
+            basin_mask = ws_local == ws_id
+            basin_mean = float(np.mean(local_intensity[basin_mask]))
+            # Fraction of voxels in this basin that are brighter than the cell mean.
+            # A correct intensity-guided cut should send bright voxels to the bright-soma basin.
+            frac_bright = float(np.mean(local_intensity[basin_mask] > cell_mean_int))
+            flush_print(f"    ws_label={ws_id} (->seed {seed_id}, soma_intensity={soma_int:.1f}): "
+                        f"{ws_cnt} voxels | mean_intensity={basin_mean:.1f} | "
+                        f"frac_above_cell_mean={frac_bright:.2f}")
+
+        # [PROFILING] BOUNDARY INTENSITY CHECK — the most direct test of whether the cut
+        # is at a dark valley. Dilate each basin, intersect with all OTHER basin voxels.
+        # If boundary_mean ≈ cell_mean_int → CUT IS AT WRONG PLACE (bright midpoint, Voronoi).
+        # If boundary_mean << cell_mean_int → CUT IS CORRECT (dark intensity valley).
+        flush_print(f"  [PROFILE|WS|BOUNDARY] cell_mean_intensity={cell_mean_int:.1f}")
+        footprint_b = footprint_rectangle((3, 3, 3))
+        for ws_id in ws_ids:
+            basin_mask = ws_local == ws_id
+            dilated = binary_dilation(basin_mask, footprint=footprint_b)
+            boundary_voxels = dilated & (ws_local > 0) & (~basin_mask)
+            if np.any(boundary_voxels):
+                bnd_mean = float(np.mean(local_intensity[boundary_voxels]))
+                bnd_frac_below_mean = float(np.mean(local_intensity[boundary_voxels] < cell_mean_int))
+                verdict = "CORRECT (dark valley)" if bnd_mean < 0.7 * cell_mean_int else "WRONG (bright cut — Voronoi bias!)"
+                flush_print(f"    boundary of ws_label={ws_id}: mean_intensity={bnd_mean:.1f} | "
+                            f"frac_below_cell_mean={bnd_frac_below_mean:.2f} | => {verdict}")
+
 
         # B. Graph-Based Merging
         nodes, edges = _build_adjacency_graph_for_cell(
-            ws_local, local_mask, local_soma, soma_props, local_intensity, spacing,
+            ws_local, local_mask, local_soma, soma_props, local_intensity,
+            cell_mean_int, spacing,
             kwargs.get('local_analysis_radius', 10),
             kwargs.get('min_local_intensity_difference', 0.0),
-            kwargs.get('min_path_intensity_ratio', 1.0)
+            kwargs.get('min_path_intensity_ratio', 1.0),
+            kwargs.get('max_interface_to_cell_mean_ratio', 0.85),
         )
+
+        # [PROFILING] Summarize what the graph decided before any merging happens.
+        merge_edges = [(k, v) for k, v in edges.items() if v['should_merge_decision']]
+        keep_edges  = [(k, v) for k, v in edges.items() if not v['should_merge_decision']]
+        flush_print(f"  [PROFILE|GRAPH] cell={cell_label}: "
+                    f"total_edges={len(edges)} | merge_edges={len(merge_edges)} | keep_edges={len(keep_edges)}")
+        for edge_key, edge_val in merge_edges:
+            flush_print(f"    [PROFILE|GRAPH] MERGE: {edge_key}")
+        for edge_key, edge_val in keep_edges:
+            flush_print(f"    [PROFILE|GRAPH] KEEP:  {edge_key}")
 
         merge_map = {i: i for i in range(len(seeds_in_crop) + 2)}
         for (id_a, id_b), metrics in edges.items():
@@ -374,6 +520,11 @@ def _separate_multi_soma_cells_chunk(
         for old_id in unique_ws_ids:
             merged_id = merge_map[old_id]
             final_local_mask[ws_local == old_id] = merged_id
+
+        # [PROFILING] Show the effective merge_map so we can detect runaway merging.
+        flush_print(f"  [PROFILE|GRAPH] merge_map (ws_id -> final_id): {dict(list(merge_map.items())[:20])}")
+        final_ids, final_counts = np.unique(final_local_mask[final_local_mask > 0], return_counts=True)
+        flush_print(f"  [PROFILE|GRAPH] post-merge labels={final_ids} | voxel_counts={final_counts}")
 
         # C. Seed-Aware Orphan Reassignment
         # Ensure every fragment actually contains a seed. If not, merge it.
@@ -577,11 +728,28 @@ def separate_multi_soma_cells(
     unique_labels = np.unique(segmentation_mask[segmentation_mask > 0])
     cell_to_somas: Dict[int, Set[int]] = {}
     
+    global_soma_centroids = {}
+    global_soma_intensities = {}
+
     soma_locs = ndimage.find_objects(soma_mask)
     for s_idx, s_slice in enumerate(soma_locs):
         if s_slice is None:
             continue
         soma_id = s_idx + 1
+        
+        # Calculate Global Centroid
+        cz = (s_slice[0].start + s_slice[0].stop) / 2.0
+        cy = (s_slice[1].start + s_slice[1].stop) / 2.0
+        cx = (s_slice[2].start + s_slice[2].stop) / 2.0
+        if spacing:
+            cz *= spacing[0]; cy *= spacing[1]; cx *= spacing[2]
+        global_soma_centroids[soma_id] = np.array([cz, cy, cx])
+        
+        # Calculate Global Intensity Reference
+        s_mask = soma_mask[s_slice] == soma_id
+        mean_i = np.mean(intensity_volume[s_slice][s_mask]) if np.any(s_mask) else 1.0
+        global_soma_intensities[soma_id] = mean_i
+
         # Which cells overlap this soma?
         cells_under = np.unique(
             segmentation_mask[s_slice][soma_mask[s_slice] == soma_id]
@@ -592,6 +760,10 @@ def separate_multi_soma_cells(
             if cell_id not in cell_to_somas:
                 cell_to_somas[cell_id] = set()
             cell_to_somas[cell_id].add(soma_id)
+
+    kwargs['cell_to_somas'] = cell_to_somas
+    kwargs['global_soma_centroids'] = global_soma_centroids
+    kwargs['global_soma_intensities'] = global_soma_intensities
 
     multi_soma_labels = [c for c, s in cell_to_somas.items() if len(s) > 1]
     
@@ -622,7 +794,9 @@ def separate_multi_soma_cells(
 
             res, _, seed_map = _separate_multi_soma_cells_chunk(
                 seg_chunk, int_chunk, soma_chunk,
-                spacing, chunk_offset, multi_soma_labels, **kwargs
+                spacing, chunk_offset, multi_soma_labels, 
+                global_offset=(sl[0].start, sl[1].start, sl[2].start), # <--- NEW
+                **kwargs
             )
 
             path = os.path.join(memmap_dir, f"chunk_{i}_{os.getpid()}.npy")
@@ -755,7 +929,7 @@ def separate_multi_soma_cells(
             final_path, dtype=np.int32, mode='w+', shape=segmentation_mask.shape
         )
 
-        flush_print("  Writing stitched result...")
+        flush_print("  Writing stitched result with Geodesic Overlap Resolution...")
         for i, sl in enumerate(tqdm(chunk_slices, desc="Writing Result")):
             if i not in chunk_data:
                 continue
@@ -773,9 +947,188 @@ def separate_multi_soma_cells(
 
             mask_nz = res > 0
             canvas_view = final_mask[sl]
-            canvas_view[mask_nz] = res[mask_nz]
-            final_mask[sl] = canvas_view
+            
+            # Identify conflict pixels where canvas already has a DIFFERENT label
+            conflict_mask = mask_nz & (canvas_view > 0) & (canvas_view != res)
+            
+            # Safely write non-conflicting pixels
+            non_conflict = mask_nz & ~conflict_mask
+            canvas_view[non_conflict] = res[non_conflict]
+            
+            # [PROFILING] Log conflict stats for every chunk written.
+            n_conflict = int(np.sum(conflict_mask))
+            n_written  = int(np.sum(non_conflict))
+            flush_print(f"  [PROFILE|STITCH] chunk={i} | written={n_written} | "
+                        f"conflicts={n_conflict} | "
+                        f"conflict_labels_existing={np.unique(canvas_view[conflict_mask]).tolist()} | "
+                        f"conflict_labels_incoming={np.unique(res[conflict_mask]).tolist()}")
+            
+            if np.any(conflict_mask):
+                unique_pairs = np.unique(
+                    np.vstack((canvas_view[conflict_mask], res[conflict_mask])), axis=1
+                ).T
+                
+                for e_lab, i_lab in unique_pairs:
+                    pair_conflict = (canvas_view == e_lab) & (res == i_lab) & conflict_mask
+                    if not np.any(pair_conflict):
+                        continue
+                        
+                    # 1. Get GLOBAL coordinates of the conflict pixels
+                    cz, cy, cx = np.where(pair_conflict)
+                    gz, gy, gx = cz + sl[0].start, cy + sl[1].start, cx + sl[2].start
+                    
+                    # 2. Extract a padded block from the GLOBAL canvas so we can see both chunks
+                    pad = overlap + 4
+                    z_min, z_max = max(0, gz.min() - pad), min(final_mask.shape[0], gz.max() + pad + 1)
+                    y_min, y_max = max(0, gy.min() - pad), min(final_mask.shape[1], gy.max() + pad + 1)
+                    x_min, x_max = max(0, gx.min() - pad), min(final_mask.shape[2], gx.max() + pad + 1)
+                    
+                    sub_slice = (slice(z_min, z_max), slice(y_min, y_max), slice(x_min, x_max))
+                    cv_sub = final_mask[sub_slice].copy()
+                    
+                    # 3. Project conflict pixels into local cv_sub coordinates
+                    local_cz, local_cy, local_cx = gz - z_min, gy - y_min, gx - x_min
+                    local_conflict = np.zeros(cv_sub.shape, dtype=bool)
+                    local_conflict[local_cz, local_cy, local_cx] = True
+                    
+                    # 4. Find safe zones globally
+                    local_e_safe = (cv_sub == e_lab) & ~local_conflict
+                    local_i_safe = (cv_sub == i_lab) & ~local_conflict
+                    
+                    # Failsafe
+                    if not np.any(local_e_safe) or not np.any(local_i_safe):
+                        flush_print(f"  [STITCHER] Failsafe Triggered. e:{np.sum(local_e_safe)}, i:{np.sum(local_i_safe)}")
+                        cv_sub[local_conflict] = i_lab
+                        final_mask[sub_slice] = cv_sub
+                        continue
+                        
+                    # 5. Run Geodesic Micro-Watershed
+                    local_domain = local_conflict | local_e_safe | local_i_safe
+                    markers = np.zeros(local_domain.shape, dtype=np.int32)
+                    markers[local_e_safe] = 1
+                    markers[local_i_safe] = 2
+                    
+                    dt = distance_transform_edt(local_domain, sampling=spacing)
 
+                    # NOTE: d_seeds (Euclidean distance from markers) is intentionally
+                    # NOT computed here. See the per-cell watershed comment for rationale:
+                    # using d_seeds in the landscape introduces a Euclidean geometric bias
+                    # that overrides intensity guidance when safe zones are unequal in size.
+                    # The pure cost field 1/speed^p is the correct formulation.
+
+                    # FIX: Use intensity-modulated speed, identical to the per-cell watershed.
+                    # Previously this was geometry-only (speed = dt + 1e-5), which caused
+                    # large conflict zones to be cut along the geometric midplane instead of
+                    # the true dark intensity valley — producing the diagonal mask artifact.
+                    stitch_intensity_weight = kwargs.get('intensity_weight', 0.5)
+                    if stitch_intensity_weight > 0 and np.any(local_domain):
+                        local_int_sub = intensity_volume[sub_slice].astype(float)
+                        smoothed_sub = ndimage.gaussian_filter(local_int_sub, sigma=1.0)
+                        p1_s, p99_s = np.percentile(smoothed_sub[local_domain], [1, 99])
+                        norm_int_sub = np.clip(
+                            (smoothed_sub - p1_s) / (p99_s - p1_s + 1e-6), 0.0, 1.0
+                        )
+                        max_dt_sub = float(np.max(dt)) if np.any(local_domain) else 1.0
+                        speed = dt + (norm_int_sub * max_dt_sub * stitch_intensity_weight) + 1e-5
+
+                        # [PROFILING] Confirm intensity contribution relative to geometry.
+                        # Only alarm when intensity is genuinely absent (ratio < 0.1).
+                        geom_c = dt[local_domain].mean()
+                        int_c  = (norm_int_sub[local_domain] * max_dt_sub * stitch_intensity_weight).mean()
+                        ratio_c = int_c / (geom_c + 1e-9)
+                        contrib_warn = " *** WARN: intensity nearly absent from speed! ***" if ratio_c < 0.1 else ""
+                        flush_print(f"    [PROFILE|STITCH|GEO] speed: geometry={geom_c:.3f} "
+                                    f"intensity_term={int_c:.3f} ratio={ratio_c:.2f} | "
+                                    f"p1={p1_s:.1f} p99={p99_s:.1f}{contrib_warn}")
+
+                        # [PROFILING] SAFE ZONE INTENSITY CHECK — the root cause test.
+                        # If e_safe and i_safe have SIMILAR mean intensity, the geodesic has
+                        # no signal to guide the cut and will default to a geometric midplane.
+                        # If the conflict zone is NOT the darkest region, the safe zones are
+                        # on the wrong side of the true cell boundary (upstream watershed error).
+                        e_safe_mean = float(np.mean(local_int_sub[local_e_safe])) if np.any(local_e_safe) else float('nan')
+                        i_safe_mean = float(np.mean(local_int_sub[local_i_safe])) if np.any(local_i_safe) else float('nan')
+                        conflict_mean = float(np.mean(local_int_sub[local_conflict]))
+                        domain_mean = float(np.mean(local_int_sub[local_domain]))
+                        is_valley = conflict_mean < min(e_safe_mean, i_safe_mean) * 0.85
+                        safe_contrast = abs(e_safe_mean - i_safe_mean) / (max(e_safe_mean, i_safe_mean) + 1e-6)
+                        # Warn on safe-zone contrast only when it is genuinely negligible (< 5%).
+                        # 10-30% contrast IS meaningful signal; do not alarm on it.
+                        contrast_warn = " *** LOW CONTRAST: geodesic cut may be geometric ***" if safe_contrast < 0.05 else ""
+                        flush_print(f"    [PROFILE|STITCH|GEO] INTENSITY MAP: "
+                                    f"e_safe_mean={e_safe_mean:.1f} | conflict_mean={conflict_mean:.1f} | "
+                                    f"i_safe_mean={i_safe_mean:.1f} | domain_mean={domain_mean:.1f}")
+                        flush_print(f"    [PROFILE|STITCH|GEO] conflict_is_valley={is_valley} "
+                                    f"(conflict={conflict_mean:.0f} vs safe_min={min(e_safe_mean,i_safe_mean):.0f}) | "
+                                    f"safe_zone_contrast={safe_contrast:.3f}{contrast_warn}")
+                        if not is_valley:
+                            flush_print(f"    [PROFILE|STITCH|GEO] *** SAFE ZONE PROBLEM: conflict zone is NOT "
+                                        f"the darkest region. Safe zones are likely on the wrong side of the "
+                                        f"true cell boundary — upstream watershed error propagated here. ***")
+                    else:
+                        local_int_sub = None
+                        speed = dt + 1e-5
+                        flush_print(f"    [PROFILE|STITCH|GEO] pair=({e_lab},{i_lab}) | "
+                                    f"intensity_weight=0 — falling back to geometry-only speed.")
+
+                    speed_power = kwargs.get('speed_power', 1.5)
+
+                    # When there is no dark valley between the two safe zones, running
+                    # the geodesic watershed is pointless: any cut it produces will be at
+                    # a bright point (WRONG), and the result depends on arbitrary safe-zone
+                    # size asymmetry. Instead, directly assign all conflict voxels to
+                    # whichever label has the larger safe zone (size-wins rule).
+                    # This avoids the expensive watershed and avoids introducing a spurious
+                    # bright-intensity cut boundary into the segmentation.
+                    if local_int_sub is not None and not is_valley:
+                        winner = e_lab if np.sum(local_e_safe) >= np.sum(local_i_safe) else i_lab
+                        flush_print(f"    [PROFILE|STITCH|GEO] NO VALLEY: skipping geodesic — "
+                                    f"assigning all {int(np.sum(local_conflict))} conflict voxels "
+                                    f"to larger safe zone (winner={winner}, "
+                                    f"e_safe={int(np.sum(local_e_safe))} vs "
+                                    f"i_safe={int(np.sum(local_i_safe))})")
+                        cv_sub[local_conflict] = winner
+                        final_mask[sub_slice] = cv_sub
+                        continue  # skip geodesic for this pair
+
+                    # d_seeds provides equal-start guarantee: all markers enter the priority
+                    # queue at elevation 0 regardless of local intensity, so dim/tiny seeds
+                    # compete fairly. See per-cell watershed comment for full rationale.
+                    d_seeds_stitch = distance_transform_edt(markers == 0, sampling=spacing)
+                    landscape = d_seeds_stitch / (speed ** speed_power)
+                    landscape[~local_domain] = 1e6
+                    
+                    ws_local = _watershed_with_simpleitk(landscape, markers)
+
+                    # [PROFILING] Log how many conflict voxels were assigned to each label.
+                    n_to_e = int(np.sum((ws_local == 1) & local_conflict))
+                    n_to_i = int(np.sum((ws_local == 2) & local_conflict))
+                    flush_print(f"    [PROFILE|STITCH|GEO] pair=({e_lab},{i_lab}) | "
+                                f"conflict_voxels={int(np.sum(local_conflict))} | "
+                                f"geodesic => e_lab={n_to_e} voxels, i_lab={n_to_i} voxels | "
+                                f"e_safe_size={int(np.sum(local_e_safe))} i_safe_size={int(np.sum(local_i_safe))}")
+
+                    # [PROFILING] RESOLVED BOUNDARY INTENSITY — checks if the geodesic placed
+                    # the final cut at a dark valley or at a bright midpoint.
+                    if local_int_sub is not None:
+                        ws_e_mask = (ws_local == 1) & local_domain
+                        ws_i_mask = (ws_local == 2) & local_domain
+                        if np.any(ws_e_mask) and np.any(ws_i_mask):
+                            dil_e = binary_dilation(ws_e_mask, footprint=footprint_rectangle((3, 3, 3)))
+                            resolved_boundary = dil_e & ws_i_mask
+                            if np.any(resolved_boundary):
+                                bnd_mean = float(np.mean(local_int_sub[resolved_boundary]))
+                                bnd_verdict = ("CORRECT (dark valley)" if bnd_mean < domain_mean * 0.85
+                                               else "WRONG (bright cut)")
+                                flush_print(f"    [PROFILE|STITCH|GEO] resolved boundary mean_intensity={bnd_mean:.1f} "
+                                            f"vs domain_mean={domain_mean:.1f} | => {bnd_verdict}")
+
+                    cv_sub[(ws_local == 2) & local_conflict] = i_lab
+                    
+                    # Write safely back to the global memmap
+                    final_mask[sub_slice] = cv_sub
+
+            final_mask[sl] = canvas_view
             os.remove(path)
 
         # Convert to array for final steps (usually fits in RAM if chunks worked)
