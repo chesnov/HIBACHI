@@ -108,6 +108,53 @@ class RelationalEngine:
         return out_path
     
     @staticmethod
+    def _save_intersection_metrics_via_pipeline(
+        mask_path, shape, spacing, mask_name, id_mapping, out_dir, sample_name, is_2d
+    ):
+        if is_2d:
+            from ..module_2d.calculate_features_2d import analyze_segmentation_2d
+        else:
+            from ..module_3d.calculate_features_3d import analyze_segmentation_3d
+
+        mask = np.memmap(mask_path, dtype=np.int32, mode='r', shape=shape)
+
+        if is_2d:
+            sp = spacing if len(spacing) == 2 else (spacing[1], spacing[2])
+            metrics_df, _ = analyze_segmentation_2d(
+                mask,
+                intensity_image=None,
+                spacing_yx=sp,
+                calculate_distances=False,   # Not needed for synthetic filtering
+                calculate_skeletons=False,   # Expensive and unused downstream
+            )
+        else:
+            metrics_df, _ = analyze_segmentation_3d(
+                mask,
+                intensity_image=None,
+                spacing_zyx=spacing,
+                calculate_distances=False,
+                calculate_skeletons=False,
+            )
+
+        del mask
+
+        if metrics_df.empty:
+            print(f"  [Intersect Metrics] No objects in {mask_name}, skipping CSV.")
+            return
+
+        # Attach parent ID mapping for traceability (same convention as analyze step)
+        map_df = pd.DataFrame(
+            list(id_mapping.items()),
+            columns=['label', f'parent_id_{mask_name}']
+        )
+        metrics_df['label'] = metrics_df['label'].astype(int)
+        metrics_df = pd.merge(map_df, metrics_df, on='label', how='right')
+
+        csv_path = os.path.join(out_dir, f"{sample_name}_relational_metrics.csv")
+        metrics_df.to_csv(csv_path, index=False)
+        print(f"  [Intersect Metrics] Saved {len(metrics_df)} objects → {csv_path}")
+    
+    @staticmethod
     def run_recipe(sample_name, registry, recipe, out_dir, shape, spacing):
         """
         Executes a sequence of relational steps.
@@ -138,10 +185,27 @@ class RelationalEngine:
 
             if step_type == "primary":
                 target_ch = step['target']
-                last_mask_path = RelationalEngine._find_dat(sample_channels.get(target_ch))
-                last_mask_name = name_registry.get(target_ch, "Primary")
-                if last_mask_path:
-                    results_to_viz.append({"name": last_mask_name, "path": last_mask_path})
+                ch_path = RelationalEngine._find_dat(sample_channels.get(target_ch))
+                ch_name = name_registry.get(target_ch, "Primary")
+
+                # Guard: when a 'primary' step immediately precedes an 'analyze' step that
+                # names the same channel as step['primary'], the UI is declaring WHICH channel
+                # is the primary object for that analysis — it is NOT introducing a new pipeline
+                # result.  We must NOT overwrite last_mask_path here, because last_mask_path
+                # still holds the accumulated intermediate (e.g. the B∩C intersection mask)
+                # that the analyze step needs as the *partner*.  Clobbering it causes the
+                # analyze step to compare A against A, giving trivially-zero distances.
+                next_step = recipe[i + 1] if i + 1 < len(recipe) else {}
+                is_analyze_role_selector = (
+                    next_step.get('type') == 'analyze' and
+                    next_step.get('primary') == target_ch
+                )
+                if not is_analyze_role_selector:
+                    last_mask_path = ch_path
+                    last_mask_name = ch_name
+
+                if ch_path:
+                    results_to_viz.append({"name": ch_name, "path": ch_path})
 
             elif step_type == "intersect":
                 inputs = step['inputs']
@@ -162,15 +226,20 @@ class RelationalEngine:
                     )
                     last_mask_name = f"{name_a}_in_{name_b}"
                     
-                    # Relabel to ensure sequential IDs (Fixes numbering gaps)
+                    # Relabel to ensure sequential IDs
                     temp_mask = np.memmap(last_mask_path, dtype=np.int32, mode='r+', shape=shape)
                     new_mask, mapping = RelationalEngine.relabel_sequentially(temp_mask)
                     temp_mask[:] = new_mask[:]
                     temp_mask.flush()
-                    del temp_mask 
+                    del temp_mask
                     
-                    parent_id_map = mapping 
+                    parent_id_map = mapping
                     results_to_viz.append({"name": last_mask_name, "path": last_mask_path})
+                    
+                    # ── Reuse existing feature pipeline to generate metrics CSV ──
+                    RelationalEngine._save_intersection_metrics_via_pipeline(
+                        last_mask_path, shape, spacing, last_mask_name, mapping, out_dir, sample_name, is_2d
+                    )
 
             elif step_type == "filter":
                 if last_mask_path:
@@ -191,43 +260,90 @@ class RelationalEngine:
                     results_to_viz.append({"name": last_mask_name, "path": last_mask_path})
 
             elif step_type == "analyze":
-                partner_bio_name = name_registry.get(step['target'], "Partner")
-                partner_dat_path = RelationalEngine._find_dat(sample_channels.get(step['target']))
-                
-                if last_mask_path and partner_dat_path:
+                # Resolve primary and partner paths/names.
+                #
+                # Three cases, all handled by whether 'primary' is set and what 'target' holds:
+                #
+                # Case 1 – no 'primary' key:
+                #   last_mask_path is primary; step['target'] (a channel key) is the partner.
+                #
+                # Case 2 – 'primary' set, target == "PREVIOUS_RESULT":
+                #   The named primary channel is looked up from the registry.
+                #   last_mask_path (e.g. a B∩C intersection) is the partner.
+                #
+                # Case 3 – 'primary' set, target is a real channel key:
+                #   Simple two-channel analysis. Both sides looked up from the registry.
+                #   last_mask_path is NOT used, so it is left untouched.
+                if step.get('primary'):
+                    primary_ch_key   = step['primary']
+                    active_mask_path = RelationalEngine._find_dat(sample_channels.get(primary_ch_key))
+                    active_mask_name = name_registry.get(primary_ch_key, primary_ch_key)
+
+                    if step.get('target') == "PREVIOUS_RESULT":
+                        # Case 2: partner is the accumulated intermediate
+                        partner_dat_path = last_mask_path
+                        partner_bio_name = last_mask_name
+                    else:
+                        # Case 3: partner is a named channel — direct two-channel analysis
+                        partner_ch_key   = step['target']
+                        partner_dat_path = RelationalEngine._find_dat(sample_channels.get(partner_ch_key))
+                        partner_bio_name = name_registry.get(partner_ch_key, partner_ch_key)
+                else:
+                    # Case 1: default — previous result is primary, target channel is partner
+                    active_mask_path = last_mask_path
+                    active_mask_name = last_mask_name
+                    partner_bio_name = name_registry.get(step['target'], "Partner")
+                    partner_dat_path = RelationalEngine._find_dat(sample_channels.get(step['target']))
+                if active_mask_path and partner_dat_path:
                     # Execute proximity and overlap logic
                     if is_2d:
                         sp_2d = spacing if len(spacing)==2 else (spacing[1], spacing[2])
                         primary_df, partner_df, inter_path = calculate_interaction_metrics_2d(
-                            last_mask_path, partner_dat_path, out_dir, shape, sp_2d, 
-                            last_mask_name, partner_bio_name
+                            active_mask_path, partner_dat_path, out_dir, shape, sp_2d,
+                            active_mask_name, partner_bio_name
                         )
                     else:
                         primary_df, partner_df, inter_path = calculate_interaction_metrics(
-                            last_mask_path, partner_dat_path, out_dir, shape, spacing, 
-                            last_mask_name, partner_bio_name
+                            active_mask_path, partner_dat_path, out_dir, shape, spacing,
+                            active_mask_name, partner_bio_name
                         )
-                    
+
                     # CRITICAL: Append the intersection mask to the viewer list
                     if inter_path:
                         results_to_viz.append({"name": f"Overlap ({partner_bio_name})", "path": inter_path})
 
                     # Rename the ID column for the final merge
-                    id_col = f"id_{last_mask_name}"
-                    
+                    id_col = f"id_{active_mask_name}"
+
+                    # Bug fix: calculate_interaction_metrics can return primary_df with the
+                    # label column already renamed in some code paths — normalise before merging.
+                    if 'label' not in primary_df.columns:
+                        label_candidates = [c for c in primary_df.columns
+                                            if c.lower() == 'label' or c.startswith('id_')]
+                        if label_candidates:
+                            primary_df = primary_df.rename(columns={label_candidates[0]: 'label'})
+                        else:
+                            print(f"  [Warning] primary_df missing 'label' column for partner "
+                                  f"{partner_bio_name}; skipping merge. Columns: {list(primary_df.columns)}")
+                            if not partner_df.empty:
+                                partner_df.to_csv(
+                                    os.path.join(out_dir, f"coverage_stats_{partner_bio_name}.csv"),
+                                    index=False)
+                            continue
+
                     if final_metrics_df is None:
                         final_metrics_df = primary_df.copy().rename(columns={'label': id_col})
                         # Insert parent ID mapping for biological traceability
                         if parent_id_map:
-                            map_df = pd.DataFrame(list(parent_id_map.items()), 
-                                                 columns=[id_col, f"parent_id_{last_mask_name}"])
+                            map_df = pd.DataFrame(list(parent_id_map.items()),
+                                                 columns=[id_col, f"parent_id_{active_mask_name}"])
                             final_metrics_df = pd.merge(map_df, final_metrics_df, on=id_col)
                     else:
                         # Join additional partners (e.g. Neurons AND Microglia) to the same table
-                        final_metrics_df = pd.merge(final_metrics_df, primary_df, 
-                                                   left_on=id_col, right_on='label', 
+                        final_metrics_df = pd.merge(final_metrics_df, primary_df,
+                                                   left_on=id_col, right_on='label',
                                                    how='outer').drop(columns=['label'])
-                    
+
                     # Save the Coverage Summary (Partner-view)
                     if not partner_df.empty:
                         partner_df.to_csv(os.path.join(out_dir, f"coverage_stats_{partner_bio_name}.csv"), index=False)

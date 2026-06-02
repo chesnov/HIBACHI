@@ -1405,19 +1405,16 @@ class CrossChannelAnalyzerWindow(QMainWindow):
         self.btn_synth = QPushButton("🧬 Generate Synthetic Channel")
         self.btn_synth.setStyleSheet("background-color: #8A2BE2; color: white;") # Purple
         
-        self.btn_primary = QPushButton("+ Set Primary")
         self.btn_intersect = QPushButton("+ Intersection")
         self.btn_filter = QPushButton("+ Volume Filter")
         self.btn_dist = QPushButton("+ Distance Analysis")
         
         self.btn_synth.clicked.connect(self.open_synthetic_dialog)
-        self.btn_primary.clicked.connect(self.add_primary_step)
         self.btn_intersect.clicked.connect(self.add_intersect_step)
         self.btn_filter.clicked.connect(self.add_filter_step)
         self.btn_dist.clicked.connect(self.add_analysis_step)
         
         add_step_layout.addWidget(self.btn_synth)
-        add_step_layout.addWidget(self.btn_primary)
         add_step_layout.addWidget(self.btn_intersect)
         add_step_layout.addWidget(self.btn_filter)
         add_step_layout.addWidget(self.btn_dist)
@@ -1497,17 +1494,6 @@ class CrossChannelAnalyzerWindow(QMainWindow):
     def get_checked_channels(self):
         return [self.channel_list.item(i).text() for i in range(self.channel_list.count()) 
                 if self.channel_list.item(i).checkState() == Qt.Checked]
-    
-    def add_primary_step(self):
-        checked = self.get_checked_channels()
-        if len(checked) != 1:
-            QMessageBox.warning(self, "Error", "Select exactly ONE channel to set as the primary mask.")
-            return
-        ch = checked[0]
-        step = {"type": "primary", "target": ch, "name": f"Set Primary: {ch}"}
-        self.recipe_steps.append(step)
-        self.recipe_list.addItem(step["name"])
-
     def open_synthetic_dialog(self):
         try:
             from .synthetic_engine import SyntheticDataDialog
@@ -1563,11 +1549,95 @@ class CrossChannelAnalyzerWindow(QMainWindow):
     def add_analysis_step(self):
         checked = self.get_checked_channels()
         if not checked:
-            QMessageBox.warning(self, "Error", "Check a channel to use as a distance reference.")
+            QMessageBox.warning(self, "Error", "Check at least one channel for distance analysis.")
             return
-        
+
+        # Determine whether there is an accumulated pipeline result (intersection / filter)
+        # that could act as one side of the analysis.
+        has_previous_result = any(
+            s['type'] in ('intersect', 'filter') for s in self.recipe_steps
+        )
+
         for ch in checked:
-            step = {"type": "analyze", "target": ch, "name": f"Analyze relationship with {ch}"}
+            if has_previous_result:
+                # --- Case A: previous accumulated result exists ---
+                # Ask which role the checked channel plays.
+                role, ok = QInputDialog.getItem(
+                    self,
+                    "Select Primary Channel",
+                    "Which side should be the PRIMARY (objects distances are reported FOR)?",
+                    [
+                        f"{ch}  →  primary  (measure FROM {ch} TO the previous result)",
+                        f"Previous result  →  primary  (measure FROM previous result TO {ch})",
+                    ],
+                    0, False
+                )
+                if not ok:
+                    return
+
+                if role.startswith(ch):
+                    # ch is primary, previous result is the partner
+                    step = {
+                        "type":    "analyze",
+                        "primary": ch,
+                        "target":  "PREVIOUS_RESULT",
+                        "name":    f"Analyze {ch} → distance to previous result",
+                    }
+                else:
+                    # previous result is primary, ch is the partner
+                    step = {
+                        "type":   "analyze",
+                        "target": ch,
+                        "name":   f"Analyze previous result → distance to {ch}",
+                    }
+
+            else:
+                # --- Case B: simple two-channel analysis, no prior pipeline result ---
+                # The second channel must be chosen from the channel list.
+                other_channels = [
+                    self.channel_list.item(i).text()
+                    for i in range(self.channel_list.count())
+                    if self.channel_list.item(i).text() != ch
+                ]
+                if not other_channels:
+                    QMessageBox.warning(self, "Error", "Need at least two channels for distance analysis.")
+                    return
+
+                partner, ok = QInputDialog.getItem(
+                    self,
+                    "Select Partner Channel",
+                    f"Measure distance FROM  '{ch}'  TO which channel?",
+                    other_channels, 0, False
+                )
+                if not ok:
+                    return
+
+                # Ask which of the two is primary
+                role, ok = QInputDialog.getItem(
+                    self,
+                    "Select Primary Channel",
+                    "Which side should be the PRIMARY (objects distances are reported FOR)?",
+                    [
+                        f"{ch}  →  primary  (measure FROM {ch} TO {partner})",
+                        f"{partner}  →  primary  (measure FROM {partner} TO {ch})",
+                    ],
+                    0, False
+                )
+                if not ok:
+                    return
+
+                if role.startswith(ch):
+                    primary_ch, partner_ch = ch, partner
+                else:
+                    primary_ch, partner_ch = partner, ch
+
+                step = {
+                    "type":    "analyze",
+                    "primary": primary_ch,
+                    "target":  partner_ch,
+                    "name":    f"Analyze {primary_ch} → distance to {partner_ch}",
+                }
+
             self.recipe_steps.append(step)
             self.recipe_list.addItem(step["name"])
 

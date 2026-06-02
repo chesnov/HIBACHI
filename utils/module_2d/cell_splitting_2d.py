@@ -357,35 +357,6 @@ def _reassign_disconnected_islands_2d(
     return segmentation
 
 
-def fill_internal_voids(segmentation_mask: np.ndarray) -> np.ndarray:
-    """
-    Fills internal holes (voids) in each labelled object independently.
-
-    Holes are filled only into pixels that are background (0) or already the
-    same label, which prevents holes at shared boundaries from being claimed
-    by the wrong neighbour.  Matches the 3D implementation exactly.
-    """
-    labels = np.unique(segmentation_mask)
-    labels = labels[labels > 0]
-    if len(labels) == 0:
-        return segmentation_mask
-    slices = ndimage.find_objects(segmentation_mask)
-    for label in tqdm(labels, desc="Filling Voids"):
-        idx = label - 1
-        if idx >= len(slices) or slices[idx] is None:
-            continue
-        sl = slices[idx]
-        crop = segmentation_mask[sl]
-        obj_mask = (crop == label)
-        filled_mask = ndimage.binary_fill_holes(obj_mask)
-        if np.any(filled_mask != obj_mask):
-            # Only fill where the original pixel is background or self
-            safe_fill = filled_mask & ((crop == label) | (crop == 0))
-            crop[safe_fill] = label
-            segmentation_mask[sl] = crop
-    return segmentation_mask
-
-
 # =============================================================================
 # Worker Function
 # =============================================================================
@@ -1159,7 +1130,6 @@ def separate_multi_soma_cells_2d(
         ret = _reassign_disconnected_islands_2d(ret, soma_mask)
 
         flush_print("  Refining (Filling voids + Relabeling)...")
-        ret = fill_internal_voids(ret)
         ret, _, _ = relabel_sequential(ret)
 
         return ret

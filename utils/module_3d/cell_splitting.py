@@ -582,38 +582,6 @@ def _separate_multi_soma_cells_chunk(
     return chunk_result, {}, label_to_seeds_map
 
 
-# =============================================================================
-# Void Filling
-# =============================================================================
-
-def fill_internal_voids(segmentation_mask: np.ndarray) -> np.ndarray:
-    """Fills internal holes in 3D objects."""
-    labels = np.unique(segmentation_mask)
-    labels = labels[labels > 0]
-    if len(labels) == 0:
-        return segmentation_mask
-
-    slices = ndimage.find_objects(segmentation_mask)
-    for i, label in enumerate(tqdm(labels, desc="Filling Voids")):
-        idx = label - 1
-        if idx >= len(slices) or slices[idx] is None:
-            continue
-        
-        sl = slices[idx]
-        crop = segmentation_mask[sl]
-        obj_mask = (crop == label)
-        
-        # 3D binary fill holes
-        filled_mask = ndimage.binary_fill_holes(obj_mask)
-        
-        if np.any(filled_mask != obj_mask):
-            # Only fill where original was 0 or Self
-            safe_fill = filled_mask & ((crop == label) | (crop == 0))
-            crop[safe_fill] = label
-            segmentation_mask[sl] = crop
-            
-    return segmentation_mask
-
 
 def _reassign_disconnected_islands(
     segmentation: np.ndarray, 
@@ -1140,7 +1108,6 @@ def separate_multi_soma_cells(
         ret = _reassign_disconnected_islands(ret, soma_mask)
 
         flush_print("  Refining (Filling voids + Relabeling)...")
-        ret = fill_internal_voids(ret)
         ret, _, _ = relabel_sequential(ret)
 
         return ret
