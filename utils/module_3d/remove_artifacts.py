@@ -572,8 +572,23 @@ def trim_edges_with_core_protection(
         else:
             protected_mask = np.zeros_like(core_mask, dtype=bool)
 
+        # Incorporate absolute Z-distance from the top and bottom of the stack.
+        # The 2D per-slice EDT ignores the Z-faces. By calculating physical Z-distance 
+        # and taking the minimum against the 2D XY distance, we mathematically restore 
+        # the exact 3D distance to the bounding box without crashing the RAM.
+        z_indices = np.arange(r_start, r_end)
+        z_dist_top = z_indices * spacing[0]
+        z_dist_bot = (total_z - 1 - z_indices) * spacing[0]
+        z_dist = np.minimum(z_dist_top, z_dist_bot)
+        
+        # Broadcast the 1D Z-distance to match the 3D chunk (Z, Y, X)
+        z_dist = z_dist[:, None, None]
+        
+        # The true distance is whichever is closer: the XY edge or the Z caps
+        effective_dist = np.minimum(dist_chunk, z_dist)
+
         to_delete = (lbl_chunk > 0) & \
-                    (dist_chunk < distance_threshold) & \
+                    (effective_dist < distance_threshold) & \
                     (~protected_mask)
 
         w_start = z - r_start
