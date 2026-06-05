@@ -805,6 +805,7 @@ class DynamicGUIManager(QObject):
         if getattr(self, 'worker', None) and self.worker.isRunning():
             self.worker.quit()
             self.worker.wait()
+            self.worker.deleteLater()
             self.worker = None
 
         self.roi_active = True
@@ -850,6 +851,7 @@ class DynamicGUIManager(QObject):
         if getattr(self, 'worker', None) and self.worker.isRunning():
             self.worker.quit()
             self.worker.wait()
+            self.worker.deleteLater()
             self.worker = None
 
         self.roi_active = False
@@ -883,6 +885,7 @@ class DynamicGUIManager(QObject):
             print("    [Thread] Stopping background worker...")
             self.worker.quit()
             self.worker.wait()
+            self.worker.deleteLater()
             self.worker = None
 
         # 1. Clear Napari layers and buffers first
@@ -1113,6 +1116,7 @@ class DynamicGUIManager(QObject):
         self.worker = StepWorker(
             self.strategy, step_index, self.image_stack, current_values
         )
+        self.worker.setParent(self)
         self.worker.finished_signal.connect(self._on_step_finished)
         self.worker.start()
 
@@ -1137,7 +1141,9 @@ class DynamicGUIManager(QObject):
         sys.stdout = self.original_stdout
         sys.stderr = self.original_stderr
         
-        self.worker = None
+        if self.worker is not None:
+            self.worker.deleteLater()
+            self.worker = None
         
         try:
             self._set_ui_busy(False)
@@ -1227,6 +1233,15 @@ class DynamicGUIManager(QObject):
 
     def create_step_widgets(self, step_method_name: str) -> None:
         """Generates parameter widgets for the given step."""
+        # Temporarily lock the window size to prevent macOS from shrinking 
+        # the window when the old parameter dock is removed.
+        try:
+            qt_win = self.viewer.window._qt_window
+            old_min = qt_win.minimumSize()
+            qt_win.setMinimumSize(qt_win.size())
+        except Exception:
+            qt_win = None
+
         self.clear_current_widgets()
         self.parameter_values = {}
         self.current_step_method = step_method_name # Store for dynamic refresh
@@ -1272,6 +1287,10 @@ class DynamicGUIManager(QObject):
                     pass
 
         self._dock_widget(scroll_w, step_display)
+        
+        # Release the minimum size lock on the next event loop tick
+        if qt_win:
+            QTimer.singleShot(0, lambda: qt_win.setMinimumSize(old_min))
 
     def create_interaction_widgets(self, step_display: str, config_key: str) -> None:
         """Creates specialized widgets for the Interaction Analysis step."""

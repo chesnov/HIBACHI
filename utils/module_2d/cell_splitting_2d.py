@@ -1012,7 +1012,7 @@ def separate_multi_soma_cells_2d(
                         # [PROFILING] SAFE ZONE INTENSITY CHECK
                         e_safe_mean = float(np.mean(local_int_sub[local_e_safe])) if np.any(local_e_safe) else float('nan')
                         i_safe_mean = float(np.mean(local_int_sub[local_i_safe])) if np.any(local_i_safe) else float('nan')
-                        conflict_mean = float(np.mean(local_int_sub[local_conflict]))
+                        conflict_mean = float(np.percentile(local_int_sub[local_conflict], 5))
                         domain_mean   = float(np.mean(local_int_sub[local_domain]))
                         is_valley = conflict_mean < min(e_safe_mean, i_safe_mean) * 0.85
                         safe_contrast = abs(e_safe_mean - i_safe_mean) / (
