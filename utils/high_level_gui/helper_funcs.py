@@ -2119,38 +2119,33 @@ def launch_image_segmentation_tool() -> QApplication:
 def create_back_to_project_button(viewer: napari.Viewer, gui_manager: Any) -> QWidget:
     """Creates the 'Back to Project List' button widget."""
     def _do():
-        # 1. Release all heavy data references before touching the window.
+        nonlocal viewer, gui_manager
+        
+        # 1. Clean up background tasks and data
         if gui_manager:
             gui_manager.shutdown_and_cleanup()
-
-        gc.collect()
-
-        # 2. Show the project view BEFORE closing Napari.
+            gui_manager = None
+            
+        # 2. Show project view first
         app_state.show_project_view_signal.emit()
-
-        # 3. Close the Napari window. Programmatic closes on macOS often leave
-        #    the window stuck open. We must hide it, ask Napari to close it,
-        #    and finally forcefully free the memory safely.
+        
+        # 3. Safely close Napari
         if viewer:
+            v = viewer  # Transfer to local variable
+            viewer = None  # BREAK THE REFERENCE CYCLE! This lets Python safely destroy the window.
+            
             try:
-                qt_win = viewer.window._qt_window
-                # Immediately remove from user view
-                qt_win.hide()
+                # Hide immediately for a snappy user experience
+                if hasattr(v.window, '_qt_window'):
+                    v.window._qt_window.hide()
                 
-                # Queue the official close for the next event loop tick so this
-                # button's click event can finish without destroying itself mid-flight.
-                QTimer.singleShot(0, viewer.close)
-                
-                # Schedule aggressive memory cleanup 500ms later. This delay is CRITICAL:
-                # it ensures Napari's internal close callbacks finish unwinding before the 
-                # C++ window object is destroyed, completely preventing the RuntimeError crash.
-                QTimer.singleShot(500, qt_win.deleteLater)
+                # Ask Napari to cleanly close itself without manually deleting C++ objects
+                QTimer.singleShot(0, v.close)
             except Exception:
-                # Fallback
-                try:
-                    viewer.close()
-                except Exception:
-                    pass
+                pass
+        
+        # 4. Force garbage collection so the orphaned viewer object is actually purged
+        QTimer.singleShot(100, gc.collect)
 
     btn = QPushButton("Back to Project List")
     btn.clicked.connect(_do)

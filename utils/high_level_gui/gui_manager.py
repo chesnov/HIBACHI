@@ -50,7 +50,30 @@ class OutputStream(QObject):
 # 2. Background Worker Thread
 # =============================================================================
 
+import atexit
+
 _orphan_threads = []
+_quit_hook_connected = False
+
+def _cleanup_all_orphans():
+    """Forcefully terminate any lingering background threads on app exit to prevent C++ aborts."""
+    for worker in list(_orphan_threads):
+        try:
+            if worker is not None and worker.isRunning():
+                worker.terminate()
+                worker.wait(200) # Give it time to cleanly exit C++ scope
+        except Exception:
+            pass
+    _orphan_threads.clear()
+
+def _register_quit_hook():
+    global _quit_hook_connected
+    if not _quit_hook_connected:
+        app = QApplication.instance()
+        if app:
+            app.aboutToQuit.connect(_cleanup_all_orphans)
+        atexit.register(_cleanup_all_orphans)
+        _quit_hook_connected = True
 
 def _cleanup_orphan_thread(worker):
     """Safely cleans up an orphaned worker thread after it finishes."""
@@ -886,6 +909,7 @@ class DynamicGUIManager(QObject):
         """Safely detaches a running worker thread so it doesn't crash the app on destruction."""
         if getattr(self, 'worker', None) and self.worker.isRunning():
             print("    [Thread] Detaching running background worker to prevent crash...")
+            _register_quit_hook()  # Ensure cleanup happens at shutdown
             try:
                 self.worker.finished_signal.disconnect()
                 self.worker.error_signal.disconnect()
