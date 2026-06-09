@@ -915,6 +915,11 @@ class DynamicGUIManager(QObject):
                 self.worker.error_signal.disconnect()
             except Exception:
                 pass
+            
+            # PRESERVE data references so Loky background processes don't segfault!
+            self.worker._preserved_strategy = self.strategy
+            self.worker._preserved_stack = self.image_stack
+
             self.worker.setParent(None)
             _orphan_threads.append(self.worker)
             self.worker.finished.connect(lambda w=self.worker: _cleanup_orphan_thread(w))
@@ -922,26 +927,29 @@ class DynamicGUIManager(QObject):
 
     def shutdown_and_cleanup(self) -> None:
         """Forcefully clears all data references and Napari internal buffers."""
+        # Check if worker is running BEFORE we stop it
+        is_worker_running = getattr(self, 'worker', None) and self.worker.isRunning()
         self._stop_worker_safely()
 
         # 1. Clear Napari layers and buffers first
         if self.viewer:
             try:
-                self.viewer.layers.clear() # This drops the actual NumPy/Memmap references in Napari
+                self.viewer.layers.clear() 
             except Exception:
                 pass
         
         # 2. Clear strategy and large data references
-        if hasattr(self, 'strategy'):
+        if hasattr(self, 'strategy') and self.strategy is not None:
             if hasattr(self.strategy, 'intermediate_state'):
-                # Crucial: This dictionary often holds the 'original_volume_ref'
-                self.strategy.intermediate_state.clear() 
+                # CRITICAL FIX: DO NOT clear the dictionary in-place if a worker is running!
+                # Doing so rips the memory-mapped file out from under the Loky process pool, causing a crash.
+                if not is_worker_running:
+                    self.strategy.intermediate_state.clear() 
             self.strategy = None
         
-        self.image_stack = None # Release the memmap object
-        self.viewer = None # Release the Napari viewer object
+        self.image_stack = None 
+        self.viewer = None 
         
-        # 3. Double-pass Garbage Collection (often needed for circular Qt references)
         gc.collect()
         gc.collect()
         print("    [RAM] Deep cleanup complete. All heavy references released.")

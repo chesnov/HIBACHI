@@ -2131,21 +2131,24 @@ def create_back_to_project_button(viewer: napari.Viewer, gui_manager: Any) -> QW
         
         # 3. Safely close Napari
         if viewer:
-            v = viewer  # Transfer to local variable
-            viewer = None  # BREAK THE REFERENCE CYCLE! This lets Python safely destroy the window.
+            v = viewer
+            viewer = None  # Break Python reference cycle
             
             try:
-                # Hide immediately for a snappy user experience
-                if hasattr(v.window, '_qt_window'):
-                    v.window._qt_window.hide()
+                qt_win = v.window._qt_window
+                qt_win.hide()
                 
-                # Ask Napari to cleanly close itself without manually deleting C++ objects
-                QTimer.singleShot(0, v.close)
+                # Ask Napari to synchronously perform its own internal tear-downs
+                v.close()
+                
+                # Directly tell PyQt to flag the native Mac window for destruction on the next frame.
+                # Because v.close() ran synchronously, this won't crash Napari anymore!
+                qt_win.deleteLater()
             except Exception:
                 pass
-        
-        # 4. Force garbage collection so the orphaned viewer object is actually purged
-        QTimer.singleShot(100, gc.collect)
+            
+            # Force GC to collect the Python Napari viewer object
+            QTimer.singleShot(100, gc.collect)
 
     btn = QPushButton("Back to Project List")
     btn.clicked.connect(_do)
