@@ -2116,6 +2116,10 @@ def interactive_segmentation_with_config(selected_folder: str = None, project_ma
 def launch_image_segmentation_tool() -> QApplication:
     """Main entry point for the GUI application."""
     app = QApplication.instance() or QApplication(sys.argv)
+    
+    # Prevent Napari from attempting to shut down the global app lifecycle 
+    # when a viewer closes. This prevents the `_close_app` TypeError on macOS.
+    app.setQuitOnLastWindowClosed(False)
 
     def show_pv():
         if not app_state.project_view_window:
@@ -2147,20 +2151,16 @@ def create_back_to_project_button(viewer: napari.Viewer, gui_manager: Any) -> QW
             viewer = None  # Break Python reference cycle
             
             try:
-                qt_win = v.window._qt_window
-                # CRITICAL FIX: Ensure Qt knows to free the memory when the window closes
-                qt_win.setAttribute(Qt.WA_DeleteOnClose, True)
+                # Hide immediately for responsiveness
+                if hasattr(v.window, '_qt_window'):
+                    v.window._qt_window.hide()
                 
-                # DEFER the close command so the button finishes its click event first.
-                # This naturally triggers Napari's built-in cleanup exacty as if the
-                # user clicked the red 'X' in the corner of the Mac window.
-                QTimer.singleShot(50, qt_win.close)
+                # CRITICAL FIX: Use Napari's native close() instead of qt_win.close().
+                # This ensures the internal app_model deregisters its actions properly
+                # and prevents the 'in_n_out missing window' TypeError on macOS.
+                QTimer.singleShot(50, v.close)
             except Exception:
-                # Fallback for future Napari API changes
-                try:
-                    QTimer.singleShot(50, v.close)
-                except Exception:
-                    pass
+                pass
             
             # Force GC to collect the Python Napari viewer object
             QTimer.singleShot(200, gc.collect)
