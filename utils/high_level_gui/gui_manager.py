@@ -50,6 +50,19 @@ class OutputStream(QObject):
 # 2. Background Worker Thread
 # =============================================================================
 
+_orphan_threads = []
+
+def _cleanup_orphan_thread(worker):
+    """Safely cleans up an orphaned worker thread after it finishes."""
+    try:
+        if _orphan_threads is not None and worker in _orphan_threads:
+            _orphan_threads.remove(worker)
+        if worker is not None:
+            worker.deleteLater()
+    except Exception:
+        pass
+
+
 class StepWorker(QThread):
     """
     Executes a processing step in a separate thread to keep the GUI responsive.
@@ -201,7 +214,7 @@ class DynamicGUIManager(QObject):
         self.log_widget.setReadOnly(True)
         self.log_widget.setMinimumHeight(150)
         self.log_widget.setMaximumHeight(200)
-        self.log_widget.setStyleSheet("font-family: monospace; font-size: 11px;")
+        self.log_widget.setStyleSheet("font-family: 'Courier New', Courier, monospace; font-size: 11px;")
 
         self.viewer.window.add_dock_widget(
             self.log_widget, area="right", name="Process Log"
@@ -801,12 +814,7 @@ class DynamicGUIManager(QObject):
                                end (used when loading an existing ROI session).
                                If False (fresh confirm), starts from Step 1.
         """
-        # Stop any running background worker
-        if getattr(self, 'worker', None) and self.worker.isRunning():
-            self.worker.quit()
-            self.worker.wait()
-            self.worker.deleteLater()
-            self.worker = None
+        self._stop_worker_safely()
 
         self.roi_active = True
         self.image_stack = cropped_image
@@ -848,11 +856,7 @@ class DynamicGUIManager(QObject):
         if self._full_image_stack is None:
             return
 
-        if getattr(self, 'worker', None) and self.worker.isRunning():
-            self.worker.quit()
-            self.worker.wait()
-            self.worker.deleteLater()
-            self.worker = None
+        self._stop_worker_safely()
 
         self.roi_active = False
         self.image_stack = self._full_image_stack
@@ -878,15 +882,23 @@ class DynamicGUIManager(QObject):
 
         print("[ROI] Returned to full-image mode.")
 
+    def _stop_worker_safely(self) -> None:
+        """Safely detaches a running worker thread so it doesn't crash the app on destruction."""
+        if getattr(self, 'worker', None) and self.worker.isRunning():
+            print("    [Thread] Detaching running background worker to prevent crash...")
+            try:
+                self.worker.finished_signal.disconnect()
+                self.worker.error_signal.disconnect()
+            except Exception:
+                pass
+            self.worker.setParent(None)
+            _orphan_threads.append(self.worker)
+            self.worker.finished.connect(lambda w=self.worker: _cleanup_orphan_thread(w))
+            self.worker = None
+
     def shutdown_and_cleanup(self) -> None:
         """Forcefully clears all data references and Napari internal buffers."""
-        # Safely terminate the background worker if it's running
-        if getattr(self, 'worker', None) and self.worker.isRunning():
-            print("    [Thread] Stopping background worker...")
-            self.worker.quit()
-            self.worker.wait()
-            self.worker.deleteLater()
-            self.worker = None
+        self._stop_worker_safely()
 
         # 1. Clear Napari layers and buffers first
         if self.viewer:

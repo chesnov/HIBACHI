@@ -2141,12 +2141,10 @@ def create_back_to_project_button(viewer: napari.Viewer, gui_manager: Any) -> QW
                 # Force macOS to immediately hide the window visually 
                 # so it doesn't persist as an empty shell
                 qt_win.hide()
-                qt_win.setAttribute(Qt.WA_DeleteOnClose, True)
                 
-                # Use Napari's official close to clean up its internal state
+                # Use Napari's official close to clean up its internal state.
+                # DO NOT call qt_win.deleteLater() manually, as it crashes Napari.
                 QTimer.singleShot(0, viewer.close)
-                # Ensure the Qt C++ object is completely destroyed
-                QTimer.singleShot(0, qt_win.deleteLater)
             except Exception:
                 # Fallback for any future Napari API change
                 try:
