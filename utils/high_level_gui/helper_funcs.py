@@ -1129,7 +1129,15 @@ class ProjectViewWindow(QMainWindow):
         self.set_config_btn.setEnabled(True)
 
     def open_cross_channel_analyzer(self):
-        self.project_manager.build_consolidated_sample_registry()
+        registry = self.project_manager.build_consolidated_sample_registry()
+        if not registry:
+            QMessageBox.warning(
+                self, 
+                "No Compatible Data", 
+                "Could not find any multi-channel samples in the parent directory.\n\n"
+                "Ensure your project is organized into 'Channel_X' folders, and that they share matching sample names."
+            )
+            return
             
         self.analyzer_window = CrossChannelAnalyzerWindow(self.project_manager)
         self.analyzer_window.show()
@@ -1360,12 +1368,16 @@ class CrossChannelAnalyzerWindow(QMainWindow):
         if not self.pm.sample_registry:
             self.pm.build_consolidated_sample_registry()
             
-        first_sample = list(self.pm.sample_registry.keys())[0]
-        channels = sorted(list(self.pm.sample_registry[first_sample].keys()))
-        for ch in channels:
-            item = QListWidgetItem(ch)
-            item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
-            item.setCheckState(Qt.Unchecked)
+        if self.pm.sample_registry:
+            first_sample = list(self.pm.sample_registry.keys())[0]
+            channels = sorted(list(self.pm.sample_registry[first_sample].keys()))
+            for ch in channels:
+                item = QListWidgetItem(ch)
+                item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+                item.setCheckState(Qt.Unchecked)
+                self.channel_list.addItem(item)
+        else:
+            item = QListWidgetItem("No channels found")
             self.channel_list.addItem(item)
         
         left_panel.addWidget(QLabel("<b>1. Select Input Channels:</b>"))
