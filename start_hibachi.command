@@ -21,10 +21,10 @@ if [ "$BEHIND" -gt 0 ]; then
         git pull
         
         echo ""
-        echo "Updating conda environment (this may take a minute)..."
-        # Hook conda into the script so it can run env update
-        eval "$(conda shell.bash hook)"
-        conda env update -f environment.yaml --prune
+        echo "Updating mamba environment (this may take a minute)..."
+        # Hook mamba into the script so it can run env update
+        eval "$(mamba shell.bash hook)"
+        mamba env update -f environment.yaml --prune
     fi
 else
     echo "HIBACHI is up to date!"
@@ -32,7 +32,7 @@ fi
 
 echo ""
 echo "Launching HIBACHI GUI..."
-# Hook conda into the script to allow 'conda activate'
-eval "$(conda shell.bash hook)"
-conda activate hibachi
+# Hook mamba into the script to allow 'mamba activate'
+eval "$(mamba shell.bash hook)"
+mamba activate hibachi
 python segment.py
