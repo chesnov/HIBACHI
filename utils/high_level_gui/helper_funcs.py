@@ -2125,28 +2125,28 @@ def create_back_to_project_button(viewer: napari.Viewer, gui_manager: Any) -> QW
 
         gc.collect()
 
-        # 2. Show the project view BEFORE closing Napari.  On macOS the app
-        #    quits if the window count ever hits zero, so we must have a
-        #    visible window in place first.
+        # 2. Show the project view BEFORE closing Napari.
         app_state.show_project_view_signal.emit()
 
-        # 3. Close the Napari window.  viewer.close() is unreliable on macOS
-        #    (the QMainWindow may stay visible).  We grab the underlying Qt
-        #    window directly, mark it for deletion, and defer the actual
-        #    close to the next event-loop tick so the project view has time
-        #    to appear before the window count changes.
+        # 3. Close the Napari window. Programmatic closes on macOS often leave
+        #    the window stuck open. We must hide it, ask Napari to close it,
+        #    and finally forcefully free the memory safely.
         if viewer:
             try:
                 qt_win = viewer.window._qt_window
-                # Force macOS to immediately hide the window visually 
-                # so it doesn't persist as an empty shell
+                # Immediately remove from user view
                 qt_win.hide()
                 
-                # Use Napari's official close to clean up its internal state.
-                # DO NOT call qt_win.deleteLater() manually, as it crashes Napari.
+                # Queue the official close for the next event loop tick so this
+                # button's click event can finish without destroying itself mid-flight.
                 QTimer.singleShot(0, viewer.close)
+                
+                # Schedule aggressive memory cleanup 500ms later. This delay is CRITICAL:
+                # it ensures Napari's internal close callbacks finish unwinding before the 
+                # C++ window object is destroyed, completely preventing the RuntimeError crash.
+                QTimer.singleShot(500, qt_win.deleteLater)
             except Exception:
-                # Fallback for any future Napari API change
+                # Fallback
                 try:
                     viewer.close()
                 except Exception:
