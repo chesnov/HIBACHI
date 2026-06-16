@@ -272,7 +272,53 @@ def calculate_interaction_metrics(
 
         intersection_memmap.flush()
 
-    # 7. Aggregate Partner Coverage Stats (Partner View)
+    # 7. Pairwise Distance Table (one row per primary-reference pair)
+    # Strategy: for each primary object, build an EDT of that single object's
+    # binary mask over the full volume, then sample it at every reference
+    # object's voxels. The minimum sample per reference object is the
+    # nearest surface-to-surface distance between that pair.
+    # This is O(N_primary) EDTs but each EDT is on a binary mask, not the
+    # full label volume, and scipy's EDT is fast on sparse masks.
+    if calculate_distance:
+        flush_print(f"  Building pairwise distance table ({primary_name} x {partner_name})...")
+        r_labels_pw = np.unique(reference_memmap)
+        r_labels_pw = r_labels_pw[r_labels_pw > 0]
+        r_slices_pw = ndimage.find_objects(reference_memmap)
+
+        pairwise_rows = []
+        for p_lbl in tqdm(labels, desc="    Pairwise distances"):
+            p_idx = p_lbl - 1
+            if p_idx >= len(object_slices) or object_slices[p_idx] is None:
+                continue
+            # EDT of the inverted single-object mask: every voxel gets its
+            # distance to the nearest surface voxel of this primary object.
+            single_primary = (primary_memmap == p_lbl)
+            p_dist = distance_transform_edt(~single_primary, sampling=edt_spacing).astype(np.float32)
+            del single_primary
+
+            for r_lbl in r_labels_pw:
+                r_idx = r_lbl - 1
+                if r_idx >= len(r_slices_pw) or r_slices_pw[r_idx] is None:
+                    continue
+                r_sl = r_slices_pw[r_idx]
+                mask_r = (reference_memmap[r_sl] == r_lbl)
+                dist_at_r = p_dist[r_sl][mask_r]
+                pairwise_rows.append({
+                    'src_id': p_lbl,
+                    'tgt_id': r_lbl,
+                    'dist': float(np.min(dist_at_r)) if dist_at_r.size > 0 else np.nan,
+                })
+            del p_dist
+
+        if pairwise_rows:
+            pairwise_df = pd.DataFrame(pairwise_rows)
+            pairwise_out_path = os.path.join(
+                output_dir, f"pairwise_distances_{partner_name}.csv"
+            )
+            pairwise_df.to_csv(pairwise_out_path, index=False)
+            flush_print(f"  Saved pairwise distances -> {pairwise_out_path}")
+
+    # 8. Aggregate Partner Coverage Stats (Partner View)
     ref_df = pd.DataFrame()
     if ref_interactions:
         flush_print(f"  Aggregating coverage stats for {partner_name}...")

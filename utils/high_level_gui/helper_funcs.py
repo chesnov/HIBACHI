@@ -1537,15 +1537,37 @@ class CrossChannelAnalyzerWindow(QMainWindow):
         if not ok: return
         label_mode = modes[mode_display]
 
+        # For parent modes, ask whether to preserve the original IDs for traceability
+        preserve_ids = False
+        if label_mode in ("parent_a", "parent_b"):
+            parent_label = "A (first channel)" if label_mode == "parent_a" else "B (second channel)"
+            id_choice, ok2 = QInputDialog.getItem(
+                self, "ID Preservation",
+                f"Inherit {parent_label} — should the result mask keep the\n"
+                f"original object IDs from that channel?\n\n"
+                f"• Keep original IDs — result IDs match the source mask exactly\n"
+                f"  (enables direct traceability to the original segmentation).\n"
+                f"• Reset to sequential — result is renumbered 1\u2026N as usual.",
+                ["Keep original IDs (preserve for traceability)",
+                 "Reset to sequential (default)"],
+                0, False
+            )
+            if not ok2: return
+            preserve_ids = id_choice.startswith("Keep")
+
+        id_suffix = " [IDs preserved]" if preserve_ids else ""
+
         if len(checked) == 2:
             step = {
                 "type": "intersect", "inputs": checked, "label_mode": label_mode,
-                "name": f"Overlap ({label_mode}): {checked[0]} & {checked[1]}"
+                "preserve_ids": preserve_ids,
+                "name": f"Overlap ({label_mode}){id_suffix}: {checked[0]} & {checked[1]}"
             }
         else:
             step = {
                 "type": "intersect", "inputs": [checked[0], "PREVIOUS_RESULT"], "label_mode": label_mode,
-                "name": f"Overlap ({label_mode}): {checked[0]} with previous"
+                "preserve_ids": preserve_ids,
+                "name": f"Overlap ({label_mode}){id_suffix}: {checked[0]} with previous"
             }
         
         self.recipe_steps.append(step)

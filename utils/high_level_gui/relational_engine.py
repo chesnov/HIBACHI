@@ -55,8 +55,15 @@ class RelationalEngine:
         return lookup[mask], mapping
     
     @staticmethod
-    def intersect_masks(path_a, path_b, out_path, shape, label_mode='binary', ndim=3):
-        """Boolean AND between two label files with configurable identity inheritance."""
+    def intersect_masks(path_a, path_b, out_path, shape, label_mode='binary', ndim=3, preserve_ids=False):
+        """Boolean AND between two label files with configurable identity inheritance.
+        
+        Args:
+            preserve_ids: When True and label_mode is 'parent_a' or 'parent_b', the
+                          inherited label IDs are written as-is without any sequential
+                          relabeling. This lets downstream steps trace result objects
+                          back to their source masks by the original ID.
+        """
         ma = np.memmap(path_a, dtype=np.int32, mode='r', shape=shape)
         mb = np.memmap(path_b, dtype=np.int32, mode='r', shape=shape)
         
@@ -76,7 +83,7 @@ class RelationalEngine:
 
         out.flush()
         del ma, mb, overlap_mask
-        return out_path
+        return out_path, preserve_ids and label_mode in ('parent_a', 'parent_b')
 
     @staticmethod
     def filter_by_volume(path_in, out_path, shape, spacing, min_vol_um3):
@@ -221,17 +228,27 @@ class RelationalEngine:
 
                 if path_a and path_b:
                     label_mode = step.get('label_mode', 'binary')
-                    last_mask_path = RelationalEngine.intersect_masks(
-                        path_a, path_b, step_out_path, shape, label_mode, len(shape)
+                    preserve_ids = step.get('preserve_ids', False)
+                    last_mask_path, ids_preserved = RelationalEngine.intersect_masks(
+                        path_a, path_b, step_out_path, shape, label_mode, len(shape), preserve_ids
                     )
                     last_mask_name = f"{name_a}_in_{name_b}"
                     
-                    # Relabel to ensure sequential IDs
-                    temp_mask = np.memmap(last_mask_path, dtype=np.int32, mode='r+', shape=shape)
-                    new_mask, mapping = RelationalEngine.relabel_sequentially(temp_mask)
-                    temp_mask[:] = new_mask[:]
-                    temp_mask.flush()
-                    del temp_mask
+                    # Relabel to sequential IDs unless the caller explicitly asked to keep
+                    # the original parent IDs for downstream traceability.
+                    if ids_preserved:
+                        # Build an identity mapping so metrics CSV still gets a parent_id column
+                        temp_mask = np.memmap(last_mask_path, dtype=np.int32, mode='r', shape=shape)
+                        unique_ids = np.unique(temp_mask)
+                        unique_ids = unique_ids[unique_ids > 0]
+                        mapping = {int(uid): int(uid) for uid in unique_ids}
+                        del temp_mask
+                    else:
+                        temp_mask = np.memmap(last_mask_path, dtype=np.int32, mode='r+', shape=shape)
+                        new_mask, mapping = RelationalEngine.relabel_sequentially(temp_mask)
+                        temp_mask[:] = new_mask[:]
+                        temp_mask.flush()
+                        del temp_mask
                     
                     parent_id_map = mapping
                     results_to_viz.append({"name": last_mask_name, "path": last_mask_path})
@@ -274,6 +291,7 @@ class RelationalEngine:
                 # Case 3 – 'primary' set, target is a real channel key:
                 #   Simple two-channel analysis. Both sides looked up from the registry.
                 #   last_mask_path is NOT used, so it is left untouched.
+                parent_id_map = {}
                 if step.get('primary'):
                     primary_ch_key   = step['primary']
                     active_mask_path = RelationalEngine._find_dat(sample_channels.get(primary_ch_key))
@@ -302,6 +320,12 @@ class RelationalEngine:
                             active_mask_path, partner_dat_path, out_dir, shape, sp_2d,
                             active_mask_name, partner_bio_name
                         )
+                        print(f"  [DEBUG] primary_df shape: {primary_df.shape}")
+                        print(f"  [DEBUG] primary_df columns: {primary_df.columns.tolist()}")
+                        print(f"  [DEBUG] primary_df head:\n{primary_df.head()}")
+                        print(f"  [DEBUG] partner_df shape: {partner_df.shape}")
+                        print(f"  [DEBUG] active_mask_path: {active_mask_path}")
+                        print(f"  [DEBUG] partner_dat_path: {partner_dat_path}")
                     else:
                         primary_df, partner_df, inter_path = calculate_interaction_metrics(
                             active_mask_path, partner_dat_path, out_dir, shape, spacing,
