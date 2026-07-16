@@ -90,5 +90,9 @@ jobs:
       - name: Publish release with both installers
         uses: softprops/action-gh-release@v2
         with:
+          # Pass the CLEAN tag name (v0.1.4), not the raw ref (refs/tags/v0.1.4).
+          # Without this the action can query a malformed release-by-tag path and
+          # get GitHub's HTML 404 back, which it treats as an unexpected error.
+          tag_name: ${{ github.ref_name }}
           files: dist/**/*
           fail_on_unmatched_files: true
