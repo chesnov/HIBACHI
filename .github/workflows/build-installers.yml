@@ -18,7 +18,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write   # needed for the release job to upload assets
+  contents: write   # needed for the release job to create/upload the release
 
 jobs:
   # ---------------------------------------------------------------- Windows
@@ -88,11 +88,30 @@ jobs:
           path: dist          # -> dist/installer-windows/..., dist/installer-macos/...
 
       - name: Publish release with both installers
-        uses: softprops/action-gh-release@v2
-        with:
-          # Pass the CLEAN tag name (v0.1.4), not the raw ref (refs/tags/v0.1.4).
-          # Without this the action can query a malformed release-by-tag path and
-          # get GitHub's HTML 404 back, which it treats as an unexpected error.
-          tag_name: ${{ github.ref_name }}
-          files: dist/**/*
-          fail_on_unmatched_files: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Flatten the per-artifact subdirs into a plain file list.
+          mapfile -t files < <(find dist -type f | sort)
+          echo "Assets to publish:"; printf '  %s\n' "${files[@]}"
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo "::error::No installer files found under dist/"; exit 1
+          fi
+
+          echo "Existing releases:"; gh release list --limit 20 || true
+
+          # view-then-create-or-upload: never throws on a non-404, unlike a
+          # blind fetch-and-fail. If the release exists we replace its assets;
+          # otherwise we create it fresh with auto-generated notes.
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG exists -> uploading assets (--clobber)."
+            gh release upload "$TAG" "${files[@]}" --clobber
+          else
+            echo "Release $TAG not found -> creating it."
+            gh release create "$TAG" "${files[@]}" --title "$TAG" --generate-notes
+          fi
