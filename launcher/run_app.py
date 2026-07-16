@@ -155,11 +155,25 @@ def _offer_rollback_after_crash(repo_root: str, code: int) -> None:
 
 
 def _launch_app(repo_root: str) -> int:
-    """Launch the real application as a child process and return its exit code."""
+    """Launch the real application and return its exit code (POSIX/Windows)."""
     entry = os.path.join(repo_root, APP_ENTRY)
     if not os.path.isfile(entry):
         print(f"[startup] ERROR: cannot find {entry}")
         return 1
+
+    # macOS: REPLACE this process with the GUI instead of spawning a child. The
+    # .app bundle already owns a Dock tile ("HIBACHI"); if we launch segment.py
+    # as a separate process it becomes its own foreground app and macOS adds a
+    # SECOND tile labelled "python". exec keeps a single process (same PID) under
+    # the bundle, so only one icon shows. The splash + update check have already
+    # finished by now, so nothing is lost -- though note the post-launch
+    # rollback-on-crash offer (below, in main) can't run after an exec; macOS
+    # users reach rollback via `--rollback` instead.
+    if sys.platform == "darwin":
+        os.chdir(repo_root)  # so `import utils` resolves (mirrors cwd= below)
+        os.execv(sys.executable, [sys.executable, entry])
+        # os.execv does not return on success.
+
     # Run with the env's own interpreter, from the repo root so `import utils` works.
     return subprocess.run([sys.executable, entry], cwd=repo_root).returncode
 
