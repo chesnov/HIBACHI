@@ -246,8 +246,8 @@ def segment_cells_first_pass_raw(
     volume: np.ndarray,
     spacing: Tuple[float, float, float],
     tubular_scales: List[float] = [0.5, 1.0, 2.0, 3.0],
-    smooth_sigma: float = 0.5,
-    connect_max_gap_physical: float = 1.0,
+    smooth_sigma: Union[float, List[float]] = 0.5,
+    connect_max_gap_physical: Union[float, List[float]] = 1.0,
     min_size_voxels: int = 50,
     low_threshold_percentile: Union[float, List[float]] = 25.0,
     high_threshold_percentile: Union[float, List[float]] = 95.0,
@@ -257,10 +257,26 @@ def segment_cells_first_pass_raw(
     temp_root_path: Optional[str] = None,
     **kwargs: Any
 ) -> Tuple[Optional[str], Optional[str], float, Dict[str, Any]]:
-    """Step 1: Raw Segmentation (Independent Smoothing + Threshold-then-OR)."""
+    """Step 1: Raw Segmentation (Independent per-scale Smoothing + Threshold-then-OR).
+
+    Smoothing and gap-closing are applied independently per tubular scale
+    (mirroring the 2D pipeline); ``smooth_sigma`` and ``connect_max_gap_physical``
+    may each be a scalar (broadcast to every scale) or a per-scale list. With a
+    single scalar value the result is identical to the previous global behavior.
+
+    Unlike the 2D pipeline, the minimum-size filter is applied GLOBALLY, once,
+    AFTER all scales are merged (see the labeling stage), so ``min_size_voxels``
+    remains a single value rather than a per-scale list.
+    """
     print(f"\n--- Step 1: Raw Segmentation (Strict Independence Mode) ---")
     n_scales = len(tubular_scales)
-    
+
+    if n_scales == 0:
+        raise ValueError(
+            "tubular_scales must contain at least one scale; got an empty "
+            "list. Check the scale-profile table upstream."
+        )
+
     if isinstance(low_threshold_percentile, (int, float)):
         low_thresh_list = [float(low_threshold_percentile)] * n_scales
     else:
@@ -273,6 +289,26 @@ def segment_cells_first_pass_raw(
 
     if len(low_thresh_list) != n_scales or len(high_thresh_list) != n_scales:
         raise ValueError("low/high_threshold_percentile lists must match length of tubular_scales.")
+
+    # --- Per-scale smoothing / gap-closing parameters ---
+    # Each entry applies ONLY to its corresponding tubular scale. A scalar is
+    # broadcast to every scale. (The min-size filter is deliberately NOT
+    # per-scale here; it stays global, applied after the merge.)
+    if isinstance(smooth_sigma, (int, float)):
+        smooth_sigma_list = [float(smooth_sigma)] * n_scales
+    else:
+        smooth_sigma_list = [float(x) for x in smooth_sigma]
+
+    if isinstance(connect_max_gap_physical, (int, float)):
+        connect_gap_list = [float(connect_max_gap_physical)] * n_scales
+    else:
+        connect_gap_list = [float(x) for x in connect_max_gap_physical]
+
+    if len(smooth_sigma_list) != n_scales or len(connect_gap_list) != n_scales:
+        raise ValueError(
+            "smooth_sigma/connect_max_gap_physical lists must match length "
+            "of tubular_scales."
+        )
 
     temp_dirs_to_clean, threshold_history = [], {}
     final_labels_memmap = None
@@ -290,7 +326,7 @@ def segment_cells_first_pass_raw(
                 if np.issubdtype(volume.dtype, np.integer):
                     norm_factor = float(np.iinfo(volume.dtype).max)
                 
-                print(f"    Normalization skipped for Percentiles, but scaling by DType Max ({norm_factor}) to [0, 1] range.")
+                print(f"    Normalization skipped for Absolute mode; scaling by DType Max ({norm_factor}) to [0, 1] range.")
                 for read_sl, _ in tqdm(list(_get_chunk_slices(volume.shape, (64, 512, 512))), desc="    Applying"):
                     norm_mm[read_sl] = volume[read_sl].astype(np.float32) / norm_factor
                 norm_mm.flush()
@@ -333,37 +369,41 @@ def segment_cells_first_pass_raw(
                     norm_mm[read_sl] = volume[read_sl].astype(np.float32) / np.where(factors > 1e-9, factors, 1.0)
                 norm_mm.flush()
 
-        # --- Stage 1.2: Independent 3D Smoothing ---
-        # This makes smooth_sigma a fixed preprocessing step for all scales (including scale=0)
-        smoothed_mm = norm_mm
-        if smooth_sigma > 0:
-            with SimpleTimer(f"Stage 1.2: Global 3D Smoothing (sigma={smooth_sigma})"):
-                smooth_dir = _get_safe_temp_dir(temp_root_path, 'smoothing'); temp_dirs_to_clean.append(smooth_dir)
-                smooth_path = os.path.join(smooth_dir, 'smoothed.dat')
-                smoothed_mm = np.memmap(smooth_path, dtype=np.float32, mode='w+', shape=volume.shape)
-                
-                # Use Dask for global smoothing
-                sigma_vox = [smooth_sigma / s if s > 0 else 0 for s in spacing]
-                d_norm = da.from_array(norm_mm, chunks=(128, 512, 512))
-                d_smooth = dask_image.ndfilters.gaussian_filter(d_norm, sigma=sigma_vox)
-                
-                with ProgressBar(dt=5):
-                    da.store(d_smooth, smoothed_mm, scheduler='threads')
-                smoothed_mm.flush()
-
-        # --- Stage 2 & 3: Multi-Scale Logic ---
+        # --- Stage 2 & 3: Multi-Scale Logic (per-scale smoothing + gap-closing,
+        # threshold-then-OR). Smoothing and gap-closing now run independently per
+        # scale inside the loop, mirroring the 2D pipeline. With a single global
+        # smooth_sigma / connect_max_gap value this is identical to the previous
+        # global behavior; per-scale lists let each scale differ.
+        # NOTE: the minimum-size filter is intentionally kept GLOBAL and applied
+        # AFTER the merge (labeling stage below), unlike the 2D pipeline which
+        # filters per scale before merging. ---
         master_dir = _get_safe_temp_dir(temp_root_path, 'master'); temp_dirs_to_clean.append(master_dir)
         master_mm = np.memmap(os.path.join(master_dir, 'm.dat'), dtype=np.uint8, mode='w+', shape=volume.shape)
         master_mm[:] = 0
 
-        # Closing structure for masks
-        rv = [math.ceil((connect_max_gap_physical/2)/s) if s>1e-9 else 0 for s in spacing]
-        struct = np.ones(tuple(max(1, 2*r+1) for r in rv), dtype=bool)
-
         for i, scale in enumerate(tubular_scales):
             current_low_p = low_thresh_list[i]
-            
+            current_smooth_sigma = smooth_sigma_list[i]
+            current_connect_gap = connect_gap_list[i]
+
             with SimpleTimer(f"Scale sigma={scale} (p{current_low_p})"):
+                # --- Per-Scale Smoothing (Preprocessing) ---
+                scale_smooth_dir = None
+                if current_smooth_sigma > 0:
+                    scale_smooth_dir = _get_safe_temp_dir(temp_root_path, f'smoothing_s{i}')
+                    scale_smooth_path = os.path.join(scale_smooth_dir, 'smoothed.dat')
+                    smoothed_mm = np.memmap(scale_smooth_path, dtype=np.float32, mode='w+', shape=volume.shape)
+
+                    sigma_vox = [current_smooth_sigma / s if s > 0 else 0 for s in spacing]
+                    d_norm = da.from_array(norm_mm, chunks=(128, 512, 512))
+                    d_smooth = dask_image.ndfilters.gaussian_filter(d_norm, sigma=sigma_vox)
+
+                    with ProgressBar(dt=5):
+                        da.store(d_smooth, smoothed_mm, scheduler='threads')
+                    smoothed_mm.flush()
+                else:
+                    smoothed_mm = norm_mm
+
                 if scale == 0:
                     # Pass-through
                     enh_mm = smoothed_mm
@@ -393,17 +433,32 @@ def segment_cells_first_pass_raw(
                 # Binary Creation, Closing, and OR-ing
                 if thresh < 1e6:
                     enh_dask = da.from_array(enh_mm, chunks=(128, 512, 512))
+
+                    # Per-scale gap-closing structure
+                    rv = [math.ceil((current_connect_gap / 2) / s) if s > 1e-9 else 0 for s in spacing]
+                    struct = np.ones(tuple(max(1, 2 * r + 1) for r in rv), dtype=bool)
+
                     clean_dask = dask_image.ndmorph.binary_closing((enh_dask > thresh), structure=struct)
                     
                     for read_sl, _ in tqdm(list(_get_chunk_slices(volume.shape, (64, 512, 512))), desc="      Merging"):
                         master_mm[read_sl] |= clean_dask[read_sl].compute().astype(np.uint8)
                 
                 master_mm.flush()
-                if enh_dir:
-                    del enh_mm; shutil.rmtree(enh_dir, ignore_errors=True); gc.collect()
 
-        # Cleanup intermediate smoothed volume
-        del smoothed_mm, norm_mm; gc.collect()
+                # Clean up this scale's intermediate buffers. `enh_mm` is dropped
+                # first since, for scale==0 or smooth_sigma==0, it may just be an
+                # alias for `smoothed_mm` (or `norm_mm`) rather than a distinct
+                # memmap.
+                if enh_dir:
+                    del enh_mm; shutil.rmtree(enh_dir, ignore_errors=True)
+                elif 'enh_mm' in locals():
+                    del enh_mm
+                if scale_smooth_dir:
+                    del smoothed_mm; shutil.rmtree(scale_smooth_dir, ignore_errors=True)
+                gc.collect()
+
+        # Cleanup normalized volume
+        del norm_mm; gc.collect()
 
         # --- Labeling and Size Filtering ---
         print("\n  [Step 1.4] Labeling Objects...")

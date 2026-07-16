@@ -1,0 +1,256 @@
+"""metadata: extracted from helper_funcs.py (auto-split along functional seams)."""
+
+
+import os
+import re
+import traceback
+import yaml  # type: ignore
+import numpy as np
+import tifffile as tiff  # type: ignore
+from xml.etree import ElementTree as ET
+from typing import Dict, Any, Union
+
+# --- Optional CZI support ---
+try:
+    from aicspylibczi import CziFile  # type: ignore
+    HAS_CZI = True
+except ImportError:
+    HAS_CZI = False
+    print("Warning: 'aicspylibczi' not installed. CZI support disabled.")
+
+
+
+class MetadataExtractor:
+    """Helper class to parse dimensions and physical scales from microscopy files."""
+
+    @staticmethod
+    def get_channel_count(path: str) -> int:
+        """Determines the number of channels in a file (CZI or TIFF)."""
+        ext = os.path.splitext(path)[1].lower()
+        if ext == '.czi' and HAS_CZI:
+            try:
+                czi = CziFile(path)
+                dims_list = czi.get_dims_shape() if hasattr(czi, 'get_dims_shape') else czi.dims_shape()
+                if dims_list:
+                    dims = dims_list[0]
+                    if 'C' in dims: return dims['C'][1] - dims['C'][0]
+                return 1
+            except Exception: return 1
+
+        elif ext in ['.tif', '.tiff']:
+            try:
+                with tiff.TiffFile(path) as tif:
+                    if tif.imagej_metadata:
+                        return int(tif.imagej_metadata.get('channels', 1))
+                    if tif.ome_metadata:
+                        match = re.search(r'SizeC="(\d+)"', str(tif.ome_metadata))
+                        if match: return int(match.group(1))
+                    if len(tif.series) > 0:
+                        shape = tif.series[0].shape
+                        if len(shape) == 3 and shape[0] < 10 and shape[0] < shape[1]: return shape[0]
+                        if len(shape) == 4: return min(shape[0], shape[1])
+            except Exception: return 1
+        return 1
+
+    @staticmethod
+    def read_tiff_metadata(path: str) -> Dict[str, Union[float, bool]]:
+        """Attempts to read physical scale (microns) with robust ImageJ support."""
+        meta: Dict[str, Union[float, bool]] = {'x': 1.0, 'y': 1.0, 'z': 1.0, 'found': False}
+        try:
+            with tiff.TiffFile(path) as tif:
+                ij = tif.imagej_metadata or {}
+                # 1. Capture Z-Spacing from ImageJ immediately
+                if 'spacing' in ij:
+                    meta['z'] = float(ij['spacing'])
+                    meta['found'] = True
+
+                # 2. Capture X/Y from Tags or ImageJ
+                if tif.pages:
+                    page = tif.pages[0]
+                    x_res = page.tags.get('XResolution')
+                    y_res = page.tags.get('YResolution')
+                    u_tag = page.tags.get('ResolutionUnit')
+                    
+                    if x_res and y_res:
+                        x_val, y_val = x_res.value, y_res.value
+                        x_dens = x_val[0]/x_val[1] if isinstance(x_val, tuple) else x_val
+                        y_dens = y_val[0]/y_val[1] if isinstance(y_val, tuple) else y_val
+                        
+                        # Unit detection: Tag says 'None' (1), but ImageJ string might say 'micron'
+                        unit_str = str(ij.get('unit', '')).lower()
+                        u_val = u_tag.value if u_tag else 1
+                        
+                        if x_dens > 0:
+                            # Case: Unit is Microns (Standard for Fiji calibration)
+                            if u_val == 3 or unit_str in ['micron', 'µm', 'um']:
+                                # If unit is cm (3), density is px/cm. 10000/dens = um/px
+                                # If unit is micron, density is px/um. 1/dens = um/px
+                                factor = 10000.0 if u_val == 3 else 1.0
+                                meta['x'], meta['y'] = factor/x_dens, factor/y_dens
+                                meta['found'] = True
+                            # Case: Unit is Inches (DPI)
+                            elif u_val == 2:
+                                meta['x'], meta['y'] = 25400.0/x_dens, 25400.0/y_dens
+                                meta['found'] = True
+                            # Case: Unit is "None" but we have numbers (often happens in bio-formats)
+                            elif u_val == 1:
+                                if x_dens < 1.0: # Likely already microns per pixel
+                                    meta['x'], meta['y'] = x_dens, y_dens
+                                else: # Likely pixels per micron
+                                    meta['x'], meta['y'] = 1.0/x_dens, 1.0/y_dens
+                                meta['found'] = True
+
+                # 3. OME-XML Fallback
+                if not meta['found'] and tif.ome_metadata:
+                    txt = str(tif.ome_metadata)
+                    for ax in ['X', 'Y', 'Z']:
+                        m = re.search(rf'PhysicalSize{ax}="([\d\.]+)"', txt)
+                        if m: 
+                            meta[ax.lower()] = float(m.group(1))
+                            meta['found'] = True
+
+        except Exception as e:
+            print(f"Metadata read error: {e}")
+        return meta
+
+    @staticmethod
+    def _parse_czi_xml_scaling(xml_input: Any) -> Dict[str, float]:
+        """Parses CZI XML object/string to find scaling in MICRONS."""
+        scales = {}
+        try:
+            root = None
+            if hasattr(xml_input, 'getroot'):
+                root = xml_input.getroot()
+            elif ET.iselement(xml_input):
+                root = xml_input
+            elif isinstance(xml_input, (str, bytes)):
+                try:
+                    if len(str(xml_input)) < 255 and os.path.exists(xml_input):
+                        root = ET.parse(xml_input).getroot()
+                    else:
+                        root = ET.fromstring(xml_input)
+                except Exception:
+                    pass
+
+            if root is not None:
+                for dist in root.iter('Distance'):
+                    axis_id = dist.get('Id')
+                    val_node = dist.find('Value')
+                    if axis_id and val_node is not None and val_node.text:
+                        try:
+                            scales[axis_id] = float(val_node.text) * 1e6
+                        except ValueError:
+                            pass
+        except Exception as e:
+            print(f"    Error parsing CZI XML: {e}")
+        return scales
+
+    @staticmethod
+    def extract_channel_to_tiff(src_path: str, dest_path: str, channel_idx: int) -> None:
+        """Extracts a channel and preserves the spatial resolution tags."""
+        try:
+            ext = os.path.splitext(src_path)[1].lower()
+            ch_data = None
+            source_meta = {'x': 1.0, 'y': 1.0, 'z': 1.0}
+
+            # --- BRANCH 1: CZI FILES ---
+            if ext == '.czi' and HAS_CZI:
+                # 1. Get Metadata specifically for CZI
+                source_meta = MetadataExtractor.get_czi_metadata(src_path)
+                
+                # 2. Extract Data using aicspylibczi
+                try:
+                    czi = CziFile(src_path)
+                    # Read specific channel. explicit T=0 ensures we get a volume, not a 4D hyperstack if time exists
+                    # This returns (data, list_of_dims). Data usually has shape (1, 1, Z, Y, X) or similar.
+                    data, dims = czi.read_image(C=channel_idx)
+                    ch_data = np.squeeze(data)
+                except Exception as czi_e:
+                    print(f"    CZI Read Error: {czi_e}")
+                    return
+
+            # --- BRANCH 2: TIFF FILES ---
+            elif ext in ['.tif', '.tiff']:
+                # 1. Get Metadata specifically for TIFF
+                source_meta = MetadataExtractor.read_tiff_metadata(src_path)
+                
+                # 2. Extract Data using tifffile
+                vol = tiff.imread(src_path)
+                
+                # Handle ImageJ Hyperstacks (Z vs C vs T)
+                if vol.ndim == 3:
+                    # Differentiate (C,Y,X) from (Z,Y,X)
+                    # Heuristic: Channels usually < 10, Z usually < Y/X
+                    if vol.shape[0] < 10 and vol.shape[0] < vol.shape[1]: 
+                        ch_data = vol[channel_idx]
+                    else: 
+                        # Assumes single channel Z-stack
+                        ch_data = vol
+                elif vol.ndim == 4:
+                    # Usually (C, Z, Y, X) or (Z, C, Y, X). 
+                    # Simplistic assumption: Smallest dim is C.
+                    if vol.shape[0] < vol.shape[1]: # (C, Z, Y, X)
+                        ch_data = vol[channel_idx]
+                    else: # (Z, C, Y, X)
+                        ch_data = vol[:, channel_idx, :, :]
+                else:
+                    ch_data = vol
+            
+            else:
+                print(f"    Unsupported file type for extraction: {ext}")
+                return
+
+            # --- COMMON: SAVE TO DISK ---
+            if ch_data is not None:
+                # Calculate resolution for ImageJ/Fiji (pixels per unit)
+                # If meta is 1.0 (default), res is 1.0
+                res_x = 1.0 / source_meta['x'] if source_meta['x'] > 0 else 1.0
+                res_y = 1.0 / source_meta['y'] if source_meta['y'] > 0 else 1.0
+
+                tiff.imwrite(
+                    dest_path, ch_data, 
+                    photometric='minisblack',
+                    resolution=(res_x, res_y),
+                    metadata={'unit': 'micron', 'spacing': source_meta['z']}
+                )
+
+        except Exception as e:
+            print(f"Extraction failed for {os.path.basename(src_path)}: {e}")
+            traceback.print_exc()
+
+    @staticmethod
+    def get_czi_metadata(path: str) -> Dict[str, Union[float, bool]]:
+        """Wrapper to get metadata specifically for CZI files."""
+        if not HAS_CZI:
+            return {'x': 1.0, 'y': 1.0, 'z': 1.0, 'found': False}
+        czi = CziFile(path)
+        scale_map = {}
+        if hasattr(czi, 'pixel_scaling'):
+            try:
+                scale_map = {k: v * 1e6 for k, v in czi.pixel_scaling.items()}
+            except Exception:
+                pass
+        if not scale_map and hasattr(czi, 'meta'):
+            xml = czi.meta() if callable(czi.meta) else czi.meta
+            scale_map = MetadataExtractor._parse_czi_xml_scaling(xml)
+        return {
+            'x': scale_map.get('X', 1.0),
+            'y': scale_map.get('Y', 1.0),
+            'z': scale_map.get('Z', 1.0),
+            'found': bool(scale_map)
+        }
+
+def get_sample_metadata(folder_path):
+    """Retrieves shape and spacing from the YAML in a project folder."""
+    for f in os.listdir(folder_path):
+        if f.endswith(('.yaml', '.yml')):
+            with open(os.path.join(folder_path, f), 'r') as file:
+                cfg = yaml.safe_load(file)
+                mode = cfg.get('mode', '')
+                is_2d = mode.endswith('_2d')
+                dim_key = 'pixel_dimensions' if is_2d else 'voxel_dimensions'
+                dims = cfg.get(dim_key, {'x':1, 'y':1, 'z':1})
+                # Note: We'd need actual pixel counts to calculate spacing, 
+                # but for preview, we can often rely on the Strategy to provide this.
+                return dims, mode
+    return None, None

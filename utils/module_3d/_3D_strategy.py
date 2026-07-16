@@ -178,6 +178,19 @@ class FluorescenceStrategy(ProcessingStrategy):
             low_thresh_input = [p['low'] for p in profiles]
             high_thresh_input = [p['high'] for p in profiles]
 
+            # Per-scale smoothing / gap-closing. Base value comes from the
+            # step's top-level scalar param; a profile row may override it
+            # per-scale by carrying its own key. (min_size stays global below.)
+            base_smooth_sigma = float(params.get("smooth_sigma", 1.3))
+            base_connect_gap = float(params.get("connect_max_gap_physical", 1.0))
+            smooth_sigma_input = [
+                float(p.get("smooth_sigma", base_smooth_sigma)) for p in profiles
+            ]
+            connect_max_gap_input = [
+                float(p.get("connect_max_gap_physical", base_connect_gap))
+                for p in profiles
+            ]
+
             # Check for special 'skip' signal in scales
             skip_enhancement = (
                 len(tubular_scales) == 1 and tubular_scales[0] == 0.0
@@ -188,10 +201,8 @@ class FluorescenceStrategy(ProcessingStrategy):
                 volume=image_stack,
                 spacing=self.spacing,
                 tubular_scales=tubular_scales,
-                smooth_sigma=float(params.get("smooth_sigma", 1.3)),
-                connect_max_gap_physical=float(
-                    params.get("connect_max_gap_physical", 1.0)
-                ),
+                smooth_sigma=smooth_sigma_input,
+                connect_max_gap_physical=connect_max_gap_input,
                 min_size_voxels=int(params.get("min_size", 2000)),
                 # Use the variables prepared above
                 low_threshold_percentile=low_thresh_input,

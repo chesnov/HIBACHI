@@ -1,0 +1,44 @@
+# =============================================================================
+# HIBACHI runtime environment  (install/environment.yml)
+# -----------------------------------------------------------------------------
+# This is the project's VALIDATED dependency set. Only two things were changed
+# from the original environment.yaml:
+#   1. Added `git` (conda-forge) -- required by the installer's clone step and
+#      the self-updater, so it works on machines with no system git.
+#   2. Dropped the Anaconda `defaults` channel (everything comes from pip or
+#      conda-forge anyway) to avoid Anaconda's commercial Terms of Service.
+#
+# The installer reads this file, and the launcher rebuilds the environment
+# automatically whenever this file changes upstream -- so this path
+# (install/environment.yml) is the single source of truth for dependencies.
+# =============================================================================
+name: hibachi
+
+channels:
+  - conda-forge
+
+dependencies:
+  - python=3.11
+  - git                 # needed for git clone + self-update on clean machines
+  - pip
+  - pip:
+      - google-crc32c>=1.7.1
+      - napari[all]~=0.5.6
+      - napari-plugin-manager~=0.1.4
+      - nbformat~=5.10.4
+      - numba~=0.61.0
+      - PartSegCore_compiled_backend~=0.15.9
+      - pipdeptree~=2.25.1
+      - plotly~=6.0.0
+      - pooch~=1.8.2
+      - pyconify~=0.2.1
+      - PyQt5~=5.15.11
+      - scikit-learn~=1.6.1
+      - seaborn~=0.13.2
+      - tifffile>=2023.1.1
+      - zarr~=3.0.2
+      - dask-image~=2024.5.3
+      - simpleitk~=2.5.2
+      - skan~=0.12.2
+      - aicspylibczi~=3.3.1
+      - fcswrite~=0.6.4

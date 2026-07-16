@@ -1,54 +1,50 @@
 execute_raw_segmentation_fluorescence_2d:
-  name: Execute Raw Segmentation (2D)
-  parameters:
-    use_absolute_thresholds:
-      label: 'Threshold Mode: Use Absolute Intensity (Disable Percentiles)'
-      type: bool
-      value: true
-    scale_profiles_percentile:
-      label: Tubularity Profiles (Percentiles)
-      type: scale_table
-      value:
-      - scale: 1.0
-        low: 95.0
-        high: 99.0
-      - scale: 1.5
-        low: 98.0
-        high: 100.0
-      - scale: 3.0
-        low: 98.0
-        high: 100.0
-    scale_profiles_absolute:
-      label: Tubularity Profiles (Absolute [0.0 - 1.0])
-      type: scale_table_absolute
-      value:
-      - scale: 0.0
-        low: 0.2
-        high: 1.0
-      - scale: 1.5
-        low: 0.03
-        high: 1.0
-    min_size:
-      label: Minimum Size (Pixels, Raw Seg)
-      type: int
-      value: 200
-      min: 1
-      max: 10000
-      step: 1
-    smooth_sigma:
-      label: Smooth Sigma (Initial)
-      type: float
-      value: 0.1
-      min: 0.0
-      max: 10.0
-      step: 0.01
-    connect_max_gap_physical:
-      label: Max Connect Gap (um)
-      type: float
-      value: 0.0
-      min: 0.0
-      max: 10.0
-      step: 0.1
+    name: Execute Raw Segmentation (2D)
+    parameters:
+      use_absolute_thresholds:
+        label: 'Threshold Mode: Use Absolute Intensity (Disable Percentiles)'
+        type: bool
+        value: true
+      scale_profiles_percentile:
+        label: Tubularity Profiles (Percentiles + Per-Scale Filters)
+        type: scale_table
+        value:
+        - scale: 1.0
+          low: 95.0
+          high: 99.0
+          smooth_sigma: 0.1
+          connect_max_gap_physical: 0.0
+        - scale: 1.5
+          low: 98.0
+          high: 100.0
+          smooth_sigma: 0.1
+          connect_max_gap_physical: 0.0
+        - scale: 3.0
+          low: 98.0
+          high: 100.0
+          smooth_sigma: 0.1
+          connect_max_gap_physical: 0.0
+      scale_profiles_absolute:
+        label: Tubularity Profiles (Absolute [0.0 - 1.0] + Per-Scale Filters)
+        type: scale_table_absolute
+        value:
+        - scale: 0.0
+          low: 0.2
+          high: 1.0
+          smooth_sigma: 0.1
+          connect_max_gap_physical: 0.0
+        - scale: 1.5
+          low: 0.03
+          high: 1.0
+          smooth_sigma: 0.1
+          connect_max_gap_physical: 0.0
+      min_size:
+        label: Minimum Size (Pixels, Raw Seg - GLOBAL)
+        type: int
+        value: 200
+        min: 10
+        max: 50000
+        step: 1
 execute_trim_edges_fluorescence_2d:
   name: Execute Edge Trimming (2D)
   parameters:

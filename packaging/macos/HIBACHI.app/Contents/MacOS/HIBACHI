@@ -1,0 +1,38 @@
+#!/bin/bash
+# =============================================================================
+# HIBACHI.app launcher (macOS)
+# -----------------------------------------------------------------------------
+# This is the executable inside HIBACHI.app. On first launch it bootstraps the
+# environment (via the bundled install.sh); on every launch it hands off to the
+# self-updating Python launcher. Setup progress is shown with macOS
+# notifications/dialogs so the user is never staring at a frozen icon.
+# =============================================================================
+set -uo pipefail
+
+HERE="$(cd "$(dirname "$0")" && pwd)"
+RES="${HERE}/../Resources"
+
+INSTALL_DIR="${HIBACHI_HOME:-$HOME/HIBACHI}"
+APP_DIR="${INSTALL_DIR}/app"
+MAMBA="${INSTALL_DIR}/micromamba/bin/micromamba"
+ENV_NAME="hibachi"
+LOG="${INSTALL_DIR}/setup.log"
+
+notify() { osascript -e "display notification \"$1\" with title \"HIBACHI\"" >/dev/null 2>&1 || true; }
+alert()  { osascript -e "display dialog \"$1\" buttons {\"OK\"} default button 1 with title \"HIBACHI\"" >/dev/null 2>&1 || true; }
+
+# First run (or a broken install): bootstrap the environment and checkout.
+if [ ! -d "${APP_DIR}/.git" ] || [ ! -x "${MAMBA}" ]; then
+    mkdir -p "${INSTALL_DIR}"
+    notify "Setting up HIBACHI (first run). This can take a few minutes…"
+    # Skip shortcut creation: this .app is itself the permanent launcher.
+    if HIBACHI_SKIP_SHORTCUT=1 bash "${RES}/install.sh" >"${LOG}" 2>&1; then
+        notify "Setup complete. Launching HIBACHI…"
+    else
+        alert "HIBACHI setup failed. Please send this log to support: ${LOG}"
+        exit 1
+    fi
+fi
+
+# Normal launch: the Python launcher self-updates then starts the app.
+exec "${MAMBA}" run -n "${ENV_NAME}" python "${APP_DIR}/launcher/run_app.py"

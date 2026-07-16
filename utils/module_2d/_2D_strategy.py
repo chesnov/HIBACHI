@@ -182,21 +182,33 @@ class Fluorescence2DStrategy(ProcessingStrategy):
             low_thresh_input = [p['low'] for p in profiles]
             high_thresh_input = [p['high'] for p in profiles]
 
-            # Standard params
-            min_size_pixels = int(params.get("min_size", 100))
-            smooth_sigma = float(params.get("smooth_sigma", 1.0))
-            connect_max_gap_physical = float(
-                params.get("connect_max_gap_physical", 1.0)
-            )
+            # Per-scale smoothing / gap-closing. Base value comes from the
+            # step's top-level scalar param; a profile row may override it
+            # per-scale by carrying its own key.
+            base_smooth_sigma = float(params.get("smooth_sigma", 0.1))
+            base_connect_gap = float(params.get("connect_max_gap_physical", 0.0))
+
+            smooth_sigma_input = [
+                float(p.get("smooth_sigma", base_smooth_sigma)) for p in profiles
+            ]
+            connect_max_gap_input = [
+                float(p.get("connect_max_gap_physical", base_connect_gap))
+                for p in profiles
+            ]
+
+            # Minimum size is a single GLOBAL value (applied after the merge),
+            # matching the 3D track. It is read from the top-level scalar param
+            # only; there is no per-scale min_size.
+            min_size_global = int(params.get("min_size", 200))
 
             # --- 2. CALL LOGIC ---
             result = segment_cells_first_pass_raw_2d(
                 image=image_stack,
                 spacing=self.spacing,
                 tubular_scales=tubular_scales,
-                smooth_sigma=smooth_sigma,
-                connect_max_gap_physical=connect_max_gap_physical,
-                min_size_pixels=min_size_pixels,
+                smooth_sigma=smooth_sigma_input,
+                connect_max_gap_physical=connect_max_gap_input,
+                min_size_pixels=min_size_global,
                 low_threshold_percentile=low_thresh_input,
                 high_threshold_percentile=high_thresh_input,
                 threshold_mode=threshold_mode,

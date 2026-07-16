@@ -203,9 +203,9 @@ def segment_cells_first_pass_raw_2d(
     image: np.ndarray,
     spacing: Union[Tuple[float, float], Tuple[float, float, float]],
     tubular_scales: List[float] = [0.5, 1.0, 2.0, 3.0],
-    smooth_sigma: float = 0.5,
-    connect_max_gap_physical: float = 1.0,
-    min_size_pixels: int = 50,
+    smooth_sigma: Union[float, List[float]] = 0.5,
+    connect_max_gap_physical: Union[float, List[float]] = 1.0,
+    min_size_pixels: Union[int, List[int]] = 50,
     low_threshold_percentile: Union[float, List[float]] = 95.0,
     high_threshold_percentile: Union[float, List[float]] = 100.0,
     threshold_mode: str = "Percentile",
@@ -214,9 +214,28 @@ def segment_cells_first_pass_raw_2d(
     temp_root_path: Optional[str] = None,
     **kwargs: Any
 ) -> Tuple[Optional[str], Optional[str], float, Dict[str, Any]]:
-    """Step 1: Raw 2D Segmentation (Independent Smoothing + Threshold-then-OR)."""
+    """
+    Step 1: Raw 2D Segmentation (Independent per-scale Smoothing/Gap +
+    Threshold-then-OR, GLOBAL size filter).
+
+    Each tubularity scale in `tubular_scales` is smoothed, enhanced, thresholded
+    and gap-closed independently, then OR-merged. `smooth_sigma` and
+    `connect_max_gap_physical` are per-scale (scalar broadcasts to all scales;
+    a list gives one entry per scale).
+
+    Unlike per-scale filtering, the minimum-size filter is applied GLOBALLY,
+    once, AFTER the merge (matching the 3D pipeline), so `min_size_pixels` is a
+    single value. A list is accepted for backward compatibility and collapsed to
+    its smallest (most permissive) entry.
+    """
     n_scales = len(tubular_scales)
-    
+
+    if n_scales == 0:
+        raise ValueError(
+            "tubular_scales must contain at least one scale; got an empty "
+            "list. Check the scale-profile table upstream."
+        )
+
     if isinstance(low_threshold_percentile, (int, float)):
         low_thresh_list = [float(low_threshold_percentile)] * n_scales
     else:
@@ -230,13 +249,41 @@ def segment_cells_first_pass_raw_2d(
     if len(low_thresh_list) != n_scales or len(high_thresh_list) != n_scales:
         raise ValueError("low/high_threshold_percentile lists must match length of tubular_scales.")
 
+    # --- Per-scale filter parameters ---
+    # Each entry below applies ONLY to its corresponding tubular scale.
+    if isinstance(smooth_sigma, (int, float)):
+        smooth_sigma_list = [float(smooth_sigma)] * n_scales
+    else:
+        smooth_sigma_list = [float(x) for x in smooth_sigma]
+
+    if isinstance(connect_max_gap_physical, (int, float)):
+        connect_gap_list = [float(connect_max_gap_physical)] * n_scales
+    else:
+        connect_gap_list = [float(x) for x in connect_max_gap_physical]
+
+    if (len(smooth_sigma_list) != n_scales
+            or len(connect_gap_list) != n_scales):
+        raise ValueError(
+            "smooth_sigma/connect_max_gap_physical lists "
+            "must match length of tubular_scales."
+        )
+
+    # Minimum-size filtering is GLOBAL (applied once, after all scales merge),
+    # matching the 3D pipeline. A single value is used for all scales; if a list
+    # is passed for backward compatibility, the smallest (most permissive) value
+    # is used.
+    if isinstance(min_size_pixels, (int, float)):
+        min_size_global = int(min_size_pixels)
+    else:
+        min_size_global = int(min(min_size_pixels)) if len(min_size_pixels) else 0
+
     temp_dirs_to_clean, threshold_history = [], {}
     final_labels_memmap = None
 
     try:
         spacing_2d = tuple(float(s) for s in spacing[-2:])
 
-        # --- Normalization ---
+        # --- Normalization (shared preprocessing across all scales) ---
         with SimpleTimer("Stage 1.1: Normalization"):
             norm_dir = _get_safe_temp_dir(temp_root_path, 'normalize'); temp_dirs_to_clean.append(norm_dir)
             norm_path = os.path.join(norm_dir, 'norm.dat')
@@ -249,7 +296,7 @@ def segment_cells_first_pass_raw_2d(
                 if np.issubdtype(image.dtype, np.integer):
                     norm_factor = float(np.iinfo(image.dtype).max)
                     
-                print(f"    Normalization skipped for Percentiles, but scaling by DType Max ({norm_factor}) to [0, 1] range.")
+                print(f"    Normalization skipped for Absolute mode; scaling by DType Max ({norm_factor}) to [0, 1] range.")
                 for read_sl, _ in tqdm(chunk_gen, desc="    Applying"):
                     norm_mm[read_sl] = image[read_sl].astype(np.float32) / norm_factor
                 norm_mm.flush()
@@ -266,36 +313,38 @@ def segment_cells_first_pass_raw_2d(
                     norm_mm[read_sl] = image[read_sl].astype(np.float32) / high_val
                 norm_mm.flush()
 
-        # --- Global 2D Smoothing (Preprocessing) ---
-        smoothed_mm = norm_mm
-        if smooth_sigma > 0:
-            with SimpleTimer(f"Stage 1.2: Global 2D Smoothing (sigma={smooth_sigma})"):
-                smooth_dir = _get_safe_temp_dir(temp_root_path, 'smoothing'); temp_dirs_to_clean.append(smooth_dir)
-                smooth_path = os.path.join(smooth_dir, 'smoothed.dat')
-                smoothed_mm = np.memmap(smooth_path, dtype=np.float32, mode='w+', shape=image.shape)
-                
-                sigma_vox = [smooth_sigma / s if s > 0 else 0 for s in spacing_2d]
-                d_norm = da.from_array(norm_mm, chunks=(4096, 4096))
-                d_smooth = dask_image.ndfilters.gaussian_filter(d_norm, sigma=sigma_vox)
-                
-                with ProgressBar(dt=5):
-                    da.store(d_smooth, smoothed_mm, scheduler='threads')
-                smoothed_mm.flush()
-
-        # --- Multi-Scale Logic (Threshold-then-OR) ---
+        # --- Multi-Scale Logic (Independent Smoothing/Gap + Threshold-then-OR) ---
+        # Smoothing and gap-closing are per-scale; the minimum-size filter is
+        # GLOBAL and applied once after the merge (see the labeling stage),
+        # matching the 3D pipeline.
         master_dir = _get_safe_temp_dir(temp_root_path, 'master'); temp_dirs_to_clean.append(master_dir)
         master_mm = np.memmap(os.path.join(master_dir, 'm.dat'), dtype=np.uint8, mode='w+', shape=image.shape)
         master_mm[:] = 0
 
-        # Closing structure
-        radius_px = math.ceil((connect_max_gap_physical / 2) / np.mean(spacing_2d))
-        struct = disk(radius_px) if radius_px > 0 else np.ones((1,1), dtype=bool)
-
-        # Use enumerate to index the specific threshold
+        # Use enumerate to index each scale's own parameters
         for i, scale in enumerate(tubular_scales):
             current_low_p = low_thresh_list[i]
-            
+            current_smooth_sigma = smooth_sigma_list[i]
+            current_connect_gap = connect_gap_list[i]
+
             with SimpleTimer(f"Scale sigma={scale} (p{current_low_p})"):
+                # --- Per-Scale Smoothing (Preprocessing) ---
+                scale_smooth_dir = None
+                if current_smooth_sigma > 0:
+                    scale_smooth_dir = _get_safe_temp_dir(temp_root_path, f'smoothing_s{i}')
+                    scale_smooth_path = os.path.join(scale_smooth_dir, 'smoothed.dat')
+                    smoothed_mm = np.memmap(scale_smooth_path, dtype=np.float32, mode='w+', shape=image.shape)
+
+                    sigma_vox = [current_smooth_sigma / s if s > 0 else 0 for s in spacing_2d]
+                    d_norm = da.from_array(norm_mm, chunks=(4096, 4096))
+                    d_smooth = dask_image.ndfilters.gaussian_filter(d_norm, sigma=sigma_vox)
+
+                    with ProgressBar(dt=5):
+                        da.store(d_smooth, smoothed_mm, scheduler='threads')
+                    smoothed_mm.flush()
+                else:
+                    smoothed_mm = norm_mm
+
                 if scale == 0:
                     enh_mm = smoothed_mm
                     enh_dir = None
@@ -320,41 +369,69 @@ def segment_cells_first_pass_raw_2d(
 
                 if thresh < 1e6:
                     enh_dask = da.from_array(enh_mm, chunks=(4096, 4096))
+
+                    # Per-scale gap-closing structure
+                    radius_px = math.ceil((current_connect_gap / 2) / np.mean(spacing_2d))
+                    struct = disk(radius_px) if radius_px > 0 else np.ones((1, 1), dtype=bool)
+
                     clean_dask = dask_image.ndmorph.binary_closing((enh_dask > thresh), structure=struct)
-                    
+
+                    # Merge this scale's detections into the master mask. Size
+                    # filtering is deferred to a single GLOBAL pass after all
+                    # scales are merged (see the labeling stage below).
                     chunk_gen = list(_get_chunk_slices_2d(image.shape, (2048, 2048), overlap=0))
                     for read_sl, _ in tqdm(chunk_gen, desc="      Merging"):
                         master_mm[read_sl] |= clean_dask[read_sl].compute().astype(np.uint8)
                 
                 master_mm.flush()
+
+                # Clean up this scale's intermediate buffers. `enh_mm` is
+                # dropped first since, for scale==0 or smooth_sigma==0, it may
+                # just be an alias for `smoothed_mm` (or `norm_mm`) rather than
+                # a distinct memmap.
                 if enh_dir:
-                    del enh_mm; shutil.rmtree(enh_dir, ignore_errors=True); gc.collect()
+                    del enh_mm; shutil.rmtree(enh_dir, ignore_errors=True)
+                elif 'enh_mm' in locals():
+                    del enh_mm
+                if scale_smooth_dir:
+                    del smoothed_mm; shutil.rmtree(scale_smooth_dir, ignore_errors=True)
+                gc.collect()
 
-        del smoothed_mm, norm_mm; gc.collect()
+        del norm_mm; gc.collect()
 
-        # --- Labeling and Size Filtering ---
+        # --- Final Labeling + GLOBAL Size Filter ---
+        # A single minimum-size filter is applied here to the merged mask,
+        # matching the 3D pipeline: objects smaller than `min_size_global`
+        # (after all scales are combined) are dropped, and survivors are given
+        # contiguous IDs.
         print("\n  [Step 1.4] Labeling Objects...")
         final_dir = _get_safe_temp_dir(temp_root_path, 'final'); labels_temp_dir = final_dir
         labels_path = os.path.join(final_dir, 'l.dat')
         final_mm = np.memmap(labels_path, dtype=np.int32, mode='w+', shape=image.shape)
-        
+
         lab_dir = _get_safe_temp_dir(temp_root_path, 'lab_zarr'); temp_dirs_to_clean.append(lab_dir)
         m_dask = da.from_array(master_mm, chunks=(4096, 4096))
-        labeled_dask, num_feats_dask = dask_image.ndmeasure.label((m_dask > 0), structure=generate_binary_structure(2, 1))
+        labeled_dask, num_feats_dask = dask_image.ndmeasure.label(
+            (m_dask > 0), structure=generate_binary_structure(2, 1)
+        )
         labeled_dask.to_zarr(os.path.join(lab_dir, 'l.zarr'), overwrite=True)
-        num_feats = num_feats_dask.compute()
+        num_feats = int(num_feats_dask.compute())
 
-        d_lbl = da.from_zarr(os.path.join(lab_dir, 'l.zarr'))
-        counts, _ = da.histogram(d_lbl, bins=num_feats+1, range=[-0.5, num_feats+0.5])
-        valid = np.where(counts.compute()[1:] >= min_size_pixels)[0] + 1
-        
-        lookup = np.zeros(num_feats + 1, dtype=np.int32)
-        for i, old_id in enumerate(valid): lookup[old_id] = i + 1
-            
-        lz = zarr.open(os.path.join(lab_dir, 'l.zarr'), mode='r')
         chunk_gen = list(_get_chunk_slices_2d(image.shape, (2048, 2048), overlap=0))
-        for rs, ws in tqdm(chunk_gen, desc="    Filtering"):
-            final_mm[ws] = lookup[lz[rs]]
+        if num_feats == 0:
+            final_mm[:] = 0
+        else:
+            d_lbl = da.from_zarr(os.path.join(lab_dir, 'l.zarr'))
+            counts, _ = da.histogram(d_lbl, bins=num_feats + 1, range=[-0.5, num_feats + 0.5])
+            valid = np.where(counts.compute()[1:] >= min_size_global)[0] + 1
+
+            lookup = np.zeros(num_feats + 1, dtype=np.int32)
+            for new_id, old_id in enumerate(valid):
+                lookup[old_id] = new_id + 1
+
+            lz = zarr.open(os.path.join(lab_dir, 'l.zarr'), mode='r')
+            for rs, ws in tqdm(chunk_gen, desc="    Filtering"):
+                final_mm[ws] = lookup[lz[rs]]
         final_mm.flush()
 
         # Explicitly release master_mm before returning

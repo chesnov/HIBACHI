@@ -10,41 +10,34 @@ execute_raw_segmentation_fluorescence:
       value: false
 
     scale_profiles_percentile:
-      label: Tubularity Profiles (Percentiles)
+      label: Tubularity Profiles (Percentiles + Per-Scale Filters)
       type: scale_table
       value:
-        - {scale: 1.0, low: 95.0, high: 99.0}
-        - {scale: 1.5, low: 98.0, high: 100.0}
-        - {scale: 3.0, low: 98.0, high: 100.0}
-        
+        - {scale: 1.0, low: 95.0, high: 99.0, smooth_sigma: 0.2, connect_max_gap_physical: 1.0}
+        - {scale: 1.5, low: 98.0, high: 100.0, smooth_sigma: 0.2, connect_max_gap_physical: 1.0}
+        - {scale: 3.0, low: 98.0, high: 100.0, smooth_sigma: 0.2, connect_max_gap_physical: 1.0}
+
     scale_profiles_absolute:
-      label: Tubularity Profiles (Absolute [0.0 - 1.0])
+      label: Tubularity Profiles (Absolute [0.0 - 1.0] + Per-Scale Filters)
       type: scale_table_absolute
       value:
-        - {scale: 1.0, low: 0.02, high: 1.0}
-        - {scale: 1.5, low: 0.03, high: 1.0}
-        - {scale: 3.0, low: 0.03, high: 1.0}
+        - {scale: 1.0, low: 0.02, high: 1.0, smooth_sigma: 0.2, connect_max_gap_physical: 1.0}
+        - {scale: 1.5, low: 0.03, high: 1.0, smooth_sigma: 0.2, connect_max_gap_physical: 1.0}
+        - {scale: 3.0, low: 0.03, high: 1.0, smooth_sigma: 0.2, connect_max_gap_physical: 1.0}
+
+    # The minimum-size filter is GLOBAL (applied once, after all scales merge)
+    # on BOTH the 2D and 3D tracks, so it lives here as a single scalar and is
+    # never a per-row column (the shared scale-table widget no longer shows one).
     min_size:
-      label: Minimum Size (Voxels, Raw Seg)
+      label: Minimum Size (Voxels, Raw Seg - GLOBAL)
       type: int
       value: 1000
       min: 10
       max: 50000
       step: 1
-    smooth_sigma:
-      label: Smooth Sigma (Initial)
-      type: float
-      value: 0.2
-      min: 0.0
-      max: 10.0
-      step: 0.1
-    connect_max_gap_physical:
-      label: Max Connect Gap (um)
-      type: float
-      value: 1.0
-      min: 0.0
-      max: 10.0
-      step: 0.1
+    # smooth_sigma and connect_max_gap_physical are now set PER SCALE in the
+    # tables above (3D honors them per-scale). The former top-level scalars were
+    # removed to avoid duplicate, conflicting controls.
 
 # --- Step 2: Edge Trimming ---
 execute_trim_edges_fluorescence:

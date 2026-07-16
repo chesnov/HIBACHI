@@ -25,31 +25,57 @@
 
 ## 🛠️ Installation
 
-### Prerequisites
-*   **Anaconda** or **Miniconda** installed on your system.
-*   **Git** (optional, to clone the repo).
+HIBACHI installs with a **native installer** on Windows and macOS, or a **single command** on Linux. You do **not** need to install Python, conda, or git yourself — the installer sets up a private, self-contained environment. After installation, **HIBACHI updates itself automatically** every time you open it.
 
-### 1. Clone the Repository
+### 🪟 Windows
+
+1.  Download **`HIBACHI-Setup.exe`** from the [**latest release**](https://github.com/chesnov/HIBACHI/releases/latest).
+2.  Double-click it and follow the wizard. The first setup downloads the scientific packages (a few hundred MB), so allow a few minutes and keep your internet connection on.
+3.  Launch **HIBACHI** from the Desktop shortcut or Start Menu.
+
+> ℹ️ If Windows shows a blue **"Windows protected your PC"** box, click **More info → Run anyway**. This appears only because the installer is not yet code-signed.
+
+### 🍎 macOS
+
+1.  Download **`HIBACHI.dmg`** from the [**latest release**](https://github.com/chesnov/HIBACHI/releases/latest).
+2.  Open the `.dmg` and drag **HIBACHI** into your **Applications** folder.
+3.  The **first time** you open it, **right-click the app → Open → Open** (needed only once, because the app is not yet notarized). The first launch downloads the packages, so allow a few minutes.
+
+### 🐧 Linux
+
+Open a terminal and paste:
+
 ```bash
+curl -fsSL https://raw.githubusercontent.com/chesnov/HIBACHI/main/install/install.sh | bash
+```
+
+This builds the environment and adds a launcher to your applications menu / Desktop. Start HIBACHI from there afterwards.
+
+### 🔄 Automatic updates
+
+Each time HIBACHI starts, it briefly checks GitHub for updates and applies them before opening. If you are offline, it simply opens the version you already have — so you never need to reinstall to stay current.
+
+<details>
+<summary><b>Advanced / developer install (run from source)</b></summary>
+
+If you would rather manage the environment yourself (e.g. for development), you need [conda / Miniforge](https://github.com/conda-forge/miniforge) and Git.
+
+```bash
+# 1. Clone the repository
 git clone https://github.com/chesnov/HIBACHI.git
 cd HIBACHI
-```
 
-### 2. Create the Environment
-An `environment.yaml` file contains all necessary dependencies (Napari, SimpleITK, Dask, etc.).
+# 2. Create the environment (all dependencies: Napari, SimpleITK, Dask, ...)
+conda env create -f install/environment.yml
 
-```bash
-# Create the environment from the file
-conda env create -f environment.yaml
-```
-
-### 3. Run the Application
-```bash
-# Activate the environment
+# 3. Run the application
 conda activate hibachi
-
 python segment.py
 ```
+
+To skip the auto-updater while developing, launch with the `HIBACHI_NO_UPDATE=1` environment variable set. The full maintainer guide — branch strategy, building the `.exe`/`.dmg` installers, and code-signing — is in [`INSTALL.md`](INSTALL.md).
+
+</details>
 
 ---
 
