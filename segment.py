@@ -16,6 +16,24 @@ import os
 import traceback
 import multiprocessing
 
+# -----------------------------------------------------------------------------
+# Windows: make the conda env's MSVC runtime (MSVCP140.dll & friends) findable
+# -----------------------------------------------------------------------------
+# pip-built extensions (PyQt5, vispy, numba, ...) are compiled against the
+# Microsoft Visual C++ runtime. conda-forge ships that runtime *inside* the env
+# (via the vc14_runtime dependency of python), but since Python 3.8 the loader
+# no longer searches PATH for an extension module's dependent DLLs. On a clean
+# machine without the system VC++ Redistributable that surfaces as
+# "MSVCP140.dll was not found" the moment PyQt5/vispy import. Registering the
+# env's DLL directories explicitly resolves it, with no admin rights needed.
+if sys.platform == "win32":
+    for _dll_dir in (sys.prefix, os.path.join(sys.prefix, "Library", "bin")):
+        if os.path.isdir(_dll_dir):
+            try:
+                os.add_dll_directory(_dll_dir)
+            except OSError:
+                pass
+
 # This monkeypatch fixes the "too many values to unpack" crash in Vispy/Napari
 # when switching between Panning (Shift+Click) and Rotating.
 try:
