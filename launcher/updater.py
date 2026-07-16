@@ -30,6 +30,7 @@ UP_TO_DATE = "up_to_date"
 UPDATED = "updated"
 OFFLINE = "offline"
 SKIPPED = "skipped"
+LOCAL_AHEAD = "local_ahead"   # checkout has un-pushed / diverged commits; left untouched
 ERROR = "error"
 
 # Path (relative to repo root) whose change triggers a dependency-env update.
@@ -147,6 +148,23 @@ def check_and_update(
         log(result.message)
         return result
 
+    # Only auto-update when the local checkout is strictly BEHIND the remote,
+    # i.e. HEAD is an ancestor of origin/<branch> and the change is a clean
+    # fast-forward. If the checkout is AHEAD or has DIVERGED (a developer's
+    # machine with un-pushed commits), we must NOT move it -- doing so would
+    # silently discard local work. In that case we leave the tree exactly as-is
+    # and just launch whatever is on disk.
+    rc, _, _ = _git(["merge-base", "--is-ancestor", "HEAD", f"origin/{branch}"], root)
+    if rc != 0:
+        result.status = LOCAL_AHEAD
+        result.message = (
+            "Local checkout is ahead of or has diverged from the server; "
+            "skipping auto-update to preserve local changes. "
+            "(Push/pull manually to sync.)"
+        )
+        log(result.message)
+        return result
+
     # Detect whether the environment spec changed between old and new.
     rc, changed, _ = _git(
         ["diff", "--name-only", f"{old_rev}..{remote_rev}"], root
@@ -156,7 +174,8 @@ def check_and_update(
         norm = {os.path.normpath(f) for f in changed_files}
         result.env_changed = os.path.normpath(ENV_FILE_REL) in norm
 
-    # 3) Preserve any local modifications before we move HEAD.
+    # Preserve any uncommitted changes to tracked files so the fast-forward can
+    # apply cleanly (untracked files never block a fast-forward).
     rc, dirty, _ = _git(["status", "--porcelain"], root)
     if rc == 0 and dirty:
         stamp = time.strftime("%Y-%m-%d_%H-%M-%S")
@@ -170,16 +189,15 @@ def check_and_update(
         else:
             log(f"Warning: could not stash local changes: {err_s}")
 
-    # 4) Try a clean fast-forward first; fall back to a hard reset to the remote.
+    # Fast-forward only. We already confirmed HEAD is an ancestor of the remote,
+    # so this cannot lose commits; there is deliberately no hard-reset fallback.
     log("Downloading and applying updates...")
     rc, _, err = _git(["merge", "--ff-only", f"origin/{branch}"], root)
     if rc != 0:
-        rc, _, err = _git(["reset", "--hard", f"origin/{branch}"], root)
-        if rc != 0:
-            result.status = ERROR
-            result.message = f"Update failed while applying changes: {err}"
-            log(result.message)
-            return result
+        result.status = ERROR
+        result.message = f"Update failed while applying changes: {err}"
+        log(result.message)
+        return result
 
     result.status = UPDATED
     short_old = (old_rev or "")[:8]
