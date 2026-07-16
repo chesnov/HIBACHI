@@ -79,6 +79,15 @@ class ProjectViewWindow(QMainWindow):
         self.set_config_btn.setEnabled(False)  # Enable only after project load
         button_layout.addWidget(self.set_config_btn)
 
+        # Unobtrusive version indicator in the status bar (check for updates /
+        # switch versions). Guarded so it can never block the home window from
+        # opening -- if this isn't a git checkout it simply won't appear.
+        try:
+            from .version_manager import attach_version_status
+            attach_version_status(self)
+        except Exception as _exc:
+            print(f"[version] status widget unavailable: {_exc}")
+
     def _update_batch_button_state(self) -> None:
         if not BatchProcessor or not self.project_manager.image_folders:
             self.batch_process_all_btn.setEnabled(False)
