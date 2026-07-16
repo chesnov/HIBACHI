@@ -36,8 +36,7 @@ Compression=lzma2
 SolidCompression=yes
 WizardStyle=modern
 ; The installer itself is small; the heavy download happens during [Run].
-; To brand the installer, add packaging\windows\hibachi.ico and uncomment:
-; SetupIconFile=hibachi.ico
+SetupIconFile=hibachi.ico
 
 [Files]
 ; Bundle the bootstrap logic and dependency spec so install.ps1 can run offline

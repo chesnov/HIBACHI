@@ -120,12 +120,21 @@ def _make_macos(repo_root: str, home: str) -> List[str]:
         f"  <string>org.hibachi.{APP_NAME.lower()}</string>\n"
         "  <key>CFBundlePackageType</key>\n"
         "  <string>APPL</string>\n"
+        "  <key>CFBundleIconFile</key>\n"
+        "  <string>hibachi.icns</string>\n"
         "  <key>LSMinimumSystemVersion</key>\n"
         "  <string>10.13</string>\n"
         "</dict>\n</plist>\n"
     )
     with open(os.path.join(app_dir, "Contents", "Info.plist"), "w") as fh:
         fh.write(info_plist)
+
+    # Copy the app icon into the bundle if it exists.
+    icns_src = os.path.join(repo_root, "packaging", "macos", "hibachi.icns")
+    res_dir = os.path.join(app_dir, "Contents", "Resources")
+    if os.path.isfile(icns_src):
+        os.makedirs(res_dir, exist_ok=True)
+        shutil.copy(icns_src, os.path.join(res_dir, "hibachi.icns"))
 
     launcher_script = os.path.join(macos_dir, APP_NAME)
     script = "#!/bin/bash\n" f"exec {_quote(launch_command(repo_root))}\n"
@@ -177,14 +186,17 @@ def _make_windows_lnk(repo_root: str, desktop_dir: str) -> None:
     mgr = _env_manager_exe()
     prefix = sys.prefix
     run_app = os.path.join(repo_root, "launcher", "run_app.py")
+    icon = os.path.join(repo_root, "packaging", "windows", "hibachi.ico")
     lnk = os.path.join(desktop_dir, f"{APP_NAME}.lnk")
     args = f'run --prefix "{prefix}" pythonw "{run_app}"'
+    icon_line = f"$S.IconLocation = '{icon}'; " if os.path.isfile(icon) else ""
     ps = (
         "$W = New-Object -ComObject WScript.Shell; "
         f"$S = $W.CreateShortcut('{lnk}'); "
         f"$S.TargetPath = '{mgr}'; "
         f"$S.Arguments = '{args}'; "
         f"$S.WorkingDirectory = '{repo_root}'; "
+        f"{icon_line}"
         "$S.Save()"
     )
     subprocess.run(["powershell", "-NoProfile", "-Command", ps], check=True)
