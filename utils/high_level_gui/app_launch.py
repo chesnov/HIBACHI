@@ -10,10 +10,12 @@ import napari  # type: ignore
 from magicgui import magicgui  # type: ignore
 from typing import Any
 from PyQt5.QtCore import QTimer  # type: ignore
+from PyQt5.QtGui import QIcon  # type: ignore
 from PyQt5.QtWidgets import (  # type: ignore
     QApplication, QMessageBox, QVBoxLayout, QPushButton, QWidget, QLabel
 )
 
+from .gui_text_utils import app_icon_path
 from .project_manager import ProjectManager, app_state
 from .project_view_window import ProjectViewWindow
 
@@ -176,9 +178,32 @@ def interactive_segmentation_with_config(selected_folder: str = None, project_ma
         QMessageBox.critical(None, "Error", str(e))
         app_state.show_project_view_signal.emit()
 
+def _apply_app_identity(app: QApplication) -> None:
+    """
+    Give the running application its name and icon.
+
+    The window/taskbar/dock icon comes from QApplication.setWindowIcon -- NOT
+    from the .desktop file -- so this is what makes the icon appear while the
+    app is running, on every platform. setDesktopFileName links the running
+    window to the installed `hibachi.desktop` entry on Linux (GNOME/Wayland).
+    """
+    app.setApplicationName("HIBACHI")
+    app.setApplicationDisplayName("HIBACHI")
+    app.setOrganizationName("HIBACHI")
+    try:
+        # Qt >= 5.7; ties the running window to hibachi.desktop on Linux.
+        app.setDesktopFileName("hibachi")
+    except Exception:
+        pass
+    icon = app_icon_path()
+    if icon:
+        app.setWindowIcon(QIcon(icon))
+
+
 def launch_image_segmentation_tool() -> QApplication:
     """Main entry point for the GUI application."""
     app = QApplication.instance() or QApplication(sys.argv)
+    _apply_app_identity(app)
     
     # Prevent Napari from attempting to shut down the global app lifecycle 
     # when a viewer closes. This prevents the `_close_app` TypeError on macOS.

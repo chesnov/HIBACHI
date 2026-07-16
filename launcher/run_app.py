@@ -82,6 +82,17 @@ def _msg(splash, text: str) -> None:
         print(f"[startup] {text}")
 
 
+def _refresh_shortcut(splash) -> None:
+    """Regenerate the desktop launcher (best-effort) so shortcut changes apply."""
+    try:
+        import make_shortcuts  # sibling module in launcher/
+
+        make_shortcuts.make_shortcut()
+        _msg(splash, "Refreshed application shortcut.")
+    except Exception as exc:  # never block launch on this
+        _msg(splash, f"Could not refresh shortcut: {exc}")
+
+
 def _launch_app(repo_root: str) -> int:
     """Launch the real application as a child process and return its exit code."""
     entry = os.path.join(repo_root, APP_ENTRY)
@@ -116,6 +127,12 @@ def main() -> int:
                 new_env[_REEXEC_GUARD] = "1"
                 os.execve(sys.executable, [sys.executable, __file__], new_env)
                 # os.execve does not return on success.
+
+            # When an update lands, regenerate the desktop launcher so changes to
+            # the shortcut (icon, launch command, window-class) take effect. The
+            # macOS .app is managed by its own bundle, so skip it there.
+            if result.status == updater.UPDATED and not sys.platform.startswith("darwin"):
+                _refresh_shortcut(splash)
 
         _msg(splash, "Launching HIBACHI...")
     finally:

@@ -3,8 +3,27 @@
 
 import os
 import re
-from typing import List, Union
+from typing import List, Optional, Union
 
+
+
+def app_icon_path() -> Optional[str]:
+    """
+    Absolute path to the application icon (a PNG), or None if not found.
+
+    This module lives at <repo>/utils/high_level_gui/, so the repo root is two
+    directories up. Returns the Linux launcher PNG if present, else the master
+    raster. Kept Qt-free so it can be imported anywhere without pulling in GUI
+    dependencies.
+    """
+    here = os.path.dirname(os.path.abspath(__file__))          # utils/high_level_gui
+    repo_root = os.path.dirname(os.path.dirname(here))          # repo root
+    for rel in (("launcher", "assets", "hibachi.png"),
+                ("assets", "icon_1024.png")):
+        candidate = os.path.join(repo_root, *rel)
+        if os.path.isfile(candidate):
+            return candidate
+    return None
 
 
 def natural_sort_key(s: str) -> List[Union[int, str]]:

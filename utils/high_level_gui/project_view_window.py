@@ -3,12 +3,13 @@
 
 import os
 import yaml  # type: ignore
-from PyQt5.QtGui import QCloseEvent  # type: ignore
+from PyQt5.QtGui import QCloseEvent, QIcon  # type: ignore
 from PyQt5.QtCore import Qt  # type: ignore
 from PyQt5.QtWidgets import (  # type: ignore
     QApplication, QFileDialog, QMessageBox, QMainWindow, QVBoxLayout, QHBoxLayout, QListWidget, QListWidgetItem, QPushButton, QWidget, QLabel, QInputDialog
 )
 
+from .gui_text_utils import app_icon_path
 from .cross_channel_window import CrossChannelAnalyzerWindow
 from .metadata import MetadataExtractor
 from .project_manager import ProjectManager
@@ -35,6 +36,9 @@ class ProjectViewWindow(QMainWindow):
 
     def initUI(self) -> None:
         self.setWindowTitle("Image Segmentation Project")
+        _icon = app_icon_path()
+        if _icon:
+            self.setWindowIcon(QIcon(_icon))
         self.setGeometry(100, 100, 700, 450)
         
         central_widget = QWidget()

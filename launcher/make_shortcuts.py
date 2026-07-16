@@ -78,6 +78,7 @@ def _make_linux(repo_root: str, home: str) -> List[str]:
         f"Exec={exec_cmd}\n"
         f"Icon={icon}\n"
         "Terminal=false\n"
+        "StartupWMClass=HIBACHI\n"
         "Categories=Science;Biology;ImageProcessing;\n"
     )
     written = []
