@@ -13,6 +13,14 @@ writes the appropriate native shortcut:
 
 The `platform` argument is injectable so the logic can be unit-tested for all
 three targets from any host.
+
+IMPORTANT: the shortcut embeds `sys.prefix` (the prefix of whatever Python runs
+this script) into the launch command. If you run this from the wrong env (e.g.
+'base'), the shortcut will launch the app in that env, show the splash, and then
+die when it fails to import napari/PyQt5. To catch that early, make_shortcut()
+verifies the current interpreter can import the GUI stack before writing
+anything (skippable with HIBACHI_SKIP_ENV_CHECK=1, and skipped when `platform`
+is passed explicitly for tests / cross-platform generation).
 """
 
 from __future__ import annotations
@@ -29,6 +37,25 @@ APP_NAME = "HIBACHI"
 def _repo_root() -> str:
     here = os.path.dirname(os.path.abspath(__file__))
     return os.path.dirname(here)  # launcher/ -> repo root
+
+
+def _current_env_can_run_app() -> bool:
+    """
+    True if the interpreter generating this shortcut can import the app's GUI
+    stack. The shortcut launches run_app.py with *this same* interpreter
+    (sys.prefix is baked into the Exec line), so if these are missing the app
+    would start the splash and then fail on import -- exactly the "quick splash,
+    then nothing" failure. Uses find_spec so we don't pay to import the heavy
+    stack just to check.
+    """
+    import importlib.util
+
+    # Require the WHOLE stack: PyQt5 alone shows up in plenty of envs (incl.
+    # base), so `any` would wave those through even though napari is missing.
+    return all(
+        importlib.util.find_spec(mod) is not None
+        for mod in ("napari", "PyQt5")
+    )
 
 
 def _env_manager_exe() -> str:
@@ -211,6 +238,23 @@ def make_shortcut(platform: Optional[str] = None, home: Optional[str] = None) ->
     home = home or os.path.expanduser("~")
     repo_root = _repo_root()
 
+    # Guard: the shortcut we write launches run_app.py under *this* interpreter
+    # (sys.prefix is baked into the launch command). If we're in the wrong env
+    # (e.g. 'base'), the app would show the splash and then fail to import its
+    # GUI stack. Fail loudly with instructions instead of writing a dead
+    # shortcut. `platform` is only passed explicitly by tests / cross-platform
+    # generation, so skip the check in that case (and via an env override).
+    if platform is None and os.environ.get("HIBACHI_SKIP_ENV_CHECK") != "1":
+        if not _current_env_can_run_app():
+            raise RuntimeError(
+                f"Running under a Python without HIBACHI's deps (sys.prefix={sys.prefix!r}).\n"
+                "The shortcut would launch the app in this same env and fail right "
+                "after the splash.\n"
+                "Re-run inside the app environment, e.g.:\n"
+                "    micromamba run -n hibachi python launcher/make_shortcuts.py\n"
+                "(set HIBACHI_SKIP_ENV_CHECK=1 to bypass this check)"
+            )
+
     if plat.startswith("linux"):
         written = _make_linux(repo_root, home)
     elif plat == "darwin" or plat.startswith("mac"):
@@ -226,4 +270,8 @@ def make_shortcut(platform: Optional[str] = None, home: Optional[str] = None) ->
 
 
 if __name__ == "__main__":
-    make_shortcut()
+    try:
+        make_shortcut()
+    except RuntimeError as exc:
+        print(f"[shortcut] {exc}", file=sys.stderr)
+        sys.exit(1)

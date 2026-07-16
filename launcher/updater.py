@@ -13,6 +13,17 @@ Design principles (see INSTALL.md for the full rationale):
   shipped file), those changes are preserved in a timestamped `git stash`
   before the update, so nothing is silently destroyed.
 
+Update flow is split into two steps so the launcher can ask before installing:
+
+    check_for_update(...)  -> UpdateResult (fetches, decides; changes nothing)
+    apply_update(...)      -> UpdateResult (stash + fast-forward merge)
+
+`check_and_update(...)` runs both back-to-back (the old auto-install behaviour)
+and is kept for compatibility / headless use.
+
+Rollback is just git: list_versions() enumerates recent commits and
+rollback_to() does a guarded `git reset --hard` to the chosen one.
+
 The only external requirement is a `git` executable on PATH -- which the conda
 environment provides, so it works even on machines with no system git.
 """
@@ -27,6 +38,7 @@ from typing import Callable, List, Optional, Tuple
 
 # Status values returned in UpdateResult.status
 UP_TO_DATE = "up_to_date"
+UPDATE_AVAILABLE = "update_available"  # a fast-forward update exists but is NOT yet applied
 UPDATED = "updated"
 OFFLINE = "offline"
 SKIPPED = "skipped"
@@ -43,9 +55,11 @@ class UpdateResult:
     old_rev: Optional[str] = None
     new_rev: Optional[str] = None
     env_changed: bool = False
+    update_available: bool = False
     branch: Optional[str] = None
     message: str = ""
     stashed: bool = False
+    changelog: List[str] = field(default_factory=list)
     log: List[str] = field(default_factory=list)
 
 
@@ -90,18 +104,42 @@ def _git(
         return 1, "", f"{type(exc).__name__}: {exc}"
 
 
-def check_and_update(
+# --------------------------------------------------------------------------- #
+# Small query helpers (used by the launcher's rollback UI)
+# --------------------------------------------------------------------------- #
+def current_branch(repo_root: str) -> str:
+    rc, cur, _ = _git(["rev-parse", "--abbrev-ref", "HEAD"], repo_root)
+    if rc == 0 and cur and cur != "HEAD":
+        return cur
+    return os.environ.get("HIBACHI_BRANCH") or "main"
+
+
+def current_rev(repo_root: str) -> Optional[str]:
+    rc, rev, _ = _git(["rev-parse", "HEAD"], repo_root)
+    return rev if rc == 0 and rev else None
+
+
+def remote_tip(repo_root: str, branch: Optional[str] = None) -> Optional[str]:
+    branch = branch or current_branch(repo_root)
+    rc, rev, _ = _git(["rev-parse", f"origin/{branch}"], repo_root)
+    return rev if rc == 0 and rev else None
+
+
+# --------------------------------------------------------------------------- #
+# Step 1: check (no side effects beyond `git fetch`)
+# --------------------------------------------------------------------------- #
+def check_for_update(
     repo_root: Optional[str] = None,
     branch: Optional[str] = None,
     fetch_timeout: int = 30,
     logger: Optional[Callable[[str], None]] = None,
 ) -> UpdateResult:
     """
-    Bring the checkout up to date with origin/<branch>, safely.
+    Fetch and decide what (if anything) can be updated -- WITHOUT applying it.
 
-    Returns an UpdateResult describing what happened. The caller should launch
-    the app regardless of status (except it may want to trigger a dependency
-    update when result.env_changed is True).
+    Returns an UpdateResult. status is one of UP_TO_DATE / UPDATE_AVAILABLE /
+    OFFLINE / LOCAL_AHEAD / SKIPPED / ERROR. When UPDATE_AVAILABLE, new_rev,
+    env_changed and changelog are populated so the caller can prompt.
     """
     log = logger or _default_logger
     result = UpdateResult(status=ERROR)
@@ -113,18 +151,15 @@ def check_and_update(
         log(result.message)
         return result
 
-    # Determine the branch to track: explicit arg > env var > current branch.
     if not branch:
         branch = os.environ.get("HIBACHI_BRANCH")
     if not branch:
-        rc, cur, _ = _git(["rev-parse", "--abbrev-ref", "HEAD"], root)
-        branch = cur if (rc == 0 and cur and cur != "HEAD") else "main"
+        branch = current_branch(root)
     result.branch = branch
 
     rc, old_rev, _ = _git(["rev-parse", "HEAD"], root)
     result.old_rev = old_rev or None
 
-    # 1) Fetch. A failure here almost always means "offline" -> launch anyway.
     log(f"Checking for updates on '{branch}'...")
     rc, _, err = _git(["fetch", "--quiet", "origin", branch], root, timeout=fetch_timeout)
     if rc != 0:
@@ -133,7 +168,6 @@ def check_and_update(
         log(result.message)
         return result
 
-    # 2) Compare local HEAD against the fetched remote tip.
     rc, remote_rev, err = _git(["rev-parse", f"origin/{branch}"], root)
     if rc != 0 or not remote_rev:
         result.status = ERROR
@@ -148,12 +182,9 @@ def check_and_update(
         log(result.message)
         return result
 
-    # Only auto-update when the local checkout is strictly BEHIND the remote,
-    # i.e. HEAD is an ancestor of origin/<branch> and the change is a clean
-    # fast-forward. If the checkout is AHEAD or has DIVERGED (a developer's
-    # machine with un-pushed commits), we must NOT move it -- doing so would
-    # silently discard local work. In that case we leave the tree exactly as-is
-    # and just launch whatever is on disk.
+    # Only a clean fast-forward (HEAD is an ancestor of the remote tip) is an
+    # auto-updatable "update". If the checkout is AHEAD or DIVERGED (a dev's
+    # machine with un-pushed commits), leave it untouched.
     rc, _, _ = _git(["merge-base", "--is-ancestor", "HEAD", f"origin/{branch}"], root)
     if rc != 0:
         result.status = LOCAL_AHEAD
@@ -165,17 +196,58 @@ def check_and_update(
         log(result.message)
         return result
 
-    # Detect whether the environment spec changed between old and new.
-    rc, changed, _ = _git(
-        ["diff", "--name-only", f"{old_rev}..{remote_rev}"], root
-    )
+    # Did the dependency spec change between here and the remote tip?
+    rc, changed, _ = _git(["diff", "--name-only", f"{old_rev}..{remote_rev}"], root)
     if rc == 0:
-        changed_files = {line.strip() for line in changed.splitlines() if line.strip()}
-        norm = {os.path.normpath(f) for f in changed_files}
+        norm = {os.path.normpath(f.strip()) for f in changed.splitlines() if f.strip()}
         result.env_changed = os.path.normpath(ENV_FILE_REL) in norm
 
-    # Preserve any uncommitted changes to tracked files so the fast-forward can
-    # apply cleanly (untracked files never block a fast-forward).
+    # Collect commit subjects for a short "what's changed" list (best-effort).
+    rc, subjects, _ = _git(
+        ["log", "--no-merges", "--format=%s", f"{old_rev}..{remote_rev}"], root
+    )
+    if rc == 0 and subjects:
+        result.changelog = [s.strip() for s in subjects.splitlines() if s.strip()][:20]
+
+    result.status = UPDATE_AVAILABLE
+    result.update_available = True
+    result.message = f"Update available: {(old_rev or '')[:8]} -> {remote_rev[:8]}."
+    log(result.message)
+    return result
+
+
+# --------------------------------------------------------------------------- #
+# Step 2: apply (stash + fast-forward)
+# --------------------------------------------------------------------------- #
+def apply_update(
+    repo_root: Optional[str] = None,
+    result: Optional[UpdateResult] = None,
+    branch: Optional[str] = None,
+    logger: Optional[Callable[[str], None]] = None,
+) -> UpdateResult:
+    """
+    Apply the fast-forward update discovered by check_for_update.
+
+    Re-verifies the fast-forward before touching anything, preserves any
+    uncommitted changes in a timestamped stash, then `git merge --ff-only`.
+    """
+    log = logger or _default_logger
+    root = repo_root or find_repo_root()
+    if result is None:
+        result = check_for_update(root, branch=branch, logger=logger)
+    if result.status not in (UPDATE_AVAILABLE, UPDATED):
+        return result  # nothing to apply (up-to-date, offline, diverged, ...)
+
+    branch = result.branch or branch or current_branch(root)
+
+    # Re-verify we are still strictly behind origin/branch.
+    rc, _, _ = _git(["merge-base", "--is-ancestor", "HEAD", f"origin/{branch}"], root)
+    if rc != 0:
+        result.status = LOCAL_AHEAD
+        result.message = "Checkout changed since the update check; skipping to be safe."
+        log(result.message)
+        return result
+
     rc, dirty, _ = _git(["status", "--porcelain"], root)
     if rc == 0 and dirty:
         stamp = time.strftime("%Y-%m-%d_%H-%M-%S")
@@ -189,8 +261,6 @@ def check_and_update(
         else:
             log(f"Warning: could not stash local changes: {err_s}")
 
-    # Fast-forward only. We already confirmed HEAD is an ancestor of the remote,
-    # so this cannot lose commits; there is deliberately no hard-reset fallback.
     log("Downloading and applying updates...")
     rc, _, err = _git(["merge", "--ff-only", f"origin/{branch}"], root)
     if rc != 0:
@@ -200,10 +270,141 @@ def check_and_update(
         return result
 
     result.status = UPDATED
-    short_old = (old_rev or "")[:8]
-    short_new = remote_rev[:8]
-    result.message = f"Updated {short_old} -> {short_new}."
+    result.update_available = False
+    result.message = f"Updated {(result.old_rev or '')[:8]} -> {(result.new_rev or '')[:8]}."
     log(result.message)
     if result.env_changed:
         log("Dependency list changed; the environment will be updated.")
     return result
+
+
+def check_and_update(
+    repo_root: Optional[str] = None,
+    branch: Optional[str] = None,
+    fetch_timeout: int = 30,
+    logger: Optional[Callable[[str], None]] = None,
+) -> UpdateResult:
+    """
+    Check and, if a fast-forward update exists, apply it immediately.
+
+    This is the original auto-install behaviour, kept for compatibility and for
+    headless/non-interactive use. Interactive callers should use
+    check_for_update() + apply_update() so they can prompt in between.
+    """
+    res = check_for_update(repo_root, branch=branch, fetch_timeout=fetch_timeout, logger=logger)
+    if res.status == UPDATE_AVAILABLE:
+        return apply_update(repo_root or find_repo_root(), res, logger=logger)
+    return res
+
+
+# --------------------------------------------------------------------------- #
+# Rollback
+# --------------------------------------------------------------------------- #
+def list_versions(
+    repo_root: Optional[str] = None,
+    limit: int = 15,
+    branch: Optional[str] = None,
+) -> List[dict]:
+    """
+    Recent versions (newest first) as dicts: {rev, short, date, subject}.
+
+    Listed along origin/<branch> when available (so you can also switch forward
+    to a fetched-but-not-installed version), otherwise along local HEAD.
+    """
+    root = repo_root or find_repo_root()
+    if not root:
+        return []
+    branch = branch or current_branch(root)
+    ref = f"origin/{branch}"
+    rc, _, _ = _git(["rev-parse", "--verify", "--quiet", ref], root)
+    if rc != 0:
+        ref = "HEAD"
+
+    rc, out, _ = _git(
+        ["log", f"-n{int(limit)}", "--first-parent",
+         "--format=%H%x1f%h%x1f%cs%x1f%s", ref],
+        root,
+    )
+    versions: List[dict] = []
+    if rc != 0 or not out:
+        return versions
+    for line in out.splitlines():
+        parts = line.split("\x1f")
+        if len(parts) == 4:
+            versions.append(
+                {"rev": parts[0], "short": parts[1], "date": parts[2], "subject": parts[3]}
+            )
+    return versions
+
+
+def rollback_to(
+    repo_root: Optional[str],
+    rev: str,
+    logger: Optional[Callable[[str], None]] = None,
+) -> Tuple[bool, str]:
+    """
+    Switch the checkout to `rev` (a guarded `git reset --hard`).
+
+    Uncommitted changes are stashed first, so nothing is silently lost. Returns
+    (ok, message).
+    """
+    log = logger or _default_logger
+    root = repo_root or find_repo_root()
+    if not root or not os.path.isdir(os.path.join(root, ".git")):
+        return False, "Not a git checkout."
+
+    rc, _, _ = _git(["rev-parse", "--verify", "--quiet", f"{rev}^{{commit}}"], root)
+    if rc != 0:
+        return False, f"Unknown version: {rev}"
+
+    rc, dirty, _ = _git(["status", "--porcelain"], root)
+    if rc == 0 and dirty:
+        stamp = time.strftime("%Y-%m-%d_%H-%M-%S")
+        _git(["stash", "push", "--include-untracked", "-m", f"hibachi-rollback-backup-{stamp}"], root)
+        log(f"Backed up local changes to a git stash ({stamp}).")
+
+    rc, _, err = _git(["reset", "--hard", rev], root)
+    if rc != 0:
+        return False, f"Rollback failed: {err}"
+
+    log(f"Switched to {rev[:8]}.")
+    return True, f"Switched to version {rev[:8]}."
+
+
+# --------------------------------------------------------------------------- #
+# Tiny persisted state (only: which update version the user chose to skip)
+# --------------------------------------------------------------------------- #
+def _state_path() -> str:
+    base = os.environ.get("HIBACHI_STATE_DIR") or os.path.join(os.path.expanduser("~"), ".hibachi")
+    try:
+        os.makedirs(base, exist_ok=True)
+    except Exception:
+        pass
+    return os.path.join(base, "state.json")
+
+
+def get_skipped_rev() -> Optional[str]:
+    import json
+    try:
+        with open(_state_path()) as fh:
+            return json.load(fh).get("skip_rev")
+    except Exception:
+        return None
+
+
+def set_skipped_rev(rev: Optional[str]) -> None:
+    import json
+    path = _state_path()
+    data = {}
+    try:
+        if os.path.isfile(path):
+            with open(path) as fh:
+                data = json.load(fh)
+    except Exception:
+        data = {}
+    data["skip_rev"] = rev
+    try:
+        with open(path, "w") as fh:
+            json.dump(data, fh)
+    except Exception:
+        pass
