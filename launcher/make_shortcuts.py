@@ -109,19 +109,54 @@ def _env_manager_exe() -> str:
     return exe_name
 
 
+def _env_python(windowless: bool = False) -> Optional[str]:
+    """
+    Absolute path to THIS env's python(w) interpreter, or None if not found.
+
+    We launch the app with the env's own interpreter directly rather than via
+    `<mgr> run`. On this project's target (a self-contained micromamba env) that
+    interpreter sits next to the runtime DLLs, so Windows finds the MSVC runtime
+    and everything else. Going through `micromamba run` was observed to start
+    python without the env's DLL directories set up, dying with
+    STATUS_DLL_NOT_FOUND (0xC0000135, "MSVCP140.dll is missing") before any of
+    our code -- including run_app.py's add_dll_directory fix -- could run. It
+    also needed git on PATH. Launching the interpreter directly avoids both.
+    """
+    prefix = sys.prefix
+    if sys.platform.startswith("win"):
+        names = ["pythonw.exe", "python.exe"] if windowless else ["python.exe", "pythonw.exe"]
+        dirs = [prefix, os.path.join(prefix, "Scripts")]
+    else:
+        names = ["python"]
+        dirs = [os.path.join(prefix, "bin")]
+    for d in dirs:
+        for n in names:
+            cand = os.path.join(d, n)
+            if os.path.isfile(cand):
+                return os.path.abspath(cand)
+    return None
+
+
 def launch_command(repo_root: str, windowless: bool = False) -> List[str]:
     """
     Build the command that runs the launcher inside this environment.
 
-    Uses `<mgr> run -p <prefix> python run_app.py` so it works no matter how the
-    env was created (named or prefix-based). On Windows we can swap in pythonw
-    to avoid a console window.
+    Prefer the env's own interpreter directly (`<prefix>/pythonw run_app.py`),
+    which loads the env's DLLs correctly and needs nothing on PATH. Fall back to
+    `<mgr> run --prefix <prefix> python run_app.py` only if we somehow can't find
+    the interpreter (should not happen in a real install).
     """
+    run_app = os.path.join(repo_root, "launcher", "run_app.py")
+    py = _env_python(windowless=windowless)
+    if py:
+        return [py, run_app]
+
+    # Fallback: env manager. Kept for robustness, but note this is the path that
+    # exhibited the DLL-not-found problem on some hosts.
     mgr = _env_manager_exe()
     prefix = sys.prefix
-    py = "pythonw" if windowless else "python"
-    run_app = os.path.join(repo_root, "launcher", "run_app.py")
-    return [mgr, "run", "--prefix", prefix, py, run_app]
+    py_name = "pythonw" if windowless else "python"
+    return [mgr, "run", "--prefix", prefix, py_name, run_app]
 
 
 def _quote(parts: List[str]) -> str:
@@ -292,17 +327,29 @@ def _make_windows(repo_root: str, home: str) -> List[str]:
 def _make_windows_lnk(repo_root: str, dest_dir: str) -> None:
     import subprocess
 
-    mgr = _env_manager_exe()
-    prefix = sys.prefix
     run_app = os.path.join(repo_root, "launcher", "run_app.py")
     icon = os.path.join(repo_root, "packaging", "windows", "hibachi.ico")
     lnk = os.path.join(dest_dir, f"{APP_NAME}.lnk")
-    args = f'run --prefix "{prefix}" pythonw "{run_app}"'
+
+    # Target the env's own pythonw.exe directly. Going through `micromamba run`
+    # produced a bare/relative target (WScript resolved "micromamba" against the
+    # Desktop -> "micromamba can't be found") AND started python without the
+    # env's DLL dirs, dying with STATUS_DLL_NOT_FOUND ("MSVCP140.dll missing").
+    # The env interpreter sits next to the runtime DLLs and needs nothing on PATH.
+    target = _env_python(windowless=True)
+    if not target:
+        # Extremely unlikely; fall back to the env-manager form.
+        mgr = _env_manager_exe()
+        target = mgr
+        args = f'run --prefix "{sys.prefix}" pythonw "{run_app}"'
+    else:
+        args = f'"{run_app}"'
+
     icon_line = f"$S.IconLocation = '{icon}'; " if os.path.isfile(icon) else ""
     ps = (
         "$W = New-Object -ComObject WScript.Shell; "
         f"$S = $W.CreateShortcut('{lnk}'); "
-        f"$S.TargetPath = '{mgr}'; "
+        f"$S.TargetPath = '{target}'; "
         f"$S.Arguments = '{args}'; "
         f"$S.WorkingDirectory = '{repo_root}'; "
         f"{icon_line}"
