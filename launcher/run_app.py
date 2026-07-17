@@ -24,6 +24,12 @@ Environment knobs (all optional):
     HIBACHI_NO_SPLASH     '1' to disable the splash window
     HIBACHI_ROLLBACK      '1' to open the rollback chooser instead of launching
     HIBACHI_STATE_DIR     where to keep launcher state (default: ~/.hibachi)
+    HIBACHI_SOFTWARE_OPENGL '1' to force Qt's bundled software OpenGL. Use this
+                          in virtual machines (VirtualBox/VMware), over remote
+                          desktop, or on any host whose GPU/driver can't provide
+                          modern OpenGL -- symptom is a vispy/OpenGL crash on
+                          opening a project ("Using glBindFramebuffer with no
+                          OpenGL context" / "glBindFramebuffer not found").
 
 Command line:
     --rollback            open the rollback chooser instead of launching
@@ -174,6 +180,36 @@ def _launch_app(repo_root: str) -> int:
         os.execv(sys.executable, [sys.executable, entry])
         # os.execv does not return on success.
 
+    if sys.platform.startswith("win"):
+        # Windows DLL resolution: the pip-installed PyQt5 wheels depend on the
+        # MSVC runtime (MSVCP140.dll), which conda-forge ships in the env root
+        # (next to pythonw.exe) and/or Library\bin. Since Python 3.8 the loader
+        # no longer searches PATH for a module's dependent DLLs, and Qt/napari
+        # startup narrows the default search (SetDefaultDllDirectories), so the
+        # env root stops being searched and Qt5Core.dll fails to find MSVCP140.dll
+        # -> the "MSVCP140.dll is missing" error. Registering the env's DLL dirs
+        # with os.add_dll_directory *before* Qt is imported fixes it. We do it in
+        # the child (a tiny -c bootstrap) so it applies to the process that
+        # actually imports Qt; __name__ stays "__main__" and __file__ is set so
+        # segment.py runs exactly as if invoked directly.
+        boot = (
+            "import os, sys\n"
+            "for _d in (sys.prefix, os.path.join(sys.prefix, 'Library', 'bin')):\n"
+            "    try:\n"
+            "        os.path.isdir(_d) and os.add_dll_directory(_d)\n"
+            "    except OSError:\n"
+            "        pass\n"
+            # Running via `-c` puts the CWD (not the script dir) on sys.path, so
+            # add the repo root explicitly -- otherwise `import utils` inside
+            # segment.py depends on the CWD being right. (cwd=repo_root below
+            # already sets that, but this makes it robust either way.)
+            f"sys.path.insert(0, {repo_root!r})\n"
+            f"__file__ = {entry!r}\n"
+            "sys.argv = [__file__]\n"
+            "exec(compile(open(__file__, 'rb').read(), __file__, 'exec'))\n"
+        )
+        return subprocess.run([sys.executable, "-c", boot], cwd=repo_root).returncode
+
     # Run with the env's own interpreter, from the repo root so `import utils` works.
     return subprocess.run([sys.executable, entry], cwd=repo_root).returncode
 
@@ -186,6 +222,32 @@ def main() -> int:
     want_rollback = ("--rollback" in sys.argv[1:]) or os.environ.get("HIBACHI_ROLLBACK") == "1"
 
     repo_root = updater.find_repo_root(_HERE) or os.path.dirname(_HERE)
+
+    # Software-OpenGL fallback for VMs / remote desktop / driverless hosts. Must
+    # be set before the child creates its QApplication and before vispy imports
+    # its GL backend, so we set it on our own environment (the launch below
+    # inherits it). Two pieces are needed and BOTH matter:
+    #   * QT_OPENGL=software  -> Qt loads its bundled opengl32sw.dll (Mesa
+    #     llvmpipe, OpenGL 3.3) instead of the host's legacy OpenGL 1.1.
+    #   * VISPY_GL_LIB=<...>/opengl32sw.dll  -> vispy loads its GL functions from
+    #     the SAME Mesa library. vispy otherwise loads the host opengl32.dll on
+    #     its own and never sees Qt's software context, which is why QT_OPENGL
+    #     alone leaves "glBindFramebuffer not found" / "no OpenGL context".
+    # Opt-in only, so machines with real GPUs keep hardware acceleration.
+    if os.environ.get("HIBACHI_SOFTWARE_OPENGL") == "1":
+        os.environ.setdefault("QT_OPENGL", "software")
+        if sys.platform.startswith("win") and not os.environ.get("VISPY_GL_LIB"):
+            _sp = os.path.join(sys.prefix, "Lib", "site-packages")
+            for _rel in (
+                os.path.join("PyQt5", "Qt5", "bin", "opengl32sw.dll"),
+                os.path.join("PyQt5", "Qt", "bin", "opengl32sw.dll"),
+                os.path.join("PySide2", "opengl32sw.dll"),
+                os.path.join("PySide6", "opengl32sw.dll"),
+            ):
+                _cand = os.path.join(_sp, _rel)
+                if os.path.isfile(_cand):
+                    os.environ["VISPY_GL_LIB"] = _cand
+                    break
 
     # Explicit rollback entry point (recovery shortcut / power users).
     if want_rollback:
