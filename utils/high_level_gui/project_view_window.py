@@ -6,23 +6,25 @@ import yaml  # type: ignore
 from PyQt5.QtGui import QCloseEvent, QIcon  # type: ignore
 from PyQt5.QtCore import Qt  # type: ignore
 from PyQt5.QtWidgets import (  # type: ignore
-    QApplication, QFileDialog, QMessageBox, QMainWindow, QVBoxLayout, QHBoxLayout, QListWidget, QListWidgetItem, QPushButton, QWidget, QLabel, QInputDialog, QStackedWidget
+    QApplication, QFileDialog, QMessageBox, QMainWindow, QVBoxLayout, QHBoxLayout,
+    QPushButton, QWidget, QLabel, QInputDialog
 )
 
 from .gui_text_utils import app_icon_path
 from .cross_channel_window import CrossChannelAnalyzerWindow
 from .metadata import MetadataExtractor
 from .project_manager import ProjectManager
-from .project_scaffolding import apply_template_config_to_project, organize_channel_project, organize_processing_dir, scan_available_presets
+from .project_scaffolding import apply_template_config_to_project
 from .project_selection import (
     classify_path, RecentProjects, PROJECT, RAW_IMAGES, PARENT_OF_PROJECTS,
     MULTICHANNEL_PROJECT, EMPTY, MISSING, build_channel_registry,
+    build_single_channel_registry,
 )
 try:
-    from .project_selection import WelcomeWidget, MultiChannelView  # need Qt; always here
+    from .project_selection import WelcomeWidget, ProjectContentsView  # need Qt; always here
 except Exception:  # pragma: no cover
     WelcomeWidget = None  # type: ignore
-    MultiChannelView = None  # type: ignore
+    ProjectContentsView = None  # type: ignore
 
 # --- Optional BatchProcessor import ---
 try:
@@ -36,11 +38,13 @@ except ImportError as e:
 
 class ProjectViewWindow(QMainWindow):
     """The main entry window for selecting a project."""
-    
+
     def __init__(self, project_manager: ProjectManager):
         super().__init__()
         self.project_manager = project_manager
         self.recent = RecentProjects()
+        self._content_view = None       # the unified ProjectContentsView (or None)
+        self._cross_scan_dir = None     # dir the cross-channel analyzer should scan
         self.initUI()
         self.setAttribute(Qt.WA_QuitOnClose)
 
@@ -49,8 +53,8 @@ class ProjectViewWindow(QMainWindow):
         _icon = app_icon_path()
         if _icon:
             self.setWindowIcon(QIcon(_icon))
-        self.setGeometry(100, 100, 700, 450)
-        
+        self.setGeometry(100, 100, 860, 560)
+
         central_widget = QWidget()
         layout = QVBoxLayout()
 
@@ -66,39 +70,44 @@ class ProjectViewWindow(QMainWindow):
         self.project_path_label = QLabel("Project Path: Not Selected")
         layout.addWidget(self.project_path_label)
 
-        # Content area swaps between the single/normal-project image list and the
-        # multi-channel tree, so both render in-place (no separate window).
-        self.content_stack = QStackedWidget()
-        self.image_list = QListWidget()
-        self.image_list.itemDoubleClicked.connect(self.open_image_view)
-        self.content_stack.addWidget(self.image_list)  # page 0: normal projects
-        self._multichannel_view = None                 # page 1: created on demand
-        layout.addWidget(self.content_stack)
-        
+        # Content area. Single- and multi-channel projects both render into the
+        # same ProjectContentsView (a checkbox tree); we just swap the instance.
+        self._content_container = QWidget()
+        self._content_holder_layout = QVBoxLayout(self._content_container)
+        self._content_holder_layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(self._content_container)
+
+        # Fixed bottom action bar -- identical for every project kind, so nothing
+        # appears/disappears as you move between single- and multi-channel views.
         button_layout = QHBoxLayout()
 
-        self.batch_process_all_btn = QPushButton("Process All Compatible Folders")
-        self.batch_process_all_btn.clicked.connect(self.run_batch_processing_all_compatible)
-        self.batch_process_all_btn.setEnabled(False)
-        button_layout.addWidget(self.batch_process_all_btn)
-        
-        layout.addLayout(button_layout)
-        central_widget.setLayout(layout)
-        self.setCentralWidget(central_widget)
+        self.process_selected_btn = QPushButton("Process Selected")
+        self.process_selected_btn.setToolTip(
+            "Batch-process every checked image/channel. Use the selection tools "
+            "at the top to check images or a whole channel at once."
+        )
+        self.process_selected_btn.clicked.connect(self._process_selected)
+        self.process_selected_btn.setEnabled(False)
+        button_layout.addWidget(self.process_selected_btn)
 
         self.cross_channel_btn = QPushButton("Open Cross-Channel Analyzer")
         self.cross_channel_btn.clicked.connect(self.open_cross_channel_analyzer)
-        self.cross_channel_btn.setEnabled(False) # Enable only after project load
+        self.cross_channel_btn.setEnabled(False)  # enable once a project loads
         button_layout.addWidget(self.cross_channel_btn)
 
         self.set_config_btn = QPushButton("⚙ Set New Channel Config…")
         self.set_config_btn.setToolTip(
-            "Choose a YAML config template and apply its processing parameters\n"
-            "to every image in the project (image dimensions are preserved)."
+            "Choose a YAML config template and apply its processing parameters to\n"
+            "the checked images (image dimensions are preserved). Available only\n"
+            "when the checked images belong to a single channel."
         )
         self.set_config_btn.clicked.connect(self.set_channel_config)
-        self.set_config_btn.setEnabled(False)  # Enable only after project load
+        self.set_config_btn.setEnabled(False)
         button_layout.addWidget(self.set_config_btn)
+
+        layout.addLayout(button_layout)
+        central_widget.setLayout(layout)
+        self.setCentralWidget(central_widget)
 
         # Unobtrusive version indicator in the status bar (check for updates /
         # switch versions). Guarded so it can never block the home window from
@@ -109,25 +118,46 @@ class ProjectViewWindow(QMainWindow):
         except Exception as _exc:
             print(f"[version] status widget unavailable: {_exc}")
 
-    def _update_batch_button_state(self) -> None:
-        if not BatchProcessor or not self.project_manager.image_folders:
-            self.batch_process_all_btn.setEnabled(False)
-            self.set_config_btn.setEnabled(False)
-            return
-        self.batch_process_all_btn.setEnabled(True)
-        self.set_config_btn.setEnabled(True)
+    # ---- content view plumbing ------------------------------------------- #
+    def _install_content_view(self, view) -> None:
+        """Swap the embedded contents view (or clear it when view is None)."""
+        if self._content_view is not None:
+            self._content_holder_layout.removeWidget(self._content_view)
+            self._content_view.deleteLater()
+        self._content_view = view
+        if view is not None:
+            self._content_holder_layout.addWidget(view)
+
+    def _update_action_buttons(self) -> None:
+        """Enable the bottom bar according to the current checked set."""
+        view = self._content_view
+        checked = view.checked_folders() if view is not None else []
+        self.process_selected_btn.setEnabled(bool(checked))
+
+        # Set Config applies per-channel, so it is only valid when the checked
+        # images belong to at most one channel (a single image, several images in
+        # the same channel, or a whole single-channel project). Checking a whole
+        # multi-channel image spans several channels and therefore disables it.
+        keys = view.checked_channel_keys() if view is not None else set()
+        self.set_config_btn.setEnabled(bool(checked) and len(keys) <= 1)
 
     def open_cross_channel_analyzer(self):
+        if self._cross_scan_dir:
+            # build_consolidated_sample_registry scans os.path.dirname(project_path),
+            # so anchoring project_path at a channel dir makes it scan the whole
+            # project root for sibling channels.
+            self.project_manager.project_path = self._cross_scan_dir
         registry = self.project_manager.build_consolidated_sample_registry()
         if not registry:
             QMessageBox.warning(
-                self, 
-                "No Compatible Data", 
+                self,
+                "No Compatible Data",
                 "Could not find any multi-channel samples in the parent directory.\n\n"
-                "Ensure your project is organized into 'Channel_X' folders, and that they share matching sample names."
+                "Ensure your project is organized into 'Channel_X' folders, and that "
+                "they share matching sample names."
             )
             return
-            
+
         self.analyzer_window = CrossChannelAnalyzerWindow(self.project_manager)
         self.analyzer_window.show()
 
@@ -180,17 +210,16 @@ class ProjectViewWindow(QMainWindow):
             return
 
         # PROJECT or RAW_IMAGES: hand off to the existing loader/scaffolder, which
-        # already knows how to organize raw images and populate the list.
-        self.content_stack.setCurrentWidget(self.image_list)
+        # already knows how to organize raw images and populate the view.
         self.project_manager.project_path = info.path
+        self._cross_scan_dir = info.path
         self.cross_channel_btn.setEnabled(True)
         self.project_path_label.setText(f"Project Path: {info.path}")
-        self.image_list.clear()
         self._load_or_organize(info.path)
 
     def open_multichannel(self, info) -> None:
         """Show the sample→channel tree for a multi-channel project, in-place."""
-        if MultiChannelView is None:
+        if ProjectContentsView is None:
             QMessageBox.information(
                 self, "Multi-channel project",
                 f"{info.note}\nOpen a specific Channel_* folder to work on it."
@@ -208,35 +237,38 @@ class ProjectViewWindow(QMainWindow):
         if self.welcome is not None:
             self.welcome.refresh_recents()
 
-        # Replace any previously embedded tree, then swap the content area to it.
-        if self._multichannel_view is not None:
-            self.content_stack.removeWidget(self._multichannel_view)
-            self._multichannel_view.deleteLater()
-            self._multichannel_view = None
-
-        view = MultiChannelView(registry)
-        view.open_requested.connect(self._open_sample_folder)
-        view.batch_requested.connect(self._batch_process_folders)
-        view.cross_channel_requested.connect(
-            lambda p=info.channel_dirs[0]: self._open_cross_channel_from(p)
+        view = ProjectContentsView(
+            registry, channel_dirs=info.channel_dirs,
+            project_dir=info.path, multichannel=True,
         )
-        self._multichannel_view = view
-        self.content_stack.addWidget(view)
-        self.content_stack.setCurrentWidget(view)
+        view.open_requested.connect(self._open_sample_folder)
+        view.selection_changed.connect(self._update_action_buttons)
+        view.add_channel_requested.connect(self._add_channel)
+        view.resetup_requested.connect(self._resetup_project)
+        self._install_content_view(view)
 
-        # The multi-channel view carries its own process / cross-channel actions,
-        # so the list-oriented bottom buttons don't apply here.
-        self.batch_process_all_btn.setEnabled(False)
-        self.set_config_btn.setEnabled(False)
-        self.cross_channel_btn.setEnabled(False)
+        # Anchor cross-channel scanning at a channel dir so its parent (the
+        # project root) is what gets scanned for sibling channels.
+        self._cross_scan_dir = info.channel_dirs[0] if info.channel_dirs else info.path
+        self.project_manager.project_path = self._cross_scan_dir
+        self.cross_channel_btn.setEnabled(True)
+        self._update_action_buttons()
 
     def _open_sample_folder(self, folder: str) -> None:
-        """Open one channel's sample image in the interactive segmentation view."""
+        """Open one image/channel folder in the interactive segmentation view."""
+        if not folder:
+            return
+        self.hide()
         from .app_launch import interactive_segmentation_with_config  # lazy: avoid cycle
         interactive_segmentation_with_config(folder, project_manager=self.project_manager)
 
+    def _process_selected(self) -> None:
+        if self._content_view is None:
+            return
+        self._batch_process_folders(self._content_view.checked_folders())
+
     def _batch_process_folders(self, folders: list) -> None:
-        """Route an arbitrary set of selected channel/sample folders to batch."""
+        """Route the checked set of image/channel folders to batch processing."""
         if not folders:
             return
         if not BatchProcessor:
@@ -250,161 +282,101 @@ class ProjectViewWindow(QMainWindow):
         )
         if reply != QMessageBox.Yes:
             return
-        # BatchProcessor iterates project_manager.image_folders, so point it at
-        # exactly the selection (may span several channels).
-        self.project_manager.image_folders = list(folders)
-        processor = BatchProcessor(self.project_manager)
-        processor.process_all_folders(force_restart_all=False)
-        QMessageBox.information(self, "Done", "Batch processing complete.")
-        if getattr(self, "_multichannel_view", None) is not None:
-            # refresh status badges after processing
-            self._multichannel_view.reload(self._multichannel_view._registry)
 
-    def _open_cross_channel_from(self, a_channel_dir: str) -> None:
-        """Open the cross-channel analyzer for the parent of a channel folder."""
-        # build_consolidated_sample_registry scans os.path.dirname(project_path),
-        # so pointing project_path at a channel dir makes it scan the whole project.
-        self.project_manager.project_path = a_channel_dir
-        self.analyzer_window = CrossChannelAnalyzerWindow(self.project_manager)
-        self.analyzer_window.show()
+        # BatchProcessor iterates project_manager.image_folders, so point it at
+        # exactly the checked set (which may span several channels), then restore.
+        saved = self.project_manager.image_folders
+        self.project_manager.image_folders = list(folders)
+        try:
+            processor = BatchProcessor(self.project_manager)
+            processor.process_all_folders(force_restart_all=False)
+        finally:
+            self.project_manager.image_folders = saved
+        QMessageBox.information(self, "Done", "Batch processing complete.")
+        if self._content_view is not None:
+            self._content_view.refresh()  # refresh status badges / last-edited
+        self._update_action_buttons()
+
+    def _add_channel(self, project_dir: str) -> None:
+        """Extract one more channel from the leftover raw images."""
+        from .organize_wizard import run_organize_wizard
+        if run_organize_wizard(self, project_dir, mode="add", project_dir=project_dir):
+            self.open_path(project_dir)  # re-classify + rebuild the tree with the new channel
+
+    def _resetup_project(self, project_dir: str) -> None:
+        """Delete the whole channel structure, then set up again from scratch."""
+        from .organize_wizard import reset_multichannel_project, run_organize_wizard
+        reply = QMessageBox.warning(
+            self, "Re-set up project?",
+            "This deletes ALL channel folders and their processed results for:\n\n"
+            f"{project_dir}\n\n"
+            "The raw source images are kept. This cannot be undone. Continue?",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No
+        )
+        if reply != QMessageBox.Yes:
+            return
+        removed = reset_multichannel_project(project_dir)
+        print(f"[resetup] removed {len(removed)} channel folder(s).")
+        if run_organize_wizard(self, project_dir, mode="new", project_dir=project_dir):
+            self.open_path(project_dir)
 
     def _load_or_organize(self, selected_path: str) -> None:
         try:
-            # Check for raw files that might need organization
+            # Already organized? Just list it.
+            self.project_manager._find_valid_image_folders()
+            if self.project_manager.image_folders:
+                self._populate_image_list(selected_path)
+                return
+
+            # Not organized yet -- are there raw images to set up into a project?
             raw_files = [
                 f for f in os.listdir(selected_path)
                 if f.lower().endswith(('.tif', '.tiff', '.czi')) and
                 os.path.isfile(os.path.join(selected_path, f))
             ]
-            
-            # Logic to distinguish New Project vs Existing Project
-            needs_organization = False
-            is_multi_channel = False
+            if raw_files:
+                from .organize_wizard import run_organize_wizard
+                if run_organize_wizard(self, selected_path, mode="new",
+                                       project_dir=selected_path):
+                    # After setup the folder is a single- or multi-channel project;
+                    # re-route so it opens in the right view (list or tree).
+                    self.open_path(selected_path)
+                return
 
-            if any(f.endswith('.czi') for f in raw_files):
-                needs_organization = True
-                is_multi_channel = True
-            elif raw_files:
-                first_tif = os.path.join(selected_path, raw_files[0])
-                if MetadataExtractor.get_channel_count(first_tif) > 1:
-                    needs_organization = True
-                    is_multi_channel = True
-                else:
-                    needs_organization = True
-                    is_multi_channel = False
-
-            if needs_organization:
-                msg = (
-                    "Setup multi-channel project structure?" if is_multi_channel
-                    else "Organize single-channel project?"
-                )
-                reply = QMessageBox.question(
-                    self, "Setup Project?",
-                    f"Found {len(raw_files)} raw images.\n{msg}",
-                    QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes
-                )
-
-                if reply == QMessageBox.Yes:
-                    presets = scan_available_presets()
-                    if not presets:
-                        QMessageBox.critical(self, "Error", "No config presets found.")
-                        return
-
-                    if is_multi_channel:
-                        # Multi-Channel Logic
-                        max_channels = 1
-                        for f in raw_files:
-                            path = os.path.join(selected_path, f)
-                            max_channels = max(max_channels, MetadataExtractor.get_channel_count(path))
-                        print(f"Detected {max_channels} channels max.")
-
-                        for ch in range(max_channels):
-                            preset_key, ok = QInputDialog.getItem(
-                                self, f"Channel {ch} Configuration",
-                                f"Select Preset for Channel {ch}:",
-                                sorted(list(presets.keys())), 0, False
-                            )
-                            if ok and preset_key:
-                                target_dir = os.path.join(
-                                    selected_path,
-                                    f"Channel_{ch}_{preset_key.split()[0]}"
-                                )
-                                QApplication.setOverrideCursor(Qt.WaitCursor)
-                                try:
-                                    organize_channel_project(
-                                        raw_files, selected_path, target_dir,
-                                        ch, presets[preset_key]
-                                    )
-                                except Exception as e:
-                                    QMessageBox.critical(self, "Error", f"Failed Ch{ch}: {e}")
-                                finally:
-                                    QApplication.restoreOverrideCursor()
-                        
-                        QMessageBox.information(
-                            self, "Done",
-                            "Project setup complete. Load specific Channel folder."
-                        )
-                        return
-                    else:
-                        # Standard/Legacy Logic
-                        preset_key, ok = QInputDialog.getItem(
-                            self, "Select Preset", "Choose configuration:",
-                            sorted(list(presets.keys())), 0, False
-                        )
-                        if ok and preset_key:
-                            QApplication.setOverrideCursor(Qt.WaitCursor)
-                            try:
-                                organize_processing_dir(selected_path, presets[preset_key])
-                            except Exception as e:
-                                QMessageBox.critical(self, "Error", f"Failed: {e}")
-                            finally:
-                                QApplication.restoreOverrideCursor()
-
-            # Standard Load (Subfolders)
-            self.project_manager._find_valid_image_folders()
-
-            for folder_path in self.project_manager.image_folders:
-                details = self.project_manager.get_image_details(folder_path)
-                item = QListWidgetItem(
-                    f"{os.path.basename(folder_path)} - Mode: {details.get('mode')}"
-                )
-                item.setData(Qt.UserRole, folder_path)
-                self.image_list.addItem(item)
-
-            # Only remember it as a "recent project" if it actually resolved to
-            # one (has image folders) -- so we don't clutter the list with raw or
-            # empty folders the user browsed by mistake.
-            if self.project_manager.image_folders:
-                self.recent.add(selected_path)
-                if self.welcome is not None:
-                    self.welcome.refresh_recents()
+            # Nothing organized and nothing to organize.
+            self._install_content_view(None)
+            self._update_action_buttons()
 
         except Exception as e:
             QMessageBox.critical(self, "Error", str(e))
 
-        self._update_batch_button_state()
-
-    def open_image_view(self, item: QListWidgetItem) -> None:
-        folder = item.data(Qt.UserRole)
-        if folder:
-            self.hide()
-            from .app_launch import interactive_segmentation_with_config  # lazy: avoid import cycle
-            interactive_segmentation_with_config(folder, project_manager=self.project_manager)
-
-    def run_batch_processing_all_compatible(self) -> None:
-        if not self.batch_process_all_btn.isEnabled():
-            return
-        reply = QMessageBox.question(
-            self, "Confirm", "Process all folders?",
-            QMessageBox.Yes | QMessageBox.No
+    def _populate_image_list(self, selected_path: str) -> None:
+        """Build the single-channel contents view and record the project as recent."""
+        registry = build_single_channel_registry(self.project_manager.image_folders)
+        view = ProjectContentsView(
+            registry, channel_dirs=None,
+            project_dir=selected_path, multichannel=False,
         )
-        if reply == QMessageBox.Yes:
-            processor = BatchProcessor(self.project_manager)
-            processor.process_all_folders(force_restart_all=False)
-            QMessageBox.information(self, "Done", "Batch processing complete.")
+        view.open_requested.connect(self._open_sample_folder)
+        view.selection_changed.connect(self._update_action_buttons)
+        self._install_content_view(view)
+
+        if self.project_manager.image_folders:
+            self.recent.add(selected_path)
+            if self.welcome is not None:
+                self.welcome.refresh_recents()
+
+        self.cross_channel_btn.setEnabled(True)
+        self._update_action_buttons()
 
     def set_channel_config(self) -> None:
-        """Opens a file dialog to pick a template YAML and applies it to all folders."""
+        """Apply a template YAML to the checked (single-channel) image folders."""
+        if self._content_view is None:
+            return
+        folders = self._content_view.checked_folders()
+        if not folders:
+            return
+
         template_path, _ = QFileDialog.getOpenFileName(
             self, "Select Config Template", "",
             "YAML Files (*.yaml *.yml);;All Files (*)"
@@ -422,14 +394,14 @@ class ProjectViewWindow(QMainWindow):
             QMessageBox.critical(self, "Error", f"Could not read template:\n{exc}")
             return
 
-        total = len(self.project_manager.image_folders)
+        total = len(folders)
         reply = QMessageBox.question(
             self,
             "Apply Config Template",
             f"Template:  {os.path.basename(template_path)}\n"
             f"Mode:      {template_mode}\n"
             f"Steps:     {len(execute_keys)}\n\n"
-            f"Apply to all {total} image folder(s) in the project?\n\n"
+            f"Apply to the {total} checked image folder(s)?\n\n"
             f"• Processing parameters will be replaced.\n"
             f"• Image dimensions are always preserved.\n"
             f"• Folders with a different mode will be skipped.\n"
@@ -440,14 +412,19 @@ class ProjectViewWindow(QMainWindow):
             return
 
         QApplication.setOverrideCursor(Qt.WaitCursor)
+        saved = self.project_manager.image_folders
+        self.project_manager.image_folders = list(folders)
         try:
             results = apply_template_config_to_project(
                 template_path, self.project_manager
             )
         except Exception as exc:
+            self.project_manager.image_folders = saved
             QApplication.restoreOverrideCursor()
             QMessageBox.critical(self, "Error", f"Config application failed:\n{exc}")
             return
+        finally:
+            self.project_manager.image_folders = saved
         QApplication.restoreOverrideCursor()
 
         summary = (
@@ -466,6 +443,10 @@ class ProjectViewWindow(QMainWindow):
             QMessageBox.warning(self, "Partial Success", summary)
         else:
             QMessageBox.information(self, "Done", summary)
+
+        if self._content_view is not None:
+            self._content_view.refresh()
+        self._update_action_buttons()
 
     def closeEvent(self, event: QCloseEvent) -> None:
         reply = QMessageBox.question(

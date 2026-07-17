@@ -22,6 +22,8 @@ from __future__ import annotations
 
 import json
 import os
+import time
+from datetime import datetime
 from dataclasses import dataclass, field
 from typing import Callable, List, Optional
 
@@ -168,6 +170,81 @@ def build_channel_registry(channel_dirs: List[str]) -> "OrderedDict":
         return [int(t) if t.isdigit() else t.lower()
                 for t in re.split(r"(\d+)", name)]
     return OrderedDict(sorted(registry.items(), key=lambda kv: _key(kv[0])))
+
+
+# Sentinel channel key used for single-channel projects. Every image in a
+# single-channel project belongs to this one implicit channel, so any subset of
+# a single-channel project is, by definition, "within one channel".
+SINGLE_CHANNEL_KEY = "__single_channel__"
+
+
+def build_single_channel_registry(image_folders: List[str]) -> "OrderedDict":
+    """
+    Map image_name -> {SINGLE_CHANNEL_KEY: image_folder} for a normal project.
+
+    This mirrors the shape of build_channel_registry so a single content widget
+    can render both project kinds. Each image folder is its own sample with one
+    implicit channel. Order follows the given list (already natural-sorted by
+    ProjectManager).
+    """
+    from collections import OrderedDict
+    registry: "OrderedDict[str, OrderedDict]" = OrderedDict()
+    for folder in image_folders:
+        name = os.path.basename(folder.rstrip("/\\"))
+        registry[name] = OrderedDict([(SINGLE_CHANNEL_KEY, folder)])
+    return registry
+
+
+def format_last_edited(ts: float) -> str:
+    """
+    Human-readable 'last edited' string.
+
+    Within the past week we show a relative label ('3 days ago'); beyond a week
+    we show the actual date. Returns '' for a missing/zero timestamp.
+    """
+    if not ts:
+        return ""
+    delta = time.time() - ts
+    if delta < 0:
+        delta = 0
+    DAY = 86400
+    if delta < 60:
+        return "just now"
+    if delta < 3600:
+        m = int(delta // 60)
+        return f"{m} minute{'s' if m != 1 else ''} ago"
+    if delta < DAY:
+        h = int(delta // 3600)
+        return f"{h} hour{'s' if h != 1 else ''} ago"
+    if delta < 7 * DAY:
+        d = int(delta // DAY)
+        return "yesterday" if d == 1 else f"{d} days ago"
+    return datetime.fromtimestamp(ts).strftime("%b %d, %Y")
+
+
+def folder_last_edited(folder: str) -> float:
+    """
+    Newest mtime across a sample folder's config YAML and its processed output.
+
+    Reflects 'when this image was last worked on' without loading pixel data:
+    the config yaml plus the '*_processed_*' directory (scanned one level deep).
+    """
+    latest = 0.0
+    try:
+        for f in os.listdir(folder):
+            full = os.path.join(folder, f)
+            if f.lower().endswith((".yaml", ".yml")):
+                latest = max(latest, os.path.getmtime(full))
+            elif os.path.isdir(full) and "_processed_" in f:
+                latest = max(latest, os.path.getmtime(full))
+                try:
+                    for g in os.listdir(full):
+                        latest = max(latest, os.path.getmtime(os.path.join(full, g)))
+                except OSError:
+                    pass
+    except OSError:
+        pass
+    return latest
 
 
 # Processing-status values for a single (channel, sample) unit.
@@ -368,7 +445,7 @@ try:
     from PyQt5.QtWidgets import (  # type: ignore
         QAbstractItemView, QFileDialog, QFrame, QHBoxLayout, QLabel, QListWidget,
         QListWidgetItem, QMenu, QPushButton, QTreeWidget, QTreeWidgetItem,
-        QVBoxLayout, QWidget,
+        QTreeWidgetItemIterator, QVBoxLayout, QWidget,
     )
     _HAVE_QT = True
 except Exception:  # pragma: no cover - headless / no Qt
@@ -556,101 +633,223 @@ if _HAVE_QT:
         STATUS_UNKNOWN: "#888888",
     }
 
-    class MultiChannelView(QWidget):
+    class _CheckTree(QTreeWidget):
+        """QTreeWidget whose Space bar toggles the checkboxes of every currently
+        highlighted leaf at once (a convenience on top of clicking each box)."""
+
+        def keyPressEvent(self, event):  # noqa: N802 (Qt naming)
+            if event.key() in (Qt.Key_Space, Qt.Key_Select):
+                leaves = [it for it in self.selectedItems()
+                          if it.data(0, Qt.UserRole)]
+                if leaves:
+                    cur = self.currentItem()
+                    anchor = cur if cur in leaves else leaves[0]
+                    new_state = (Qt.Unchecked
+                                 if anchor.checkState(0) == Qt.Checked
+                                 else Qt.Checked)
+                    for it in leaves:
+                        it.setCheckState(0, new_state)
+                    return
+            super().keyPressEvent(event)
+
+    class ProjectContentsView(QWidget):
         """
-        Sample-first tree for a multi-channel project.
+        Unified, checkbox-driven contents view for single- and multi-channel
+        projects.
 
-            image_01
-                Channel 0 · Microglia   ✓ processed (fluorescence)
-                Channel 1 · Plaques     — not processed
-            image_02
-                Channel 0 · Microglia   … in progress
+        Multi-channel layout (sample-first):
 
-        Only channels that actually exist for a sample are shown (no ghost rows).
-        Double-click a channel leaf to open it. Select any set of channel leaves
-        (across samples/channels) and 'Process selected' routes exactly those to
-        batch processing; a right-click offers 'Select all in this channel'.
+            [ ] image_01
+                [ ] Channel 0 · Microglia   iMG      ✓ processed (fluorescence)  2 days ago
+                [ ] Channel 1 · Plaques     ps129    — not processed             Mar 04, 2026
+            [ ] image_02
+                [ ] Channel 0 · Microglia   iMG      … in progress              yesterday
 
-        The widget is presentation only. It emits:
-            open_requested(str)        -> a single sample folder to open
-            batch_requested(list)      -> sample folders to batch-process
-            cross_channel_requested()  -> open the cross-channel analyzer
-        Leaf rows carry their sample-folder path in Qt.UserRole; parent rows
-        carry None so they're easy to skip.
+        Single-channel layout (each image is its own row / implicit channel):
+
+            [ ] image_01   iMG   ✓ processed (fluorescence)   3 days ago
+            [ ] image_02   iMG   — not processed              Jan 12, 2026
+
+        Checkboxes are the single source of truth for what actions apply to.
+        Row highlighting (shift/ctrl) only exists so Space can bulk-toggle checks.
+        Checking a multi-channel image checks all of its channels (so it then
+        spans several channels); the host uses checked_channel_keys() to decide
+        whether channel-scoped actions (Set Config) are allowed.
+
+        Signals:
+            open_requested(str)         a sample folder to open (double-click)
+            selection_changed()         the checked set changed
+            add_channel_requested(str)  project dir (multi-channel only)
+            resetup_requested(str)      project dir (multi-channel only)
         """
 
         open_requested = pyqtSignal(str)
-        batch_requested = pyqtSignal(list)
-        cross_channel_requested = pyqtSignal()
+        selection_changed = pyqtSignal()
+        add_channel_requested = pyqtSignal(str)
+        resetup_requested = pyqtSignal(str)
 
-        def __init__(self, registry, parent=None):
+        def __init__(self, registry, channel_dirs=None, project_dir: str = "",
+                     multichannel: Optional[bool] = None, parent=None):
             super().__init__(parent)
-            self._registry = registry  # OrderedDict sample -> {channel_dir: sample_folder}
+            self._registry = registry                    # sample -> {channel_key: folder}
+            self._channel_dirs = list(channel_dirs or [])  # canonical channel order
+            self._project_dir = project_dir
+            self._multichannel = (bool(self._channel_dirs)
+                                  if multichannel is None else multichannel)
+            self._loading = False
             self._build()
             self.reload(registry)
 
+        # ---- construction --------------------------------------------------- #
         def _build(self) -> None:
             root = QVBoxLayout(self)
 
-            self.tree = QTreeWidget()
-            self.tree.setHeaderLabels(["Sample / Channel", "Status"])
-            self.tree.setColumnWidth(0, 340)
+            top = QHBoxLayout()
+            top.addWidget(QLabel("Select:"))
+            self.select_all_btn = QPushButton("All images")
+            self.select_all_btn.setToolTip("Check every image (and every channel).")
+            self.select_all_btn.clicked.connect(lambda: self._check_all(Qt.Checked))
+            top.addWidget(self.select_all_btn)
+
+            self.clear_btn = QPushButton("Clear")
+            self.clear_btn.setToolTip("Uncheck everything.")
+            self.clear_btn.clicked.connect(lambda: self._check_all(Qt.Unchecked))
+            top.addWidget(self.clear_btn)
+
+            # Positional channel shortcuts: 1 = the first channel shown under each
+            # image, 2 = the second, and so on. Numbers stay compact because each
+            # channel already appears with its full config name in the tree.
+            if self._multichannel and self._channel_dirs:
+                sep = QFrame()
+                sep.setFrameShape(QFrame.VLine)
+                sep.setFrameShadow(QFrame.Sunken)
+                top.addWidget(sep)
+                top.addWidget(QLabel("Channel:"))
+                for i, ch_dir in enumerate(self._channel_dirs, start=1):
+                    b = QPushButton(str(i))
+                    b.setMaximumWidth(34)
+                    b.setToolTip(
+                        f"Select {channel_display_name(ch_dir)} for all images."
+                    )
+                    b.clicked.connect(
+                        lambda _=False, key=ch_dir: self._select_channel(key)
+                    )
+                    top.addWidget(b)
+
+            top.addStretch(1)
+
+            # Project-structure actions live up here, next to the selection tools,
+            # so the bottom action bar stays fixed across project kinds.
+            if self._multichannel:
+                self.add_channel_btn = QPushButton("＋ Add channel…")
+                self.add_channel_btn.setToolTip(
+                    "Extract another channel from the raw source images that "
+                    "remain in the project folder."
+                )
+                self.add_channel_btn.clicked.connect(
+                    lambda: self.add_channel_requested.emit(self._project_dir)
+                )
+                top.addWidget(self.add_channel_btn)
+
+                self.resetup_btn = QPushButton("Re-set up project…")
+                self.resetup_btn.setToolTip(
+                    "Delete the current channel structure and processed results, "
+                    "then set the project up again from scratch. Raw images kept."
+                )
+                self.resetup_btn.clicked.connect(
+                    lambda: self.resetup_requested.emit(self._project_dir)
+                )
+                top.addWidget(self.resetup_btn)
+            root.addLayout(top)
+
+            self.tree = _CheckTree()
+            self.tree.setHeaderLabels(["Image / Channel", "Config", "Status", "Last edited"])
+            self.tree.setColumnWidth(0, 300)
+            self.tree.setColumnWidth(1, 110)
+            self.tree.setColumnWidth(2, 200)
             self.tree.setSelectionMode(QAbstractItemView.ExtendedSelection)
-            self.tree.setContextMenuPolicy(Qt.CustomContextMenu)
-            self.tree.customContextMenuRequested.connect(self._context_menu)
+            self.tree.setRootIsDecorated(self._multichannel)
             self.tree.itemDoubleClicked.connect(self._on_double_click)
+            self.tree.itemChanged.connect(self._on_item_changed)
             root.addWidget(self.tree)
-
-            btns = QHBoxLayout()
-            self.process_btn = QPushButton("Process selected")
-            self.process_btn.setToolTip(
-                "Batch-process every selected channel row. Tip: right-click a row "
-                "to select an entire channel at once."
-            )
-            self.process_btn.clicked.connect(self._process_selected)
-            self.process_btn.setEnabled(False)
-            btns.addWidget(self.process_btn)
-
-            self.cross_btn = QPushButton("Cross-channel analysis")
-            self.cross_btn.clicked.connect(self.cross_channel_requested.emit)
-            btns.addWidget(self.cross_btn)
-            btns.addStretch(1)
-            root.addLayout(btns)
-
-            self.tree.itemSelectionChanged.connect(
-                lambda: self.process_btn.setEnabled(bool(self._selected_leaf_paths()))
-            )
 
         # ---- population ----------------------------------------------------- #
         def reload(self, registry) -> None:
-            """Rebuild the tree (and recompute status) from a registry."""
+            """Rebuild the tree (recomputing status/last-edited) from a registry."""
             self._registry = registry
+            self._loading = True
             self.tree.clear()
-            for sample, channels in registry.items():
-                parent = QTreeWidgetItem([sample, ""])
-                parent.setData(0, Qt.UserRole, None)  # parent rows are not openable
-                done = 0
-                for ch_dir, sample_folder in channels.items():
-                    status = sample_status(sample_folder)
-                    if status == STATUS_PROCESSED:
-                        done += 1
-                    mode = self._read_mode(sample_folder)
-                    label = channel_display_name(ch_dir)
-                    status_txt = _STATUS_TEXT.get(status, status)
-                    if mode:
-                        status_txt += f"  ({mode})"
-                    leaf = QTreeWidgetItem([label, status_txt])
-                    leaf.setData(0, Qt.UserRole, sample_folder)
-                    leaf.setData(1, Qt.UserRole, os.path.basename(ch_dir.rstrip("/\\")))
-                    color = _STATUS_COLOR.get(status)
-                    if color:
-                        from PyQt5.QtGui import QColor, QBrush  # type: ignore
-                        leaf.setForeground(1, QBrush(QColor(color)))
-                    parent.addChild(leaf)
-                total = len(channels)
-                parent.setText(1, f"{done}/{total} processed")
-                self.tree.addTopLevelItem(parent)
-            self.tree.expandAll()
+            if self._multichannel:
+                for sample, channels in registry.items():
+                    parent = QTreeWidgetItem([sample, "", "", ""])
+                    parent.setData(0, Qt.UserRole, None)   # parents aren't openable
+                    parent.setFlags(
+                        parent.flags() | Qt.ItemIsUserCheckable | Qt.ItemIsAutoTristate
+                    )
+                    parent.setCheckState(0, Qt.Unchecked)
+                    done = 0
+                    for ch_dir, folder in channels.items():
+                        if sample_status(folder) == STATUS_PROCESSED:
+                            done += 1
+                        parent.addChild(self._make_leaf(
+                            channel_display_name(ch_dir), folder, ch_dir))
+                    parent.setText(2, f"{done}/{len(channels)} processed")
+                    self.tree.addTopLevelItem(parent)
+                self.tree.expandAll()
+            else:
+                for name, channels in registry.items():
+                    (ch_key, folder), = channels.items()
+                    self.tree.addTopLevelItem(self._make_leaf(name, folder, ch_key))
+            self._loading = False
+            self.selection_changed.emit()
+
+        def refresh(self) -> None:
+            """Recompute the tree from the current registry, keeping checks."""
+            checked = set(self.checked_folders())
+            self.reload(self._registry)
+            if checked:
+                self._loading = True
+                it = QTreeWidgetItemIterator(self.tree)
+                while it.value():
+                    item = it.value()
+                    p = item.data(0, Qt.UserRole)
+                    if p and p in checked:
+                        item.setCheckState(0, Qt.Checked)
+                    it += 1
+                self._loading = False
+            self.selection_changed.emit()
+
+        def _make_leaf(self, name: str, folder: str, channel_key: str) -> "QTreeWidgetItem":
+            status = sample_status(folder)
+            mode = self._read_mode(folder)
+            status_txt = _STATUS_TEXT.get(status, status)
+            if mode:
+                status_txt += f"  ({mode})"
+            leaf = QTreeWidgetItem([
+                name,
+                self._config_name(folder),
+                status_txt,
+                format_last_edited(folder_last_edited(folder)),
+            ])
+            leaf.setData(0, Qt.UserRole, folder)         # actionable path
+            leaf.setData(1, Qt.UserRole, channel_key)    # channel identity
+            leaf.setFlags(leaf.flags() | Qt.ItemIsUserCheckable)
+            leaf.setCheckState(0, Qt.Unchecked)
+            color = _STATUS_COLOR.get(status)
+            if color:
+                from PyQt5.QtGui import QColor, QBrush  # type: ignore
+                leaf.setForeground(2, QBrush(QColor(color)))
+            return leaf
+
+        @staticmethod
+        def _config_name(folder: str) -> str:
+            try:
+                for f in os.listdir(folder):
+                    if f.lower().endswith((".yaml", ".yml")):
+                        return os.path.splitext(f)[0]
+            except OSError:
+                pass
+            return ""
 
         @staticmethod
         def _read_mode(sample_folder: str) -> str:
@@ -665,47 +864,69 @@ if _HAVE_QT:
             except Exception:
                 return ""
 
-        # ---- selection / actions -------------------------------------------- #
-        def _selected_leaf_paths(self) -> List[str]:
-            paths = []
-            for item in self.tree.selectedItems():
+        # ---- checked-set queries -------------------------------------------- #
+        def checked_folders(self) -> List[str]:
+            """Sample folders whose leaf is checked (the actionable set)."""
+            out: List[str] = []
+            it = QTreeWidgetItemIterator(self.tree)
+            while it.value():
+                item = it.value()
                 p = item.data(0, Qt.UserRole)
-                if p:  # leaf rows only (parents carry None)
-                    paths.append(p)
-            return paths
+                if p and item.checkState(0) == Qt.Checked:
+                    out.append(p)
+                it += 1
+            return out
+
+        def checked_channel_keys(self) -> set:
+            """Distinct channel identities among the checked leaves."""
+            keys = set()
+            it = QTreeWidgetItemIterator(self.tree)
+            while it.value():
+                item = it.value()
+                p = item.data(0, Qt.UserRole)
+                if p and item.checkState(0) == Qt.Checked:
+                    keys.add(item.data(1, Qt.UserRole))
+                it += 1
+            return keys
+
+        # ---- selection helpers ---------------------------------------------- #
+        def _check_all(self, state) -> None:
+            self._loading = True
+            it = QTreeWidgetItemIterator(self.tree)
+            while it.value():
+                item = it.value()
+                if item.data(0, Qt.UserRole):
+                    item.setCheckState(0, state)
+                it += 1
+            self._loading = False
+            self.selection_changed.emit()
+
+        def _select_channel(self, channel_key: str) -> None:
+            """Check exactly the leaves of one channel across all images."""
+            self._loading = True
+            it = QTreeWidgetItemIterator(self.tree)
+            while it.value():
+                item = it.value()
+                p = item.data(0, Qt.UserRole)
+                if p:
+                    item.setCheckState(
+                        0,
+                        Qt.Checked if item.data(1, Qt.UserRole) == channel_key
+                        else Qt.Unchecked,
+                    )
+                it += 1
+            self._loading = False
+            self.selection_changed.emit()
+
+        # ---- events --------------------------------------------------------- #
+        def _on_item_changed(self, _item, _col) -> None:
+            if not self._loading:
+                self.selection_changed.emit()
 
         def _on_double_click(self, item, _column) -> None:
             p = item.data(0, Qt.UserRole)
             if p:
                 self.open_requested.emit(p)
 
-        def _process_selected(self) -> None:
-            paths = self._selected_leaf_paths()
-            if paths:
-                self.batch_requested.emit(paths)
-
-        def _context_menu(self, pos) -> None:
-            item = self.tree.itemAt(pos)
-            if item is None:
-                return
-            menu = QMenu(self)
-            leaf_path = item.data(0, Qt.UserRole)
-            channel_key = item.data(1, Qt.UserRole)
-            if leaf_path and channel_key:
-                act_all = menu.addAction(f"Select all in {channel_display_name(channel_key)}")
-                act_open = menu.addAction("Open this channel")
-                chosen = menu.exec_(self.tree.viewport().mapToGlobal(pos))
-                if chosen == act_all:
-                    self._select_entire_channel(channel_key)
-                elif chosen == act_open:
-                    self.open_requested.emit(leaf_path)
-
-        def _select_entire_channel(self, channel_key: str) -> None:
-            """Select every leaf belonging to the given channel (folder basename)."""
-            self.tree.clearSelection()
-            for i in range(self.tree.topLevelItemCount()):
-                parent = self.tree.topLevelItem(i)
-                for j in range(parent.childCount()):
-                    leaf = parent.child(j)
-                    if leaf.data(1, Qt.UserRole) == channel_key:
-                        leaf.setSelected(True)
+    # Backwards-compatible alias: older call sites referred to MultiChannelView.
+    MultiChannelView = ProjectContentsView
