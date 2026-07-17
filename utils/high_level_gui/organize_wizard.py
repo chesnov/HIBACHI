@@ -209,6 +209,11 @@ if _HAVE_QT:
         def nextId(self) -> int:  # noqa: N802
             return self._wiz.page_presets_id
 
+        def isFinalPage(self) -> bool:  # noqa: N802
+            # Never final: the user must pass through the presets page (which is
+            # where a preset is actually chosen and recorded) before finishing.
+            return False
+
     class _PresetsPage(QWizardPage):
         def __init__(self, wiz: "OrganizeWizard"):
             super().__init__()
@@ -274,6 +279,12 @@ if _HAVE_QT:
                 )
             return bool(self._wiz.selections)
 
+        def isFinalPage(self) -> bool:  # noqa: N802
+            return True
+
+        def nextId(self) -> int:  # noqa: N802
+            return -1
+
     class OrganizeWizard(QWizard):
         """
         Guided setup. Construct with the raw project dir; call exec_() and check
@@ -307,18 +318,42 @@ if _HAVE_QT:
             self.setWizardStyle(QWizard.ModernStyle)
 
             self.page_presets_id = 1
+            self._presets_page = _PresetsPage(self)
             if mode == "add":
-                self.setPage(0, _PresetsPage(self))
+                self.setPage(0, self._presets_page)
                 self.page_presets_id = 0
             else:
                 self.setPage(0, _DetectPage(self))
-                self.setPage(1, _PresetsPage(self))
+                self.setPage(1, self._presets_page)
 
             self.button(QWizard.FinishButton).setText("Organize")
+
+        def _collect_selections(self) -> None:
+            """
+            Read the chosen presets straight from the presets page's combos.
+
+            Called at finish time so we never depend on QWizard having invoked
+            the page's validatePage() (which only fires if that page is the one
+            Finish is clicked on). This makes "No presets were chosen" impossible
+            whenever the presets page was actually shown and populated.
+            """
+            page = self._presets_page
+            combos = getattr(page, "_combos", {})
+            if self.mode == "add":
+                chan = getattr(page, "_chan_combo", None)
+                if chan is not None and -1 in combos:
+                    self.selections = {int(chan.currentData()): combos[-1].currentText()}
+            else:
+                self.selections = {idx: cb.currentText() for idx, cb in combos.items()}
+                self.is_multichannel = (
+                    bool(self.field(_F_MULTI))
+                    and int(self.detect["max_channels"]) > 1  # type: ignore[index]
+                )
 
         def accept(self) -> None:  # noqa: N802
             # runs when the user clicks Organize/Finish
             try:
+                self._collect_selections()
                 self._run()
             except Exception as exc:  # pragma: no cover - surfaced to user
                 QMessageBox.critical(self, "Setup failed", str(exc))
