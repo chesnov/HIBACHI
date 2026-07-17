@@ -45,16 +45,18 @@ Source: "..\..\install\install.ps1";     DestDir: "{app}\bootstrap"; Flags: igno
 Source: "..\..\install\environment.yml";  DestDir: "{app}\bootstrap"; Flags: ignoreversion
 
 [Run]
-; Run the bootstrap with a visible progress message. install.ps1 reads config
-; from environment variables so we don't have to edit it here.
+; Run the bootstrap with a visible progress message. Pass the user's chosen
+; install folder ({app}) so install.ps1 puts micromamba + the checkout THERE and
+; the shortcut points at that location (a non-default folder used to be ignored).
 Filename: "powershell.exe"; \
-  Parameters: "-ExecutionPolicy Bypass -NoProfile -File ""{app}\bootstrap\install.ps1"""; \
+  Parameters: "-ExecutionPolicy Bypass -NoProfile -File ""{app}\bootstrap\install.ps1"" -InstallDir ""{app}"""; \
   StatusMsg: "Downloading and setting up HIBACHI (this can take several minutes)..."; \
   Flags: runhidden waituntilterminated
 
 [UninstallRun]
 ; Best-effort cleanup of the installed environment + checkout on uninstall.
-Filename: "cmd.exe"; Parameters: "/c rmdir /s /q ""{%USERPROFILE}\HIBACHI"""; Flags: runhidden; RunOnceId: "RemoveHibachiHome"
+; Remove the chosen install dir ({app}), not a hardcoded default path.
+Filename: "cmd.exe"; Parameters: "/c rmdir /s /q ""{app}"""; Flags: runhidden; RunOnceId: "RemoveHibachiHome"
 
 [Messages]
 WelcomeLabel2=This will install [name] for the current user.%n%nThe first setup downloads the scientific packages (a few hundred MB) and may take several minutes. An internet connection is required.

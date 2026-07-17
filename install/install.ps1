@@ -7,6 +7,11 @@
 #
 # No admin rights required; nothing is installed system-wide.
 #
+# Install location (highest priority first):
+#   1. -InstallDir <path>   (the Inno Setup wizard passes the user's chosen {app})
+#   2. $env:HIBACHI_HOME
+#   3. default: %USERPROFILE%\HIBACHI
+#
 # This script is IDEMPOTENT and FAILS LOUDLY: re-running it over an existing
 # install updates the env in place and force-syncs the checkout. Native command
 # (git / micromamba) exit codes are checked explicitly, because
@@ -14,13 +19,21 @@
 # programs in Windows PowerShell 5.1 -- which is exactly how a failed `git fetch`
 # used to slip through and leave the old version installed while reporting success.
 # =============================================================================
+param([string]$InstallDir = "")
+
 $ErrorActionPreference = "Stop"
 
 # ------------------------- CONFIG (edit for your repo) ----------------------- #
 $GhOwner    = if ($env:HIBACHI_OWNER)  { $env:HIBACHI_OWNER }  else { "chesnov" }
 $GhRepo     = if ($env:HIBACHI_REPO)   { $env:HIBACHI_REPO }   else { "HIBACHI" }
 $Branch     = if ($env:HIBACHI_BRANCH) { $env:HIBACHI_BRANCH } else { "main" }
-$InstallDir = if ($env:HIBACHI_HOME)   { $env:HIBACHI_HOME }   else { Join-Path $env:USERPROFILE "HIBACHI" }
+if (-not $InstallDir) {
+    $InstallDir = if ($env:HIBACHI_HOME) { $env:HIBACHI_HOME } else { Join-Path $env:USERPROFILE "HIBACHI" }
+}
+# Publish the chosen location so every child process (git, micromamba, and
+# especially make_shortcuts.py) uses the SAME install dir instead of assuming
+# the default. This is what makes a non-default install produce a working icon.
+$env:HIBACHI_HOME = $InstallDir
 $EnvName    = "hibachi"
 # ----------------------------------------------------------------------------- #
 

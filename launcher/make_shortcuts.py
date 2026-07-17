@@ -78,27 +78,24 @@ def _env_manager_exe() -> str:
         if exe:
             return os.path.abspath(exe)
 
-    # 2. Probe the standard install layout. make_shortcuts is often run without
-    #    micromamba on PATH (e.g. `micromamba run python make_shortcuts.py`, or a
-    #    direct `python.exe make_shortcuts.py`), so PATH lookup above returns
-    #    nothing and we must know where the bootstrap put micromamba.
-    install_dir = os.environ.get("HIBACHI_HOME") or os.path.join(
-        os.path.expanduser("~"), "HIBACHI"
-    )
+    # 2. Derive from the running interpreter's own prefix -- this is
+    #    location-independent and needs no assumption about the install dir.
+    #    The env lives at  <root>/micromamba/envs/<name>, so the manager is two
+    #    directories up: <root>/micromamba/<exe>.
     exe_name = "micromamba.exe" if sys.platform.startswith("win") else "micromamba"
+    mamba_root = os.path.dirname(os.path.dirname(sys.prefix))  # .../micromamba
     candidates = [
-        os.path.join(install_dir, "micromamba", exe_name),          # Windows layout
-        os.path.join(install_dir, "micromamba", "bin", exe_name),   # macOS / Linux layout
+        os.path.join(mamba_root, exe_name),          # Windows layout
+        os.path.join(mamba_root, "bin", exe_name),   # macOS / Linux layout
     ]
-    # 3. Derive it from the running interpreter's prefix as a last locate attempt:
-    #    <root>/micromamba/envs/hibachi/python(.exe) -> <root>/micromamba/<exe>.
-    prefix = sys.prefix
-    envs_marker = os.path.join("micromamba", "envs")
-    idx = prefix.find(envs_marker)
-    if idx != -1:
-        mamba_root = os.path.join(prefix[:idx], "micromamba")
-        candidates.append(os.path.join(mamba_root, exe_name))          # Windows
-        candidates.append(os.path.join(mamba_root, "bin", exe_name))   # macOS / Linux
+
+    # 3. Also probe an explicit install dir if provided, as a secondary guess.
+    install_dir = os.environ.get("HIBACHI_HOME")
+    if install_dir:
+        candidates += [
+            os.path.join(install_dir, "micromamba", exe_name),
+            os.path.join(install_dir, "micromamba", "bin", exe_name),
+        ]
 
     for guess in candidates:
         if os.path.isfile(guess):
@@ -251,6 +248,32 @@ def _make_macos(repo_root: str, home: str) -> List[str]:
 # --------------------------------------------------------------------------- #
 # Windows
 # --------------------------------------------------------------------------- #
+def _windows_known_dir(value_name: str, fallback: str) -> str:
+    """
+    Resolve a Windows shell folder from the registry so we honor redirection.
+
+    On corporate/managed machines the Desktop (and other shell folders) are very
+    often redirected into OneDrive -- e.g. C:\\Users\\me\\OneDrive\\Desktop rather
+    than C:\\Users\\me\\Desktop. Writing the shortcut to the naive
+    <home>\\Desktop path then puts it somewhere the user never sees ("no desktop
+    icon"), which is the classic reason a shortcut that worked on a clean test
+    box vanishes on a real one. We read the actual location from
+    HKCU\\...\\Explorer\\User Shell Folders (value 'Desktop' / 'Programs'),
+    expanding any %VARS%, and fall back to the naive path only if that fails.
+    """
+    try:
+        import winreg  # Windows-only; import lazily so this module still loads elsewhere
+        subkey = r"Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders"
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, subkey) as k:
+            raw, _ = winreg.QueryValueEx(k, value_name)
+        resolved = os.path.expandvars(raw)
+        if resolved and os.path.isabs(resolved):
+            return resolved
+    except Exception:
+        pass
+    return fallback
+
+
 def _cleanup_windows_shortcuts(dirs: List[str]) -> None:
     """
     Remove HIBACHI shortcuts left by earlier installs.
@@ -274,11 +297,16 @@ def _cleanup_windows_shortcuts(dirs: List[str]) -> None:
 
 def _make_windows(repo_root: str, home: str) -> List[str]:
     written = []
-    desktop_dir = os.path.join(home, "Desktop")
-    start_menu = os.path.join(
-        os.environ.get("APPDATA", os.path.join(home, "AppData", "Roaming")),
-        "Microsoft", "Windows", "Start Menu", "Programs",
+    desktop_dir = _windows_known_dir("Desktop", os.path.join(home, "Desktop"))
+    start_menu = _windows_known_dir(
+        "Programs",
+        os.path.join(
+            os.environ.get("APPDATA", os.path.join(home, "AppData", "Roaming")),
+            "Microsoft", "Windows", "Start Menu", "Programs",
+        ),
     )
+    print(f"[shortcut] desktop dir:   {desktop_dir}")
+    print(f"[shortcut] start menu dir: {start_menu}")
 
     # Clear out anything a previous install left behind so we don't end up with
     # a broken logo .lnk sitting next to a working .bat (the "two icons" bug).
@@ -345,17 +373,22 @@ def _make_windows_lnk(repo_root: str, dest_dir: str) -> None:
     else:
         args = f'"{run_app}"'
 
-    icon_line = f"$S.IconLocation = '{icon}'; " if os.path.isfile(icon) else ""
+    icon_line = f"$S.IconLocation = '{_ps_q(icon)}'; " if os.path.isfile(icon) else ""
     ps = (
         "$W = New-Object -ComObject WScript.Shell; "
-        f"$S = $W.CreateShortcut('{lnk}'); "
-        f"$S.TargetPath = '{target}'; "
-        f"$S.Arguments = '{args}'; "
-        f"$S.WorkingDirectory = '{repo_root}'; "
+        f"$S = $W.CreateShortcut('{_ps_q(lnk)}'); "
+        f"$S.TargetPath = '{_ps_q(target)}'; "
+        f"$S.Arguments = '{_ps_q(args)}'; "
+        f"$S.WorkingDirectory = '{_ps_q(repo_root)}'; "
         f"{icon_line}"
         "$S.Save()"
     )
     subprocess.run(["powershell", "-NoProfile", "-Command", ps], check=True)
+
+
+def _ps_q(s: str) -> str:
+    """Escape a string for inclusion inside a single-quoted PowerShell literal."""
+    return s.replace("'", "''")
 
 
 # --------------------------------------------------------------------------- #
