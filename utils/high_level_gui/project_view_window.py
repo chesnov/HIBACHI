@@ -16,12 +16,13 @@ from .project_manager import ProjectManager
 from .project_scaffolding import apply_template_config_to_project, organize_channel_project, organize_processing_dir, scan_available_presets
 from .project_selection import (
     classify_path, RecentProjects, PROJECT, RAW_IMAGES, PARENT_OF_PROJECTS,
-    EMPTY, MISSING,
+    MULTICHANNEL_PROJECT, EMPTY, MISSING, build_channel_registry,
 )
 try:
-    from .project_selection import WelcomeWidget  # needs Qt; always true here
+    from .project_selection import WelcomeWidget, MultiChannelView  # need Qt; always here
 except Exception:  # pragma: no cover
     WelcomeWidget = None  # type: ignore
+    MultiChannelView = None  # type: ignore
 
 # --- Optional BatchProcessor import ---
 try:
@@ -177,6 +178,10 @@ class ProjectViewWindow(QMainWindow):
                 self.open_path(info.project_roots[names.index(choice)])
             return
 
+        if info.kind == MULTICHANNEL_PROJECT:
+            self.open_multichannel(info)
+            return
+
         # PROJECT or RAW_IMAGES: hand off to the existing loader/scaffolder, which
         # already knows how to organize raw images and populate the list.
         self.project_manager.project_path = info.path
@@ -184,6 +189,77 @@ class ProjectViewWindow(QMainWindow):
         self.project_path_label.setText(f"Project Path: {info.path}")
         self.image_list.clear()
         self._load_or_organize(info.path)
+
+    def open_multichannel(self, info) -> None:
+        """Show the sample→channel tree for a multi-channel project."""
+        if MultiChannelView is None:
+            # Extremely unlikely (needs Qt, which we're already running under).
+            QMessageBox.information(
+                self, "Multi-channel project",
+                f"{info.note}\nOpen a specific Channel_* folder to work on it."
+            )
+            return
+
+        registry = build_channel_registry(info.channel_dirs)
+        if not registry:
+            QMessageBox.warning(self, "Empty project",
+                                "No samples were found in the channel folders.")
+            return
+
+        self.project_path_label.setText(f"Project Path: {info.path}  (multi-channel)")
+        self.recent.add(info.path)
+        if self.welcome is not None:
+            self.welcome.refresh_recents()
+
+        view = MultiChannelView(registry)
+        view.setWindowTitle(f"Multi-channel — {os.path.basename(info.path)}")
+        view.open_requested.connect(self._open_sample_folder)
+        view.batch_requested.connect(self._batch_process_folders)
+        view.cross_channel_requested.connect(
+            lambda p=info.channel_dirs[0]: self._open_cross_channel_from(p)
+        )
+        view.resize(640, 480)
+        view.show()
+        # keep a reference so it isn't garbage-collected
+        self._multichannel_view = view
+
+    def _open_sample_folder(self, folder: str) -> None:
+        """Open one channel's sample image in the interactive segmentation view."""
+        from .app_launch import interactive_segmentation_with_config  # lazy: avoid cycle
+        interactive_segmentation_with_config(folder, project_manager=self.project_manager)
+
+    def _batch_process_folders(self, folders: list) -> None:
+        """Route an arbitrary set of selected channel/sample folders to batch."""
+        if not folders:
+            return
+        if not BatchProcessor:
+            QMessageBox.warning(self, "Unavailable", "Batch processor is not available.")
+            return
+        reply = QMessageBox.question(
+            self, "Confirm",
+            f"Process {len(folders)} selected image folder"
+            f"{'s' if len(folders) != 1 else ''}?",
+            QMessageBox.Yes | QMessageBox.No
+        )
+        if reply != QMessageBox.Yes:
+            return
+        # BatchProcessor iterates project_manager.image_folders, so point it at
+        # exactly the selection (may span several channels).
+        self.project_manager.image_folders = list(folders)
+        processor = BatchProcessor(self.project_manager)
+        processor.process_all_folders(force_restart_all=False)
+        QMessageBox.information(self, "Done", "Batch processing complete.")
+        if getattr(self, "_multichannel_view", None) is not None:
+            # refresh status badges after processing
+            self._multichannel_view.reload(self._multichannel_view._registry)
+
+    def _open_cross_channel_from(self, a_channel_dir: str) -> None:
+        """Open the cross-channel analyzer for the parent of a channel folder."""
+        # build_consolidated_sample_registry scans os.path.dirname(project_path),
+        # so pointing project_path at a channel dir makes it scan the whole project.
+        self.project_manager.project_path = a_channel_dir
+        self.analyzer_window = CrossChannelAnalyzerWindow(self.project_manager)
+        self.analyzer_window.show()
 
     def _load_or_organize(self, selected_path: str) -> None:
         try:
