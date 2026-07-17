@@ -336,37 +336,29 @@ if _HAVE_QT:
             title.setStyleSheet("font-size: 15px; font-weight: bold;")
             root.addWidget(title)
 
-            hint = QLabel(
-                "A project is a folder whose sub-folders each hold one image and "
-                "its config:\n"
-                "    my_project/  →  sample_01/  (image.tif + config.yaml)\n"
-                "Pick a folder of raw images to create one, or a project folder to open it."
-            )
-            hint.setStyleSheet("color: #6b7075;")
-            root.addWidget(hint)
-
             drop = _DropFrame()
             drop.dropped.connect(self.path_chosen.emit)
             root.addWidget(drop)
 
-            btns = QHBoxLayout()
-            open_btn = QPushButton("Open project or images…")
-            open_btn.clicked.connect(self._browse_folder)
-            btns.addWidget(open_btn)
-
-            file_btn = QPushButton("Pick by image file…")
-            file_btn.setToolTip("Select any image; HIBACHI uses its containing folder.")
-            file_btn.clicked.connect(self._browse_file)
-            btns.addWidget(file_btn)
-            root.addLayout(btns)
+            # One button for everything: it accepts a project folder, a folder of
+            # raw images, or an image file (its folder is used) -- classify_path
+            # figures out which and open_path acts accordingly.
+            open_btn = QPushButton("Open…")
+            open_btn.setToolTip(
+                "Choose a project folder, a folder of images, or an image file."
+            )
+            open_btn.clicked.connect(self._browse)
+            root.addWidget(open_btn)
 
             recent_label = QLabel("Recent projects")
             recent_label.setStyleSheet("font-weight: bold; margin-top: 6px;")
             root.addWidget(recent_label)
 
             self.recent_list = QListWidget()
+            # Use only itemActivated (Enter / double-click, per platform). Connecting
+            # both itemActivated and itemDoubleClicked could fire the slot twice, and
+            # relying on the passed item is fragile -- we read the selection instead.
             self.recent_list.itemActivated.connect(self._open_recent)
-            self.recent_list.itemDoubleClicked.connect(self._open_recent)
             root.addWidget(self.recent_list)
 
             tools = QHBoxLayout()
@@ -401,7 +393,14 @@ if _HAVE_QT:
                 item.setToolTip(e.path)
                 self.recent_list.addItem(item)
 
-        def _open_recent(self, item: "QListWidgetItem") -> None:
+        def _open_recent(self, item: "QListWidgetItem" = None) -> None:
+            # Be defensive: some Qt builds/paths can invoke this without a valid
+            # item (the reported 'NoneType' has no attribute 'data'). Fall back to
+            # the current selection, and ignore the non-selectable placeholder row.
+            if item is None:
+                item = self.recent_list.currentItem()
+            if item is None:
+                return
             path = item.data(Qt.UserRole)
             if path:
                 self.path_chosen.emit(path)
@@ -413,20 +412,11 @@ if _HAVE_QT:
                     self.recent.remove(path)
             self.refresh_recents()
 
-        # ---- browse dialogs ------------------------------------------------- #
-        def _browse_folder(self) -> None:
+        # ---- browse dialog -------------------------------------------------- #
+        def _browse(self) -> None:
             folder = QFileDialog.getExistingDirectory(
                 self, "Select a project folder or a folder of images", self._last_dir
             )
             if folder:
                 self._last_dir = folder
                 self.path_chosen.emit(folder)
-
-        def _browse_file(self) -> None:
-            fname, _ = QFileDialog.getOpenFileName(
-                self, "Select an image (its folder will be used)", self._last_dir,
-                "Images (*.tif *.tiff *.czi);;All files (*)"
-            )
-            if fname:
-                self._last_dir = os.path.dirname(fname)
-                self.path_chosen.emit(fname)  # classify_path redirects file -> folder

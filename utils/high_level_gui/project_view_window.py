@@ -70,10 +70,7 @@ class ProjectViewWindow(QMainWindow):
         layout.addWidget(self.image_list)
         
         button_layout = QHBoxLayout()
-        select_project_btn = QPushButton("Select/Load Project Folder")
-        select_project_btn.clicked.connect(self.load_project)
-        button_layout.addWidget(select_project_btn)
-        
+
         self.batch_process_all_btn = QPushButton("Process All Compatible Folders")
         self.batch_process_all_btn.clicked.connect(self.run_batch_processing_all_compatible)
         self.batch_process_all_btn.setEnabled(False)
