@@ -25,6 +25,8 @@ INSTALL_DIR="${HIBACHI_HOME:-$HOME/HIBACHI}"
 APP_DIR="${INSTALL_DIR}/app"
 MAMBA="${INSTALL_DIR}/micromamba/bin/micromamba"
 ENV_NAME="hibachi"
+ENV_PREFIX="${INSTALL_DIR}/micromamba/envs/${ENV_NAME}"
+ENV_PY="${ENV_PREFIX}/bin/python"
 LOG="${INSTALL_DIR}/setup.log"
 MARKER="${INSTALL_DIR}/.bootstrapped_version"
 
@@ -56,5 +58,14 @@ if [ "${need_bootstrap}" = "1" ]; then
     fi
 fi
 
-# Normal launch: the Python launcher self-updates then starts the app.
-exec "${MAMBA}" run -n "${ENV_NAME}" python "${APP_DIR}/launcher/run_app.py"
+# Normal launch: the Python launcher self-updates then starts the app. Use the
+# env's own interpreter directly rather than `micromamba run` -- it needs nothing
+# on PATH, keeps a single process under the bundle's Dock tile, and (as we
+# learned on Windows) doesn't hide the child's output/errors. run_app.py itself
+# restores the env's PATH so `git` (self-update) still resolves.
+export HIBACHI_HOME="${INSTALL_DIR}"
+if [ -x "${ENV_PY}" ]; then
+    exec "${ENV_PY}" "${APP_DIR}/launcher/run_app.py"
+else
+    exec "${MAMBA}" run -n "${ENV_NAME}" python "${APP_DIR}/launcher/run_app.py"
+fi

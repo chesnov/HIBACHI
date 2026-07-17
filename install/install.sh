@@ -95,11 +95,22 @@ else
 fi
 
 # --- 4. Create the double-click launcher ------------------------------------- #
+# Publish the chosen install dir so make_shortcuts.py builds a shortcut for THIS
+# location rather than assuming the default (matches the Windows fix).
+export HIBACHI_HOME="${INSTALL_DIR}"
+# Prefer the env's own interpreter over `micromamba run`: it needs nothing on
+# PATH and doesn't swallow stdout/stderr the way `micromamba run` can, so any
+# failure here is actually visible. Fall back to `run` only if it's missing.
+ENV_PY="${ENV_PREFIX}/bin/python"
 if [ "${HIBACHI_SKIP_SHORTCUT:-0}" = "1" ]; then
   say "Skipping shortcut creation (launched from a native app bundle)"
 else
   say "Creating desktop launcher"
-  "${MAMBA_BIN}" run -n "${ENV_NAME}" python "${APP_DIR}/launcher/make_shortcuts.py"
+  if [ -x "${ENV_PY}" ]; then
+    "${ENV_PY}" "${APP_DIR}/launcher/make_shortcuts.py"
+  else
+    "${MAMBA_BIN}" run -n "${ENV_NAME}" python "${APP_DIR}/launcher/make_shortcuts.py"
+  fi
 fi
 
 say "Done!"
@@ -109,7 +120,7 @@ HIBACHI is installed at:
   ${APP_DIR}
 
 Launch it from your Applications menu / Desktop shortcut, or directly with:
-  "${MAMBA_BIN}" run -n ${ENV_NAME} python "${APP_DIR}/launcher/run_app.py"
+  "${ENV_PREFIX}/bin/python" "${APP_DIR}/launcher/run_app.py"
 
 It will check for updates automatically each time it starts.
 EOF
