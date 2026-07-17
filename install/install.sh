@@ -11,6 +11,11 @@
 #   2. Builds the 'hibachi' environment from environment.yml (Python + git + all deps).
 #   3. git-clones the app into the install directory.
 #   4. Creates a double-click launcher (.desktop on Linux, .app on macOS).
+#
+# This script is IDEMPOTENT: re-running it over an existing install updates the
+# environment in place and force-syncs the checkout to the current release,
+# instead of erroring out or leaving the old version behind. `set -e` makes any
+# failure (e.g. a failed git fetch) abort loudly rather than silently proceed.
 # =============================================================================
 set -euo pipefail
 
@@ -27,6 +32,7 @@ ENV_YML_URL="https://raw.githubusercontent.com/${GH_OWNER}/${GH_REPO}/${BRANCH}/
 MAMBA_ROOT="${INSTALL_DIR}/micromamba"
 MAMBA_BIN="${MAMBA_ROOT}/bin/micromamba"
 APP_DIR="${INSTALL_DIR}/app"
+ENV_PREFIX="${MAMBA_ROOT}/envs/${ENV_NAME}"
 
 say() { printf '\n\033[1;36m==> %s\033[0m\n' "$*"; }
 err() { printf '\n\033[1;31mERROR: %s\033[0m\n' "$*" >&2; exit 1; }
@@ -57,19 +63,29 @@ else
 fi
 export MAMBA_ROOT_PREFIX="${MAMBA_ROOT}"
 
-# --- 2. Build the environment from environment.yml --------------------------- #
+# --- 2. Build (or update) the environment from environment.yml --------------- #
 say "Fetching dependency list"
 mkdir -p "${INSTALL_DIR}"
 ENV_YML="${INSTALL_DIR}/environment.yml"
 curl -fsSL "${ENV_YML_URL}" -o "${ENV_YML}" \
   || err "Could not download environment.yml from ${ENV_YML_URL}"
 
-say "Creating the '${ENV_NAME}' environment (first run downloads packages; be patient)"
-"${MAMBA_BIN}" create -y -n "${ENV_NAME}" -f "${ENV_YML}"
+# `create` is NOT idempotent (it aborts if the prefix already exists), so on a
+# re-install we update the existing env in place instead. This is what lets a
+# new installer safely run over an old one.
+if [ -d "${ENV_PREFIX}" ]; then
+  say "Updating the '${ENV_NAME}' environment"
+  "${MAMBA_BIN}" env update -n "${ENV_NAME}" -f "${ENV_YML}" -y
+else
+  say "Creating the '${ENV_NAME}' environment (first run downloads packages; be patient)"
+  "${MAMBA_BIN}" create -y -n "${ENV_NAME}" -f "${ENV_YML}"
+fi
 
-# --- 3. Clone (or update) the application ------------------------------------ #
+# --- 3. Clone (or force-sync) the application -------------------------------- #
+# A failure here aborts the whole script (set -e), so the caller/.app launcher
+# reports "setup failed" instead of silently launching the stale checkout.
 if [ -d "${APP_DIR}/.git" ]; then
-  say "Updating existing checkout"
+  say "Updating existing checkout to the latest ${BRANCH}"
   "${MAMBA_BIN}" run -n "${ENV_NAME}" git -C "${APP_DIR}" fetch origin "${BRANCH}"
   "${MAMBA_BIN}" run -n "${ENV_NAME}" git -C "${APP_DIR}" checkout "${BRANCH}"
   "${MAMBA_BIN}" run -n "${ENV_NAME}" git -C "${APP_DIR}" reset --hard "origin/${BRANCH}"

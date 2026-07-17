@@ -6,27 +6,49 @@
 # environment (via the bundled install.sh); on every launch it hands off to the
 # self-updating Python launcher. Setup progress is shown with macOS
 # notifications/dialogs so the user is never staring at a frozen icon.
+#
+# VERSION-AWARE BOOTSTRAP: the old logic only ran install.sh when there was no
+# checkout at all, so dragging a NEW .dmg over an EXISTING install never
+# refreshed the app -- it just re-launched the stale checkout in ~/HIBACHI/app.
+# We now also re-run the bootstrap whenever the version stamped into THIS bundle
+# differs from the version recorded at the last successful bootstrap. Because
+# install.sh force-syncs the checkout to the current release (and is idempotent),
+# a freshly-installed .app now actually installs its version.
 # =============================================================================
 set -uo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 RES="${HERE}/../Resources"
+PLIST="${HERE}/../Info.plist"
 
 INSTALL_DIR="${HIBACHI_HOME:-$HOME/HIBACHI}"
 APP_DIR="${INSTALL_DIR}/app"
 MAMBA="${INSTALL_DIR}/micromamba/bin/micromamba"
 ENV_NAME="hibachi"
 LOG="${INSTALL_DIR}/setup.log"
+MARKER="${INSTALL_DIR}/.bootstrapped_version"
 
 notify() { osascript -e "display notification \"$1\" with title \"HIBACHI\"" >/dev/null 2>&1 || true; }
 alert()  { osascript -e "display dialog \"$1\" buttons {\"OK\"} default button 1 with title \"HIBACHI\"" >/dev/null 2>&1 || true; }
 
-# First run (or a broken install): bootstrap the environment and checkout.
+# Version stamped into this .app bundle (build_dmg.sh sets CFBundleShortVersionString).
+BUNDLE_VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "${PLIST}" 2>/dev/null || echo "0.0.0")"
+INSTALLED_VERSION="$(cat "${MARKER}" 2>/dev/null || echo "")"
+
+# Decide whether we need to (re)bootstrap.
+need_bootstrap=0
 if [ ! -d "${APP_DIR}/.git" ] || [ ! -x "${MAMBA}" ]; then
+    need_bootstrap=1                          # first run or a broken install
+elif [ "${BUNDLE_VERSION}" != "${INSTALLED_VERSION}" ]; then
+    need_bootstrap=1                          # a different/newer .app was installed over the old one
+fi
+
+if [ "${need_bootstrap}" = "1" ]; then
     mkdir -p "${INSTALL_DIR}"
-    notify "Setting up HIBACHI (first run). This can take a few minutes…"
+    notify "Setting up HIBACHI. This can take a few minutes…"
     # Skip shortcut creation: this .app is itself the permanent launcher.
     if HIBACHI_SKIP_SHORTCUT=1 bash "${RES}/install.sh" >"${LOG}" 2>&1; then
+        printf '%s\n' "${BUNDLE_VERSION}" > "${MARKER}"
         notify "Setup complete. Launching HIBACHI…"
     else
         alert "HIBACHI setup failed. Please send this log to support: ${LOG}"
