@@ -1,5 +1,6 @@
 import abc
 import os
+import sys
 import gc
 import time
 import traceback
@@ -20,6 +21,47 @@ warnings.filterwarnings(
     category=UserWarning,
     module=r"napari\._vispy",
 )
+
+
+def _hibachi_version_stamp() -> Dict[str, Any]:
+    """
+    Build the `hibachi_version` block written into each processed config.
+
+    Records the git commit (so the exact code can be checked out to reproduce
+    the run), the branch, whether the working tree was dirty, and a UTC
+    timestamp of when the config was saved. Reuses the launcher's stdlib-only
+    `updater` module (no Qt import). Fully best-effort: on any failure it returns
+    a minimal stamp rather than raising, so saving the config never breaks.
+    """
+    import datetime
+
+    stamp: Dict[str, Any] = {
+        "commit": None,
+        "short": None,
+        "date": None,
+        "branch": None,
+        "dirty": None,
+        "processed_at": datetime.datetime.now(datetime.timezone.utc)
+        .replace(microsecond=0)
+        .isoformat(),
+    }
+    try:
+        # repo layout: <repo>/utils/high_level_gui/processing_strategies.py
+        repo_root = os.path.dirname(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        )
+        launcher = os.path.join(repo_root, "launcher")
+        if launcher not in sys.path:
+            sys.path.insert(0, launcher)
+        import updater  # type: ignore
+
+        info = updater.describe_version(repo_root)
+        for key in ("commit", "short", "date", "branch", "dirty"):
+            if key in info:
+                stamp[key] = info[key]
+    except Exception as exc:  # pragma: no cover - defensive
+        print(f"[version] could not determine HIBACHI version: {exc}")
+    return stamp
 
 
 class StepDefinition(TypedDict):
@@ -293,6 +335,14 @@ class ProcessingStrategy(abc.ABC):
 
         if saved_state_dict:
             config_to_save['saved_state'] = saved_state_dict
+
+        # Stamp the running HIBACHI version so this processed run can be
+        # reproduced later (git checkout the recorded commit). Best-effort and
+        # non-fatal: if the version can't be determined, we still save the config.
+        try:
+            config_to_save['hibachi_version'] = _hibachi_version_stamp()
+        except Exception as e:
+            print(f"Warning: could not stamp HIBACHI version: {e}")
 
         try:
             with open(config_save_path, 'w') as file:

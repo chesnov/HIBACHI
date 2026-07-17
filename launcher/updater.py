@@ -34,7 +34,7 @@ import os
 import subprocess
 import time
 from dataclasses import dataclass, field
-from typing import Callable, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 # Status values returned in UpdateResult.status
 UP_TO_DATE = "up_to_date"
@@ -174,6 +174,45 @@ def remote_tip(repo_root: str, branch: Optional[str] = None) -> Optional[str]:
     branch = branch or current_branch(repo_root)
     rc, rev, _ = _git(["rev-parse", f"origin/{branch}"], repo_root)
     return rev if rc == 0 and rev else None
+
+
+def describe_version(repo_root: Optional[str] = None) -> Dict[str, Optional[str]]:
+    """
+    Best-effort snapshot of the running HIBACHI version, for stamping into
+    processed output so an analysis can be reproduced later (`git checkout
+    <commit>` restores the exact code that produced it).
+
+    Returns a dict with keys: commit (full sha), short (abbrev sha), date
+    (commit date, YYYY-MM-DD), branch, and dirty (True if the working tree had
+    uncommitted changes at processing time -- important, because a dirty tree
+    means the commit alone does NOT fully reproduce the code). Never raises; any
+    field it can't determine is None (e.g. not a git checkout -> commit is None).
+    """
+    info: Dict[str, Optional[str]] = {
+        "commit": None, "short": None, "date": None, "branch": None, "dirty": None,
+    }
+    try:
+        if not repo_root:
+            repo_root = find_repo_root(os.path.dirname(os.path.abspath(__file__)))
+        if not repo_root:
+            return info
+        rc, out, _ = _git(["log", "-1", "--format=%H%x1f%h%x1f%cs", "HEAD"], repo_root)
+        if rc == 0 and out:
+            parts = (out.split("\x1f") + ["", "", ""])[:3]
+            info["commit"] = parts[0] or None
+            info["short"] = parts[1] or None
+            info["date"] = parts[2] or None
+        info["branch"] = current_branch(repo_root)
+        # Only tracked-file modifications count as "dirty". We ignore untracked
+        # files because importing modules writes __pycache__/*.pyc into the tree,
+        # which would otherwise mark every run dirty. What matters for
+        # reproducibility is whether the committed source was hand-edited.
+        rc, out, _ = _git(["status", "--porcelain", "--untracked-files=no"], repo_root)
+        if rc == 0:
+            info["dirty"] = bool(out.strip())
+    except Exception:  # pragma: no cover - defensive; version stamping is best-effort
+        pass
+    return info
 
 
 # --------------------------------------------------------------------------- #
