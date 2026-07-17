@@ -25,6 +25,7 @@ from __future__ import annotations
 import os
 import re
 import shutil
+import yaml
 from typing import Dict, List, Optional
 
 _RAW_EXTS = (".tif", ".tiff", ".czi")
@@ -148,6 +149,66 @@ def reset_single_channel_project(project_dir: str) -> List[str]:
                 pass
             shutil.rmtree(sub, ignore_errors=True)
             removed.append(sub)
+    return removed
+
+
+def is_synthetic_channel(channel_dir: str) -> bool:
+    """
+    True if a channel folder was procedurally generated.
+
+    Synthetic channels carry `synthetic: true` in their per-sample config YAMLs
+    (written by the synthetic engine); real extracted channels carry
+    `synthetic: false`. A channel whose configs lack the key entirely is treated
+    as real. Returns True if any sample config in the channel is marked synthetic.
+    """
+    try:
+        entries = os.listdir(channel_dir)
+    except OSError:
+        return False
+    for item in entries:
+        sub = os.path.join(channel_dir, item)
+        if not os.path.isdir(sub):
+            continue
+        try:
+            files = os.listdir(sub)
+        except OSError:
+            continue
+        yml = next((f for f in files if f.lower().endswith((".yaml", ".yml"))), None)
+        if not yml:
+            continue
+        try:
+            with open(os.path.join(sub, yml), "r") as fh:
+                cfg = yaml.safe_load(fh) or {}
+        except Exception:
+            continue
+        if bool(cfg.get("synthetic", False)):
+            return True
+    return False
+
+
+def purge_derived_artifacts(project_dir: str) -> List[str]:
+    """
+    Remove derived artifacts that must not survive a re-setup.
+
+    Deletes the entire RELATIONAL_ANALYSIS folder (all saved cross-channel runs)
+    and any synthetic channels (identified via `synthetic: true` in their
+    configs). Real channels are left untouched. Returns the list of removed paths.
+    """
+    removed: List[str] = []
+    rel = os.path.join(project_dir, "RELATIONAL_ANALYSIS")
+    if os.path.isdir(rel):
+        shutil.rmtree(rel, ignore_errors=True)
+        removed.append(rel)
+    try:
+        entries = os.listdir(project_dir)
+    except OSError:
+        entries = []
+    for item in entries:
+        full = os.path.join(project_dir, item)
+        if (os.path.isdir(full) and re.match(r"(?i)channel_\d+_", item)
+                and is_synthetic_channel(full)):
+            shutil.rmtree(full, ignore_errors=True)
+            removed.append(full)
     return removed
 
 

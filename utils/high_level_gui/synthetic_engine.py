@@ -255,9 +255,17 @@ def generate_synthetic_channel(pm, template_ch, rel_filter, out_dir):
         os.makedirs(sample_out, exist_ok=True)
         tiff.imwrite(os.path.join(sample_out, f"{sample_name}.tif"), synth_img)
         
-        # Copy YAML configuration
-        yml = next((f for f in os.listdir(ch_path) if f.lower().endswith('.yaml')), None)
+        # Copy YAML configuration, tagging it as procedurally generated so the
+        # channel can be robustly identified later (e.g. cleaned up on re-setup).
+        yml = next((f for f in os.listdir(ch_path) if f.lower().endswith(('.yaml', '.yml'))), None)
         if yml:
-            shutil.copy(os.path.join(ch_path, yml), os.path.join(sample_out, yml))
+            try:
+                with open(os.path.join(ch_path, yml), 'r') as f:
+                    cfg = yaml.safe_load(f) or {}
+            except Exception:
+                cfg = {}
+            cfg['synthetic'] = True
+            with open(os.path.join(sample_out, yml), 'w') as f:
+                yaml.dump(cfg, f, default_flow_style=False, sort_keys=False)
             
         print(f"[{sample_name}] Generated {spots_drawn} procedural objects.")

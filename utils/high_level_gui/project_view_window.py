@@ -370,7 +370,7 @@ class ProjectViewWindow(QMainWindow):
         """
         from .organize_wizard import (
             reset_multichannel_project, reset_single_channel_project,
-            existing_channel_indices, run_organize_wizard,
+            purge_derived_artifacts, existing_channel_indices, run_organize_wizard,
         )
         is_multi = bool(existing_channel_indices(project_dir))
         if is_multi:
@@ -385,16 +385,22 @@ class ProjectViewWindow(QMainWindow):
         reply = QMessageBox.warning(
             self, "Re-set up project?",
             f"{detail}\n\n{project_dir}\n\n"
-            "The raw source images are kept. This cannot be undone. Continue?",
+            "Any saved cross-channel analyses and synthetic channels from previous "
+            "runs are also removed. The raw source images are kept. This cannot be "
+            "undone. Continue?",
             QMessageBox.Yes | QMessageBox.No, QMessageBox.No
         )
         if reply != QMessageBox.Yes:
             return
+        # Clear derived artifacts (cross-channel analyses + synthetic channels)
+        # first, then tear down the channel/image structure.
+        purged = purge_derived_artifacts(project_dir)
         if is_multi:
             removed = reset_multichannel_project(project_dir)
         else:
             removed = reset_single_channel_project(project_dir)
-        print(f"[resetup] removed {len(removed)} folder(s).")
+        print(f"[resetup] removed {len(removed)} folder(s), "
+              f"purged {len(purged)} derived artifact(s).")
         if run_organize_wizard(self, project_dir, mode="new", project_dir=project_dir):
             self.open_path(project_dir)
 

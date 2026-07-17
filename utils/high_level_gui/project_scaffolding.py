@@ -259,6 +259,7 @@ def organize_channel_project(
             if not is_2d_mode:
                 cfg[dimension_key]['z'] = total_d
             cfg['mode'] = mode
+            cfg['synthetic'] = False  # real extracted channel
             with open(new_config_path, 'w') as f:
                 yaml.dump(cfg, f, default_flow_style=False, sort_keys=False)
         except Exception:
@@ -407,6 +408,7 @@ def organize_processing_dir(drctry: str, preset_details: Dict[str, str]) -> None
             if not is_2d_mode:
                 cfg[dimension_key]['z'] = float(row.get('Depth (um)', 0.0))
             cfg['mode'] = mode
+            cfg['synthetic'] = False  # real image (not procedurally generated)
             with open(new_config_path, 'w') as f:
                 yaml.dump(cfg, f, default_flow_style=False, sort_keys=False)
         except Exception: pass
