@@ -59,14 +59,54 @@ def _current_env_can_run_app() -> bool:
 
 
 def _env_manager_exe() -> str:
-    """Absolute path to micromamba/mamba/conda, for embedding in the shortcut."""
+    """
+    Absolute path to micromamba/mamba/conda, for embedding in the shortcut.
+
+    IMPORTANT: this path is baked into the .lnk / .bat that the user double-
+    clicks. It MUST be an absolute path. If we returned a bare name like
+    "micromamba", double-clicking the shortcut would only work when micromamba
+    happens to be on the user's PATH -- which it is not for a GUI shortcut -- and
+    the launch fails with "micromamba can't be found". So after PATH lookup we
+    fall back to probing the known HIBACHI install layout rather than a bare
+    literal.
+    """
+    # 1. Explicit override, then PATH lookup (covers being run inside the env).
     for cand in (os.environ.get("MAMBA_EXE"), "micromamba", "mamba", "conda"):
         if not cand:
             continue
         exe = cand if os.path.isabs(cand) else shutil.which(cand)
         if exe:
-            return exe
-    return "micromamba"  # last-resort literal; user PATH may still resolve it
+            return os.path.abspath(exe)
+
+    # 2. Probe the standard install layout. make_shortcuts is often run without
+    #    micromamba on PATH (e.g. `micromamba run python make_shortcuts.py`, or a
+    #    direct `python.exe make_shortcuts.py`), so PATH lookup above returns
+    #    nothing and we must know where the bootstrap put micromamba.
+    install_dir = os.environ.get("HIBACHI_HOME") or os.path.join(
+        os.path.expanduser("~"), "HIBACHI"
+    )
+    exe_name = "micromamba.exe" if sys.platform.startswith("win") else "micromamba"
+    candidates = [
+        os.path.join(install_dir, "micromamba", exe_name),          # Windows layout
+        os.path.join(install_dir, "micromamba", "bin", exe_name),   # macOS / Linux layout
+    ]
+    # 3. Derive it from the running interpreter's prefix as a last locate attempt:
+    #    <root>/micromamba/envs/hibachi/python(.exe) -> <root>/micromamba/<exe>.
+    prefix = sys.prefix
+    envs_marker = os.path.join("micromamba", "envs")
+    idx = prefix.find(envs_marker)
+    if idx != -1:
+        mamba_root = os.path.join(prefix[:idx], "micromamba")
+        candidates.append(os.path.join(mamba_root, exe_name))          # Windows
+        candidates.append(os.path.join(mamba_root, "bin", exe_name))   # macOS / Linux
+
+    for guess in candidates:
+        if os.path.isfile(guess):
+            return os.path.abspath(guess)
+
+    # 4. Give up gracefully. Still better to emit the platform-correct exe name
+    #    than nothing, but this path should be unreachable in a real install.
+    return exe_name
 
 
 def launch_command(repo_root: str, windowless: bool = False) -> List[str]:
