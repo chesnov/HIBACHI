@@ -4,14 +4,16 @@
 import os
 import yaml  # type: ignore
 from PyQt5.QtGui import QCloseEvent, QIcon  # type: ignore
-from PyQt5.QtCore import Qt  # type: ignore
+from PyQt5.QtCore import Qt, QEvent  # type: ignore
 from PyQt5.QtWidgets import (  # type: ignore
     QApplication, QFileDialog, QMessageBox, QMainWindow, QVBoxLayout, QHBoxLayout,
     QPushButton, QWidget, QLabel, QInputDialog
 )
 
-from .gui_text_utils import app_icon_path
-from .cross_channel_window import CrossChannelAnalyzerWindow
+from .gui_text_utils import app_icon_path, clean_filename_for_matching
+from .cross_channel_window import (
+    CrossChannelAnalyzerWindow, list_relational_analyses, open_sample_overlay,
+)
 from .metadata import MetadataExtractor
 from .project_manager import ProjectManager
 from .project_scaffolding import apply_template_config_to_project
@@ -45,6 +47,7 @@ class ProjectViewWindow(QMainWindow):
         self.recent = RecentProjects()
         self._content_view = None       # the unified ProjectContentsView (or None)
         self._cross_scan_dir = None     # dir the cross-channel analyzer should scan
+        self._project_root = None       # project root that holds RELATIONAL_ANALYSIS
         self.initUI()
         self.setAttribute(Qt.WA_QuitOnClose)
 
@@ -213,6 +216,7 @@ class ProjectViewWindow(QMainWindow):
         # already knows how to organize raw images and populate the view.
         self.project_manager.project_path = info.path
         self._cross_scan_dir = info.path
+        self._project_root = info.path
         self.cross_channel_btn.setEnabled(True)
         self.project_path_label.setText(f"Project Path: {info.path}")
         self._load_or_organize(info.path)
@@ -240,13 +244,16 @@ class ProjectViewWindow(QMainWindow):
         view = ProjectContentsView(
             registry, channel_dirs=info.channel_dirs,
             project_dir=info.path, multichannel=True,
+            analyses=list_relational_analyses(info.path),
         )
         view.open_requested.connect(self._open_sample_folder)
+        view.overlay_requested.connect(self._open_overlay)
         view.selection_changed.connect(self._update_action_buttons)
         view.add_channel_requested.connect(self._add_channel)
         view.resetup_requested.connect(self._resetup_project)
         self._install_content_view(view)
 
+        self._project_root = info.path
         # Anchor cross-channel scanning at a channel dir so its parent (the
         # project root) is what gets scanned for sibling channels.
         self._cross_scan_dir = info.channel_dirs[0] if info.channel_dirs else info.path
@@ -261,6 +268,51 @@ class ProjectViewWindow(QMainWindow):
         self.hide()
         from .app_launch import interactive_segmentation_with_config  # lazy: avoid cycle
         interactive_segmentation_with_config(folder, project_manager=self.project_manager)
+
+    def _open_overlay(self, sample_name: str) -> None:
+        """Open a sample's multi-channel viewer (parent row double-click).
+
+        Always shows the raw intensity channels (segmentation hidden). If an
+        analysis is selected in the picker, its cross-channel layers are added
+        on top and shown.
+        """
+        view = self._content_view
+        if view is None:
+            return
+        analysis = view.current_analysis()  # None on the neutral entry
+
+        # The tree keys samples by folder basename; the consolidated registry and
+        # analysis folders use the "clean" name. Map between the two.
+        clean = clean_filename_for_matching(sample_name)
+        if not self.project_manager.sample_registry:
+            self.project_manager.build_consolidated_sample_registry()
+        if clean not in self.project_manager.sample_registry:
+            QMessageBox.warning(
+                self, "No cross-channel data",
+                f"Could not find consolidated channels for '{sample_name}'."
+            )
+            return
+        try:
+            open_sample_overlay(self.project_manager, clean, analysis, parent=self)
+        except Exception as exc:
+            QMessageBox.critical(self, "Overlay Error", f"Could not open overlay:\n{exc}")
+
+    def _rescan_analyses(self) -> None:
+        """Refresh the overlay picker from disk (cheap; called on re-activation)."""
+        view = self._content_view
+        if view is None or not getattr(view, "_multichannel", False) or not self._project_root:
+            return
+        try:
+            view.set_analyses(list_relational_analyses(self._project_root))
+        except Exception as exc:
+            print(f"[analyses] rescan failed: {exc}")
+
+    def changeEvent(self, event) -> None:
+        # When the window regains focus (e.g. after closing the analyzer or an
+        # overlay viewer), rescan so freshly-run analyses appear in the picker.
+        if event.type() == QEvent.ActivationChange and self.isActiveWindow():
+            self._rescan_analyses()
+        super().changeEvent(event)
 
     def _process_selected(self) -> None:
         if self._content_view is None:
@@ -304,19 +356,39 @@ class ProjectViewWindow(QMainWindow):
             self.open_path(project_dir)  # re-classify + rebuild the tree with the new channel
 
     def _resetup_project(self, project_dir: str) -> None:
-        """Delete the whole channel structure, then set up again from scratch."""
-        from .organize_wizard import reset_multichannel_project, run_organize_wizard
+        """Delete the organized structure, then set up again from scratch.
+
+        Multi-channel projects re-extract from the loose raw source images;
+        single-channel projects have their images moved back to the project root
+        first. Either way the raw images are preserved.
+        """
+        from .organize_wizard import (
+            reset_multichannel_project, reset_single_channel_project,
+            existing_channel_indices, run_organize_wizard,
+        )
+        is_multi = bool(existing_channel_indices(project_dir))
+        if is_multi:
+            detail = (
+                "This deletes ALL channel folders and their processed results for:"
+            )
+        else:
+            detail = (
+                "This moves your images back to the project root and deletes the "
+                "organized folders and their processed results for:"
+            )
         reply = QMessageBox.warning(
             self, "Re-set up project?",
-            "This deletes ALL channel folders and their processed results for:\n\n"
-            f"{project_dir}\n\n"
+            f"{detail}\n\n{project_dir}\n\n"
             "The raw source images are kept. This cannot be undone. Continue?",
             QMessageBox.Yes | QMessageBox.No, QMessageBox.No
         )
         if reply != QMessageBox.Yes:
             return
-        removed = reset_multichannel_project(project_dir)
-        print(f"[resetup] removed {len(removed)} channel folder(s).")
+        if is_multi:
+            removed = reset_multichannel_project(project_dir)
+        else:
+            removed = reset_single_channel_project(project_dir)
+        print(f"[resetup] removed {len(removed)} folder(s).")
         if run_organize_wizard(self, project_dir, mode="new", project_dir=project_dir):
             self.open_path(project_dir)
 
@@ -359,6 +431,7 @@ class ProjectViewWindow(QMainWindow):
         )
         view.open_requested.connect(self._open_sample_folder)
         view.selection_changed.connect(self._update_action_buttons)
+        view.resetup_requested.connect(self._resetup_project)
         self._install_content_view(view)
 
         if self.project_manager.image_folders:

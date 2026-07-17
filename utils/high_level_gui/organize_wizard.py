@@ -111,6 +111,46 @@ def reset_multichannel_project(project_dir: str) -> List[str]:
     return removed
 
 
+def reset_single_channel_project(project_dir: str) -> List[str]:
+    """
+    Undo a single-channel organize so it can be set up again from scratch.
+
+    Single-channel setup MOVES each image into its own per-image subfolder (with
+    a config and, later, processed outputs). This reverses that: every organized
+    subfolder (exactly one image + one config at its top level) has its image
+    moved back to the project root, then the subfolder is deleted (dropping its
+    config and processed outputs). The raw images themselves are preserved.
+
+    Returns the list of removed subfolder paths.
+    """
+    removed: List[str] = []
+    try:
+        entries = os.listdir(project_dir)
+    except OSError:
+        return removed
+    for item in entries:
+        sub = os.path.join(project_dir, item)
+        if not os.path.isdir(sub):
+            continue
+        try:
+            contents = os.listdir(sub)
+        except OSError:
+            continue
+        tifs = [f for f in contents if f.lower().endswith((".tif", ".tiff"))]
+        yamls = [f for f in contents if f.lower().endswith((".yaml", ".yml"))]
+        if len(tifs) == 1 and len(yamls) == 1:
+            src = os.path.join(sub, tifs[0])
+            dst = os.path.join(project_dir, tifs[0])
+            try:
+                if not os.path.exists(dst):
+                    shutil.move(src, dst)
+            except OSError:
+                pass
+            shutil.rmtree(sub, ignore_errors=True)
+            removed.append(sub)
+    return removed
+
+
 # --------------------------------------------------------------------------- #
 # Qt wizard (only if PyQt5 is present)
 # --------------------------------------------------------------------------- #

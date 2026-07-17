@@ -150,6 +150,22 @@ def channel_display_name(channel_dir: str) -> str:
     return base
 
 
+def channel_number_label(channel_dir: str, position: int) -> str:
+    """
+    Short label for a channel shortcut button.
+
+    Uses the channel's real number from its folder name ('Channel_0_Microglia'
+    -> '0') so the button matches the 'Channel 0 ·' text under each image, even
+    if channels are non-contiguous. Falls back to the 0-based position when the
+    folder name has no parseable channel number.
+    """
+    base = os.path.basename(channel_dir.rstrip("/\\"))
+    parts = base.split("_")
+    if len(parts) >= 2 and parts[0].lower() == "channel" and parts[1] != "":
+        return parts[1]
+    return str(position)
+
+
 def build_channel_registry(channel_dirs: List[str]) -> "OrderedDict":
     """
     Map sample -> {channel_dir: sample_folder_path}, sample-first for the tree.
@@ -443,9 +459,9 @@ class RecentProjects:
 try:
     from PyQt5.QtCore import Qt, pyqtSignal  # type: ignore
     from PyQt5.QtWidgets import (  # type: ignore
-        QAbstractItemView, QFileDialog, QFrame, QHBoxLayout, QLabel, QListWidget,
-        QListWidgetItem, QMenu, QPushButton, QTreeWidget, QTreeWidgetItem,
-        QTreeWidgetItemIterator, QVBoxLayout, QWidget,
+        QAbstractItemView, QComboBox, QFileDialog, QFrame, QHBoxLayout, QLabel,
+        QListWidget, QListWidgetItem, QMenu, QPushButton, QTreeWidget,
+        QTreeWidgetItem, QTreeWidgetItemIterator, QVBoxLayout, QWidget,
     )
     _HAVE_QT = True
 except Exception:  # pragma: no cover - headless / no Qt
@@ -679,23 +695,35 @@ if _HAVE_QT:
         Signals:
             open_requested(str)         a sample folder to open (double-click)
             selection_changed()         the checked set changed
+        Signals:
+            open_requested(str)         a sample folder to open (double-click leaf)
+            overlay_requested(str)      a sample name to overlay (double-click parent)
+            selection_changed()         the checked set changed
             add_channel_requested(str)  project dir (multi-channel only)
             resetup_requested(str)      project dir (multi-channel only)
         """
 
         open_requested = pyqtSignal(str)
+        overlay_requested = pyqtSignal(str)
         selection_changed = pyqtSignal()
         add_channel_requested = pyqtSignal(str)
         resetup_requested = pyqtSignal(str)
 
+        # Roles used on tree items:
+        #   column 0, Qt.UserRole      -> leaf: actionable sample-folder path
+        #   column 1, Qt.UserRole      -> leaf: channel identity key
+        #   column 0, _SAMPLE_ROLE     -> parent: sample name (overlay target)
+        _SAMPLE_ROLE = Qt.UserRole + 1
+
         def __init__(self, registry, channel_dirs=None, project_dir: str = "",
-                     multichannel: Optional[bool] = None, parent=None):
+                     multichannel: Optional[bool] = None, analyses=None, parent=None):
             super().__init__(parent)
             self._registry = registry                    # sample -> {channel_key: folder}
             self._channel_dirs = list(channel_dirs or [])  # canonical channel order
             self._project_dir = project_dir
             self._multichannel = (bool(self._channel_dirs)
                                   if multichannel is None else multichannel)
+            self._analyses = list(analyses or [])        # cross-channel analysis names
             self._loading = False
             self._build()
             self.reload(registry)
@@ -716,17 +744,16 @@ if _HAVE_QT:
             self.clear_btn.clicked.connect(lambda: self._check_all(Qt.Unchecked))
             top.addWidget(self.clear_btn)
 
-            # Positional channel shortcuts: 1 = the first channel shown under each
-            # image, 2 = the second, and so on. Numbers stay compact because each
-            # channel already appears with its full config name in the tree.
+            # Channel shortcuts labelled by real channel number (0-based), so a
+            # button matches the 'Channel 0 ·' text shown under each image.
             if self._multichannel and self._channel_dirs:
                 sep = QFrame()
                 sep.setFrameShape(QFrame.VLine)
                 sep.setFrameShadow(QFrame.Sunken)
                 top.addWidget(sep)
                 top.addWidget(QLabel("Channel:"))
-                for i, ch_dir in enumerate(self._channel_dirs, start=1):
-                    b = QPushButton(str(i))
+                for i, ch_dir in enumerate(self._channel_dirs):
+                    b = QPushButton(channel_number_label(ch_dir, i))
                     b.setMaximumWidth(34)
                     b.setToolTip(
                         f"Select {channel_display_name(ch_dir)} for all images."
@@ -735,6 +762,27 @@ if _HAVE_QT:
                         lambda _=False, key=ch_dir: self._select_channel(key)
                     )
                     top.addWidget(b)
+
+            # Cross-channel overlay picker (multi-channel only). Sits to the right
+            # of the channel selectors. Hidden until at least one saved analysis
+            # exists; double-clicking an image row then overlays the chosen one.
+            self._overlay_widgets = []
+            self.analysis_combo = None
+            if self._multichannel:
+                osep = QFrame()
+                osep.setFrameShape(QFrame.VLine)
+                osep.setFrameShadow(QFrame.Sunken)
+                olabel = QLabel("Overlay:")
+                self.analysis_combo = QComboBox()
+                self.analysis_combo.setToolTip(
+                    "Double-click an image (parent) row to overlay this saved "
+                    "cross-channel analysis. Channels always open on their own."
+                )
+                top.addWidget(osep)
+                top.addWidget(olabel)
+                top.addWidget(self.analysis_combo)
+                self._overlay_widgets = [osep, olabel, self.analysis_combo]
+                self._populate_analysis_combo(keep_selection=False)
 
             top.addStretch(1)
 
@@ -751,15 +799,16 @@ if _HAVE_QT:
                 )
                 top.addWidget(self.add_channel_btn)
 
-                self.resetup_btn = QPushButton("Re-set up project…")
-                self.resetup_btn.setToolTip(
-                    "Delete the current channel structure and processed results, "
-                    "then set the project up again from scratch. Raw images kept."
-                )
-                self.resetup_btn.clicked.connect(
-                    lambda: self.resetup_requested.emit(self._project_dir)
-                )
-                top.addWidget(self.resetup_btn)
+            # Re-set up is available for both single- and multi-channel projects.
+            self.resetup_btn = QPushButton("Re-set up project…")
+            self.resetup_btn.setToolTip(
+                "Delete the organized structure and processed results, then set "
+                "the project up again from scratch. Raw images are kept."
+            )
+            self.resetup_btn.clicked.connect(
+                lambda: self.resetup_requested.emit(self._project_dir)
+            )
+            top.addWidget(self.resetup_btn)
             root.addLayout(top)
 
             self.tree = _CheckTree()
@@ -782,7 +831,8 @@ if _HAVE_QT:
             if self._multichannel:
                 for sample, channels in registry.items():
                     parent = QTreeWidgetItem([sample, "", "", ""])
-                    parent.setData(0, Qt.UserRole, None)   # parents aren't openable
+                    parent.setData(0, Qt.UserRole, None)   # not a leaf: no folder path
+                    parent.setData(0, self._SAMPLE_ROLE, sample)  # overlay target
                     parent.setFlags(
                         parent.flags() | Qt.ItemIsUserCheckable | Qt.ItemIsAutoTristate
                     )
@@ -926,7 +976,47 @@ if _HAVE_QT:
         def _on_double_click(self, item, _column) -> None:
             p = item.data(0, Qt.UserRole)
             if p:
+                # Leaf: always open this one channel's normal processing view.
                 self.open_requested.emit(p)
+                return
+            sample = item.data(0, self._SAMPLE_ROLE)
+            if sample is not None:
+                # Parent image row: open the multi-channel sample viewer (raw
+                # channels visible, segmentation hidden). If the picker has an
+                # analysis selected, the host also overlays its derived layers.
+                self.overlay_requested.emit(sample)
+
+        # ---- cross-channel overlay picker ----------------------------------- #
+        def _populate_analysis_combo(self, keep_selection: bool = True) -> None:
+            combo = self.analysis_combo
+            if combo is None:
+                return
+            previous = combo.currentData() if keep_selection else None
+            combo.blockSignals(True)
+            combo.clear()
+            combo.addItem("— none —", None)          # neutral default: no overlay
+            for name in self._analyses:
+                combo.addItem(name, name)
+            if previous is not None:
+                idx = combo.findData(previous)
+                combo.setCurrentIndex(idx if idx >= 0 else 0)
+            else:
+                combo.setCurrentIndex(0)
+            combo.blockSignals(False)
+            # Only expose the picker once at least one analysis exists.
+            visible = bool(self._analyses)
+            for w in self._overlay_widgets:
+                w.setVisible(visible)
+
+        def set_analyses(self, analyses) -> None:
+            """Refresh the list of available cross-channel analyses in the picker."""
+            self._analyses = list(analyses or [])
+            self._populate_analysis_combo(keep_selection=True)
+
+        def current_analysis(self) -> Optional[str]:
+            """The selected analysis name, or None when on the neutral entry."""
+            combo = self.analysis_combo
+            return combo.currentData() if combo is not None else None
 
     # Backwards-compatible alias: older call sites referred to MultiChannelView.
     MultiChannelView = ProjectContentsView
