@@ -197,7 +197,8 @@ def describe_version(repo_root: Optional[str] = None) -> Dict[str, Optional[str]
     field it can't determine is None (e.g. not a git checkout -> commit is None).
     """
     info: Dict[str, Optional[str]] = {
-        "commit": None, "short": None, "date": None, "branch": None, "dirty": None,
+        "commit": None, "short": None, "date": None, "branch": None,
+        "tag": None, "dirty": None,
     }
     try:
         if not repo_root:
@@ -211,6 +212,12 @@ def describe_version(repo_root: Optional[str] = None) -> Dict[str, Optional[str]
             info["short"] = parts[1] or None
             info["date"] = parts[2] or None
         info["branch"] = current_branch(repo_root)
+        # Nearest semantic tag, e.g. 'v1.2.0' (exact) or 'v1.2.0-3-gabc123' (3
+        # commits after the tag). Empty/None if the repo has no tags. This is the
+        # human-facing version to cite when reproducing an analysis.
+        rc, tag, _ = _git(["describe", "--tags", "--always"], repo_root)
+        if rc == 0 and tag:
+            info["tag"] = tag
         # Only tracked-file modifications count as "dirty". We ignore untracked
         # files because importing modules writes __pycache__/*.pyc into the tree,
         # which would otherwise mark every run dirty. What matters for

@@ -6,7 +6,7 @@ import yaml  # type: ignore
 from PyQt5.QtGui import QCloseEvent, QIcon  # type: ignore
 from PyQt5.QtCore import Qt  # type: ignore
 from PyQt5.QtWidgets import (  # type: ignore
-    QApplication, QFileDialog, QMessageBox, QMainWindow, QVBoxLayout, QHBoxLayout, QListWidget, QListWidgetItem, QPushButton, QWidget, QLabel, QInputDialog
+    QApplication, QFileDialog, QMessageBox, QMainWindow, QVBoxLayout, QHBoxLayout, QListWidget, QListWidgetItem, QPushButton, QWidget, QLabel, QInputDialog, QStackedWidget
 )
 
 from .gui_text_utils import app_icon_path
@@ -65,10 +65,15 @@ class ProjectViewWindow(QMainWindow):
 
         self.project_path_label = QLabel("Project Path: Not Selected")
         layout.addWidget(self.project_path_label)
-        
+
+        # Content area swaps between the single/normal-project image list and the
+        # multi-channel tree, so both render in-place (no separate window).
+        self.content_stack = QStackedWidget()
         self.image_list = QListWidget()
         self.image_list.itemDoubleClicked.connect(self.open_image_view)
-        layout.addWidget(self.image_list)
+        self.content_stack.addWidget(self.image_list)  # page 0: normal projects
+        self._multichannel_view = None                 # page 1: created on demand
+        layout.addWidget(self.content_stack)
         
         button_layout = QHBoxLayout()
 
@@ -126,14 +131,6 @@ class ProjectViewWindow(QMainWindow):
         self.analyzer_window = CrossChannelAnalyzerWindow(self.project_manager)
         self.analyzer_window.show()
 
-    def load_project(self) -> None:
-        """Browse for a folder, then route it through the smart classifier."""
-        selected_path = QFileDialog.getExistingDirectory(
-            self, "Select a project folder or a folder of images", ""
-        )
-        if selected_path:
-            self.open_path(selected_path)
-
     def open_path(self, selected_path: str) -> None:
         """
         Act on any user-selected path (from Browse, a recent row, or a drop),
@@ -184,6 +181,7 @@ class ProjectViewWindow(QMainWindow):
 
         # PROJECT or RAW_IMAGES: hand off to the existing loader/scaffolder, which
         # already knows how to organize raw images and populate the list.
+        self.content_stack.setCurrentWidget(self.image_list)
         self.project_manager.project_path = info.path
         self.cross_channel_btn.setEnabled(True)
         self.project_path_label.setText(f"Project Path: {info.path}")
@@ -191,9 +189,8 @@ class ProjectViewWindow(QMainWindow):
         self._load_or_organize(info.path)
 
     def open_multichannel(self, info) -> None:
-        """Show the sample→channel tree for a multi-channel project."""
+        """Show the sample→channel tree for a multi-channel project, in-place."""
         if MultiChannelView is None:
-            # Extremely unlikely (needs Qt, which we're already running under).
             QMessageBox.information(
                 self, "Multi-channel project",
                 f"{info.note}\nOpen a specific Channel_* folder to work on it."
@@ -211,17 +208,27 @@ class ProjectViewWindow(QMainWindow):
         if self.welcome is not None:
             self.welcome.refresh_recents()
 
+        # Replace any previously embedded tree, then swap the content area to it.
+        if self._multichannel_view is not None:
+            self.content_stack.removeWidget(self._multichannel_view)
+            self._multichannel_view.deleteLater()
+            self._multichannel_view = None
+
         view = MultiChannelView(registry)
-        view.setWindowTitle(f"Multi-channel — {os.path.basename(info.path)}")
         view.open_requested.connect(self._open_sample_folder)
         view.batch_requested.connect(self._batch_process_folders)
         view.cross_channel_requested.connect(
             lambda p=info.channel_dirs[0]: self._open_cross_channel_from(p)
         )
-        view.resize(640, 480)
-        view.show()
-        # keep a reference so it isn't garbage-collected
         self._multichannel_view = view
+        self.content_stack.addWidget(view)
+        self.content_stack.setCurrentWidget(view)
+
+        # The multi-channel view carries its own process / cross-channel actions,
+        # so the list-oriented bottom buttons don't apply here.
+        self.batch_process_all_btn.setEnabled(False)
+        self.set_config_btn.setEnabled(False)
+        self.cross_channel_btn.setEnabled(False)
 
     def _open_sample_folder(self, folder: str) -> None:
         """Open one channel's sample image in the interactive segmentation view."""

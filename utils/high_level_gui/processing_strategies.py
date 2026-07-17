@@ -38,6 +38,7 @@ def _hibachi_version_stamp() -> Dict[str, Any]:
     stamp: Dict[str, Any] = {
         "commit": None,
         "short": None,
+        "tag": None,
         "date": None,
         "branch": None,
         "dirty": None,
@@ -56,7 +57,7 @@ def _hibachi_version_stamp() -> Dict[str, Any]:
         import updater  # type: ignore
 
         info = updater.describe_version(repo_root)
-        for key in ("commit", "short", "date", "branch", "dirty"):
+        for key in ("commit", "short", "tag", "date", "branch", "dirty"):
             if key in info:
                 stamp[key] = info[key]
     except Exception as exc:  # pragma: no cover - defensive
