@@ -281,11 +281,17 @@ class ProjectViewWindow(QMainWindow):
             return
         analysis = view.current_analysis()  # None on the neutral entry
 
+        # Re-anchor the scan at THIS project's channel dir and rebuild the
+        # consolidated registry fresh every time. project_path can drift (opening
+        # a channel leaf, the analyzer, another project) and the registry may be
+        # stale from a previous project, so relying on a cached one is unsafe.
+        if self._cross_scan_dir:
+            self.project_manager.project_path = self._cross_scan_dir
+        self.project_manager.build_consolidated_sample_registry()
+
         # The tree keys samples by folder basename; the consolidated registry and
         # analysis folders use the "clean" name. Map between the two.
         clean = clean_filename_for_matching(sample_name)
-        if not self.project_manager.sample_registry:
-            self.project_manager.build_consolidated_sample_registry()
         if clean not in self.project_manager.sample_registry:
             QMessageBox.warning(
                 self, "No cross-channel data",
