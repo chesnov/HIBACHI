@@ -176,46 +176,87 @@ def _make_macos(repo_root: str, home: str) -> List[str]:
 # --------------------------------------------------------------------------- #
 # Windows
 # --------------------------------------------------------------------------- #
-def _make_windows(repo_root: str, home: str) -> List[str]:
-    # pythonw avoids a lingering console window.
-    cmd = _quote(launch_command(repo_root, windowless=True))
-    bat = "@echo off\r\n" f"start \"\" {cmd}\r\n"
-    written = []
+def _cleanup_windows_shortcuts(dirs: List[str]) -> None:
+    """
+    Remove HIBACHI shortcuts left by earlier installs.
 
+    Historically we wrote BOTH a HIBACHI.bat (generic/no-logo icon) and a
+    HIBACHI.lnk (logo) to the Desktop, so users saw two icons -- and a stale
+    .lnk from an older build could launch the wrong interpreter and fail with
+    "MSVCP140.dll is missing". We now write a single shortcut, so first delete
+    any of the old ones (both extensions, Desktop + Start Menu) before writing.
+    """
+    for d in dirs:
+        for name in (f"{APP_NAME}.bat", f"{APP_NAME}.lnk"):
+            p = os.path.join(d, name)
+            try:
+                if os.path.exists(p):
+                    os.remove(p)
+                    print(f"[shortcut] removed stale shortcut: {p}")
+            except OSError as exc:
+                print(f"[shortcut] could not remove {p}: {exc}")
+
+
+def _make_windows(repo_root: str, home: str) -> List[str]:
+    written = []
     desktop_dir = os.path.join(home, "Desktop")
-    for target_dir in (
-        desktop_dir,
-        os.path.join(
-            os.environ.get("APPDATA", os.path.join(home, "AppData", "Roaming")),
-            "Microsoft", "Windows", "Start Menu", "Programs",
-        ),
-    ):
+    start_menu = os.path.join(
+        os.environ.get("APPDATA", os.path.join(home, "AppData", "Roaming")),
+        "Microsoft", "Windows", "Start Menu", "Programs",
+    )
+
+    # Clear out anything a previous install left behind so we don't end up with
+    # a broken logo .lnk sitting next to a working .bat (the "two icons" bug).
+    _cleanup_windows_shortcuts([desktop_dir, start_menu])
+
+    # Preferred launcher: ONE .lnk with the real icon, launched through the env
+    # manager (`micromamba run --prefix <prefix> pythonw ...`) so the app runs
+    # under the env's own pythonw.exe -- the only place the conda-provided MSVC
+    # runtime (MSVCP140.dll, needed by the pip Qt wheels) is on the DLL search
+    # path. A .lnk that launches Python any other way is what produces the
+    # "MSVCP140.dll is missing" error.
+    lnk_ok = False
+    try:
+        os.makedirs(desktop_dir, exist_ok=True)
+        _make_windows_lnk(repo_root, desktop_dir)
+        written.append(os.path.join(desktop_dir, f"{APP_NAME}.lnk"))
+        lnk_ok = True
+    except Exception as exc:  # pragma: no cover
+        print(f"[shortcut] .lnk creation failed, falling back to .bat: {exc}")
+
+    # Fallback ONLY if the .lnk could not be created (e.g. PowerShell blocked):
+    # a .bat that still routes through the env manager.
+    if not lnk_ok:
+        cmd = _quote(launch_command(repo_root, windowless=True))
+        bat = "@echo off\r\n" f"start \"\" {cmd}\r\n"
         try:
-            os.makedirs(target_dir, exist_ok=True)
-            bat_path = os.path.join(target_dir, f"{APP_NAME}.bat")
+            os.makedirs(desktop_dir, exist_ok=True)
+            bat_path = os.path.join(desktop_dir, f"{APP_NAME}.bat")
             with open(bat_path, "w", newline="") as fh:
                 fh.write(bat)
             written.append(bat_path)
         except Exception as exc:  # pragma: no cover
-            print(f"[shortcut] could not write to {target_dir}: {exc}")
+            print(f"[shortcut] could not write to {desktop_dir}: {exc}")
 
-    # Best-effort: also drop a nicer .lnk on the Desktop via PowerShell.
+    # Start Menu entry (one .lnk; not on the Desktop, so it doesn't double the icon).
     try:
-        _make_windows_lnk(repo_root, desktop_dir)
-        written.append(os.path.join(desktop_dir, f"{APP_NAME}.lnk"))
+        os.makedirs(start_menu, exist_ok=True)
+        _make_windows_lnk(repo_root, start_menu)
+        written.append(os.path.join(start_menu, f"{APP_NAME}.lnk"))
     except Exception as exc:  # pragma: no cover
-        print(f"[shortcut] .lnk creation skipped: {exc}")
+        print(f"[shortcut] Start Menu .lnk skipped: {exc}")
+
     return written
 
 
-def _make_windows_lnk(repo_root: str, desktop_dir: str) -> None:
+def _make_windows_lnk(repo_root: str, dest_dir: str) -> None:
     import subprocess
 
     mgr = _env_manager_exe()
     prefix = sys.prefix
     run_app = os.path.join(repo_root, "launcher", "run_app.py")
     icon = os.path.join(repo_root, "packaging", "windows", "hibachi.ico")
-    lnk = os.path.join(desktop_dir, f"{APP_NAME}.lnk")
+    lnk = os.path.join(dest_dir, f"{APP_NAME}.lnk")
     args = f'run --prefix "{prefix}" pythonw "{run_app}"'
     icon_line = f"$S.IconLocation = '{icon}'; " if os.path.isfile(icon) else ""
     ps = (
