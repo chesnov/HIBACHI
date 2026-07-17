@@ -214,6 +214,40 @@ def _launch_app(repo_root: str) -> int:
     return subprocess.run([sys.executable, entry], cwd=repo_root).returncode
 
 
+def _activate_env_path() -> None:
+    """
+    Put the active env's binary directories on PATH.
+
+    We launch the app with the env's interpreter directly (not `micromamba run`),
+    which is what fixed the DLL-not-found crash -- but it also skips conda
+    activation, so PATH no longer contains the env's bin dirs. Tools the app
+    shells out to via subprocess (notably `git`, used by the self-updater) then
+    fail with "git executable not found on PATH", even though git ships inside
+    the env. This restores just the PATH part of activation. subprocess and the
+    launched child both inherit os.environ, so this covers both.
+    """
+    prefix = sys.prefix
+    if sys.platform.startswith("win"):
+        dirs = [
+            prefix,
+            os.path.join(prefix, "Library", "bin"),
+            os.path.join(prefix, "Library", "cmd"),
+            os.path.join(prefix, "Library", "mingw-w64", "bin"),
+            os.path.join(prefix, "Library", "mingw64", "bin"),
+            os.path.join(prefix, "Library", "usr", "bin"),
+            os.path.join(prefix, "Scripts"),
+        ]
+    else:
+        dirs = [os.path.join(prefix, "bin")]
+    dirs = [d for d in dirs if os.path.isdir(d)]
+    current = os.environ.get("PATH", "")
+    # Prepend, skipping any already present, so env tools win but we don't bloat PATH.
+    have = set(current.split(os.pathsep))
+    new = [d for d in dirs if d not in have]
+    if new:
+        os.environ["PATH"] = os.pathsep.join(new + ([current] if current else []))
+
+
 def main() -> int:
     no_update = os.environ.get("HIBACHI_NO_UPDATE") == "1"
     no_splash = os.environ.get("HIBACHI_NO_SPLASH") == "1"
@@ -222,6 +256,11 @@ def main() -> int:
     want_rollback = ("--rollback" in sys.argv[1:]) or os.environ.get("HIBACHI_ROLLBACK") == "1"
 
     repo_root = updater.find_repo_root(_HERE) or os.path.dirname(_HERE)
+
+    # Restore the env's PATH first: the update check below shells out to `git`,
+    # which lives inside the env but isn't on PATH when we launch the interpreter
+    # directly. Do this before check_for_update or it reports "git not found".
+    _activate_env_path()
 
     # Software-OpenGL fallback for VMs / remote desktop / driverless hosts. Must
     # be set before the child creates its QApplication and before vispy imports

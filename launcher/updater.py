@@ -81,6 +81,57 @@ def find_repo_root(start: Optional[str] = None) -> Optional[str]:
         here = parent
 
 
+_GIT_EXE: Optional[str] = None
+
+
+def _find_git() -> str:
+    """
+    Resolve a git executable, preferring an absolute path over the bare name.
+
+    Order: $HIBACHI_GIT, then PATH, then the known conda-env locations relative
+    to this interpreter's prefix (git ships inside the env). Falls back to the
+    bare "git" if nothing is found, preserving the old behaviour. Cached.
+
+    This makes the self-updater robust when the app is launched with the env's
+    interpreter directly (no conda activation), where git is installed in the
+    env but not on PATH.
+    """
+    global _GIT_EXE
+    if _GIT_EXE is not None:
+        return _GIT_EXE
+
+    import shutil
+    import sys
+
+    override = os.environ.get("HIBACHI_GIT")
+    if override and os.path.isfile(override):
+        _GIT_EXE = override
+        return _GIT_EXE
+
+    found = shutil.which("git")
+    if found:
+        _GIT_EXE = found
+        return _GIT_EXE
+
+    prefix = sys.prefix
+    if sys.platform.startswith("win"):
+        candidates = [
+            os.path.join(prefix, "Library", "bin", "git.exe"),
+            os.path.join(prefix, "Library", "cmd", "git.exe"),
+            os.path.join(prefix, "Library", "mingw64", "bin", "git.exe"),
+            os.path.join(prefix, "Library", "mingw-w64", "bin", "git.exe"),
+        ]
+    else:
+        candidates = [os.path.join(prefix, "bin", "git")]
+    for cand in candidates:
+        if os.path.isfile(cand):
+            _GIT_EXE = cand
+            return _GIT_EXE
+
+    _GIT_EXE = "git"  # last resort; may still resolve via PATH at call time
+    return _GIT_EXE
+
+
 def _git(
     args: List[str],
     cwd: str,
@@ -89,7 +140,7 @@ def _git(
     """Run a git command, returning (returncode, stdout, stderr). Never raises."""
     try:
         proc = subprocess.run(
-            ["git", *args],
+            [_find_git(), *args],
             cwd=cwd,
             capture_output=True,
             text=True,
@@ -97,7 +148,7 @@ def _git(
         )
         return proc.returncode, proc.stdout.strip(), proc.stderr.strip()
     except FileNotFoundError:
-        return 127, "", "git executable not found on PATH"
+        return 127, "", "git executable not found (checked PATH and the env)"
     except subprocess.TimeoutExpired:
         return 124, "", f"git {' '.join(args)} timed out after {timeout}s"
     except Exception as exc:  # pragma: no cover - defensive
