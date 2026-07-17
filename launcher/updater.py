@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+import sys
 import time
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Tuple
@@ -132,6 +133,12 @@ def _find_git() -> str:
     return _GIT_EXE
 
 
+# Windows: launching a console program (git) from a GUI process (pythonw) pops a
+# console window for a split second. Passing CREATE_NO_WINDOW suppresses it, so
+# the self-update's many git calls don't flash terminals on the user's screen.
+_CREATE_NO_WINDOW = 0x08000000 if sys.platform.startswith("win") else 0
+
+
 def _git(
     args: List[str],
     cwd: str,
@@ -145,6 +152,7 @@ def _git(
             capture_output=True,
             text=True,
             timeout=timeout,
+            creationflags=_CREATE_NO_WINDOW,
         )
         return proc.returncode, proc.stdout.strip(), proc.stderr.strip()
     except FileNotFoundError:

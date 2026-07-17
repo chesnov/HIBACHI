@@ -45,13 +45,15 @@ Source: "..\..\install\install.ps1";     DestDir: "{app}\bootstrap"; Flags: igno
 Source: "..\..\install\environment.yml";  DestDir: "{app}\bootstrap"; Flags: ignoreversion
 
 [Run]
-; Run the bootstrap with a visible progress message. Pass the user's chosen
-; install folder ({app}) so install.ps1 puts micromamba + the checkout THERE and
-; the shortcut points at that location (a non-default folder used to be ignored).
+; Show the console during setup: the slow part (downloading micromamba, solving
+; and creating the conda env) takes minutes, and micromamba prints live download
+; / solve progress. Running it VISIBLE means the user sees it working instead of
+; staring at a status bar that filled in the first second and then sits still.
+; (App launch is separate and stays windowless.)
 Filename: "powershell.exe"; \
   Parameters: "-ExecutionPolicy Bypass -NoProfile -File ""{app}\bootstrap\install.ps1"" -InstallDir ""{app}"""; \
-  StatusMsg: "Downloading and setting up HIBACHI (this can take several minutes)..."; \
-  Flags: runhidden waituntilterminated
+  StatusMsg: "Setting up HIBACHI. A console window shows live progress; this takes several minutes..."; \
+  Flags: waituntilterminated
 
 [UninstallRun]
 ; Best-effort cleanup of the installed environment + checkout on uninstall.

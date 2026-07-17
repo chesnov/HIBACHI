@@ -14,6 +14,14 @@ from .cross_channel_window import CrossChannelAnalyzerWindow
 from .metadata import MetadataExtractor
 from .project_manager import ProjectManager
 from .project_scaffolding import apply_template_config_to_project, organize_channel_project, organize_processing_dir, scan_available_presets
+from .project_selection import (
+    classify_path, RecentProjects, PROJECT, RAW_IMAGES, PARENT_OF_PROJECTS,
+    EMPTY, MISSING,
+)
+try:
+    from .project_selection import WelcomeWidget  # needs Qt; always true here
+except Exception:  # pragma: no cover
+    WelcomeWidget = None  # type: ignore
 
 # --- Optional BatchProcessor import ---
 try:
@@ -31,6 +39,7 @@ class ProjectViewWindow(QMainWindow):
     def __init__(self, project_manager: ProjectManager):
         super().__init__()
         self.project_manager = project_manager
+        self.recent = RecentProjects()
         self.initUI()
         self.setAttribute(Qt.WA_QuitOnClose)
 
@@ -43,7 +52,16 @@ class ProjectViewWindow(QMainWindow):
         
         central_widget = QWidget()
         layout = QVBoxLayout()
-        
+
+        # Guided welcome panel: recent projects, drag-and-drop, and forgiving
+        # Browse buttons. Every selection is routed through open_path(), which
+        # classifies it and does the right thing (open / organize / drill in).
+        self.welcome = None
+        if WelcomeWidget is not None:
+            self.welcome = WelcomeWidget(self.recent)
+            self.welcome.path_chosen.connect(self.open_path)
+            layout.addWidget(self.welcome)
+
         self.project_path_label = QLabel("Project Path: Not Selected")
         layout.addWidget(self.project_path_label)
         
@@ -111,14 +129,66 @@ class ProjectViewWindow(QMainWindow):
         self.analyzer_window.show()
 
     def load_project(self) -> None:
-        selected_path = self.project_manager.select_project_folder()
-        self.cross_channel_btn.setEnabled(True)
-        if not selected_path:
+        """Browse for a folder, then route it through the smart classifier."""
+        selected_path = QFileDialog.getExistingDirectory(
+            self, "Select a project folder or a folder of images", ""
+        )
+        if selected_path:
+            self.open_path(selected_path)
+
+    def open_path(self, selected_path: str) -> None:
+        """
+        Act on any user-selected path (from Browse, a recent row, or a drop),
+        deciding what it is instead of assuming the user picked correctly.
+
+          * a project            -> open it
+          * loose raw images      -> offer to organize into a project
+          * a folder of projects  -> let the user pick which one
+          * an image file         -> use its containing folder (handled by classify)
+          * empty / missing       -> explain, don't fail silently
+        """
+        info = classify_path(selected_path)
+
+        if info.redirected_from_file:
+            QMessageBox.information(
+                self, "Using folder",
+                "You selected an image file, so HIBACHI will use its folder:\n\n"
+                f"{info.path}"
+            )
+
+        if info.kind == MISSING:
+            QMessageBox.warning(self, "Not found", info.note)
             return
-            
-        self.project_path_label.setText(f"Project Path: {selected_path}")
+
+        if info.kind == EMPTY:
+            QMessageBox.warning(
+                self, "Nothing to open",
+                f"{info.note}\n\nPick a folder that contains images, or a project "
+                "folder (whose sub-folders each hold one image and one config)."
+            )
+            return
+
+        if info.kind == PARENT_OF_PROJECTS:
+            names = [os.path.basename(p) for p in info.project_roots]
+            choice, ok = QInputDialog.getItem(
+                self, "Choose a project",
+                f"{os.path.basename(info.path)} contains several projects.\n"
+                "Which would you like to open?",
+                names, 0, False
+            )
+            if ok and choice:
+                self.open_path(info.project_roots[names.index(choice)])
+            return
+
+        # PROJECT or RAW_IMAGES: hand off to the existing loader/scaffolder, which
+        # already knows how to organize raw images and populate the list.
+        self.project_manager.project_path = info.path
+        self.cross_channel_btn.setEnabled(True)
+        self.project_path_label.setText(f"Project Path: {info.path}")
         self.image_list.clear()
-        
+        self._load_or_organize(info.path)
+
+    def _load_or_organize(self, selected_path: str) -> None:
         try:
             # Check for raw files that might need organization
             raw_files = [
@@ -220,10 +290,18 @@ class ProjectViewWindow(QMainWindow):
                 )
                 item.setData(Qt.UserRole, folder_path)
                 self.image_list.addItem(item)
-                
+
+            # Only remember it as a "recent project" if it actually resolved to
+            # one (has image folders) -- so we don't clutter the list with raw or
+            # empty folders the user browsed by mistake.
+            if self.project_manager.image_folders:
+                self.recent.add(selected_path)
+                if self.welcome is not None:
+                    self.welcome.refresh_recents()
+
         except Exception as e:
             QMessageBox.critical(self, "Error", str(e))
-            
+
         self._update_batch_button_state()
 
     def open_image_view(self, item: QListWidgetItem) -> None:

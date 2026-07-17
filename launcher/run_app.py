@@ -68,6 +68,11 @@ def _find_env_manager() -> tuple[str, list[str]] | tuple[None, None]:
     return None, None
 
 
+# Windows: suppress the console window that pops when this GUI (pythonw) process
+# spawns console programs (micromamba, python). 0 on other platforms.
+_CREATE_NO_WINDOW = 0x08000000 if sys.platform.startswith("win") else 0
+
+
 def _update_environment(repo_root: str, splash) -> bool:
     """Run `<mgr> env update` for the *currently active* prefix. Best-effort."""
     exe, _ = _find_env_manager()
@@ -80,7 +85,7 @@ def _update_environment(repo_root: str, splash) -> bool:
     cmd = [exe, "env", "update", "--prefix", prefix, "--file", env_file, "--yes"]
     _msg(splash, "Updating dependencies (this may take a few minutes)...")
     try:
-        subprocess.run(cmd, check=True)
+        subprocess.run(cmd, check=True, creationflags=_CREATE_NO_WINDOW)
         return True
     except subprocess.CalledProcessError as exc:
         _msg(splash, f"Dependency update failed ({exc.returncode}); using existing packages.")
@@ -188,7 +193,9 @@ def _launch_app(repo_root: str) -> int:
     # registers the env's DLL directories itself, at its very top, before Qt is
     # imported (see the os.add_dll_directory block in segment.py). Running a real
     # file on disk is both cleaner and far less likely to trip a false positive.
-    return subprocess.run([sys.executable, entry], cwd=repo_root).returncode
+    return subprocess.run(
+        [sys.executable, entry], cwd=repo_root, creationflags=_CREATE_NO_WINDOW
+    ).returncode
 
 
 def _activate_env_path() -> None:

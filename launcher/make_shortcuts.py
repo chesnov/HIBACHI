@@ -383,7 +383,15 @@ def _make_windows_lnk(repo_root: str, dest_dir: str) -> None:
         f"{icon_line}"
         "$S.Save()"
     )
-    subprocess.run(["powershell", "-NoProfile", "-Command", ps], check=True)
+    # CREATE_NO_WINDOW: run_app refreshes the shortcut on every launch via this
+    # PowerShell call; without the flag a console window flashes each time the
+    # app starts (looks alarming to users). Windows-only flag; 0 elsewhere.
+    _no_window = 0x08000000 if sys.platform.startswith("win") else 0
+    subprocess.run(
+        ["powershell", "-NoProfile", "-Command", ps],
+        check=True,
+        creationflags=_no_window,
+    )
 
 
 def _ps_q(s: str) -> str:
