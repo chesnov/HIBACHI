@@ -180,37 +180,14 @@ def _launch_app(repo_root: str) -> int:
         os.execv(sys.executable, [sys.executable, entry])
         # os.execv does not return on success.
 
-    if sys.platform.startswith("win"):
-        # Windows DLL resolution: the pip-installed PyQt5 wheels depend on the
-        # MSVC runtime (MSVCP140.dll), which conda-forge ships in the env root
-        # (next to pythonw.exe) and/or Library\bin. Since Python 3.8 the loader
-        # no longer searches PATH for a module's dependent DLLs, and Qt/napari
-        # startup narrows the default search (SetDefaultDllDirectories), so the
-        # env root stops being searched and Qt5Core.dll fails to find MSVCP140.dll
-        # -> the "MSVCP140.dll is missing" error. Registering the env's DLL dirs
-        # with os.add_dll_directory *before* Qt is imported fixes it. We do it in
-        # the child (a tiny -c bootstrap) so it applies to the process that
-        # actually imports Qt; __name__ stays "__main__" and __file__ is set so
-        # segment.py runs exactly as if invoked directly.
-        boot = (
-            "import os, sys\n"
-            "for _d in (sys.prefix, os.path.join(sys.prefix, 'Library', 'bin')):\n"
-            "    try:\n"
-            "        os.path.isdir(_d) and os.add_dll_directory(_d)\n"
-            "    except OSError:\n"
-            "        pass\n"
-            # Running via `-c` puts the CWD (not the script dir) on sys.path, so
-            # add the repo root explicitly -- otherwise `import utils` inside
-            # segment.py depends on the CWD being right. (cwd=repo_root below
-            # already sets that, but this makes it robust either way.)
-            f"sys.path.insert(0, {repo_root!r})\n"
-            f"__file__ = {entry!r}\n"
-            "sys.argv = [__file__]\n"
-            "exec(compile(open(__file__, 'rb').read(), __file__, 'exec'))\n"
-        )
-        return subprocess.run([sys.executable, "-c", boot], cwd=repo_root).returncode
-
-    # Run with the env's own interpreter, from the repo root so `import utils` works.
+    # All other platforms (incl. Windows): run the real entry point as a plain,
+    # named script with the env's own interpreter, from the repo root so
+    # `import utils` resolves. We deliberately do NOT use `python -c "exec(...)"`:
+    # executing a code string is a behavioural pattern endpoint-security tools
+    # (EDR) flag as loader-like, and it is unnecessary here -- segment.py already
+    # registers the env's DLL directories itself, at its very top, before Qt is
+    # imported (see the os.add_dll_directory block in segment.py). Running a real
+    # file on disk is both cleaner and far less likely to trip a false positive.
     return subprocess.run([sys.executable, entry], cwd=repo_root).returncode
 
 
