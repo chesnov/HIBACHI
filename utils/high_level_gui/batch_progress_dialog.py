@@ -11,6 +11,7 @@ separate process rather than a thread).
 from __future__ import annotations
 
 import multiprocessing as mp
+import os
 import queue as _pyqueue
 from typing import Dict, List
 
@@ -181,7 +182,7 @@ class BatchProgressDialog(QDialog):
             self._proc = self._ctx.Process(
                 target=run_batch_process,
                 args=(self._folders, self._force_map, self._queue),
-                daemon=True,
+                daemon=False,  # the pipeline spawns its own Pool workers
             )
             self._proc.start()
         except Exception as exc:
@@ -254,13 +255,51 @@ class BatchProgressDialog(QDialog):
         self._finish(cancelled=True)
 
     def _kill_process(self) -> None:
-        if self._proc is not None:
-            try:
-                if self._proc.is_alive():
-                    self._proc.terminate()
-                self._proc.join(2)
-            except Exception:
-                pass
+        """Terminate the worker AND every process it spawned (Pool workers).
+
+        On POSIX the child detached into its own process group (os.setsid), so we
+        can signal that group. We guard against ever signalling the GUI's own
+        group (in case the child hasn't detached yet) and escalate SIGTERM ->
+        SIGKILL. On Windows we kill the tree with taskkill /T.
+        """
+        proc = self._proc
+        if proc is None:
+            return
+        try:
+            pid = proc.pid
+            if pid is not None and proc.is_alive():
+                if os.name == "posix":
+                    import signal
+                    try:
+                        pgid = os.getpgid(pid)
+                    except Exception:
+                        pgid = None
+                    # Never signal our own group (would kill the GUI).
+                    if pgid is not None and pgid != os.getpgid(0):
+                        try:
+                            os.killpg(pgid, signal.SIGTERM)
+                        except Exception:
+                            proc.terminate()
+                        proc.join(1.5)
+                        if proc.is_alive():
+                            try:
+                                os.killpg(pgid, signal.SIGKILL)
+                            except Exception:
+                                proc.kill()
+                    else:
+                        proc.terminate()  # not detached yet: single process only
+                else:
+                    import subprocess
+                    try:
+                        subprocess.run(
+                            ["taskkill", "/F", "/T", "/PID", str(pid)],
+                            capture_output=True,
+                        )
+                    except Exception:
+                        proc.terminate()
+            proc.join(2)
+        except Exception:
+            pass
 
     def _finish(self, cancelled: bool) -> None:
         if self._finished:

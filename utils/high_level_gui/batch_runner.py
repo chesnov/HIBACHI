@@ -21,6 +21,7 @@ IPC: a single multiprocessing.Queue carries tagged messages back to the parent:
 
 from __future__ import annotations
 
+import os
 import sys
 import traceback
 from typing import Dict, List
@@ -60,6 +61,15 @@ def run_batch_process(folders: List[str], force_map: Dict[str, bool], queue) -> 
     # Route all output back to the parent's console pane.
     sys.stdout = _QueueWriter(queue)
     sys.stderr = _QueueWriter(queue)
+
+    # Detach into our own process group / session (POSIX) so the GUI can kill
+    # this entire subtree on Cancel — including any worker Pool the feature
+    # pipeline spawns — without ever touching the GUI's own process group.
+    if os.name == "posix":
+        try:
+            os.setsid()
+        except Exception:
+            pass
 
     try:
         # Imported here (not at module top) so the import cost lands in the child
