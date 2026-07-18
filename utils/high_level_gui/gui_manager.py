@@ -1170,10 +1170,14 @@ class DynamicGUIManager(QObject):
         return self.current_step["value"] > 0
 
     def can_go_forward(self) -> bool:
-        """Forward moves only into already-valid territory, up to and including
-        the first unprocessed step; then it disables."""
+        """Forward moves into any already-valid position, up to and including the
+        terminal 'all steps complete' state (current == num_steps) once every
+        step is processed. The valid frontier is the only cap: a config that
+        isn't fully processed, or an edited (dirty) current step, stops Forward
+        at the right place.
+        """
         cur = self.current_step["value"]
-        return (cur + 1) < self.num_steps and (cur + 1) <= self.valid_frontier()
+        return (cur + 1) <= self.valid_frontier()
 
     def can_process(self) -> bool:
         """Process is available on the first non-valid step, i.e. the current
@@ -1185,11 +1189,21 @@ class DynamicGUIManager(QObject):
         return cur == self.valid_frontier()
 
     def go_forward(self) -> None:
-        """Navigate to the next step without computing anything."""
+        """Navigate forward without computing anything.
+
+        Advancing past the last step lands on the terminal 'complete' state
+        (current == num_steps): no parameter widgets, just the final results
+        (the viewer layers persist). This mirrors where processing the last step
+        leaves you, so Back/Forward are symmetric at the end.
+        """
         if not self.can_go_forward():
             return
         self.current_step["value"] += 1
-        self.create_step_widgets(self.processing_steps[self.current_step["value"]])
+        idx = self.current_step["value"]
+        if idx >= self.num_steps:
+            self.clear_current_widgets()
+        else:
+            self.create_step_widgets(self.processing_steps[idx])
 
     def go_back(self) -> None:
         """Non-destructive back navigation.
@@ -1283,30 +1297,77 @@ class DynamicGUIManager(QObject):
         if recon.is_clean:
             return True  # already current — nothing to do
 
-        # Stale: step/parameter structure drifted (or values fell out of range).
-        if not confirm_reconcile(parent, recon, context="Re-processing this run"):
-            return False  # user cancelled — leave the config untouched
+        # Work out which *already-computed* results this reconcile invalidates.
+        # A step is stale if its parameters changed (clamped / reset / type
+        # changed / a param added or removed) or the step itself was added by the
+        # current pipeline. Everything from the earliest such step onward depends
+        # on it, so those results must go — otherwise old outputs would look like
+        # they came from the new parameters. (Steps the reference dropped aren't
+        # current-pipeline steps, so they don't map to a result to invalidate.)
+        changed_keys = {c.step for c in recon.param_changes} | set(recon.added_steps)
+        step_keys = [self.strategy.get_config_key(s["method"])
+                     for s in self.strategy.steps]
+        changed_indices = [i for i, k in enumerate(step_keys) if k in changed_keys]
+        earliest = min(changed_indices) if changed_indices else None
 
-        # Adopt the reconciled config, persist it, and rebuild the widgets so the
-        # user sees the current pipeline's options before anything is computed.
+        completed = self.strategy.get_last_completed_step()  # count of leading done
+        # Only completed steps have results to lose; the affected, data-bearing
+        # steps run from `earliest` up to the last completed step.
+        affected = []
+        if earliest is not None and earliest < completed:
+            for i in range(earliest, completed):
+                method = self.processing_steps[i]
+                affected.append(
+                    f"Step {i + 1}: {self.step_display_names.get(method, method)}"
+                )
+
+        # Stale: show the diff (and, if results will be lost, warn explicitly).
+        if not confirm_reconcile(parent, recon, context="Re-processing this run",
+                                 impact_lines=affected or None):
+            return False  # user cancelled — leave the config and results untouched
+
+        # Adopt the reconciled config and persist it.
         self.config = recon.merged
         self.initial_config = copy.deepcopy(recon.merged)
         self.strategy.config = self.config
+
+        # Delete the now-invalid results (the earliest changed step and every
+        # step after it), so nothing on disk claims to come from the new params.
+        if affected:
+            for i in range(earliest, self.num_steps):
+                self.cleanup_step(i + 1)  # cleanup_step_artifacts is 1-based
+            # Move the cursor to the first step that must be recomputed.
+            self.current_step["value"] = min(self.current_step["value"], earliest)
+
         try:
             self.strategy.save_config(self.config)
         except Exception as exc:
             print(f"[reconcile] could not persist canonized config: {exc}")
 
-        if step_index < self.num_steps:
-            self.create_step_widgets(self.processing_steps[step_index])
+        idx = self.current_step["value"]
+        if idx < self.num_steps:
+            self.create_step_widgets(self.processing_steps[idx])
+        else:
+            self.clear_current_widgets()
         self.params_edited.emit()  # let the nav buttons re-evaluate
 
-        QMessageBox.information(
-            parent, "Config updated to current pipeline",
-            "This run was tuned on a different pipeline version, so its config was "
-            "updated to match the current one. Your tuned values were kept wherever "
-            "they still apply. Review the parameters, then press Process to run."
-        )
+        if affected:
+            QMessageBox.information(
+                parent, "Config updated \u2014 stale results cleared",
+                "This run was tuned on a different pipeline version, so its config "
+                "was updated to match the current one and the now-outdated results "
+                f"for {len(affected)} step(s) were cleared. Your tuned values were "
+                "kept wherever they still apply. Review the parameters, then press "
+                "Process to recompute from the first cleared step."
+            )
+        else:
+            QMessageBox.information(
+                parent, "Config updated to current pipeline",
+                "This run was tuned on a different pipeline version, so its config "
+                "was updated to match the current one. Your tuned values were kept "
+                "wherever they still apply. No completed results were affected. "
+                "Review the parameters, then press Process to run."
+            )
         return False
 
     # --- Step Execution ---

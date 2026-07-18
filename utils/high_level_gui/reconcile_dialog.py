@@ -96,7 +96,7 @@ if _HAVE_QT:
 
         def __init__(self, result: Any, parent: "QWidget" = None, *,
                      title: str = "Update config to current pipeline?",
-                     context: str = "") -> None:
+                     context: str = "", impact_lines=None) -> None:
             super().__init__(parent)
             self.setWindowTitle(title)
             self.setModal(True)
@@ -114,6 +114,26 @@ if _HAVE_QT:
             header.setWordWrap(True)
             layout.addWidget(header)
 
+            # Prominent, unmissable warning about results that will be deleted.
+            # Old outputs computed with the stale parameters must not survive, or
+            # they'd masquerade as having been produced by the new ones.
+            if impact_lines:
+                warn = QLabel(
+                    "\u26a0 The parameters below changed, so the results already "
+                    "computed for these steps (and every step after them) will be "
+                    "deleted and must be re-processed:"
+                )
+                warn.setWordWrap(True)
+                warn.setStyleSheet(
+                    "color: #b00020; font-weight: bold; "
+                    "border: 1px solid #b00020; border-radius: 6px; padding: 6px;"
+                )
+                layout.addWidget(warn)
+                impact = QLabel("\n".join(f"   \u2022 {ln}" for ln in impact_lines))
+                impact.setWordWrap(True)
+                impact.setStyleSheet("color: #b00020;")
+                layout.addWidget(impact)
+
             # Read-only, scrollable tree grouped under the three headers. A
             # QTreeWidget is itself scrollable, so it satisfies the "inside a
             # scroll area" requirement without a redundant QScrollArea wrapper.
@@ -124,7 +144,8 @@ if _HAVE_QT:
             layout.addWidget(self.tree, stretch=1)
 
             buttons = QDialogButtonBox()
-            self._apply_btn = buttons.addButton("Apply", QDialogButtonBox.AcceptRole)
+            apply_label = "Apply & clear results" if impact_lines else "Apply"
+            self._apply_btn = buttons.addButton(apply_label, QDialogButtonBox.AcceptRole)
             buttons.addButton("Cancel", QDialogButtonBox.RejectRole)
             buttons.accepted.connect(self.accept)
             buttons.rejected.connect(self.reject)
@@ -134,17 +155,21 @@ if _HAVE_QT:
 
 def confirm_reconcile(parent, result: Any, *,
                       title: str = "Update config to current pipeline?",
-                      context: str = "") -> bool:
+                      context: str = "", impact_lines=None) -> bool:
     """Show the reconcile diff and return True iff the user chose Apply.
 
     ``result`` is a ``config_library.ReconcileResult``. A clean result (no
     differences) returns True without prompting -- there is nothing to confirm.
+    ``impact_lines`` is an optional list of human-readable step labels whose
+    already-computed results will be deleted if the user proceeds; when given,
+    the dialog shows a prominent warning and the Apply button says so.
     """
     if getattr(result, "is_clean", False):
         return True
     if not _HAVE_QT:  # pragma: no cover - defensive; UI path always has Qt
         raise RuntimeError("confirm_reconcile requires PyQt5 (no display available).")
-    dlg = ReconcileDialog(result, parent, title=title, context=context)
+    dlg = ReconcileDialog(result, parent, title=title, context=context,
+                          impact_lines=impact_lines)
     return dlg.exec_() == QDialog.Accepted
 
 
