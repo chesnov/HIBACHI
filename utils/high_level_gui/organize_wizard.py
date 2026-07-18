@@ -212,6 +212,48 @@ def purge_derived_artifacts(project_dir: str) -> List[str]:
     return removed
 
 
+def detect_default_mode(raw_dir: str) -> Optional[str]:
+    """Best-effort guess of a raw folder's processing mode ('fluorescence' /
+    'fluorescence_2d'), or None when it can't be told confidently.
+
+    This is used only to *filter* the preset list so a plainly-3D dataset doesn't
+    offer 2D configs (and vice-versa). It is deliberately conservative: any doubt
+    returns None and the wizard shows every preset, so a wrong guess can never
+    leave the user unable to pick a config. The user's preset choice, not this
+    guess, ultimately sets the mode.
+    """
+    import tifffile as tiff  # type: ignore
+
+    try:
+        files = [f for f in sorted(os.listdir(raw_dir))
+                 if f.lower().endswith((".tif", ".tiff"))
+                 and os.path.isfile(os.path.join(raw_dir, f))]
+    except OSError:
+        return None
+    if not files:
+        return None  # e.g. only .czi present -> don't guess
+
+    try:
+        with tiff.TiffFile(os.path.join(raw_dir, files[0])) as tf:
+            shape = tf.series[0].shape
+    except Exception:
+        return None
+
+    ndim = len(shape)
+    if ndim == 2:
+        return "fluorescence_2d"                       # single plane
+    if ndim >= 4:
+        return "fluorescence"                          # has Z and channel axes
+    if ndim == 3:
+        # (Z, Y, X) stack vs (C, Y, X) multi-channel plane. Mirror the channel
+        # heuristic used elsewhere: a small leading axis (< 10 and < the next)
+        # reads as channels -> a 2D image; otherwise it's a Z stack -> 3D.
+        if shape[0] < 10 and shape[0] < shape[1]:
+            return "fluorescence_2d"
+        return "fluorescence"
+    return None
+
+
 # --------------------------------------------------------------------------- #
 # Qt wizard (only if PyQt5 is present)
 # --------------------------------------------------------------------------- #
@@ -295,7 +337,7 @@ if _HAVE_QT:
                 self._form.removeRow(0)
             self._combos.clear()
 
-            presets = list(self._wiz.presets.keys())
+            presets = self._wiz.preset_keys()
             if not presets:
                 self._hint.setText("No configuration presets were found.")
                 return
@@ -364,6 +406,9 @@ if _HAVE_QT:
             self.project_dir = project_dir or raw_dir
             self.detect = detect_raw(raw_dir)
             self.presets = scan_available_presets()
+            # Best-effort mode guess used only to filter the preset list; None
+            # means "show everything" (see detect_default_mode).
+            self.mode_filter = detect_default_mode(raw_dir)
             self.selections: Dict[int, str] = {}   # channel_idx -> preset_key
             self.is_multichannel = False
 
@@ -388,6 +433,23 @@ if _HAVE_QT:
                 self.setPage(1, self._presets_page)
 
             self.button(QWizard.FinishButton).setText("Organize")
+
+        def preset_keys(self) -> List[str]:
+            """Preset labels to offer, filtered by the detected mode when possible.
+
+            Filters to presets whose ``default_mode`` matches the detected mode so
+            a 2D project doesn't list 3D configs (and vice-versa). If the mode is
+            unknown, or filtering would leave nothing to choose, every preset is
+            returned -- the wizard must never be left with an empty picker.
+            """
+            all_keys = list(self.presets.keys())
+            if not self.mode_filter:
+                return all_keys
+            filtered = [
+                k for k in all_keys
+                if self.presets[k].get("default_mode") == self.mode_filter
+            ]
+            return filtered or all_keys
 
         def _collect_selections(self) -> None:
             """
@@ -453,6 +515,22 @@ if _HAVE_QT:
     def run_organize_wizard(parent, raw_dir: str, mode: str = "new",
                             project_dir: Optional[str] = None) -> bool:
         """Convenience: build, run, and report whether setup completed."""
+        # Surface any broken config files up front so they're an explicit warning
+        # rather than silently missing from the preset list.
+        try:
+            from .config_library import scan_problems
+            problems = scan_problems()
+        except Exception:
+            problems = []
+        if problems:
+            preview = "\n".join(f"\u2022 {p}\n    {m}" for p, m in problems[:6])
+            if len(problems) > 6:
+                preview += f"\n\u2026 and {len(problems) - 6} more"
+            QMessageBox.warning(
+                parent, "Some configs could not be read",
+                f"{len(problems)} config file(s) were skipped and won't appear as "
+                f"presets:\n\n{preview}"
+            )
         wiz = OrganizeWizard(raw_dir, mode=mode, project_dir=project_dir, parent=parent)
         if not wiz.presets:
             QMessageBox.critical(parent, "No presets",

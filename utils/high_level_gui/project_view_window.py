@@ -109,6 +109,24 @@ class ProjectViewWindow(QMainWindow):
         self.set_config_btn.setEnabled(False)
         button_layout.addWidget(self.set_config_btn)
 
+        self.config_library_btn = QPushButton("\U0001f4da Config Library\u2026")
+        self.config_library_btn.setToolTip(
+            "Browse, import, duplicate, rename and export the configs in your "
+            "cross-project library (and see any that failed to load)."
+        )
+        self.config_library_btn.clicked.connect(self.open_config_library_manager)
+        button_layout.addWidget(self.config_library_btn)
+
+        self.export_run_btn = QPushButton("\u2b07 Export run config\u2026")
+        self.export_run_btn.setToolTip(
+            "Export the exact processing_config from a single checked, processed "
+            "image — byte-for-byte, keeping saved thresholds, dimensions and the "
+            "pipeline version — so a collaborator can reproduce the run."
+        )
+        self.export_run_btn.clicked.connect(self._export_run_config)
+        self.export_run_btn.setEnabled(False)
+        button_layout.addWidget(self.export_run_btn)
+
         layout.addLayout(button_layout)
         central_widget.setLayout(layout)
         self.setCentralWidget(central_widget)
@@ -144,6 +162,13 @@ class ProjectViewWindow(QMainWindow):
         # multi-channel image spans several channels and therefore disables it.
         keys = view.checked_channel_keys() if view is not None else set()
         self.set_config_btn.setEnabled(bool(checked) and len(keys) <= 1)
+
+        # Export run config is a single-folder, reproducibility action: enable it
+        # only when exactly one checked folder actually has a processed run config.
+        one = checked[0] if len(checked) == 1 else None
+        self.export_run_btn.setEnabled(
+            one is not None and self._run_config_path(one) is not None
+        )
 
     def open_cross_channel_analyzer(self):
         if self._cross_scan_dir:
@@ -495,10 +520,12 @@ class ProjectViewWindow(QMainWindow):
         if not folders:
             return
 
-        template_path, _ = QFileDialog.getOpenFileName(
-            self, "Select Config Template", "",
-            "YAML Files (*.yaml *.yml);;All Files (*)"
-        )
+        # Resolve the mode of the checked folders so the picker only offers
+        # compatible configs. All checked folders belong to at most one channel
+        # (the button is disabled otherwise), so they share a mode in practice.
+        folder_mode = self._checked_folders_mode(folders)
+
+        template_path = self._pick_template(folder_mode)
         if not template_path:
             return
 
@@ -523,19 +550,35 @@ class ProjectViewWindow(QMainWindow):
             f"• Processing parameters will be replaced.\n"
             f"• Image dimensions are always preserved.\n"
             f"• Folders with a different mode will be skipped.\n"
-            f"• Existing computed state (e.g. thresholds) is preserved.",
+            f"• Existing computed state (e.g. thresholds) is preserved.\n\n"
+            f"If the template was tuned on a different pipeline version, you'll be "
+            f"shown exactly what changes before anything is written.",
             QMessageBox.Yes | QMessageBox.No
         )
         if reply != QMessageBox.Yes:
             return
+
+        # Reconcile the template against the current canonical schema first, and
+        # show the diff for confirmation. Any config problem (bad/no mode, no
+        # canonical reference) is raised by the logic layer and surfaced here --
+        # never worked around silently.
+        from .reconcile_dialog import make_reconcile_confirm
+        from .config_library import ConfigLibraryError
 
         QApplication.setOverrideCursor(Qt.WaitCursor)
         saved = self.project_manager.image_folders
         self.project_manager.image_folders = list(folders)
         try:
             results = apply_template_config_to_project(
-                template_path, self.project_manager
+                template_path, self.project_manager,
+                reconcile_confirm=make_reconcile_confirm(
+                    self, context="Set New Channel Config"),
             )
+        except ConfigLibraryError as exc:
+            self.project_manager.image_folders = saved
+            QApplication.restoreOverrideCursor()
+            QMessageBox.critical(self, "Config error", str(exc))
+            return
         except Exception as exc:
             self.project_manager.image_folders = saved
             QApplication.restoreOverrideCursor()
@@ -544,6 +587,11 @@ class ProjectViewWindow(QMainWindow):
         finally:
             self.project_manager.image_folders = saved
         QApplication.restoreOverrideCursor()
+
+        # The user cancelled the reconcile diff: nothing was written, so we say
+        # nothing (no misleading "Done" dialog).
+        if results.get('aborted'):
+            return
 
         summary = (
             f"Config template applied.\n\n"
@@ -565,6 +613,180 @@ class ProjectViewWindow(QMainWindow):
         if self._content_view is not None:
             self._content_view.refresh()
         self._update_action_buttons()
+
+    # ---- config library plumbing ----------------------------------------- #
+    def _checked_folders_mode(self, folders: list):
+        """Resolve the common mode of the checked folders, or None if ambiguous.
+
+        Reads each folder's mode via ``get_image_details``; returns the single
+        shared mode when they agree (ignoring 'unknown'/'error'), else None so the
+        picker falls back to showing all configs.
+        """
+        modes = set()
+        for folder in folders:
+            try:
+                m = self.project_manager.get_image_details(folder).get('mode')
+            except Exception:
+                m = None
+            if m and m not in ('unknown', 'error'):
+                modes.add(m)
+        return next(iter(modes)) if len(modes) == 1 else None
+
+    def _pick_template(self, folder_mode):
+        """Offer library configs (filtered by mode) plus Import / Browse options.
+
+        Returns an absolute template path, or None if the user cancelled. Any
+        config-library problem is surfaced via a message box rather than silently
+        skipped.
+        """
+        from . import config_library as cl
+        from .config_library import ConfigLibraryError, ConfigModeError
+
+        _IMPORT = "\u2795  Import from file\u2026 (adds it to your library)"
+        _BROWSE = "\U0001f4c1  Browse for a file\u2026 (use once, don't save)"
+
+        try:
+            entries = cl.list_all(mode=folder_mode)
+        except ConfigLibraryError as exc:
+            QMessageBox.critical(self, "Config error", str(exc))
+            entries = []
+
+        labels = [e.label for e in entries]
+        options = labels + [_IMPORT, _BROWSE]
+
+        mode_note = (f" for mode '{folder_mode}'" if folder_mode
+                     else " (mode could not be resolved; showing all)")
+        choice, ok = QInputDialog.getItem(
+            self, "Choose a config",
+            f"Pick a config to apply{mode_note}:",
+            options, 0, False
+        )
+        if not ok or not choice:
+            return None
+
+        if choice == _BROWSE:
+            path, _ = QFileDialog.getOpenFileName(
+                self, "Select Config Template", "",
+                "YAML Files (*.yaml *.yml);;All Files (*)"
+            )
+            return path or None
+
+        if choice == _IMPORT:
+            path, _ = QFileDialog.getOpenFileName(
+                self, "Import config into library", "",
+                "YAML Files (*.yaml *.yml);;All Files (*)"
+            )
+            if not path:
+                return None
+            try:
+                entry = cl.import_config(path)
+            except ConfigModeError as exc:
+                QMessageBox.critical(
+                    self, "Config error",
+                    f"That file has no valid 'mode' and can't be imported:\n\n{exc}"
+                )
+                return None
+            except FileExistsError:
+                reply = QMessageBox.question(
+                    self, "Already exists",
+                    "A library config with that name already exists.\n\nOverwrite it?",
+                    QMessageBox.Yes | QMessageBox.No, QMessageBox.No
+                )
+                if reply != QMessageBox.Yes:
+                    return None
+                try:
+                    entry = cl.import_config(path, overwrite=True)
+                except (ConfigLibraryError, OSError) as exc:
+                    QMessageBox.critical(self, "Config error", str(exc))
+                    return None
+            except (ConfigLibraryError, OSError) as exc:
+                QMessageBox.critical(self, "Config error", str(exc))
+                return None
+            return entry.path
+
+        # Otherwise the user picked a discovered entry by its label.
+        idx = labels.index(choice)
+        return entries[idx].path
+
+    def open_config_library_manager(self) -> None:
+        """Open the Config Library manager dialog."""
+        try:
+            from .config_library_dialog import open_config_library
+        except Exception as exc:
+            QMessageBox.critical(self, "Unavailable",
+                                 f"Config Library manager unavailable:\n{exc}")
+            return
+        open_config_library(self)
+
+    def _run_config_path(self, folder: str):
+        """Absolute path to a folder's processed run config, or None if absent.
+
+        Looks for ``<basename>_processed_<mode>/processing_config_<mode>.yaml``
+        next to the image, matching how the pipeline writes it.
+        """
+        if not folder:
+            return None
+        try:
+            details = self.project_manager.get_image_details(folder)
+        except Exception:
+            return None
+        tif_file = details.get('tif_file')
+        mode = details.get('mode')
+        if not tif_file or not mode or mode in ('unknown', 'error'):
+            return None
+        basename = os.path.splitext(tif_file)[0]
+        path = os.path.join(
+            folder, f"{basename}_processed_{mode}", f"processing_config_{mode}.yaml"
+        )
+        return path if os.path.isfile(path) else None
+
+    def _export_run_config(self) -> None:
+        """Export one processed folder's run config verbatim (reproducibility)."""
+        if self._content_view is None:
+            return
+        checked = self._content_view.checked_folders()
+        if len(checked) != 1:
+            QMessageBox.information(
+                self, "Select one image",
+                "Check exactly one processed image to export its run config."
+            )
+            return
+        run_cfg = self._run_config_path(checked[0])
+        if not run_cfg:
+            QMessageBox.information(
+                self, "No run config",
+                "That image has no processed run config yet. Process it first."
+            )
+            return
+
+        from . import config_library as cl
+        from .config_library import ConfigLibraryError
+
+        # Preview provenance so the user knows they're sharing a full run record.
+        try:
+            prov = cl.read_provenance(run_cfg)
+        except Exception:
+            prov = {}
+        ver = prov.get("hibachi_version")
+        ver_text = (ver.get("short") or ver.get("commit")) if isinstance(ver, dict) else ver
+
+        default_name = f"{os.path.basename(checked[0])}_run_config.yaml"
+        dst, _ = QFileDialog.getSaveFileName(
+            self, "Export run config", default_name,
+            "YAML Files (*.yaml *.yml);;All Files (*)"
+        )
+        if not dst:
+            return
+        try:
+            cl.export_run_config(run_cfg, dst)
+        except (ConfigLibraryError, FileNotFoundError, OSError) as exc:
+            QMessageBox.critical(self, "Config error", str(exc))
+            return
+        QMessageBox.information(
+            self, "Exported",
+            "Exported the full run config (saved_state, dimensions and pipeline "
+            f"version{f' {ver_text}' if ver_text else ''} preserved) to:\n\n{dst}"
+        )
 
     def closeEvent(self, event: QCloseEvent) -> None:
         reply = QMessageBox.question(

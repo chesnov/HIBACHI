@@ -12,7 +12,8 @@ import numpy as np
 from skimage.draw import polygon as skimage_polygon  # type: ignore
 from PyQt5.QtWidgets import (  # type: ignore
     QMessageBox, QWidget, QVBoxLayout, QScrollArea, QLabel,
-    QTextEdit, QProgressBar, QApplication, QPushButton, QFileDialog, QDockWidget
+    QTextEdit, QProgressBar, QApplication, QPushButton, QFileDialog, QDockWidget,
+    QInputDialog
 )
 from PyQt5.QtCore import QThread, pyqtSignal, QObject, Qt, QTimer  # type: ignore
 from PyQt5.QtGui import QTextCursor  # type: ignore
@@ -176,6 +177,9 @@ class DynamicGUIManager(QObject):
         # Initialize Persistent Log Widget
         self.log_widget: Optional[QTextEdit] = None
         self._init_persistent_log()
+        # "Save to Library…" — the primary way the library grows from a config
+        # dialled in here in the tuning view.
+        self._init_library_dock()
 
         # Project Paths
         self.inputdir = os.path.dirname(self.file_loc)
@@ -241,6 +245,95 @@ class DynamicGUIManager(QObject):
 
         self.viewer.window.add_dock_widget(
             self.log_widget, area="right", name="Process Log"
+        )
+
+    def _init_library_dock(self) -> None:
+        """Add a small dock with a 'Save to Library…' button.
+
+        The library is the cross-project home for dialled-in configs; saving from
+        the tuning view is the primary way it grows. The button is best-effort:
+        if anything about the dock fails it must never block the segmentation UI
+        from opening.
+        """
+        try:
+            container = QWidget()
+            lay = QVBoxLayout(container)
+            lay.setContentsMargins(5, 5, 5, 5)
+            btn = QPushButton("\U0001f4be  Save to Library\u2026")
+            btn.setToolTip(
+                "Save the current parameters as a reusable preset in your config "
+                "library (shared across projects). Image- and run-specific data "
+                "(dimensions, saved thresholds) are stripped; the pipeline version "
+                "is kept as provenance."
+            )
+            btn.clicked.connect(self.save_current_to_library)
+            lay.addWidget(btn)
+            self.viewer.window.add_dock_widget(
+                container, area="right", name="Config Library"
+            )
+        except Exception as exc:  # pragma: no cover - defensive
+            print(f"[library] could not add Save-to-Library dock: {exc}")
+
+    def save_current_to_library(self) -> None:
+        """Save the live config as a library preset (§5.4).
+
+        ``self.config`` is kept in lockstep with the widgets by
+        ``parameter_changed`` (which writes each edited value straight back into
+        ``self.config[step]['parameters'][param]['value']``), so it already
+        reflects the current widget state. ``sanitize_for_library`` strips
+        image/run-specific keys and keeps ``mode`` + ``hibachi_version``.
+        """
+        from . import config_library as cl
+        from .config_library import ConfigLibraryError, ConfigModeError
+
+        # Stamp provenance if the working config doesn't already carry it, so the
+        # saved preset records which pipeline version tuned it.
+        config = self.config
+        if not config.get("hibachi_version"):
+            try:
+                from .processing_strategies import _hibachi_version_stamp
+                config = dict(config)
+                config["hibachi_version"] = _hibachi_version_stamp()
+            except Exception as exc:  # provenance is best-effort, never fatal
+                print(f"[library] could not stamp version: {exc}")
+                config = self.config
+
+        default_name = f"{self.basename} ({self.processing_mode})"
+        name, ok = QInputDialog.getText(
+            None, "Save to Library", "Preset name:", text=default_name
+        )
+        if not ok or not name.strip():
+            return
+        name = name.strip()
+
+        try:
+            entry = cl.save_to_library(config, name)
+        except FileExistsError:
+            reply = QMessageBox.question(
+                None, "Already exists",
+                f"A library config named '{name}' already exists.\n\nOverwrite it?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No
+            )
+            if reply != QMessageBox.Yes:
+                return
+            try:
+                entry = cl.save_to_library(config, name, overwrite=True)
+            except (ConfigLibraryError, OSError) as exc:
+                QMessageBox.critical(None, "Config error", str(exc))
+                return
+        except ConfigModeError as exc:
+            QMessageBox.critical(
+                None, "Config error",
+                f"This config has no valid 'mode', so it can't be saved:\n\n{exc}"
+            )
+            return
+        except (ConfigLibraryError, OSError) as exc:
+            QMessageBox.critical(None, "Config error", str(exc))
+            return
+
+        QMessageBox.information(
+            None, "Saved to Library",
+            f"Saved '{entry.name}' to your config library:\n\n{entry.path}"
         )
 
     # =========================================================================

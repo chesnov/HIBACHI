@@ -7,7 +7,7 @@ import gc
 import yaml  # type: ignore
 import pandas as pd
 import tifffile as tiff  # type: ignore
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Callable
 
 from .gui_text_utils import clean_filename_for_matching, natural_sort_key
 from .metadata import MetadataExtractor
@@ -15,38 +15,30 @@ from .metadata import MetadataExtractor
 
 
 def scan_available_presets() -> Dict[str, Dict[str, str]]:
-    """Scans the module directories for available YAML configuration presets."""
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    search_locations = [
-        (os.path.join(script_dir, '..', 'module_3d', 'configs'), 'fluorescence'),
-        (os.path.join(script_dir, '..', 'module_2d', 'configs'), 'fluorescence_2d')
-    ]
-    presets = {}
-    
-    for config_dir, default_mode in search_locations:
-        if not os.path.exists(config_dir):
-            continue
-        try:
-            files = [
-                f for f in os.listdir(config_dir)
-                if f.lower().endswith(('.yaml', '.yml'))
-            ]
-            for f in files:
-                full_path = os.path.join(config_dir, f)
-                clean_name = os.path.splitext(f)[0].replace('_', ' ').title()
-                suffix = " (2D)" if "module_2d" in config_dir else " (3D)"
-                presets[f"{clean_name}{suffix}"] = {
-                    "path": full_path,
-                    "default_mode": default_mode
-                }
-        except Exception:
-            pass
-    return presets
+    """Discover configuration presets, merging in-repo built-ins with the user's
+    config library.
+
+    Kept here as the stable public entry point (``helper_funcs`` and the organize
+    wizard import it from this module), but the logic now lives in
+    ``config_library`` so built-in and user-library configs are surfaced together,
+    each labelled with its source, with every preset's ``default_mode`` read from
+    the file's explicit ``mode``. Only valid configs are returned; malformed ones
+    are surfaced (with their error) in the Config Library manager instead.
+
+    Returns:
+        ``{label: {"path", "default_mode", "source"}}``. The label's first
+        whitespace token remains the clean config name, preserving
+        ``channel_target_name``.
+    """
+    # Imported lazily to avoid any import-order coupling at module load.
+    from .config_library import scan_available_presets as _impl
+    return _impl()
 
 def apply_template_config_to_project(
     template_yaml_path: str,
     project_manager: Any,
-    target_mode: Optional[str] = None
+    target_mode: Optional[str] = None,
+    reconcile_confirm: Optional[Callable[[Any], bool]] = None
 ) -> Dict[str, Any]:
     """
     Applies a template YAML config to every matching image folder in a project.
@@ -67,9 +59,21 @@ def apply_template_config_to_project(
         target_mode:        If given, only folders whose ``mode`` field matches
                             this string are updated.  If ``None``, the mode is
                             taken from the template itself and used as the filter.
+        reconcile_confirm:  Optional callback used to reconcile the template
+                            against the current canonical built-in *before*
+                            anything is written. When supplied and the template
+                            differs from the pipeline's current step/parameter
+                            schema, it is called with a ``ReconcileResult``; it
+                            must return True to proceed (using the reconciled
+                            config) or False to abort. Any problem (missing mode,
+                            no canonical reference) is raised to the caller to
+                            show the user -- never worked around silently. When
+                            ``None`` the template is applied verbatim (legacy
+                            behaviour), so existing callers are unaffected.
 
     Returns:
-        dict with keys ``success``, ``failed``, ``skipped``, ``updated_folders``.
+        dict with keys ``success``, ``failed``, ``skipped``, ``updated_folders``,
+        and ``aborted`` (True only if ``reconcile_confirm`` declined the diff).
     """
     try:
         with open(template_yaml_path, 'r') as fh:
@@ -77,11 +81,26 @@ def apply_template_config_to_project(
     except Exception as exc:
         raise ValueError(f"Cannot read template file: {exc}") from exc
 
-    effective_filter_mode = target_mode or template.get('mode')
-
     results: Dict[str, Any] = {
-        'success': 0, 'failed': 0, 'skipped': 0, 'updated_folders': []
+        'success': 0, 'failed': 0, 'skipped': 0,
+        'updated_folders': [], 'aborted': False
     }
+
+    # -- Reconcile the template against the canonical built-in schema --------
+    # Structure comes from the current pipeline; the template's tuned values are
+    # carried over. Nothing is written until the user confirms the diff, so a
+    # stale template surfaces its differences instead of silently breaking. Any
+    # problem (missing mode, no canonical reference) propagates to the caller.
+    if reconcile_confirm is not None:
+        from .config_library import reconcile as _reconcile
+        recon = _reconcile(template, mode=target_mode or template.get('mode'))
+        if not recon.is_clean:
+            if not reconcile_confirm(recon):
+                results['aborted'] = True
+                return results
+        template = recon.merged
+
+    effective_filter_mode = target_mode or template.get('mode')
 
     for folder_path in project_manager.image_folders:
         details = project_manager.get_image_details(folder_path)
