@@ -135,6 +135,9 @@ class DynamicGUIManager(QObject):
     """
     process_started = pyqtSignal()
     process_finished = pyqtSignal()
+    # Emitted when a parameter widget value changes, so the navigation buttons
+    # (Back / Forward / Process) can re-evaluate the "valid frontier".
+    params_edited = pyqtSignal()
 
     def __init__(
         self,
@@ -158,6 +161,11 @@ class DynamicGUIManager(QObject):
         self.current_widgets: Dict[QDockWidget, QScrollArea] = {}
         self.current_step = {"value": 0}
         self.parameter_values: Dict[str, Any] = {}
+        # Baseline for the currently-shown step: the parameter values the widgets
+        # were built from (i.e. the last-committed / last-run values). Compared
+        # against live values to tell whether the current step has unsaved edits.
+        self._active_config_key: Optional[str] = None
+        self._active_baseline: Dict[str, Any] = {}
         self.worker: Optional[StepWorker] = None
 
         # ROI / sub-region state
@@ -867,8 +875,8 @@ class DynamicGUIManager(QObject):
             self.delete_all_checkpoint_files()
             self.create_step_widgets(self.processing_steps[0])
 
-        # Notify connected slots (update_navigation_buttons in helper_funcs.py)
-        # so the ◀ Previous Step button reflects the current step index.
+        # Notify connected slots (refresh_nav in app_launch) so the Back /
+        # Forward / Process buttons reflect the current step index.
         self.process_finished.emit()
 
         print(f"[ROI] Now in ROI mode — shape {self.image_stack.shape}, "
@@ -899,8 +907,8 @@ class DynamicGUIManager(QObject):
         self.strategy.intermediate_state = {}
         self.restore_from_checkpoint()
 
-        # Notify connected slots (update_navigation_buttons in helper_funcs.py)
-        # so the ◀ Previous Step button reflects the resumed step index.
+        # Notify connected slots (refresh_nav in app_launch) so the Back /
+        # Forward / Process buttons reflect the resumed step index.
         self.process_finished.emit()
 
         print("[ROI] Returned to full-image mode.")
@@ -1097,6 +1105,204 @@ class DynamicGUIManager(QObject):
         """Cleans artifacts for a specific step."""
         self.strategy.cleanup_step_artifacts(self.viewer, step_number)
 
+    # ------------------------------------------------------------------ #
+    # Valid frontier + non-destructive navigation
+    # ------------------------------------------------------------------ #
+    # Model: steps [0, frontier) are "processed and current" (their artifact is
+    # on disk and their parameters are unchanged). `frontier` is the first step
+    # that is unprocessed OR (for the step currently on screen) has unsaved edits.
+    # Because edits are never allowed to survive navigation, only the current
+    # step can ever be dirty, so the frontier is fully determined by on-disk
+    # artifacts plus the current step's edit state. Navigation (Back/Forward) is
+    # non-destructive; only Process deletes downstream results.
+
+    def _params_snapshot(self, config_key: str) -> Dict[str, Any]:
+        """Deep-copied {param_name: value} for a step's parameter block."""
+        block = self.config.get(config_key, {}) or {}
+        params = block.get("parameters", {}) or {}
+        return {
+            name: copy.deepcopy(pconf.get("value"))
+            for name, pconf in params.items()
+            if isinstance(pconf, dict)
+        }
+
+    def is_current_step_dirty(self) -> bool:
+        """True if the on-screen step has parameter values differing from the
+        ones its widgets were built from (i.e. unsaved edits)."""
+        key = getattr(self, "_active_config_key", None)
+        if not key:
+            return False
+        # The interaction-analysis step is repeatable and not part of the
+        # processed segmentation chain, so it never gates navigation.
+        if getattr(self, "current_step_method", None) == "execute_interaction_analysis":
+            return False
+        return self._params_snapshot(key) != getattr(self, "_active_baseline", {})
+
+    def _revert_current_edits(self) -> None:
+        """Restore the current step's parameters to their built-from baseline."""
+        key = getattr(self, "_active_config_key", None)
+        baseline = getattr(self, "_active_baseline", None)
+        if not key or baseline is None:
+            return
+        params = (self.config.get(key, {}) or {}).get("parameters", {}) or {}
+        for name, val in baseline.items():
+            if isinstance(params.get(name), dict):
+                params[name]["value"] = copy.deepcopy(val)
+
+    def valid_frontier(self) -> int:
+        """0-based index of the first step that is not processed-and-current."""
+        completed = self.strategy.get_last_completed_step()  # count of leading done
+        frontier = completed
+        cur = self.current_step["value"]
+        # Editing an already-processed step collapses the frontier to it: its
+        # downstream results are now provisional until it is re-processed.
+        if cur < frontier and self.is_current_step_dirty():
+            frontier = cur
+        return frontier
+
+    def can_go_back(self) -> bool:
+        return self.current_step["value"] > 0
+
+    def can_go_forward(self) -> bool:
+        """Forward moves only into already-valid territory, up to and including
+        the first unprocessed step; then it disables."""
+        cur = self.current_step["value"]
+        return (cur + 1) < self.num_steps and (cur + 1) <= self.valid_frontier()
+
+    def can_process(self) -> bool:
+        """Process is available on the first non-valid step, i.e. the current
+        step is either unprocessed or has unsaved edits (which collapse the
+        frontier to it). Clean, already-processed steps have nothing to compute."""
+        cur = self.current_step["value"]
+        if cur >= self.num_steps:
+            return False
+        return cur == self.valid_frontier()
+
+    def go_forward(self) -> None:
+        """Navigate to the next step without computing anything."""
+        if not self.can_go_forward():
+            return
+        self.current_step["value"] += 1
+        self.create_step_widgets(self.processing_steps[self.current_step["value"]])
+
+    def go_back(self) -> None:
+        """Non-destructive back navigation.
+
+        Results are never deleted by going back. If the current step has unsaved
+        edits, the user must resolve them first: discard (revert to the last
+        committed values) or process now (compute this step, which clears later
+        results). Cancelling leaves everything as-is.
+        """
+        if not self.can_go_back():
+            return
+
+        if self.is_current_step_dirty():
+            parent = None
+            try:
+                parent = self.viewer.window._qt_window
+            except Exception:
+                parent = None
+            box = QMessageBox(parent)
+            box.setIcon(QMessageBox.Warning)
+            box.setWindowTitle("Unsaved parameter changes")
+            box.setText("You changed parameters on this step but haven't processed them.")
+            box.setInformativeText(
+                "Going back won't keep un-processed edits. Discard them, or "
+                "process this step now (which clears any later results and "
+                "recomputes)?"
+            )
+            discard_btn = box.addButton("Discard changes", QMessageBox.DestructiveRole)
+            process_btn = box.addButton("Process now", QMessageBox.AcceptRole)
+            cancel_btn = box.addButton("Cancel", QMessageBox.RejectRole)
+            box.setDefaultButton(cancel_btn)
+            box.exec_()
+            clicked = box.clickedButton()
+
+            if clicked == cancel_btn:
+                return
+            if clicked == process_btn:
+                # Commit the edits by processing; stay on this step (processing
+                # is asynchronous, so we don't also navigate). The user can go
+                # back again once it completes.
+                self.execute_processing_step()
+                return
+            # Discard: revert to the committed values, then navigate.
+            self._revert_current_edits()
+
+        self.current_step["value"] -= 1
+        self.create_step_widgets(self.processing_steps[self.current_step["value"]])
+
+    def _ensure_config_canonical(self, step_index: int) -> bool:
+        """Make the config match the current pipeline before (re)processing.
+
+        Returns True if processing may proceed now (the config was already
+        current). Returns False if it must not proceed right now — because the
+        user cancelled, a config problem was surfaced, or the config was just
+        canonized (in which case the widgets have been rebuilt to the current
+        pipeline and the user is asked to review and press Process again).
+
+        This is the ONLY place staleness is enforced. Viewing results and
+        cross-channel analysis never reach here, so an old run can always be
+        inspected or analysed without reconciling; only actual computation is
+        gated. A config that merely holds different-but-valid tuned values
+        reconciles clean and is left untouched, so normal use has no friction.
+        """
+        try:
+            from .config_library import reconcile, ConfigLibraryError
+            from .reconcile_dialog import confirm_reconcile
+        except Exception as exc:
+            # Don't silently skip: say so, but don't block processing either.
+            print(f"[reconcile] unavailable, proceeding without canonize: {exc}")
+            return True
+
+        parent = None
+        try:
+            parent = self.viewer.window._qt_window
+        except Exception:
+            parent = None
+
+        try:
+            recon = reconcile(self.config)
+        except ConfigLibraryError as exc:
+            QMessageBox.critical(
+                parent, "Config error",
+                "This run's config can't be reconciled against the current "
+                f"pipeline, so it can't be re-processed:\n\n{exc}"
+            )
+            return False
+        except Exception as exc:
+            QMessageBox.critical(parent, "Config error", str(exc))
+            return False
+
+        if recon.is_clean:
+            return True  # already current — nothing to do
+
+        # Stale: step/parameter structure drifted (or values fell out of range).
+        if not confirm_reconcile(parent, recon, context="Re-processing this run"):
+            return False  # user cancelled — leave the config untouched
+
+        # Adopt the reconciled config, persist it, and rebuild the widgets so the
+        # user sees the current pipeline's options before anything is computed.
+        self.config = recon.merged
+        self.initial_config = copy.deepcopy(recon.merged)
+        self.strategy.config = self.config
+        try:
+            self.strategy.save_config(self.config)
+        except Exception as exc:
+            print(f"[reconcile] could not persist canonized config: {exc}")
+
+        if step_index < self.num_steps:
+            self.create_step_widgets(self.processing_steps[step_index])
+        self.params_edited.emit()  # let the nav buttons re-evaluate
+
+        QMessageBox.information(
+            parent, "Config updated to current pipeline",
+            "This run was tuned on a different pipeline version, so its config was "
+            "updated to match the current one. Your tuned values were kept wherever "
+            "they still apply. Review the parameters, then press Process to run."
+        )
+        return False
+
     # --- Step Execution ---
 
     def execute_processing_step(self) -> None:
@@ -1117,7 +1323,14 @@ class DynamicGUIManager(QObject):
         step_display = self.step_display_names.get(
             logical_step, f"Step {step_index + 1}"
         )
-        
+
+        # Before computing, ensure a stale config is brought up to the current
+        # pipeline (interaction analysis is exempt — repeatable, not in the
+        # canonical chain). If this canonizes or is cancelled, don't process now.
+        if logical_step != "execute_interaction_analysis":
+            if not self._ensure_config_canonical(step_index):
+                return
+
         current_values = self.get_current_values()
         
         # Validation for Interaction Step
@@ -1292,6 +1505,13 @@ class DynamicGUIManager(QObject):
         
         config_key = self.strategy.get_config_key(step_method_name)
         step_display = self.step_display_names.get(step_method_name, step_method_name)
+
+        # Record the values these widgets are built from. Because edits are never
+        # allowed to survive navigation (see go_back), this baseline is always the
+        # last-committed state of the step, so "live vs baseline" is a reliable
+        # dirty check.
+        self._active_config_key = config_key
+        self._active_baseline = self._params_snapshot(config_key)
         
         # Special Case: Interaction Analysis
         if step_method_name == "execute_interaction_analysis":
@@ -1419,6 +1639,8 @@ class DynamicGUIManager(QObject):
                 QTimer.singleShot(0, lambda: self.create_step_widgets(self.current_step_method))
         except Exception:
             pass
+        # Let the navigation controls re-evaluate (this step may now be "dirty").
+        self.params_edited.emit()
 
     def get_current_values(self) -> Dict[str, Any]:
         """Returns the current state of parameters."""

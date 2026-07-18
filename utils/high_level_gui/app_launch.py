@@ -83,53 +83,97 @@ def interactive_segmentation_with_config(selected_folder: str = None, project_ma
             create_back_to_project_button(viewer, gui_manager), area="left", name="Navigation"
         )
 
-        @magicgui(call_button="▶ Next Step / Run Current")
-        def continue_processing():
-            gui_manager.execute_processing_step()
+        # --- Processing control -------------------------------------------
+        # Navigation (Back / Forward) is non-destructive: it never deletes
+        # results. Computing is a separate, explicit action (Process), which is
+        # the only thing that clears downstream results. Forward is allowed only
+        # into already-processed steps and disables at the first unprocessed one;
+        # all the enable/frontier logic lives in the gui_manager.
+        btn_process = QPushButton("\u2699 Process Current Step")
+        btn_process.setToolTip(
+            "Process this step with the current parameters.\n"
+            "Re-processing a step clears the results of every step after it."
+        )
+        btn_forward = QPushButton("Forward \u25b6")
+        btn_forward.setToolTip(
+            "Go to the next step (no computation). Enabled only for steps that are\n"
+            "already processed; disabled once you reach the first unprocessed step."
+        )
+        btn_back = QPushButton("\u25c0 Back")
+        btn_back.setToolTip(
+            "Go to the previous step. Non-destructive \u2014 results are kept.\n"
+            "If you changed parameters here, you'll be asked to discard them or\n"
+            "process this step first."
+        )
 
-        @magicgui(call_button="◀ Previous Step")
-        def go_to_previous_step():
+        def refresh_nav():
+            # While a step is processing, leave the buttons as the process-start
+            # handler set them; this also avoids a race when "Process now" is
+            # chosen from the Back prompt (which starts processing synchronously).
+            worker = getattr(gui_manager, "worker", None)
+            if worker is not None and worker.isRunning():
+                return
             idx = gui_manager.current_step["value"]
-            if idx > 0:
-                gui_manager.cleanup_step(idx)
-                gui_manager.current_step["value"] -= 1
-                gui_manager.create_step_widgets(
-                    gui_manager.processing_steps[gui_manager.current_step["value"]]
-                )
-                update_navigation_buttons()
-
-        def update_navigation_buttons():
-            idx = gui_manager.current_step["value"]
-            total = len(gui_manager.processing_steps)
-            go_to_previous_step.enabled = (idx > 0)
-            continue_processing.enabled = (idx < total)
-            
-            if idx < total:
+            total = gui_manager.num_steps
+            btn_back.setEnabled(gui_manager.can_go_back())
+            btn_forward.setEnabled(gui_manager.can_go_forward())
+            can_proc = gui_manager.can_process()
+            btn_process.setEnabled(can_proc)
+            if can_proc and idx < total:
                 step_name = gui_manager.processing_steps[idx]
                 display = gui_manager.step_display_names.get(step_name, step_name)
-                continue_processing.label = f"Run Step {idx + 1}: {display}"
+                if gui_manager.is_current_step_dirty():
+                    btn_process.setText(
+                        f"\u2699 Re-process Step {idx + 1}: {display}  (clears later results)"
+                    )
+                else:
+                    btn_process.setText(f"\u2699 Process Step {idx + 1}: {display}")
+            elif gui_manager.valid_frontier() >= total:
+                btn_process.setText("\u2713 All Steps Complete")
             else:
-                continue_processing.label = "Processing Complete"
+                btn_process.setText("\u2699 Process Current Step")
+
+        def on_back():
+            gui_manager.go_back()
+            refresh_nav()
+
+        def on_forward():
+            gui_manager.go_forward()
+            refresh_nav()
+
+        def on_process():
+            # Asynchronous: process_started disables the buttons, process_finished
+            # re-runs refresh_nav once the step (and any advance) has completed.
+            gui_manager.execute_processing_step()
+
+        btn_back.clicked.connect(on_back)
+        btn_forward.clicked.connect(on_forward)
+        btn_process.clicked.connect(on_process)
 
         def disable_buttons_during_process():
-            continue_processing.enabled = False
-            go_to_previous_step.enabled = False
-            continue_processing.label = "Processing... (Please Wait)"
+            btn_back.setEnabled(False)
+            btn_forward.setEnabled(False)
+            btn_process.setEnabled(False)
+            btn_process.setText("Processing\u2026 (please wait)")
 
         gui_manager.process_started.connect(disable_buttons_during_process)
-        gui_manager.process_finished.connect(update_navigation_buttons)
+        gui_manager.process_finished.connect(refresh_nav)
+        # Editing a parameter can change the frontier (this step becomes dirty),
+        # so re-evaluate the buttons whenever a value changes.
+        gui_manager.params_edited.connect(refresh_nav)
 
         container = QWidget()
         l = QVBoxLayout()
         container.setLayout(l)
-        l.addWidget(continue_processing.native)
-        l.addWidget(go_to_previous_step.native)
+        l.addWidget(btn_process)
+        l.addWidget(btn_forward)
+        l.addWidget(btn_back)
         l.setContentsMargins(5, 5, 5, 5)
-        
+
         viewer.window.add_dock_widget(
             container, area="left", name="Processing Control"
         )
-        update_navigation_buttons()
+        refresh_nav()
 
         # --- ROI / Sub-region panel ---
         roi_container = QWidget()
