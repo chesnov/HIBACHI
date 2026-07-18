@@ -288,7 +288,8 @@ class BatchProcessor:
         self,
         folder_path: str,
         target_strategy_key: str,
-        force_restart: bool = False
+        force_restart: bool = False,
+        progress_callback: Any = None,
     ) -> bool:
         """
         Runs the processing pipeline for a single image folder.
@@ -410,6 +411,16 @@ class BatchProcessor:
                         actual_method = f"{method_name}_2d"
 
                 print(f"  [Exec] Step {step_num}/{num_total_steps}: {method_name}...")
+                if progress_callback is not None:
+                    try:
+                        progress_callback({
+                            "kind": "step",
+                            "step_idx": step_num,
+                            "total_steps": num_total_steps,
+                            "step_name": method_name,   # raw; UI prettifies
+                        })
+                    except Exception:
+                        pass
                 start_step = time.time()
 
                 # Extract parameters
@@ -470,6 +481,99 @@ class BatchProcessor:
             if image_stack is not None:
                 del image_stack
             gc.collect()
+
+    def prescan_folders(self) -> Tuple[List[str], List[str], Dict[str, Dict[str, Any]]]:
+        """
+        Categorise every folder before any processing (main-thread friendly).
+
+        Returns (complete_folders, partial_folders, scan_results) where
+        scan_results maps folder_path -> the dict from _scan_folder_status. This
+        lets the caller show the reprocess prompt on the GUI thread and then hand
+        a resolved per-folder plan to a worker (thread or process).
+        """
+        complete: List[str] = []
+        partial: List[str] = []
+        scan: Dict[str, Dict[str, Any]] = {}
+        for fp in (self.project_manager.image_folders or []):
+            info = self._scan_folder_status(fp)
+            scan[fp] = info
+            if info['status'] == 'complete':
+                complete.append(fp)
+            elif info['status'] == 'partial':
+                partial.append(fp)
+        return complete, partial, scan
+
+    def run_folders(
+        self,
+        force_map: Dict[str, bool],
+        progress_callback: Any = None,
+    ) -> Tuple[int, int, int]:
+        """
+        Process every folder using a pre-resolved per-folder restart plan.
+
+        Unlike process_all_folders, this does NO scanning and shows NO prompts —
+        the caller has already decided (via prescan_folders + a GUI prompt) which
+        folders to force-restart. Suitable for running inside a worker process.
+
+        force_map maps folder_path -> whether to force a restart from step 1.
+        progress_callback (optional) receives dict events:
+            {"kind": "folder", "folder_idx", "total_folders", "folder_name"}
+            {"kind": "step",   "folder_idx", "total_folders", "folder_name",
+                                "step_idx", "total_steps", "step_name"}
+        Returns (success, failed, skipped).
+        """
+        folders = self.project_manager.image_folders or []
+        total = len(folders)
+        success = failed = skipped = 0
+
+        print(f"\n{'='*60}\nBATCH PROCESSING STARTED ({total} folder(s))\n{'='*60}")
+        start_batch = time.time()
+
+        for i, fp in enumerate(folders):
+            name = os.path.basename(fp)
+            if progress_callback is not None:
+                try:
+                    progress_callback({
+                        "kind": "folder",
+                        "folder_idx": i,
+                        "total_folders": total,
+                        "folder_name": name,
+                    })
+                except Exception:
+                    pass
+
+            print(f"\nProcessing {i+1}/{total}: {name}")
+            details = self.project_manager.get_image_details(fp)
+            mode = details.get('mode', 'unknown')
+
+            if mode not in self.supported_strategies:
+                reason = "unsupported mode" if details['mode'] != 'error' else "invalid folder"
+                print(f"  [Skip] {name} — {reason} ({mode}).")
+                skipped += 1
+                continue
+
+            # Per-folder step callback that carries the folder context.
+            step_cb = None
+            if progress_callback is not None:
+                def step_cb(info, _i=i, _name=name):
+                    info = dict(info)
+                    info.update({"folder_idx": _i, "total_folders": total,
+                                 "folder_name": _name})
+                    progress_callback(info)
+
+            ok = self.process_single_folder(
+                fp, mode, force_restart=bool(force_map.get(fp, False)),
+                progress_callback=step_cb,
+            )
+            if ok:
+                success += 1
+            else:
+                failed += 1
+            time.sleep(0.1)
+
+        print(f"\n{'='*60}\nBATCH SUMMARY\nTotal Time: {time.time() - start_batch:.2f}s")
+        print(f"Successful: {success}\nFailed: {failed}\nSkipped: {skipped}\n{'='*60}")
+        return success, failed, skipped
 
     def process_all_folders(self, force_restart_all: bool = False) -> Tuple[int, int, int]:
         """

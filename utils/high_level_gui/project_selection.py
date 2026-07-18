@@ -313,6 +313,73 @@ def sample_status(sample_folder: str) -> str:
     return STATUS_IN_PROGRESS
 
 
+def prettify_step_name(method: str) -> str:
+    """'execute_raw_segmentation' -> 'Raw Segmentation'; strips a mode suffix."""
+    if not method:
+        return ""
+    name = method
+    if name.startswith("execute_"):
+        name = name[len("execute_"):]
+    for sfx in ("_2d", "_3d"):
+        if name.endswith(sfx):
+            name = name[: -len(sfx)]
+    name = name.replace("_", " ").strip()
+    return name.title() if name else method
+
+
+def partial_step_label(sample_folder: str) -> str:
+    """
+    For a partially-processed folder, name the last fully completed pipeline step.
+
+    Returns a string like 'Step 3/7: Soma Extraction', or '' if it can't be
+    determined. This instantiates the strategy (header + config only, no pixel
+    data), so callers should invoke it ONLY for in-progress folders to keep the
+    tree fast.
+    """
+    try:
+        import os as _os
+        import yaml  # type: ignore
+        import tifffile as _tiff  # type: ignore
+
+        contents = _os.listdir(sample_folder)
+        tif = next((f for f in contents if f.lower().endswith((".tif", ".tiff"))), None)
+        yml = next((f for f in contents if f.lower().endswith((".yaml", ".yml"))), None)
+        if not tif or not yml:
+            return ""
+        with open(_os.path.join(sample_folder, yml), "r", encoding="utf-8") as fh:
+            cfg = yaml.safe_load(fh) or {}
+        mode = cfg.get("mode", "unknown")
+
+        from ..module_3d._3D_strategy import FluorescenceStrategy  # type: ignore
+        from ..module_2d._2D_strategy import Fluorescence2DStrategy  # type: ignore
+        strat_cls = {
+            "fluorescence": FluorescenceStrategy,
+            "fluorescence_2d": Fluorescence2DStrategy,
+        }.get(mode)
+        if strat_cls is None:
+            return ""
+
+        with _tiff.TiffFile(_os.path.join(sample_folder, tif)) as tf:
+            shape = tf.series[0].shape if tf.series else (1,)
+        basename = _os.path.splitext(tif)[0]
+        processed_dir = _os.path.join(sample_folder, f"{basename}_processed_{mode}")
+
+        # Spacing/scale don't affect on-disk checkpoint detection, so pass
+        # neutral values — we only read get_last_completed_step() + step names.
+        strat = strat_cls(
+            config=cfg.copy(), processed_dir=processed_dir, image_shape=shape,
+            spacing=(1.0, 1.0, 1.0), scale_factor=1.0,
+        )
+        last = strat.get_last_completed_step()
+        total = strat.num_steps
+        if last <= 0 or not getattr(strat, "steps", None):
+            return ""
+        method = strat.steps[last - 1].get("method", "")
+        return f"Step {last}/{total}: {prettify_step_name(method)}"
+    except Exception:
+        return ""
+
+
 def classify_path(path: Optional[str]) -> Classification:
     """
     Inspect a user-selected path and describe what it is, so the caller can do
@@ -873,6 +940,13 @@ if _HAVE_QT:
             status = sample_status(folder)
             mode = self._read_mode(folder)
             status_txt = _STATUS_TEXT.get(status, status)
+            # For a partially-processed folder, name the last completed step
+            # instead of a generic "in progress". Computed here only (per the
+            # in-progress branch) so complete/unprocessed rows stay instant.
+            if status == STATUS_IN_PROGRESS:
+                step_lbl = partial_step_label(folder)
+                if step_lbl:
+                    status_txt = step_lbl
             if mode:
                 status_txt += f"  ({mode})"
             leaf = QTreeWidgetItem([

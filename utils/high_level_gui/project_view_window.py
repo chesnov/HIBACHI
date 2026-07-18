@@ -48,6 +48,7 @@ class ProjectViewWindow(QMainWindow):
         self._content_view = None       # the unified ProjectContentsView (or None)
         self._cross_scan_dir = None     # dir the cross-channel analyzer should scan
         self._project_root = None       # project root that holds RELATIONAL_ANALYSIS
+        self._batch_dialog = None       # live batch progress dialog (if running)
         self.initUI()
         self.setAttribute(Qt.WA_QuitOnClose)
 
@@ -326,33 +327,65 @@ class ProjectViewWindow(QMainWindow):
         self._batch_process_folders(self._content_view.checked_folders())
 
     def _batch_process_folders(self, folders: list) -> None:
-        """Route the checked set of image/channel folders to batch processing."""
+        """
+        Batch-process the checked folders in a separate process, with a live
+        progress dialog (spinner, per-image and per-stage bars, console) and an
+        immediate Cancel. The scan + reprocess prompt run here on the GUI thread;
+        only the actual processing runs in the child process.
+        """
         if not folders:
             return
         if not BatchProcessor:
             QMessageBox.warning(self, "Unavailable", "Batch processor is not available.")
             return
-        reply = QMessageBox.question(
-            self, "Confirm",
-            f"Process {len(folders)} selected image folder"
-            f"{'s' if len(folders) != 1 else ''}?",
-            QMessageBox.Yes | QMessageBox.No
-        )
-        if reply != QMessageBox.Yes:
-            return
 
-        # BatchProcessor iterates project_manager.image_folders, so point it at
-        # exactly the checked set (which may span several channels), then restore.
+        folders = list(folders)
+
+        # Prescan + reprocess prompt must run on the GUI thread (they may show a
+        # QMessageBox). Point a BatchProcessor at exactly the checked set.
         saved = self.project_manager.image_folders
-        self.project_manager.image_folders = list(folders)
+        self.project_manager.image_folders = folders
         try:
             processor = BatchProcessor(self.project_manager)
-            processor.process_all_folders(force_restart_all=False)
+            complete, partial, scan = processor.prescan_folders()
+
+            restart_complete = restart_partial = False
+            if complete or partial:
+                choice = processor._prompt_reprocess_choice(complete, partial)
+                if choice == 'cancel':
+                    return
+                restart_complete = restart_partial = (choice == 'restart_all')
+            else:
+                confirm = QMessageBox.question(
+                    self, "Confirm",
+                    f"Process {len(folders)} selected image folder"
+                    f"{'s' if len(folders) != 1 else ''}?",
+                    QMessageBox.Yes | QMessageBox.No,
+                )
+                if confirm != QMessageBox.Yes:
+                    return
+
+            force_map = {}
+            for fp, info in scan.items():
+                st = info.get('status')
+                force_map[fp] = ((st == 'complete' and restart_complete)
+                                 or (st == 'partial' and restart_partial))
         finally:
             self.project_manager.image_folders = saved
-        QMessageBox.information(self, "Done", "Batch processing complete.")
+
+        # Hand the resolved plan to the process-backed progress dialog.
+        from .batch_progress_dialog import BatchProgressDialog
+        dlg = BatchProgressDialog(folders, force_map, parent=self)
+        self._batch_dialog = dlg  # keep a reference alive
+        dlg.finished_batch.connect(self._on_batch_finished)
+        dlg.show()
+        dlg.start()
+
+    def _on_batch_finished(self, success: int, failed: int, skipped: int,
+                           cancelled: bool) -> None:
+        """Refresh the view after a batch run (or cancellation) completes."""
         if self._content_view is not None:
-            self._content_view.refresh()  # refresh status badges / last-edited
+            self._content_view.refresh()
         self._update_action_buttons()
 
     def _add_channel(self, project_dir: str) -> None:
