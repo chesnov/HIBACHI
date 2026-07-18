@@ -1129,6 +1129,12 @@ class DynamicGUIManager(QObject):
     def is_current_step_dirty(self) -> bool:
         """True if the on-screen step has parameter values differing from the
         ones its widgets were built from (i.e. unsaved edits)."""
+        # No editable step is shown when we're past the last step (e.g. right
+        # after processing the final step, which clears the widgets). The stale
+        # baseline from the step we just committed must not read as "dirty".
+        cur = self.current_step["value"]
+        if cur < 0 or cur >= self.num_steps:
+            return False
         key = getattr(self, "_active_config_key", None)
         if not key:
             return False
@@ -1485,6 +1491,11 @@ class DynamicGUIManager(QObject):
             except Exception:
                 pass
         self.current_widgets.clear()
+        # No step is on screen now, so there is no baseline to compare against.
+        # (create_step_widgets calls this first, then sets a fresh baseline; the
+        # end-of-processing path calls it alone, and this keeps dirty == False.)
+        self._active_config_key = None
+        self._active_baseline = {}
 
     # --- Widget Creation ---
 

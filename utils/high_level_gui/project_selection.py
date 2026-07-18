@@ -376,7 +376,12 @@ def partial_step_label(sample_folder: str) -> str:
             return ""
         method = strat.steps[last - 1].get("method", "")
         return f"Step {last}/{total}: {prettify_step_name(method)}"
-    except Exception:
+    except Exception as exc:
+        # Falling back to a generic "in progress" label is fine, but do it
+        # loudly: a silent failure here is why a freshly-processed image can look
+        # like a generic in-progress row instead of naming its completed step.
+        print(f"[status] partial_step_label({os.path.basename(sample_folder)}) "
+              f"failed: {type(exc).__name__}: {exc}")
         return ""
 
 

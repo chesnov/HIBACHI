@@ -49,6 +49,10 @@ class ProjectViewWindow(QMainWindow):
         self._cross_scan_dir = None     # dir the cross-channel analyzer should scan
         self._project_root = None       # project root that holds RELATIONAL_ANALYSIS
         self._batch_dialog = None       # live batch progress dialog (if running)
+        # Set when we open a sample in the napari view; on returning (window
+        # re-activates) we refresh the tree so status / "last edited" reflect any
+        # processing just done, instead of showing stale values.
+        self._pending_content_refresh = False
         self.initUI()
         self.setAttribute(Qt.WA_QuitOnClose)
 
@@ -291,6 +295,9 @@ class ProjectViewWindow(QMainWindow):
         """Open one image/channel folder in the interactive segmentation view."""
         if not folder:
             return
+        # Processing may change this folder's status/outputs; refresh the tree
+        # when we come back so it doesn't show stale "in progress / N ago".
+        self._pending_content_refresh = True
         self.hide()
         from .app_launch import interactive_segmentation_with_config  # lazy: avoid cycle
         interactive_segmentation_with_config(folder, project_manager=self.project_manager)
@@ -344,6 +351,16 @@ class ProjectViewWindow(QMainWindow):
         # overlay viewer), rescan so freshly-run analyses appear in the picker.
         if event.type() == QEvent.ActivationChange and self.isActiveWindow():
             self._rescan_analyses()
+            # If we just came back from processing a sample, recompute the tree so
+            # status ("Step k/n …") and "last edited" reflect what's now on disk.
+            if self._pending_content_refresh:
+                self._pending_content_refresh = False
+                if self._content_view is not None:
+                    try:
+                        self._content_view.refresh()
+                        self._update_action_buttons()
+                    except Exception as exc:
+                        print(f"[project view] tree refresh failed: {exc}")
         super().changeEvent(event)
 
     def _process_selected(self) -> None:
