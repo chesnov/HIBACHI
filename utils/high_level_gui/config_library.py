@@ -197,6 +197,17 @@ def library_root() -> str:
     return os.path.join(_default_state_dir(), "configs")
 
 
+def desktop_dir() -> str:
+    """Best-effort absolute path to the user's Desktop, falling back to home.
+
+    Used as the default starting location for 'save/export' file dialogs. Kept
+    here (Qt-free) so every dialog and any headless caller share one definition.
+    """
+    home = os.path.expanduser("~")
+    desktop = os.path.join(home, "Desktop")
+    return desktop if os.path.isdir(desktop) else home
+
+
 def _mode_dir(mode: str) -> str:
     return os.path.join(library_root(), _MODE_SUBDIR.get(mode, "3d"))
 
@@ -418,23 +429,69 @@ def export_run_config(run_config_path: str, dst_path: str) -> str:
     return export_config(run_config_path, dst_path)
 
 
+def _lenient_mode(data: Dict[str, Any]) -> Optional[str]:
+    """Resolve a config's mode for a *read-only preview*, as robustly as possible.
+
+    Prefers the explicit top-level ``mode`` (exactly how ``mode_of`` determines
+    it). If that's absent -- e.g. an externally shared file that dropped the key
+    -- it falls back to the step-key suffix: any ``execute_*_2d`` step means 2D,
+    otherwise (there being ``execute_*`` steps at all) 3D. Only a file with no
+    recognisable structure at all returns ``None``.
+
+    This lenient inference lives *only* in the preview path. ``mode_of`` stays
+    strict and still raises on a missing/invalid mode (the no-silent-fallback
+    rule), so nothing is ever *applied* on an inferred mode -- it's just shown.
+    """
+    declared = data.get("mode")
+    if declared in (MODE_2D, MODE_3D):
+        return declared
+    step_keys = [k for k in data if isinstance(k, str) and k.startswith("execute_")]
+    if step_keys:
+        return MODE_2D if any(k.endswith("_2d") for k in step_keys) else MODE_3D
+    return None
+
+
+def _has_dimensions(data: Dict[str, Any]) -> bool:
+    """True if the config carries a non-empty physical-calibration block.
+
+    Accepts either ``voxel_dimensions`` (3D) or ``pixel_dimensions`` (2D). A key
+    that is present but empty/blank does not count as having dimensions.
+    """
+    for key in ("voxel_dimensions", "pixel_dimensions"):
+        val = data.get(key)
+        if isinstance(val, dict) and any(axis in val for axis in ("x", "y", "z")):
+            return True
+        if val not in (None, {}, [], ""):
+            return True
+    return False
+
+
 def read_provenance(path: str) -> Dict[str, Any]:
     """Summarise what a shared config file contains, for display before use.
 
-    Returns a dict with ``mode`` (or None if unresolved), ``hibachi_version``,
-    ``has_saved_state``, ``has_dimensions``, and ``is_full_run`` (True when it
-    carries run-specific state, i.e. it's a reproducibility record rather than a
-    portable preset). Never raises on a bad mode — this is a read-only preview.
+    Returns a dict with:
+      * ``mode`` -- ``fluorescence`` / ``fluorescence_2d``, resolved leniently
+        (see ``_lenient_mode``); only ``None`` for a file with no recognisable
+        structure.
+      * ``hibachi_version`` -- the pipeline-version provenance stamp, if any.
+      * ``has_saved_state`` -- whether the file carries a ``saved_state`` block,
+        i.e. computed run values such as the auto-detected segmentation
+        threshold. Portable library presets are stripped of this; processed-run
+        configs keep it.
+      * ``has_dimensions`` -- whether the file carries physical calibration
+        (``voxel_dimensions`` / ``pixel_dimensions``). Also stripped from
+        portable presets (dimensions are per-image), kept by run configs.
+      * ``is_full_run`` -- True when it carries run-specific state
+        (``has_saved_state`` or ``has_dimensions``): a reproducibility record
+        rather than a portable preset.
+
+    Never raises on a bad mode -- this is a read-only preview.
     """
     data = _load_yaml(path)
-    try:
-        resolved = mode_of(data)
-    except ConfigModeError:
-        resolved = None
     has_state = "saved_state" in data
-    has_dims = "voxel_dimensions" in data or "pixel_dimensions" in data
+    has_dims = _has_dimensions(data)
     return {
-        "mode": resolved,
+        "mode": _lenient_mode(data),
         "hibachi_version": data.get("hibachi_version"),
         "has_saved_state": has_state,
         "has_dimensions": has_dims,

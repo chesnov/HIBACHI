@@ -770,9 +770,11 @@ class ProjectViewWindow(QMainWindow):
         ver = prov.get("hibachi_version")
         ver_text = (ver.get("short") or ver.get("commit")) if isinstance(ver, dict) else ver
 
-        default_name = f"{os.path.basename(checked[0])}_run_config.yaml"
+        default_path = os.path.join(
+            cl.desktop_dir(), f"{os.path.basename(checked[0])}_run_config.yaml"
+        )
         dst, _ = QFileDialog.getSaveFileName(
-            self, "Export run config", default_name,
+            self, "Export run config", default_path,
             "YAML Files (*.yaml *.yml);;All Files (*)"
         )
         if not dst:

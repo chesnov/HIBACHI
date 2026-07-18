@@ -243,14 +243,23 @@ if _HAVE_QT:
                 ver_text = ver.get("short") or ver.get("commit") or ver.get("processed_at") or "present"
             else:
                 ver_text = ver if ver else "(none recorded)"
-            kind = ("Full run record (carries saved_state / dimensions)"
-                    if prov.get("is_full_run")
-                    else "Portable preset")
+            mode_val = prov.get("mode") or entry.mode
+            if prov.get("is_full_run"):
+                kind = "Full run record \u2014 keeps run state for exact reproduction"
+            else:
+                kind = "Portable preset \u2014 dimensions & run state are set per-image"
+            saved = ("yes \u2014 computed run values (e.g. auto-detected threshold)"
+                     if prov.get("has_saved_state")
+                     else "no \u2014 stripped for portability")
+            dims = ("yes \u2014 physical calibration stored"
+                    if prov.get("has_dimensions")
+                    else "no \u2014 taken from each image on use")
             self._prov.setPlainText(
-                f"Kind: {kind}\n"
+                f"mode: {mode_val}\n"
+                f"kind: {kind}\n"
                 f"hibachi_version: {ver_text}\n"
-                f"has_saved_state: {prov.get('has_saved_state')}\n"
-                f"has_dimensions:  {prov.get('has_dimensions')}"
+                f"saved_state: {saved}\n"
+                f"dimensions: {dims}"
             )
 
         # ---- actions ------------------------------------------------------- #
@@ -353,8 +362,11 @@ if _HAVE_QT:
             entry = self._current_entry()
             if entry is None:
                 return
+            default_path = os.path.join(
+                cl.desktop_dir(), f"{cl.sanitize_name(entry.name)}.yaml"
+            )
             dst, _ = QFileDialog.getSaveFileName(
-                self, "Export preset", f"{entry.name}.yaml",
+                self, "Export preset", default_path,
                 "YAML Files (*.yaml *.yml);;All Files (*)"
             )
             if not dst:
