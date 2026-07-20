@@ -123,9 +123,10 @@ class ProjectViewWindow(QMainWindow):
 
         self.export_run_btn = QPushButton("\u2b07 Export run config\u2026")
         self.export_run_btn.setToolTip(
-            "Export the exact processing_config from a single checked, processed "
-            "image — byte-for-byte, keeping saved thresholds, dimensions and the "
-            "pipeline version — so a collaborator can reproduce the run."
+            "Export a single checked, processed image's run config — either as a "
+            "reusable preset in your Config Library, or to a file (byte-for-byte, "
+            "keeping saved thresholds, dimensions and the pipeline version) so a "
+            "collaborator can reproduce the run."
         )
         self.export_run_btn.clicked.connect(self._export_run_config)
         self.export_run_btn.setEnabled(False)
@@ -567,7 +568,9 @@ class ProjectViewWindow(QMainWindow):
             f"• Processing parameters will be replaced.\n"
             f"• Image dimensions are always preserved.\n"
             f"• Folders with a different mode will be skipped.\n"
-            f"• Existing computed state (e.g. thresholds) is preserved.\n\n"
+            f"• Any already-processed results whose parameters change will be "
+            f"CLEARED, so those images reopen unprocessed (they were computed "
+            f"with the old parameters).\n\n"
             f"If the template was tuned on a different pipeline version, you'll be "
             f"shown exactly what changes before anything is written.",
             QMessageBox.Yes | QMessageBox.No
@@ -590,6 +593,7 @@ class ProjectViewWindow(QMainWindow):
                 template_path, self.project_manager,
                 reconcile_confirm=make_reconcile_confirm(
                     self, context="Set New Channel Config"),
+                clear_stale_results=True,
             )
         except ConfigLibraryError as exc:
             self.project_manager.image_folders = saved
@@ -615,6 +619,8 @@ class ProjectViewWindow(QMainWindow):
             f"Updated : {results['success']}\n"
             f"Skipped : {results['skipped']}  (different mode or invalid)\n"
             f"Failed  : {results['failed']}\n"
+            f"Results cleared : {results.get('cleared', 0)}  "
+            f"(parameters changed — these images reopen unprocessed)\n"
         )
         if results['updated_folders']:
             preview = results['updated_folders'][:8]
@@ -786,6 +792,60 @@ class ProjectViewWindow(QMainWindow):
             prov = {}
         ver = prov.get("hibachi_version")
         ver_text = (ver.get("short") or ver.get("commit")) if isinstance(ver, dict) else ver
+
+        # Choose a destination: a reusable preset in the user's library, or a
+        # standalone file on disk.
+        dest_box = QMessageBox(self)
+        dest_box.setWindowTitle("Export run config")
+        dest_box.setIcon(QMessageBox.Question)
+        dest_box.setText("Where should this config go?")
+        dest_box.setInformativeText(
+            "Save it as a preset in your Config Library to reuse it on other "
+            "images, or export it to a file to share (a file keeps the full "
+            "reproducibility record; a preset is sanitised for reuse)."
+        )
+        preset_btn = dest_box.addButton("Save as preset", QMessageBox.AcceptRole)
+        file_btn = dest_box.addButton("Export to file\u2026", QMessageBox.ActionRole)
+        dest_box.addButton("Cancel", QMessageBox.RejectRole)
+        dest_box.setDefaultButton(preset_btn)
+        dest_box.exec_()
+        clicked = dest_box.clickedButton()
+
+        if clicked == preset_btn:
+            default_name = os.path.basename(checked[0])
+            name, ok = QInputDialog.getText(
+                self, "Save preset", "Preset name:", text=default_name
+            )
+            if not ok or not name.strip():
+                return
+            name = name.strip()
+            try:
+                entry = cl.import_config(run_cfg, name=name)
+            except FileExistsError:
+                reply = QMessageBox.question(
+                    self, "Already exists",
+                    f"A library preset named '{name}' already exists.\n\nOverwrite it?",
+                    QMessageBox.Yes | QMessageBox.No, QMessageBox.No
+                )
+                if reply != QMessageBox.Yes:
+                    return
+                try:
+                    entry = cl.import_config(run_cfg, name=name, overwrite=True)
+                except (ConfigLibraryError, OSError) as exc:
+                    QMessageBox.critical(self, "Config error", str(exc))
+                    return
+            except (ConfigLibraryError, OSError) as exc:
+                QMessageBox.critical(self, "Config error", str(exc))
+                return
+            QMessageBox.information(
+                self, "Saved to library",
+                f"Saved '{entry.name}' to your Config Library. It will now appear "
+                "in the config picker for matching images."
+            )
+            return
+
+        if clicked != file_btn:
+            return  # cancelled
 
         default_path = os.path.join(
             cl.desktop_dir(), f"{os.path.basename(checked[0])}_run_config.yaml"

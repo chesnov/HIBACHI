@@ -215,6 +215,9 @@ class Fluorescence2DStrategy(ProcessingStrategy):
                 low_threshold_percentile=low_thresh_input,
                 high_threshold_percentile=high_thresh_input,
                 threshold_mode=threshold_mode,
+                subtract_background_radius=int(
+                    params.get("subtract_background_radius", 0)
+                ),
                 temp_root_path=self.temp_dir
             )
 

@@ -34,11 +34,98 @@ def scan_available_presets() -> Dict[str, Dict[str, str]]:
     from .config_library import scan_available_presets as _impl
     return _impl()
 
+def _execute_params_differ(new_cfg: Dict[str, Any], old_cfg: Dict[str, Any]) -> bool:
+    """True if the two configs' ``execute_*`` parameter *values* differ.
+
+    Compares only the tuned values (not labels/ranges/metadata), so a config
+    that merely carries the same values in a newer schema doesn't read as a
+    change. Used to decide whether applying a new config to a processed folder
+    actually invalidates that folder's results."""
+    def _values(cfg: Dict[str, Any]) -> Dict[str, Any]:
+        out: Dict[str, Any] = {}
+        for key, block in (cfg or {}).items():
+            if key.startswith("execute_") and isinstance(block, dict):
+                params = block.get("parameters") or {}
+                out[key] = {
+                    pname: (pconf or {}).get("value")
+                    for pname, pconf in params.items()
+                    if isinstance(pconf, dict)
+                }
+        return out
+    return _values(new_cfg) != _values(old_cfg)
+
+
+def _clear_processed_result_files(folder_path: str, details: Dict[str, Any]) -> int:
+    """Delete a folder's on-disk result artifacts so it reads as unprocessed.
+
+    The processed config (and the folder's main YAML) are left in place; only the
+    computed checkpoint files are removed. This is used when a new config is
+    applied to an already-processed folder: the old results came from different
+    parameters, so leaving them would make the folder open showing stale data
+    (the reported bug). Returns the number of files removed.
+
+    Checkpoint paths are taken from the strategy itself (the single source of
+    truth) rather than re-derived here, so this can't drift from what the
+    pipeline actually writes. Best-effort throughout: any failure returns 0
+    rather than raising, since a failed cleanup must not abort a config apply.
+    """
+    tif_file = details.get("tif_file")
+    mode = details.get("mode")
+    yaml_file = details.get("yaml_file")
+    if not tif_file or not yaml_file or not mode or mode in ("unknown", "error"):
+        return 0
+
+    basename = os.path.splitext(tif_file)[0]
+    proc_dir = os.path.join(folder_path, f"{basename}_processed_{mode}")
+    if not os.path.isdir(proc_dir):
+        return 0
+
+    try:
+        with open(os.path.join(folder_path, yaml_file), "r") as fh:
+            cfg = yaml.safe_load(fh) or {}
+    except Exception:
+        cfg = {}
+
+    try:
+        from ..module_3d._3D_strategy import FluorescenceStrategy  # type: ignore
+        from ..module_2d._2D_strategy import Fluorescence2DStrategy  # type: ignore
+    except Exception:
+        return 0
+    strat_cls = {
+        "fluorescence": FluorescenceStrategy,
+        "fluorescence_2d": Fluorescence2DStrategy,
+    }.get(mode)
+    if strat_cls is None:
+        return 0
+
+    # Shape/spacing don't affect checkpoint *paths* (only processed_dir + mode),
+    # so neutral values are fine — mirrors the status probe in project_selection.
+    try:
+        strat = strat_cls(
+            config=cfg, processed_dir=proc_dir, image_shape=(1, 1, 1),
+            spacing=(1.0, 1.0, 1.0), scale_factor=1.0,
+        )
+        files = strat.get_checkpoint_files()
+    except Exception:
+        return 0
+
+    removed = 0
+    for path in files.values():
+        try:
+            if path and os.path.isfile(path):
+                os.remove(path)
+                removed += 1
+        except OSError:
+            pass
+    return removed
+
+
 def apply_template_config_to_project(
     template_yaml_path: str,
     project_manager: Any,
     target_mode: Optional[str] = None,
-    reconcile_confirm: Optional[Callable[[Any], bool]] = None
+    reconcile_confirm: Optional[Callable[[Any], bool]] = None,
+    clear_stale_results: bool = False
 ) -> Dict[str, Any]:
     """
     Applies a template YAML config to every matching image folder in a project.
@@ -83,7 +170,8 @@ def apply_template_config_to_project(
 
     results: Dict[str, Any] = {
         'success': 0, 'failed': 0, 'skipped': 0,
-        'updated_folders': [], 'aborted': False
+        'updated_folders': [], 'aborted': False,
+        'cleared': 0, 'cleared_folders': []
     }
 
     # -- Reconcile the template against the canonical built-in schema --------
@@ -172,6 +260,23 @@ def apply_template_config_to_project(
                 try:
                     with open(proc_config_path, 'r') as fh:
                         existing_proc: Dict[str, Any] = yaml.safe_load(fh) or {}
+
+                    # The processed config records the parameters the on-disk
+                    # results were computed from. If the incoming config changes
+                    # those values, the results are now stale — clear them so the
+                    # folder opens unprocessed instead of showing data from the
+                    # old parameters. Gated on clear_stale_results (the caller
+                    # confirms with the user first).
+                    if clear_stale_results and _execute_params_differ(
+                        merged_main, existing_proc
+                    ):
+                        n = _clear_processed_result_files(folder_path, details)
+                        if n:
+                            results['cleared'] += 1
+                            results['cleared_folders'].append(folder_name)
+                            # Stale computed state (e.g. an auto-threshold from
+                            # the old params) must not carry over either.
+                            existing_proc.pop('saved_state', None)
 
                     merged_proc = dict(merged_main)
 

@@ -45,6 +45,13 @@ execute_raw_segmentation_fluorescence_2d:
         min: 10
         max: 50000
         step: 1
+      subtract_background_radius:
+        label: Subtract Background Radius (px, white top-hat; 0 = off)
+        type: int
+        value: 0
+        min: 0
+        max: 200
+        step: 1
 execute_trim_edges_fluorescence_2d:
   name: Execute Edge Trimming (2D)
   parameters:

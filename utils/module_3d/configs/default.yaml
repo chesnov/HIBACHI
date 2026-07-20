@@ -38,6 +38,13 @@ execute_raw_segmentation_fluorescence:
     # smooth_sigma and connect_max_gap_physical are now set PER SCALE in the
     # tables above (3D honors them per-scale). The former top-level scalars were
     # removed to avoid duplicate, conflicting controls.
+    subtract_background_radius:
+      label: Subtract Background Radius (px, white top-hat; 0 = off)
+      type: int
+      value: 0
+      min: 0
+      max: 200
+      step: 1
 
 # --- Step 2: Edge Trimming ---
 execute_trim_edges_fluorescence:
