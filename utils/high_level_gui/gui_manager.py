@@ -86,6 +86,60 @@ def _cleanup_orphan_thread(worker):
         pass
 
 
+def _snapshot_child_pids() -> set:
+    """PIDs of every child process this (GUI) process currently owns.
+
+    Captured just before a step starts so we can tell that step's newly-spawned
+    workers apart from anything that was already running."""
+    try:
+        import psutil  # already a project dependency
+        return {c.pid for c in psutil.Process().children(recursive=True)}
+    except Exception:
+        return set()
+
+
+def _terminate_new_children(baseline_pids: set) -> None:
+    """Kill every worker process spawned since ``baseline_pids`` was taken.
+
+    Interactive processing runs in a worker *thread*, but the heavy lifting is
+    fanned out to multiprocessing.Pool workers that are child processes of the
+    GUI. Killing the thread mid-call is unsafe (it can strand the GIL), so when
+    the user leaves the image we instead kill the *processes* it spawned — that
+    is what actually stops the computation. Anything already alive at baseline
+    (i.e. not part of this run) is left untouched. Mirrors the batch path, which
+    likewise cancels by killing processes rather than threads."""
+    try:
+        import psutil
+        me = psutil.Process()
+    except Exception:
+        return
+
+    victims = []
+    try:
+        for c in me.children(recursive=True):
+            if c.pid not in baseline_pids:
+                victims.append(c)
+    except Exception:
+        return
+    if not victims:
+        return
+
+    for c in victims:
+        try:
+            c.terminate()  # SIGTERM first for a clean shutdown
+        except Exception:
+            pass
+    try:
+        _, alive = psutil.wait_procs(victims, timeout=1.5)
+    except Exception:
+        alive = victims
+    for c in alive:
+        try:
+            c.kill()  # hard-kill anything that ignored SIGTERM
+        except Exception:
+            pass
+
+
 class StepWorker(QThread):
     """
     Executes a processing step in a separate thread to keep the GUI responsive.
@@ -167,6 +221,9 @@ class DynamicGUIManager(QObject):
         self._active_config_key: Optional[str] = None
         self._active_baseline: Dict[str, Any] = {}
         self.worker: Optional[StepWorker] = None
+        # Snapshot of child PIDs taken right before each step starts, so leaving
+        # the image can kill exactly the worker processes this run spawned.
+        self._worker_child_baseline: set = set()
 
         # ROI / sub-region state
         # These are set when the user confirms a polygon crop.
@@ -914,17 +971,37 @@ class DynamicGUIManager(QObject):
         print("[ROI] Returned to full-image mode.")
 
     def _stop_worker_safely(self) -> None:
-        """Safely detaches a running worker thread so it doesn't crash the app on destruction."""
+        """Stops a running step: kills the worker processes it spawned, then
+        detaches the (now quickly-unwinding) thread so it can't crash the app on
+        destruction."""
         if getattr(self, 'worker', None) and self.worker.isRunning():
-            print("    [Thread] Detaching running background worker to prevent crash...")
+            print("    [Thread] Stopping background worker and its child processes...")
             _register_quit_hook()  # Ensure cleanup happens at shutdown
+
+            # Kill the multiprocessing.Pool workers this step spawned. Once they
+            # die, the imap loop in the worker thread raises and unwinds on its
+            # own — no computation keeps running in the background.
+            try:
+                _terminate_new_children(getattr(self, '_worker_child_baseline', set()))
+            except Exception:
+                pass
+
             try:
                 self.worker.finished_signal.disconnect()
                 self.worker.error_signal.disconnect()
             except Exception:
                 pass
-            
-            # PRESERVE data references so Loky background processes don't segfault!
+
+            # _on_step_finished won't run now (signals are detached), so restore
+            # the streams here or stdout stays pointed at a dead log widget.
+            try:
+                sys.stdout = self.original_stdout
+                sys.stderr = self.original_stderr
+            except Exception:
+                pass
+
+            # PRESERVE data references so the unwinding worker doesn't segfault
+            # reading a memmap we might otherwise free.
             self.worker._preserved_strategy = self.strategy
             self.worker._preserved_stack = self.image_stack
 
@@ -1297,6 +1374,14 @@ class DynamicGUIManager(QObject):
         if recon.is_clean:
             return True  # already current — nothing to do
 
+        # Did the user have un-processed edits on the current step when they hit
+        # Process? If so, once we canonize we can run those edits straight away
+        # instead of forcing a second Process click (the reported friction: the
+        # rebuild below resets the step's baseline, so the pending edit would
+        # otherwise stop reading as "dirty" and the Process button would grey
+        # out until the user re-typed the same change).
+        was_dirty = self.is_current_step_dirty()
+
         # Work out which *already-computed* results this reconcile invalidates.
         # A step is stale if its parameters changed (clamped / reset / type
         # changed / a param added or removed) or the step itself was added by the
@@ -1336,8 +1421,9 @@ class DynamicGUIManager(QObject):
         if affected:
             for i in range(earliest, self.num_steps):
                 self.cleanup_step(i + 1)  # cleanup_step_artifacts is 1-based
-            # Move the cursor to the first step that must be recomputed.
-            self.current_step["value"] = min(self.current_step["value"], earliest)
+            # Land on the first step that must be recomputed so Process is
+            # enabled there (frontier == cursor == earliest after the cleanup).
+            self.current_step["value"] = earliest
 
         try:
             self.strategy.save_config(self.config)
@@ -1360,14 +1446,21 @@ class DynamicGUIManager(QObject):
                 "kept wherever they still apply. Review the parameters, then press "
                 "Process to recompute from the first cleared step."
             )
-        else:
-            QMessageBox.information(
-                parent, "Config updated to current pipeline",
-                "This run was tuned on a different pipeline version, so its config "
-                "was updated to match the current one. Your tuned values were kept "
-                "wherever they still apply. No completed results were affected. "
-                "Review the parameters, then press Process to run."
-            )
+            return False  # results were lost — make the user review + click again
+
+        if was_dirty:
+            # The user was mid-tune and pressed Process; they've now approved the
+            # config diff, and their edits survived into the canonical config.
+            # Run them now rather than forcing another click.
+            return True
+
+        QMessageBox.information(
+            parent, "Config updated to current pipeline",
+            "This run was tuned on a different pipeline version, so its config "
+            "was updated to match the current one. Your tuned values were kept "
+            "wherever they still apply. No completed results were affected. "
+            "Review the parameters, then press Process to run."
+        )
         return False
 
     # --- Step Execution ---
@@ -1437,6 +1530,9 @@ class DynamicGUIManager(QObject):
         sys.stderr = self.output_stream
 
         # Start Worker
+        # Record existing children first so _stop_worker_safely can later kill
+        # only the pool workers *this* step spawns.
+        self._worker_child_baseline = _snapshot_child_pids()
         self.worker = StepWorker(
             self.strategy, step_index, self.image_stack, current_values
         )

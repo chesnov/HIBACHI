@@ -40,11 +40,22 @@ class ScalesTableWidget(QWidget):
     ]
 
     # Defaults used when a row is missing a key (e.g. legacy configs) or
-    # when a brand-new row is added via "+".
+    # when a brand-new row is added via "+". Low/High are threshold-mode
+    # dependent: percentiles run 0-100, absolute intensities run 0.0-1.0, so a
+    # new row must be seeded on the right scale (picked via _row_defaults()).
     _DEFAULTS = {
         "scale": 1.0,
         "low": 95.0,
         "high": 100.0,
+        "smooth_sigma": 0.1,
+        "connect_max_gap_physical": 0.0,
+    }
+
+    # Absolute-intensity variant: values are normalised to [0.0, 1.0].
+    _ABSOLUTE_DEFAULTS = {
+        "scale": 1.0,
+        "low": 0.2,
+        "high": 1.0,
         "smooth_sigma": 0.1,
         "connect_max_gap_physical": 0.0,
     }
@@ -94,15 +105,20 @@ class ScalesTableWidget(QWidget):
         # Populate
         self.set_value(initial_value)
 
+    def _row_defaults(self) -> Dict[str, float]:
+        """Default row values appropriate to the current threshold mode."""
+        return self._ABSOLUTE_DEFAULTS if self.is_absolute else self._DEFAULTS
+
     def set_value(self, data: List[Dict[str, float]]):
         self.table.blockSignals(True)
         self.table.setRowCount(0)
+        defaults = self._row_defaults()
         if isinstance(data, list):
             for row_idx, item in enumerate(data):
                 if isinstance(item, dict):
                     self.table.insertRow(row_idx)
                     for col_idx, (key, _) in enumerate(self._COLUMNS):
-                        self._set_item(row_idx, col_idx, item.get(key, self._DEFAULTS[key]))
+                        self._set_item(row_idx, col_idx, item.get(key, defaults[key]))
         self.table.blockSignals(False)
 
     def _set_item(self, row, col, val):
@@ -112,8 +128,9 @@ class ScalesTableWidget(QWidget):
     def add_row(self):
         r = self.table.rowCount()
         self.table.insertRow(r)
+        defaults = self._row_defaults()
         for col_idx, (key, _) in enumerate(self._COLUMNS):
-            self._set_item(r, col_idx, self._DEFAULTS[key])
+            self._set_item(r, col_idx, defaults[key])
         self._emit_change()
 
     def remove_row(self):

@@ -115,6 +115,9 @@ class Fluorescence2DStrategy(ProcessingStrategy):
             "branch_data": os.path.join(
                 self.processed_dir, f"branch_data_{p}.csv"
             ),
+            "metrics_fcs": os.path.join(
+                self.processed_dir, f"metrics_{p}.fcs"
+            ),
             "last_interaction_meta": os.path.join(
                 self.processed_dir, "last_interaction_meta.yaml"
             )
@@ -767,3 +770,4 @@ class Fluorescence2DStrategy(ProcessingStrategy):
             self._remove_file_safely(files.get("distances_matrix"))
             self._remove_file_safely(files.get("points_matrix"))
             self._remove_file_safely(files.get("branch_data"))
+            self._remove_file_safely(files.get("metrics_fcs"))
