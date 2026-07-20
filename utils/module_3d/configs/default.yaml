@@ -21,9 +21,9 @@ execute_raw_segmentation_fluorescence:
       label: Tubularity Profiles (Absolute [0.0 - 1.0] + Per-Scale Filters)
       type: scale_table_absolute
       value:
-        - {scale: 1.0, low: 0.02, high: 1.0, smooth_sigma: 0.2, connect_max_gap_physical: 1.0}
-        - {scale: 1.5, low: 0.03, high: 1.0, smooth_sigma: 0.2, connect_max_gap_physical: 1.0}
-        - {scale: 3.0, low: 0.03, high: 1.0, smooth_sigma: 0.2, connect_max_gap_physical: 1.0}
+        - {scale: 1.0, low: 0.02, high: 1.0, seed: 0.0, smooth_sigma: 0.2, connect_max_gap_physical: 1.0}
+        - {scale: 1.5, low: 0.03, high: 1.0, seed: 0.0, smooth_sigma: 0.2, connect_max_gap_physical: 1.0}
+        - {scale: 3.0, low: 0.03, high: 1.0, seed: 0.0, smooth_sigma: 0.2, connect_max_gap_physical: 1.0}
 
     # The minimum-size filter is GLOBAL (applied once, after all scales merge)
     # on BOTH the 2D and 3D tracks, so it lives here as a single scalar and is

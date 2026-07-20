@@ -251,6 +251,7 @@ def segment_cells_first_pass_raw(
     min_size_voxels: int = 50,
     low_threshold_percentile: Union[float, List[float]] = 25.0,
     high_threshold_percentile: Union[float, List[float]] = 95.0,
+    seed_threshold: Union[float, List[float]] = 0.0,
     threshold_mode: str = "Percentile",
     skip_tubular_enhancement: bool = False,
     subtract_background_radius: int = 0,
@@ -289,6 +290,14 @@ def segment_cells_first_pass_raw(
 
     if len(low_thresh_list) != n_scales or len(high_thresh_list) != n_scales:
         raise ValueError("low/high_threshold_percentile lists must match length of tubular_scales.")
+
+    # Per-scale hysteresis seed (Absolute mode; 0 = off). Scalar broadcasts.
+    if isinstance(seed_threshold, (int, float)):
+        seed_thresh_list = [float(seed_threshold)] * n_scales
+    else:
+        seed_thresh_list = [float(x) for x in seed_threshold]
+    if len(seed_thresh_list) != n_scales:
+        raise ValueError("seed_threshold list must match length of tubular_scales.")
 
     # --- Per-scale smoothing / gap-closing parameters ---
     # Each entry applies ONLY to its corresponding tubular scale. A scalar is
@@ -381,6 +390,18 @@ def segment_cells_first_pass_raw(
         master_mm = np.memmap(os.path.join(master_dir, 'm.dat'), dtype=np.uint8, mode='w+', shape=volume.shape)
         master_mm[:] = 0
 
+        # Seed accumulator for hysteresis (Absolute mode). Marks confident
+        # (`high`) detections from hysteresis scales, plus ALL pixels from
+        # non-hysteresis scales. After the merge, a labelled object is kept only
+        # if it contains a seed — so an object made only of dim (`low`) pixels
+        # with no confident core is dropped, while dim processes that connect to
+        # a bright seed (or to a plain-threshold detection such as a soma) are
+        # retained. With no seed configured (all rows high>=1.0) every pixel is
+        # its own seed, so this reduces exactly to the previous size-only filter.
+        master_seed_dir = _get_safe_temp_dir(temp_root_path, 'master_seed'); temp_dirs_to_clean.append(master_seed_dir)
+        master_seed_mm = np.memmap(os.path.join(master_seed_dir, 'seed.dat'), dtype=np.uint8, mode='w+', shape=volume.shape)
+        master_seed_mm[:] = 0
+
         for i, scale in enumerate(tubular_scales):
             current_low_p = low_thresh_list[i]
             current_smooth_sigma = smooth_sigma_list[i]
@@ -430,6 +451,25 @@ def segment_cells_first_pass_raw(
                     thresh = max(thresh, 1e-5); threshold_history[scale] = thresh
                     print(f"      [Scale {scale}] Isolated Threshold (p{current_low_p}): {thresh:.6f}")
 
+                # `high` is an intuitive UPPER bound (band-pass): reject
+                # response above it — too-bright structures (e.g. saturated
+                # autofluorescence). Absolute mode only; high >= 1.0 disables it.
+                # `seed` is a SEPARATE, opt-in hysteresis control: keep dim
+                # (`low`) regions only where they connect to a `seed`-bright
+                # pixel. Absolute mode only; 0 disables (scale seeds itself).
+                current_high = high_thresh_list[i]
+                current_seed = seed_thresh_list[i]
+                use_upper = (
+                    threshold_mode == "Absolute"
+                    and current_high < 1.0
+                    and current_high > thresh
+                )
+                seed_active = (
+                    threshold_mode == "Absolute"
+                    and current_seed > 0.0
+                    and current_seed > thresh
+                )
+
                 # Binary Creation, Closing, and OR-ing
                 if thresh < 1e6:
                     enh_dask = da.from_array(enh_mm, chunks=(128, 512, 512))
@@ -438,12 +478,29 @@ def segment_cells_first_pass_raw(
                     rv = [math.ceil((current_connect_gap / 2) / s) if s > 1e-9 else 0 for s in spacing]
                     struct = np.ones(tuple(max(1, 2 * r + 1) for r in rv), dtype=bool)
 
-                    clean_dask = dask_image.ndmorph.binary_closing((enh_dask > thresh), structure=struct)
-                    
+                    band = enh_dask > thresh
+                    if use_upper:
+                        band = band & (enh_dask < current_high)
+                        print(f"      [Scale {scale}] Upper bound (reject > {current_high:.6f})")
+                    clean_dask = dask_image.ndmorph.binary_closing(band, structure=struct)
+
+                    # Seed mask: confident `seed`-bright pixels (within the upper
+                    # bound) when hysteresis is on; otherwise the detection
+                    # itself, so a scale with no seed is never dropped below.
+                    if seed_active:
+                        seed_dask = enh_dask > current_seed
+                        if use_upper:
+                            seed_dask = seed_dask & (enh_dask < current_high)
+                        print(f"      [Scale {scale}] Hysteresis seed @ {current_seed:.6f}")
+                    else:
+                        seed_dask = clean_dask
+
                     for read_sl, _ in tqdm(list(_get_chunk_slices(volume.shape, (64, 512, 512))), desc="      Merging"):
                         master_mm[read_sl] |= clean_dask[read_sl].compute().astype(np.uint8)
+                        master_seed_mm[read_sl] |= seed_dask[read_sl].compute().astype(np.uint8)
                 
                 master_mm.flush()
+                master_seed_mm.flush()
 
                 # Clean up this scale's intermediate buffers. `enh_mm` is dropped
                 # first since, for scale==0 or smooth_sigma==0, it may just be an
@@ -474,26 +531,47 @@ def segment_cells_first_pass_raw(
 
         d_lbl = da.from_zarr(os.path.join(lab_dir, 'l.zarr'))
         counts, _ = da.histogram(d_lbl, bins=num_feats+1, range=[-0.5, num_feats+0.5])
-        valid = np.where(counts.compute()[1:] >= min_size_voxels)[0] + 1
-        
-        lookup = np.zeros(num_feats + 1, dtype=np.int32)
-        for i, old_id in enumerate(valid): lookup[old_id] = i + 1
-            
+        size_ok = counts.compute()[1:] >= min_size_voxels  # position k -> label k+1
+
         lz = zarr.open(os.path.join(lab_dir, 'l.zarr'), mode='r')
+
+        # Hysteresis resolution: an object survives only if it BOTH meets the
+        # global size floor AND contains at least one seed pixel. When no scale
+        # set a `high` seed, master_seed_mm == master_mm, so every object is
+        # seeded and this reduces to the plain size filter.
+        seeded = np.zeros(num_feats + 1, dtype=bool)
+        for rs, _ in list(_get_chunk_slices(volume.shape, (64, 512, 512))):
+            seed_chunk = master_seed_mm[rs] > 0
+            if seed_chunk.any():
+                seeded[np.unique(lz[rs][seed_chunk])] = True
+        seeded[0] = False
+
+        keep = np.zeros(num_feats + 1, dtype=bool)
+        keep[1:] = size_ok
+        keep &= seeded
+
+        lookup = np.zeros(num_feats + 1, dtype=np.int32)
+        new_id = 0
+        for old_id in range(1, num_feats + 1):
+            if keep[old_id]:
+                new_id += 1
+                lookup[old_id] = new_id
+
         for rs, ws in tqdm(list(_get_chunk_slices(volume.shape, (64, 512, 512))), desc="    Filtering"):
             final_mm[ws] = lookup[lz[rs]]
         final_mm.flush()
 
         # Explicitly release large internal memmaps
-        if 'master_mm' in locals():
-            del master_mm
+        for _m in ('master_mm', 'master_seed_mm'):
+            if _m in locals():
+                del locals()[_m]
 
         return labels_path, labels_temp_dir, threshold_history.get(tubular_scales[0], 0.0), {'threshold_history': threshold_history}
 
     finally:
         if final_labels_memmap is not None: del final_labels_memmap
         # Close any local memmap handles to release file locks
-        for var in ['final_mm', 'norm_mm', 'smoothed_mm', 'master_mm', 'input_mm', 'enh_mm']:
+        for var in ['final_mm', 'norm_mm', 'smoothed_mm', 'master_mm', 'master_seed_mm', 'input_mm', 'enh_mm']:
             if var in locals():
                 try: del locals()[var]
                 except: pass

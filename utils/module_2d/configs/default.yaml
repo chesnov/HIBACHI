@@ -31,11 +31,13 @@ execute_raw_segmentation_fluorescence_2d:
         - scale: 0.0
           low: 0.2
           high: 1.0
+          seed: 0.0
           smooth_sigma: 0.1
           connect_max_gap_physical: 0.0
         - scale: 1.5
           low: 0.03
           high: 1.0
+          seed: 0.0
           smooth_sigma: 0.1
           connect_max_gap_physical: 0.0
       min_size:

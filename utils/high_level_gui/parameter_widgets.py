@@ -47,6 +47,7 @@ class ScalesTableWidget(QWidget):
         "scale": 1.0,
         "low": 95.0,
         "high": 100.0,
+        "seed": 0.0,
         "smooth_sigma": 0.1,
         "connect_max_gap_physical": 0.0,
     }
@@ -56,6 +57,7 @@ class ScalesTableWidget(QWidget):
         "scale": 1.0,
         "low": 0.2,
         "high": 1.0,
+        "seed": 0.0,
         "smooth_sigma": 0.1,
         "connect_max_gap_physical": 0.0,
     }
@@ -83,18 +85,30 @@ class ScalesTableWidget(QWidget):
         btn_layout.addWidget(self.btn_rem)
         self.layout.addLayout(btn_layout)
 
+        # Column set is mode-dependent: the hysteresis `seed` column is only
+        # meaningful in Absolute mode (see the segmentation stage), so the
+        # Percentile table doesn't show it. Built per-instance from _COLUMNS.
+        self._columns = list(self._COLUMNS)
+        if is_absolute:
+            insert_at = next(
+                (i for i, (k, _) in enumerate(self._columns) if k == "high"), len(self._columns) - 1
+            ) + 1
+            self._columns.insert(insert_at, ("seed", None))
+
         # Table
         headers = []
-        for key, text in self._COLUMNS:
+        for key, text in self._columns:
             if key == "low":
-                headers.append("Low Val" if is_absolute else "Low %")
+                headers.append("Low (min)" if is_absolute else "Low %")
             elif key == "high":
-                headers.append("High Val" if is_absolute else "High %")
+                headers.append("High (max)" if is_absolute else "High %")
+            elif key == "seed":
+                headers.append("Seed (0=off)")
             else:
                 headers.append(text)
 
         self.table = QTableWidget()
-        self.table.setColumnCount(len(self._COLUMNS))
+        self.table.setColumnCount(len(self._columns))
         self.table.setHorizontalHeaderLabels(headers)
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
@@ -117,7 +131,7 @@ class ScalesTableWidget(QWidget):
             for row_idx, item in enumerate(data):
                 if isinstance(item, dict):
                     self.table.insertRow(row_idx)
-                    for col_idx, (key, _) in enumerate(self._COLUMNS):
+                    for col_idx, (key, _) in enumerate(self._columns):
                         self._set_item(row_idx, col_idx, item.get(key, defaults[key]))
         self.table.blockSignals(False)
 
@@ -129,7 +143,7 @@ class ScalesTableWidget(QWidget):
         r = self.table.rowCount()
         self.table.insertRow(r)
         defaults = self._row_defaults()
-        for col_idx, (key, _) in enumerate(self._COLUMNS):
+        for col_idx, (key, _) in enumerate(self._columns):
             self._set_item(r, col_idx, defaults[key])
         self._emit_change()
 
@@ -144,7 +158,7 @@ class ScalesTableWidget(QWidget):
         for r in range(self.table.rowCount()):
             try:
                 row_dict = {}
-                for col_idx, (key, _) in enumerate(self._COLUMNS):
+                for col_idx, (key, _) in enumerate(self._columns):
                     raw = float(self.table.item(r, col_idx).text())
                     # Min Size is a pixel count; keep it as an int for downstream use.
                     row_dict[key] = int(round(raw)) if key == "min_size" else raw

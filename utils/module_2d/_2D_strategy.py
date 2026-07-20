@@ -184,6 +184,8 @@ class Fluorescence2DStrategy(ProcessingStrategy):
             tubular_scales = [p['scale'] for p in profiles]
             low_thresh_input = [p['low'] for p in profiles]
             high_thresh_input = [p['high'] for p in profiles]
+            # Per-scale hysteresis seed (Absolute mode; 0/absent = off).
+            seed_thresh_input = [float(p.get('seed', 0.0)) for p in profiles]
 
             # Per-scale smoothing / gap-closing. Base value comes from the
             # step's top-level scalar param; a profile row may override it
@@ -214,6 +216,7 @@ class Fluorescence2DStrategy(ProcessingStrategy):
                 min_size_pixels=min_size_global,
                 low_threshold_percentile=low_thresh_input,
                 high_threshold_percentile=high_thresh_input,
+                seed_threshold=seed_thresh_input,
                 threshold_mode=threshold_mode,
                 subtract_background_radius=int(
                     params.get("subtract_background_radius", 0)
