@@ -45,13 +45,13 @@ execute_raw_segmentation_fluorescence:
       min: 0
       max: 200
       step: 1
-    coherence_weight:
-      label: Coherence Weight (tubular; suppresses incoherent texture; 0 = off)
+    coherence_floor:
+      label: Coherence Floor (tubular; dim pixels must be oriented; 0 = off)
       type: float
       value: 0.0
       min: 0.0
-      max: 8.0
-      step: 0.5
+      max: 1.0
+      step: 0.05
 
 # --- Step 2: Edge Trimming ---
 execute_trim_edges_fluorescence:

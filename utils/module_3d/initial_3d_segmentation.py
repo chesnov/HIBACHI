@@ -299,7 +299,7 @@ def segment_cells_first_pass_raw(
     threshold_mode: str = "Percentile",
     skip_tubular_enhancement: bool = False,
     subtract_background_radius: int = 0,
-    coherence_weight: float = 0.0,
+    coherence_floor: float = 0.0,
     temp_root_path: Optional[str] = None,
     **kwargs: Any
 ) -> Tuple[Optional[str], Optional[str], float, Dict[str, Any]]:
@@ -482,23 +482,6 @@ def segment_cells_first_pass_raw(
                         subtract_background_radius=subtract_background_radius, temp_root_path=temp_root_path
                     )
 
-                # Orientation-coherence weighting (general; 0 = off). Multiplies
-                # the tubular response by coherence**gamma so incoherent texture
-                # (noise, isotropic background) is suppressed relative to truly
-                # oriented structure, on the one axis a magnitude threshold
-                # can't see. Only for scale > 0 — blobs are legitimately
-                # isotropic, so the intensity path is never coherence-weighted.
-                if coherence_weight > 0.0 and scale != 0:
-                    coh = _orientation_coherence(
-                        smoothed_mm, spacing, scale, chunks=(128, 512, 512)
-                    )
-                    enh_dask0 = da.from_array(enh_mm, chunks=(128, 512, 512))
-                    weighted = enh_dask0 * (coh ** float(coherence_weight))
-                    for read_sl, _ in _get_chunk_slices(volume.shape, (64, 512, 512)):
-                        enh_mm[read_sl] = weighted[read_sl].compute().astype(np.float32)
-                    enh_mm.flush()
-                    print(f"      [Scale {scale}] Coherence-weighted (gamma={coherence_weight})")
-
                 # Independent Thresholding Pass
                 stride_z = max(1, min(4, volume.shape[0] // 32))
                 stride_xy = max(1, min(16, min(volume.shape[1:]) // 128))
@@ -531,6 +514,14 @@ def segment_cells_first_pass_raw(
                     and current_seed > 0.0
                     and current_seed > thresh
                 )
+                # Coherence gate: dim pixels (below `seed`) survive only if
+                # locally oriented (coherence > floor); bright pixels (>= seed)
+                # are exempt, so strong thick/beaded structure is never cut by
+                # shape. Pairs with the seed (which defines "bright enough to
+                # trust outright") and applies to the tubular path only.
+                coh_active = (
+                    coherence_floor > 0.0 and scale != 0 and seed_active
+                )
 
                 # Binary Creation, Closing, and OR-ing
                 if thresh < 1e6:
@@ -544,6 +535,14 @@ def segment_cells_first_pass_raw(
                     if use_upper:
                         band = band & (enh_dask < current_high)
                         print(f"      [Scale {scale}] Upper bound (reject > {current_high:.6f})")
+                    if coh_active:
+                        # Dim (< seed) pixels must be coherent; bright ones are
+                        # exempt so thick/beaded structure isn't cut by shape.
+                        coh = _orientation_coherence(
+                            smoothed_mm, spacing, scale, chunks=(128, 512, 512)
+                        )
+                        band = band & ((coh > coherence_floor) | (enh_dask > current_seed))
+                        print(f"      [Scale {scale}] Coherence gate on dim band (floor={coherence_floor})")
                     clean_dask = dask_image.ndmorph.binary_closing(band, structure=struct)
 
                     # Seed mask: confident `seed`-bright pixels (within the upper
