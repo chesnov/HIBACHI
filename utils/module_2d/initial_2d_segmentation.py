@@ -451,14 +451,11 @@ def segment_cells_first_pass_raw_2d(
                     and current_seed > 0.0
                     and current_seed > thresh
                 )
-                # Coherence gate: dim pixels (below `seed`) survive only if
-                # locally oriented (coherence > floor); bright pixels (>= seed)
-                # are exempt, so strong thick/beaded structure is never cut by
-                # shape. Pairs with the seed (which defines "bright enough to
-                # trust outright") and applies to the tubular path only.
-                coh_active = (
-                    coherence_floor > 0.0 and scale != 0 and seed_active
-                )
+                # Coherence now SEEDS (it no longer gates the grow): a component
+                # survives only if it contains an oriented (coherent) core, so
+                # incoherent background is dropped whole while real structure —
+                # grown by magnitude — is never fragmented. Tubular path only.
+                coh_active = (coherence_floor > 0.0 and scale != 0)
 
                 if thresh < 1e6:
                     enh_dask = da.from_array(enh_mm, chunks=(4096, 4096))
@@ -471,20 +468,28 @@ def segment_cells_first_pass_raw_2d(
                     if use_upper:
                         band = band & (enh_dask < current_high)
                         print(f"      [Scale {scale}] Upper bound (reject > {current_high:.6f})")
+                    # Grow is magnitude-only: a structure fills contiguously
+                    # through its own faint/incoherent stretches, so coherence
+                    # can never fragment a real branch.
+                    clean_dask = dask_image.ndmorph.binary_closing(band, structure=struct)
+
+                    # Seed mask defines the confident cores a component must
+                    # contain to survive the hysteresis test below.
+                    #   coherence on  -> a coherent core (oriented structure);
+                    #                    optionally also a bright core if `seed`
+                    #                    is set. Incoherent background has no
+                    #                    coherent core and is dropped whole,
+                    #                    without cutting into real structure.
+                    #   coherence off -> the bright `seed` core (or self-seed).
                     if coh_active:
-                        # Dim (< seed) pixels must be coherent; bright ones are
-                        # exempt so thick/beaded structure isn't cut by shape.
                         coh = _orientation_coherence(
                             smoothed_mm, spacing_2d, scale, chunks=(4096, 4096)
                         )
-                        band = band & ((coh > coherence_floor) | (enh_dask > current_seed))
-                        print(f"      [Scale {scale}] Coherence gate on dim band (floor={coherence_floor})")
-                    clean_dask = dask_image.ndmorph.binary_closing(band, structure=struct)
-
-                    # Seed mask: confident `seed`-bright pixels (within the upper
-                    # bound) when hysteresis is on; otherwise the detection
-                    # itself, so a scale with no seed is never dropped below.
-                    if seed_active:
+                        seed_dask = (coh > coherence_floor) & band
+                        if seed_active:
+                            seed_dask = seed_dask | (enh_dask > current_seed)
+                        print(f"      [Scale {scale}] Coherent-core seed (floor={coherence_floor})")
+                    elif seed_active:
                         seed_dask = enh_dask > current_seed
                         if use_upper:
                             seed_dask = seed_dask & (enh_dask < current_high)

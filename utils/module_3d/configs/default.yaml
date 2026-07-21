@@ -46,7 +46,7 @@ execute_raw_segmentation_fluorescence:
       max: 200
       step: 1
     coherence_floor:
-      label: Coherence Floor (tubular; dim pixels must be oriented; 0 = off)
+      label: Coherence Floor (tubular; needs an oriented core to keep a structure; 0 = off)
       type: float
       value: 0.0
       min: 0.0
