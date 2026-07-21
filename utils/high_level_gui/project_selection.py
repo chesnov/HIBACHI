@@ -941,6 +941,21 @@ if _HAVE_QT:
                 self._loading = False
             self.selection_changed.emit()
 
+        def highlight_folder(self, folder: str) -> None:
+            """Make `folder`'s row the current (highlighted) selection and scroll
+            it into view. Used when returning from an image so the one you were
+            just looking at stays marked, instead of the list losing its place."""
+            if not folder:
+                return
+            it = QTreeWidgetItemIterator(self.tree)
+            while it.value():
+                item = it.value()
+                if item.data(0, Qt.UserRole) == folder:
+                    self.tree.setCurrentItem(item)
+                    self.tree.scrollToItem(item)
+                    break
+                it += 1
+
         def _make_leaf(self, name: str, folder: str, channel_key: str) -> "QTreeWidgetItem":
             status = sample_status(folder)
             mode = self._read_mode(folder)

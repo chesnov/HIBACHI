@@ -53,6 +53,7 @@ class ProjectViewWindow(QMainWindow):
         # re-activates) we refresh the tree so status / "last edited" reflect any
         # processing just done, instead of showing stale values.
         self._pending_content_refresh = False
+        self._last_opened_folder = None  # re-highlighted on return from an image
         self.initUI()
         self.setAttribute(Qt.WA_QuitOnClose)
 
@@ -299,6 +300,7 @@ class ProjectViewWindow(QMainWindow):
         # Processing may change this folder's status/outputs; refresh the tree
         # when we come back so it doesn't show stale "in progress / N ago".
         self._pending_content_refresh = True
+        self._last_opened_folder = folder
         self.hide()
         from .app_launch import interactive_segmentation_with_config  # lazy: avoid cycle
         interactive_segmentation_with_config(folder, project_manager=self.project_manager)
@@ -360,6 +362,10 @@ class ProjectViewWindow(QMainWindow):
                     try:
                         self._content_view.refresh()
                         self._update_action_buttons()
+                        # Keep the image we just came back from highlighted so
+                        # it's easy to see where we were in the list.
+                        if self._last_opened_folder:
+                            self._content_view.highlight_folder(self._last_opened_folder)
                     except Exception as exc:
                         print(f"[project view] tree refresh failed: {exc}")
         super().changeEvent(event)

@@ -5,7 +5,7 @@ from magicgui import magicgui  # type: ignore
 from typing import Dict, Any, List, Optional, Callable
 from PyQt5.QtCore import pyqtSignal  # type: ignore
 from PyQt5.QtWidgets import (  # type: ignore
-    QVBoxLayout, QHBoxLayout, QPushButton, QWidget, QLabel, QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView
+    QVBoxLayout, QHBoxLayout, QPushButton, QWidget, QLabel, QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView, QAbstractSpinBox
 )
 
 
@@ -269,6 +269,18 @@ def create_parameter_widget(
 
         if widget:
             widget.param_name = param_name
+
+            # Spin boxes (int/float params) otherwise re-validate on every
+            # keystroke with auto_call, which fights multi-digit entry: typing
+            # "600" into a field with a minimum snaps the partial value and the
+            # digits get eaten. Committing on Enter/focus-out instead makes them
+            # behave like normal numeric fields. Applied app-wide here since
+            # every parameter widget is built through this function.
+            try:
+                for sb in widget.native.findChildren(QAbstractSpinBox):
+                    sb.setKeyboardTracking(False)
+            except Exception:
+                pass
 
     except Exception:
         return None
