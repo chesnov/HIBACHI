@@ -242,6 +242,50 @@ class SimpleTimer:
         print(f"    [Timer] Finished: {self.name} in {time.perf_counter()-self.start:.2f}s")
 
 
+def _orientation_coherence(smoothed_mm, spacing, scale, chunks):
+    """Structure-tensor orientation coherence in [0, 1].
+
+    0 = locally isotropic (texture / noise / flat); →1 = a single dominant
+    local gradient orientation (an edge or ridge flank). A general image
+    operator with no model of what is imaged: it is computed from the
+    gradient-covariance (structure) tensor and normalised fractional-anisotropy
+    style, so it is invariant to intensity scale. Dimension-generic — derives
+    ndim from the array — so 2D and 3D share identical logic. Fully elementwise
+    on dask arrays, so it is chunk-safe on large memmaps.
+    """
+    ndim = smoothed_mm.ndim
+    n = float(ndim)
+    d = da.from_array(smoothed_mm, chunks=chunks).astype(np.float32)
+
+    # Derivative (noise) and integration scales, in voxels, tied to `scale`.
+    sigma_grad = [max(1.0, 0.5 * scale / s) if s > 1e-9 else 1.0 for s in spacing]
+    rho = [max(1.5, 2.0 * scale / s) if s > 1e-9 else 1.5 for s in spacing]
+
+    sm = dask_image.ndfilters.gaussian_filter(d, sigma=sigma_grad)
+    grads = da.gradient(sm)
+    if ndim == 1:
+        grads = [grads]
+
+    # Structure-tensor components, integrated (smoothed) at scale rho.
+    diag = [dask_image.ndfilters.gaussian_filter(g * g, sigma=rho) for g in grads]
+    trace = diag[0]
+    jnorm2 = diag[0] * diag[0]
+    for dd in diag[1:]:
+        trace = trace + dd
+        jnorm2 = jnorm2 + dd * dd
+    for a in range(ndim):
+        for b in range(a + 1, ndim):
+            jab = dask_image.ndfilters.gaussian_filter(grads[a] * grads[b], sigma=rho)
+            jnorm2 = jnorm2 + 2.0 * (jab * jab)
+
+    # Fractional-anisotropy-style coherence from tensor invariants (no explicit
+    # eigen-decomposition): ||J_dev||^2 = ||J||^2 - trace^2 / n.
+    eps = 1e-12
+    dev2 = da.maximum(jnorm2 - (trace * trace) / n, 0.0)
+    coh = da.sqrt((n / (n - 1.0)) * dev2 / (jnorm2 + eps))
+    return da.clip(coh, 0.0, 1.0)
+
+
 def segment_cells_first_pass_raw(
     volume: np.ndarray,
     spacing: Tuple[float, float, float],
@@ -255,6 +299,7 @@ def segment_cells_first_pass_raw(
     threshold_mode: str = "Percentile",
     skip_tubular_enhancement: bool = False,
     subtract_background_radius: int = 0,
+    coherence_weight: float = 0.0,
     temp_root_path: Optional[str] = None,
     **kwargs: Any
 ) -> Tuple[Optional[str], Optional[str], float, Dict[str, Any]]:
@@ -436,7 +481,24 @@ def segment_cells_first_pass_raw(
                         skip_tubular_enhancement=skip_tubular_enhancement,
                         subtract_background_radius=subtract_background_radius, temp_root_path=temp_root_path
                     )
-                
+
+                # Orientation-coherence weighting (general; 0 = off). Multiplies
+                # the tubular response by coherence**gamma so incoherent texture
+                # (noise, isotropic background) is suppressed relative to truly
+                # oriented structure, on the one axis a magnitude threshold
+                # can't see. Only for scale > 0 — blobs are legitimately
+                # isotropic, so the intensity path is never coherence-weighted.
+                if coherence_weight > 0.0 and scale != 0:
+                    coh = _orientation_coherence(
+                        smoothed_mm, spacing, scale, chunks=(128, 512, 512)
+                    )
+                    enh_dask0 = da.from_array(enh_mm, chunks=(128, 512, 512))
+                    weighted = enh_dask0 * (coh ** float(coherence_weight))
+                    for read_sl, _ in _get_chunk_slices(volume.shape, (64, 512, 512)):
+                        enh_mm[read_sl] = weighted[read_sl].compute().astype(np.float32)
+                    enh_mm.flush()
+                    print(f"      [Scale {scale}] Coherence-weighted (gamma={coherence_weight})")
+
                 # Independent Thresholding Pass
                 stride_z = max(1, min(4, volume.shape[0] // 32))
                 stride_xy = max(1, min(16, min(volume.shape[1:]) // 128))

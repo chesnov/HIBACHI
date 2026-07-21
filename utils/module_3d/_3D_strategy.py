@@ -218,6 +218,7 @@ class FluorescenceStrategy(ProcessingStrategy):
                 subtract_background_radius=int(
                     params.get("subtract_background_radius", 0)
                 ),
+                coherence_weight=float(params.get("coherence_weight", 0.0)),
                 temp_root_path=self.temp_dir
             )
 
