@@ -179,6 +179,9 @@ def create_parameter_widget(
     """Creates a MagicGUI widget for a specific parameter definition."""
     param_type = param_config.get("type", "float")
     label = param_config.get("label", param_name)
+    # Long explanations live in `hint` and surface on hover, so the label column
+    # stays short and the GUI doesn't stretch. Falls back to the label.
+    tooltip = param_config.get("hint", "") or label
     widget = None
 
     try:
@@ -186,6 +189,8 @@ def create_parameter_widget(
         if param_type == "scale_table" or param_type == "scale_table_percentile":
             initial_val = param_config.get("value",[])
             widget = ScalesTableWidget(initial_val, label, is_absolute=False)
+            if tooltip:
+                widget.setToolTip(tooltip)
             widget.valueChanged.connect(callback)
             return widget
         
@@ -193,6 +198,8 @@ def create_parameter_widget(
         elif param_type == "scale_table_absolute":
             initial_val = param_config.get("value",[])
             widget = ScalesTableWidget(initial_val, label, is_absolute=True)
+            if tooltip:
+                widget.setToolTip(tooltip)
             widget.valueChanged.connect(callback)
             return widget
         
@@ -218,7 +225,7 @@ def create_parameter_widget(
 
             widget = magicgui(
                 list_widget, auto_call=True,
-                value_str={"widget_type": "LineEdit", "label": label}
+                value_str={"widget_type": "LineEdit", "label": label, "tooltip": tooltip}
             )
 
         elif param_type == "float":
@@ -228,7 +235,7 @@ def create_parameter_widget(
             widget = magicgui(
                 float_widget, auto_call=True,
                 value={
-                    "widget_type": "FloatSpinBox", "label": label,
+                    "widget_type": "FloatSpinBox", "label": label, "tooltip": tooltip,
                     "min": float(param_config.get("min", 0)),
                     "max": float(param_config.get("max", 100)),
                     "step": float(param_config.get("step", 0.1))
@@ -242,7 +249,7 @@ def create_parameter_widget(
             widget = magicgui(
                 int_widget, auto_call=True,
                 value={
-                    "widget_type": "SpinBox", "label": label,
+                    "widget_type": "SpinBox", "label": label, "tooltip": tooltip,
                     "min": int(param_config.get("min", 0)),
                     "max": int(param_config.get("max", 100)),
                     "step": int(param_config.get("step", 1))
@@ -255,7 +262,7 @@ def create_parameter_widget(
                 return value
             widget = magicgui(
                 bool_widget, auto_call=True,
-                value={"widget_type": "CheckBox", "label": label}
+                value={"widget_type": "CheckBox", "label": label, "tooltip": tooltip}
             )
 
         else:
@@ -264,7 +271,7 @@ def create_parameter_widget(
                 return value
             widget = magicgui(
                 fallback, auto_call=True,
-                value={"widget_type": "LineEdit", "label": label}
+                value={"widget_type": "LineEdit", "label": label, "tooltip": tooltip}
             )
 
         if widget:

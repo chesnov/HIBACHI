@@ -553,6 +553,21 @@ def segment_cells_first_pass_raw(
                         if seed_active:
                             seed_dask = seed_dask | (enh_dask > current_seed)
                         print(f"      [Scale {scale}] Coherent-core seed (floor={coherence_floor})")
+                        # DIAGNOSTIC: coherence distribution over the foreground.
+                        # If p50/p90 sit near 1.0, coherence isn't discriminating
+                        # (integration scale too small); if it's spread out, the
+                        # floor is meaningful and any leftover noise is a flood.
+                        try:
+                            st = max(1, min(volume.shape[1:]) // 512)
+                            cs = coh[:, ::st, ::st].compute()
+                            bs = (enh_dask[:, ::st, ::st] > thresh).compute()
+                            fg = cs[bs]
+                            if fg.size:
+                                p = np.percentile(fg, [10, 50, 90, 99])
+                                print(f"      [DIAG] coherence over foreground "
+                                      f"p10/50/90/99 = {p[0]:.2f}/{p[1]:.2f}/{p[2]:.2f}/{p[3]:.2f}")
+                        except Exception:
+                            pass
                     elif seed_active:
                         seed_dask = enh_dask > current_seed
                         if use_upper:
@@ -597,7 +612,19 @@ def segment_cells_first_pass_raw(
 
         d_lbl = da.from_zarr(os.path.join(lab_dir, 'l.zarr'))
         counts, _ = da.histogram(d_lbl, bins=num_feats+1, range=[-0.5, num_feats+0.5])
-        size_ok = counts.compute()[1:] >= min_size_voxels  # position k -> label k+1
+        csz = counts.compute()
+        size_ok = csz[1:] >= min_size_voxels  # position k -> label k+1
+
+        # DIAGNOSTIC: if one component holds most of the foreground, the mask
+        # is a single connected flood (coherence can't gate it by seeding);
+        # if foreground is spread over many components, seeding can.
+        try:
+            tot = float(csz[1:].sum())
+            if tot > 0:
+                print(f"    [DIAG] {num_feats} components; largest holds "
+                      f"{100.0 * csz[1:].max() / tot:.0f}% of foreground")
+        except Exception:
+            pass
 
         lz = zarr.open(os.path.join(lab_dir, 'l.zarr'), mode='r')
 

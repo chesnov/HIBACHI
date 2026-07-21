@@ -48,14 +48,20 @@ execute_raw_segmentation_fluorescence_2d:
         max: 50000
         step: 1
       subtract_background_radius:
-        label: Subtract Background Radius (px, white top-hat; 0 = off)
+        label: Subtract Background (px)
+        hint: White top-hat radius in pixels. Removes background broader than
+          this footprint while keeping finer structure. 0 = off.
         type: int
         value: 0
         min: 0
         max: 200
         step: 1
       coherence_floor:
-        label: Coherence Floor (tubular; needs an oriented core to keep a structure; 0 = off)
+        label: Coherence Floor
+        hint: Tubular path only. A structure is kept only if it contains an
+          oriented (coherent) core above this value, in [0, 1]. Higher = stricter;
+          1.0 keeps nothing. 0 = off. Set the tubular Seed to 0 to let coherence
+          alone decide what anchors.
         type: float
         value: 0.0
         min: 0.0
