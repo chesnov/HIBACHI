@@ -12,7 +12,7 @@ import numpy as np
 from skimage.draw import polygon as skimage_polygon  # type: ignore
 from PyQt5.QtWidgets import (  # type: ignore
     QMessageBox, QWidget, QVBoxLayout, QScrollArea, QLabel,
-    QTextEdit, QProgressBar, QApplication, QPushButton, QFileDialog, QDockWidget
+    QTextEdit, QProgressBar, QApplication, QPushButton, QFileDialog, QDockWidget, QLayout
 )
 from PyQt5.QtCore import QThread, pyqtSignal, QObject, Qt, QTimer  # type: ignore
 from PyQt5.QtGui import QTextCursor  # type: ignore
@@ -1784,10 +1784,19 @@ class DynamicGUIManager(QObject):
 
     def _dock_widget(self, widget: QWidget, name: str) -> None:
         """Docks the given widget into the Napari window."""
+        # Keep the parameter panel at its natural height and scroll when the
+        # dock is short, instead of compressing the controls. SetMinimumSize
+        # ties the content's minimum to its contents so the scroll area shows a
+        # scrollbar rather than squishing; the trailing stretch soaks up extra
+        # space when the dock is tall so the widgets don't splay out either.
+        lay = widget.layout()
+        if isinstance(lay, QVBoxLayout):
+            lay.addStretch(1)
+            lay.setSizeConstraint(QLayout.SetMinimumSize)
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setWidget(widget)
-        scroll.setMinimumWidth(350) 
+        scroll.setMinimumWidth(350)
         dock = self.viewer.window.add_dock_widget(
             scroll, area="right", name=f"Step: {name}"
         )

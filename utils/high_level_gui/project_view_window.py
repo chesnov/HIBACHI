@@ -62,7 +62,14 @@ class ProjectViewWindow(QMainWindow):
         _icon = app_icon_path()
         if _icon:
             self.setWindowIcon(QIcon(_icon))
-        self.setGeometry(100, 100, 860, 560)
+        # Open occupying the full vertical span of the screen (moderate width),
+        # since the project tree is tall — avoids the squished default height.
+        try:
+            avail = QApplication.primaryScreen().availableGeometry()
+            width = min(900, avail.width())
+            self.setGeometry(avail.x() + 60, avail.y(), width, avail.height())
+        except Exception:
+            self.setGeometry(100, 100, 860, 560)
 
         central_widget = QWidget()
         layout = QVBoxLayout()
@@ -195,6 +202,8 @@ class ProjectViewWindow(QMainWindow):
 
         self.analyzer_window = CrossChannelAnalyzerWindow(self.project_manager)
         self.analyzer_window.show()
+        self.analyzer_window.raise_()
+        self.analyzer_window.activateWindow()
 
     def open_path(self, selected_path: str) -> None:
         """

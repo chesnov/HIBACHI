@@ -77,6 +77,15 @@ def interactive_segmentation_with_config(selected_folder: str = None, project_ma
         qt_window = viewer.window._qt_window
         qt_window.destroyed.connect(_handle_napari_close)
 
+        # Open maximized and bring to the foreground so the user doesn't have to
+        # click the app icon to surface it.
+        try:
+            qt_window.showMaximized()
+            qt_window.raise_()
+            qt_window.activateWindow()
+        except Exception:
+            pass
+
         gui_manager = DynamicGUIManager(viewer, config, image_stack, file_loc, mode,
                                         project_manager=project_manager)
         viewer.window.add_dock_widget(
@@ -256,8 +265,11 @@ def launch_image_segmentation_tool() -> QApplication:
     def show_pv():
         if not app_state.project_view_window:
             app_state.project_view_window = ProjectViewWindow(ProjectManager())
-        app_state.project_view_window.show()
-        app_state.project_view_window.raise_()
+        pv = app_state.project_view_window
+        pv.showNormal()          # de-minimise if needed
+        pv.show()
+        pv.raise_()
+        pv.activateWindow()
 
     app_state.show_project_view_signal.connect(show_pv)
     show_pv()

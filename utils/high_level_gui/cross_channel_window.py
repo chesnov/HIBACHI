@@ -362,6 +362,11 @@ class CrossChannelAnalyzerWindow(QMainWindow):
         os.makedirs(sample_out_dir, exist_ok=True)
 
         viewer = napari.Viewer(title=f"Cross-Channel Preview: {sample_name}")
+        try:
+            _qw = viewer.window._qt_window
+            _qw.showMaximized(); _qw.raise_(); _qw.activateWindow()
+        except Exception:
+            pass
         
         # Predefined colormaps for raw channels
         colormaps = ['cyan', 'magenta', 'yellow', 'green', 'red', 'blue']
@@ -601,6 +606,11 @@ def open_sample_overlay(project_manager, sample_name, analysis_name=None, parent
     title = (f"Overlay: {analysis_name} | {sample_name}"
              if analysis_name else f"Sample: {sample_name}")
     viewer = napari.Viewer(title=title)
+    try:
+        _qw = viewer.window._qt_window
+        _qw.showMaximized(); _qw.raise_(); _qw.activateWindow()
+    except Exception:
+        pass
     colormaps = ['cyan', 'magenta', 'yellow', 'green', 'red', 'blue']
     shape = None
     spacing = (1.0, 1.0, 1.0)
