@@ -62,6 +62,17 @@ execute_raw_segmentation_fluorescence:
       min: 0
       max: 5000
       step: 1
+    trace_max_gap:
+      label: Trace Gap (µm)
+      hint: Orientation-following gap tracing. Reconnects a structure broken by
+        a dim stretch by walking the local intensity ridge outward from each
+        fragment tip (branch-by-branch, so arborized cells are handled) and
+        bridging to whatever it reaches within this distance. 0 = off.
+      type: float
+      value: 0.0
+      min: 0.0
+      max: 50.0
+      step: 0.5
 
 # --- Step 2: Edge Trimming ---
 execute_trim_edges_fluorescence:

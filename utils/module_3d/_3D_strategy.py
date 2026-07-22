@@ -212,9 +212,7 @@ class FluorescenceStrategy(ProcessingStrategy):
                 high_threshold_percentile=high_thresh_input,
                 threshold_mode=threshold_mode,
                 skip_tubular_enhancement=skip_enhancement,
-                subtract_background_radius=int(
-                    params.get("subtract_background_radius", 0)
-                ),
+                trace_max_gap=float(params.get("trace_max_gap", 0.0)),
                 temp_root_path=self.temp_dir
             )
 

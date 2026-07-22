@@ -215,6 +215,7 @@ class Fluorescence2DStrategy(ProcessingStrategy):
                 low_threshold_percentile=low_thresh_input,
                 high_threshold_percentile=high_thresh_input,
                 threshold_mode=threshold_mode,
+                trace_max_gap=float(params.get("trace_max_gap", 0.0)),
                 temp_root_path=self.temp_dir
             )
 

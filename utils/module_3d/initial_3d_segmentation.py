@@ -242,6 +242,160 @@ class SimpleTimer:
         print(f"    [Timer] Finished: {self.name} in {time.perf_counter()-self.start:.2f}s")
 
 
+def _trace_link_fragments(final_mm, image, spacing, max_gap, step=1.0,
+                          angle_tol_deg=45.0, momentum=0.5, recenter_radius=3):
+    """Orientation-following gap tracing to reconnect a structure broken by a
+    dim stretch. Walks the local intensity ridge outward from each fragment
+    endpoint, branch-by-branch -- direction comes from the recentred path, and
+    each step re-snaps transversally onto the local ridge -- so it follows a
+    process across a faint gap and handles arbors (every endpoint has its own
+    local heading; no global cell axis). Fragments whose traces reach one
+    another are merged and the traced path is painted so the object is
+    spatially contiguous.
+
+    Memory-light: the label and image arrays stay on disk (memmaps); only small
+    local windows are read per endpoint/step, and relabelling streams one slab
+    at a time -- the full mask is never held in RAM. Opt-in (max_gap <= 0 is a
+    no-op upstream). Returns the new object count, or None if nothing linked.
+    General: uses only intensity ridges and geometry, no model of the imaged
+    object. Returns None quietly if scipy/skimage are unavailable.
+    """
+    try:
+        from scipy import ndimage as _ndi
+        from skimage.morphology import skeletonize as _skel
+    except Exception:
+        return None
+
+    ndim = final_mm.ndim
+    sp = np.asarray(spacing[-ndim:], dtype=float)
+    mean_sp = float(sp.mean())
+    max_steps = max(1, int(round(max_gap / (step * max(mean_sp, 1e-9)))))
+    shape = np.asarray(final_mm.shape)
+    cos_tol = float(np.cos(np.deg2rad(angle_tol_deg)))
+
+    def _recenter(cur, d):
+        ci = np.round(cur).astype(int)
+        sl = tuple(slice(max(0, ci[k] - recenter_radius),
+                         min(int(shape[k]), ci[k] + recenter_radius + 1)) for k in range(ndim))
+        w = np.asarray(image[sl], dtype=float)
+        s = w.sum()
+        if s <= 1e-9:
+            return cur, 0.0
+        coords = np.indices(w.shape).reshape(ndim, -1)
+        base = np.array([x.start for x in sl])
+        cen = base + (coords * w.ravel()).sum(1) / s
+        off = cen - cur
+        off = off - (off @ d) * d          # keep only the transverse component
+        return cur + off, float(w.max())
+
+    def _trace(start, direction, own):
+        cur = start.astype(float).copy()
+        d = direction.astype(float).copy()
+        try:
+            min_int = 0.25 * float(image[tuple(np.round(start).astype(int))])
+        except Exception:
+            min_int = 0.0
+        path = [cur.copy()]
+        lost = 0
+        for _ in range(max_steps):
+            prev = cur.copy()
+            cur = cur + step * d
+            cur, peak = _recenter(cur, d)
+            disp = cur - prev
+            dn = np.linalg.norm(disp)
+            if dn > 1e-6:
+                nd = disp / dn
+                if nd @ d < cos_tol:
+                    return 0, None          # path bent too sharply -> stop
+                d = momentum * d + (1 - momentum) * nd
+                d /= (np.linalg.norm(d) + 1e-12)
+            ci = np.round(cur).astype(int)
+            if np.any(ci < 0) or np.any(ci >= shape):
+                return 0, None
+            path.append(cur.copy())
+            lab = int(final_mm[tuple(ci)])
+            if lab != 0 and lab != own:
+                return lab, path            # reached another fragment
+            if peak < min_int:
+                lost += 1
+                if lost > 5:
+                    return 0, None          # trail faded out
+            else:
+                lost = 0
+        return 0, None
+
+    parent = {}
+
+    def _find(x):
+        parent.setdefault(x, x)
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    objs = _ndi.find_objects(final_mm)       # streams the memmap; O(labels) memory
+    bridges = []
+    for idx, sl in enumerate(objs):
+        lab = idx + 1
+        if sl is None:
+            continue
+        sub = np.asarray(final_mm[sl]) == lab
+        if sub.sum() < 3:
+            continue
+        try:
+            sk = _skel(sub)
+        except Exception:
+            continue
+        pts = np.argwhere(sk)
+        if len(pts) < 3:
+            continue
+        nb = _ndi.convolve(sk.astype(int), np.ones((3,) * ndim, dtype=int), mode='constant') - 1
+        base = np.array([x.start for x in sl])
+        for epl in np.argwhere(sk & (nb == 1)):
+            dd = pts - epl
+            near = pts[(dd ** 2).sum(1) <= 100]      # ~10 px for a stable tangent
+            c = near.mean(0)
+            t = epl - c
+            tn = np.linalg.norm(t)
+            if tn < 1e-9:
+                continue
+            hit, path = _trace((epl + base).astype(float), t / tn, lab)
+            if hit and _find(hit) != _find(lab):
+                parent[_find(lab)] = _find(hit)
+                bridges.append((path, lab))
+
+    if not parent:
+        return None
+
+    maxid = int(final_mm.max())
+    root_of = np.arange(maxid + 1)
+    for i in range(1, maxid + 1):
+        root_of[i] = _find(i) if i in parent else i
+    uniq = sorted(set(int(root_of[i]) for i in range(1, maxid + 1)))
+    compact = {r: k + 1 for k, r in enumerate(uniq)}
+    lut = np.zeros(maxid + 1, dtype=np.int32)
+    for i in range(1, maxid + 1):
+        lut[i] = compact[int(root_of[i])]
+
+    # Paint traced bridges with a small radius so each path is solid & contiguous.
+    br = 1
+    ball = np.argwhere(np.ones((2 * br + 1,) * ndim)) - br
+    ball = ball[(ball ** 2).sum(1) <= br * br + 1]
+    for path, lab in bridges:
+        for p in path:
+            ci = np.round(p).astype(int)
+            for o in ball:
+                q = ci + o
+                if np.all(q >= 0) and np.all(q < shape):
+                    final_mm[tuple(q)] = lab
+
+    # Relabel in place, streaming one leading-axis slab at a time.
+    for i0 in range(int(shape[0])):
+        final_mm[i0] = lut[final_mm[i0]]
+    return len(uniq)
+
+
+
 def segment_cells_first_pass_raw(
     volume: np.ndarray,
     spacing: Tuple[float, float, float],
@@ -254,6 +408,7 @@ def segment_cells_first_pass_raw(
     threshold_mode: str = "Percentile",
     skip_tubular_enhancement: bool = False,
     subtract_background_radius: int = 0,
+    trace_max_gap: float = 0.0,
     temp_root_path: Optional[str] = None,
     **kwargs: Any
 ) -> Tuple[Optional[str], Optional[str], float, Dict[str, Any]]:
@@ -483,6 +638,18 @@ def segment_cells_first_pass_raw(
         for rs, ws in tqdm(list(_get_chunk_slices(volume.shape, (64, 512, 512))), desc="    Filtering"):
             final_mm[ws] = lookup[lz[rs]]
         final_mm.flush()
+
+        # Orientation-following gap tracing (opt-in; 0 = off). Reconnects a
+        # structure broken by a dim stretch by walking the local intensity ridge
+        # across the gap. Memory-light (windowed memmap access).
+        if trace_max_gap > 0.0:
+            try:
+                n_obj = _trace_link_fragments(final_mm, volume, spacing, trace_max_gap)
+                if n_obj is not None:
+                    print(f"    [DIAG] orientation trace-link -> {n_obj} objects")
+                    final_mm.flush()
+            except Exception as exc:
+                print(f"    [trace-link] skipped: {exc}")
 
         # Explicitly release large internal memmaps
         if 'master_mm' in locals():
