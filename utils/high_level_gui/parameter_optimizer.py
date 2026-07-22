@@ -149,6 +149,54 @@ def _active_profiles(params: Dict[str, Any]) -> Tuple[str, List[Dict[str, Any]]]
     raise OptimizationError("Config has no scale-profile table to optimize.")
 
 
+def _flatten_params(raw: Dict[str, Any]) -> Dict[str, Any]:
+    """Resolve a step's parameter block to plain values.
+
+    Saved configs use the rich schema (each param is ``{label, type, value}``,
+    like default.yaml); the pipeline resolves that to bare values before it runs
+    a step. Do the same here: unwrap any ``{... 'value': X}`` entry to X, and
+    leave genuine mapping/list values (e.g. pixel_dimensions, the scale table's
+    row list) untouched. Works whether the input is already flat or rich.
+    """
+    flat: Dict[str, Any] = {}
+    for key, val in (raw or {}).items():
+        if isinstance(val, dict) and "value" in val:
+            flat[key] = val["value"]
+        else:
+            flat[key] = val
+    return flat
+
+
+def _write_leaf_into_config(rich_params: Dict[str, Any], leaf: Tuple[Any, str],
+                            value: float, table_key: str) -> None:
+    """Write an optimized leaf back into a rich-schema parameter block, in
+    place, preserving the ``{label, type, value}`` wrappers so the output config
+    stays a valid template. Handles both rich and already-flat blocks."""
+    scale, field = leaf
+
+    def _rows(entry):
+        if isinstance(entry, dict) and "value" in entry:
+            return entry["value"]
+        return entry
+
+    if scale == _SCALAR_KEY:
+        out = int(round(value)) if field == "min_size" else float(value)
+        entry = rich_params.get(field)
+        if isinstance(entry, dict) and "value" in entry:
+            entry["value"] = out
+        else:
+            rich_params[field] = out
+        return
+
+    rows = _rows(rich_params.get(table_key))
+    if not isinstance(rows, list):
+        return
+    for row in rows:
+        if isinstance(row, dict) and abs(float(row.get("scale", 1e18)) - float(scale)) < 1e-9:
+            row[field] = float(value)
+            return
+
+
 def _params_to_kwargs(params: Dict[str, Any]) -> Dict[str, Any]:
     """Mirror _2D_strategy.execute_raw_segmentation's parameter parsing."""
     _tbl, profiles = _active_profiles(params)
@@ -375,7 +423,7 @@ def optimize_initial_segmentation(
         cfg_path, tif_path = _find_config_and_image(folder)
         config = _load_yaml(cfg_path)
         step_key = _raw_seg_step_key(config)
-        params = config[step_key].get("parameters", config[step_key])
+        params = _flatten_params(config[step_key].get("parameters", config[step_key]))
         image = _load_image(tif_path)
         if is_2d and image.ndim != 2:
             image = np.squeeze(image)
@@ -469,8 +517,9 @@ def optimize_initial_segmentation(
 
     # ---- Curvature-weighted compromise -> merged config --------------------- #
     merged_config = copy.deepcopy(base_configs[0])
-    merged_params = merged_config[step_keys[0]].get(
-        "parameters", merged_config[step_keys[0]])
+    _merged_step = merged_config[step_keys[0]]
+    merged_params = _merged_step.get("parameters", _merged_step)
+    table_key, _ = _active_profiles(params_list[0])
     report_values: Dict[str, Dict[str, Any]] = {}
 
     for leaf in optimizable:
@@ -484,7 +533,7 @@ def optimize_initial_segmentation(
             how = "mean (no sensitivity)"
         # Never extrapolate beyond the range the images actually used.
         value = float(np.clip(value, min(vals), max(vals)))
-        _set_leaf(merged_params, leaf, value)
+        _write_leaf_into_config(merged_params, leaf, value, table_key)
         label = field if scale == _SCALAR_KEY else f"scale{scale:g}.{field}"
         report_values[label] = {
             "per_image": [None if v is None else round(v, 6)
