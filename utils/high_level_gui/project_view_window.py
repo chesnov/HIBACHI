@@ -121,6 +121,17 @@ class ProjectViewWindow(QMainWindow):
         self.set_config_btn.setEnabled(False)
         button_layout.addWidget(self.set_config_btn)
 
+        self.optimize_btn = QPushButton("\U0001f39b Optimize Parameters\u2026")
+        self.optimize_btn.setToolTip(
+            "Find ONE shared initial-segmentation config for the checked images "
+            "that minimizes how far each image's result drifts from its own "
+            "optimum (curvature-weighted, using the actual masks). Available when "
+            "two or more images of the same mode are checked."
+        )
+        self.optimize_btn.clicked.connect(self._optimize_parameters)
+        self.optimize_btn.setEnabled(False)
+        button_layout.addWidget(self.optimize_btn)
+
         self.config_library_btn = QPushButton("\U0001f4da Config Library\u2026")
         self.config_library_btn.setToolTip(
             "Browse, import, duplicate, rename and export the configs in your "
@@ -182,6 +193,51 @@ class ProjectViewWindow(QMainWindow):
         self.export_run_btn.setEnabled(
             one is not None and self._run_config_path(one) is not None
         )
+
+        # Parameter optimization reconciles several images into one shared
+        # config, so it needs >= 2 checked images that all share one mode.
+        self.optimize_btn.setEnabled(
+            len(checked) >= 2 and self._uniform_mode(checked) is not None
+        )
+
+    def _uniform_mode(self, folders: list):
+        """Return the common processing mode of `folders`, or None if they are
+        mixed / undetermined."""
+        modes = set()
+        for folder in folders:
+            try:
+                mode = self.project_manager.get_image_details(folder).get('mode')
+            except Exception:
+                return None
+            if not mode or mode in ('unknown', 'error'):
+                return None
+            modes.add(mode)
+        return next(iter(modes)) if len(modes) == 1 else None
+
+    def _optimize_parameters(self) -> None:
+        """Optimize one shared initial-segmentation config across the checked
+        images (curvature-weighted compromise, using their masks)."""
+        if self._content_view is None:
+            return
+        checked = self._content_view.checked_folders()
+        if len(checked) < 2:
+            return
+        mode = self._uniform_mode(checked)
+        if mode is None:
+            QMessageBox.information(
+                self, "Mixed modes",
+                "Parameter optimization needs two or more checked images that "
+                "share the same processing mode (all 2D, or all 3D)."
+            )
+            return
+        try:
+            from .parameter_optimizer import run_optimization_dialog
+        except Exception as exc:
+            QMessageBox.warning(
+                self, "Unavailable",
+                f"Parameter optimizer could not be loaded:\n{exc}")
+            return
+        run_optimization_dialog(self, list(checked), mode)
 
     def open_cross_channel_analyzer(self):
         if self._cross_scan_dir:
