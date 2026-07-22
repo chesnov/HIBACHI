@@ -87,6 +87,69 @@ def _get_chunk_slices(
                 yield read_slice, write_slice
 
 
+# Internal toggle for the bilateral crest test (NOT a GUI parameter). It refines
+# the tubular response for every config, so there is no slider to A/B it against
+# -- flip this to compare with/without, then leave it on once proven.
+_CREST_TEST = True
+
+
+def _crest_pairs(ndim: int):
+    """Unit vectors, one per antipodal direction pair, for the crest sampling.
+    2D: 4 pairs (axes + diagonals); 3D: the 13 unique 3x3x3 neighbourhood axes."""
+    if ndim == 2:
+        base = [(1, 0), (0, 1), (1, 1), (1, -1)]
+    else:
+        base = []
+        for dz in (-1, 0, 1):
+            for dy in (-1, 0, 1):
+                for dx in (-1, 0, 1):
+                    v = (dz, dy, dx)
+                    if v == (0, 0, 0):
+                        continue
+                    if v > tuple(-c for c in v):   # keep one of each antipodal pair
+                        base.append(v)
+    out = []
+    for v in base:
+        a = np.asarray(v, dtype=np.float32)
+        out.append(a / np.linalg.norm(a))
+    return out
+
+
+def _crest_weight(block, sigma, delta_factor: float = 2.0):
+    """Bilateral crest weight in [0, 1] that penalises edge-like responses.
+
+    A true process is a *two-sided* bright crest: along some direction (across
+    the ridge) the intensity drops on BOTH flanks. A step/edge or the boundary
+    of diffuse thick background rises on one side and stays high -- it is not a
+    two-sided crest -- yet its Hessian signature fools Frangi/Sato into a tube-
+    like response. This samples the smoothed intensity at +/- (delta_factor *
+    sigma) along a fixed set of directions and, per antipodal pair, takes the
+    two-sided margin min(centre - flank+, centre - flank-). The best two-sided
+    margin normalised by the best one-sided drop is ~1 for a genuine crest and
+    ~0 for an edge. Scale-aware (offset scales with sigma, so a larger-`scale`
+    profile row widens the test for thick processes) and contrast-invariant (a
+    ratio, so it behaves identically in dim and bright fields). No eigen-
+    decomposition -- cheap and identical in 2D and 3D.
+    """
+    from scipy.ndimage import gaussian_filter, map_coordinates
+    Is = gaussian_filter(block.astype(np.float32), float(sigma))
+    d = max(1.0, delta_factor * float(sigma))
+    idx = np.indices(Is.shape).astype(np.float32)
+    best_two = np.full(Is.shape, -np.inf, dtype=np.float32)
+    best_one = np.zeros(Is.shape, dtype=np.float32)
+    for u in _crest_pairs(Is.ndim):
+        plus = map_coordinates(
+            Is, [idx[k] + d * u[k] for k in range(Is.ndim)], order=1, mode='nearest')
+        minus = map_coordinates(
+            Is, [idx[k] - d * u[k] for k in range(Is.ndim)], order=1, mode='nearest')
+        a = Is - plus
+        b = Is - minus
+        best_two = np.maximum(best_two, np.minimum(a, b))
+        best_one = np.maximum(best_one, np.maximum(a, b))
+    return np.clip(best_two, 0.0, None) / (best_one + 1e-6)
+
+
+
 def _process_block_worker(
     chunk_info: Tuple[Tuple[slice, ...], Tuple[slice, ...]],
     input_memmap_info: Tuple[str, Tuple[int, ...], Any],
@@ -144,7 +207,12 @@ def _process_block_worker(
                                beta=beta_val, gamma=frangi_gamma, black_ridges=black_ridges)
                 s_res = sato(slice_2d, sigmas=[sigma], black_ridges=black_ridges)
                 scale_res = np.maximum(f_res, s_res)
-                
+
+                # Penalise edge/boundary responses (matches the 2D path; the 3D
+                # enhancement is 2D-per-slice, so the crest test is per-slice too).
+                if _CREST_TEST:
+                    scale_res = scale_res * _crest_weight(slice_2d, sigma)
+
                 if sigma >= 2.0:
                     scale_res *= slice_2d
                 

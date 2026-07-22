@@ -99,6 +99,16 @@ class ScalesTableWidget(QWidget):
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.table.setMinimumHeight(150)
+        # Demand enough width to show every column header. QTableView.sizeHint
+        # doesn't sum columns, so without this the dock opens too narrow and the
+        # (stretched) rightmost column gets clipped; this drives the dock wider
+        # and gives a horizontal scrollbar as a fallback if it's dragged narrow.
+        try:
+            fm = self.table.horizontalHeader().fontMetrics()
+            needed = sum(fm.horizontalAdvance(str(h)) + 30 for h in headers) + 28
+            self.table.setMinimumWidth(int(needed))
+        except Exception:
+            pass
         self.table.itemChanged.connect(self._emit_change)
         self.layout.addWidget(self.table)
         

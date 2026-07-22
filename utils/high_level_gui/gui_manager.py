@@ -1796,7 +1796,16 @@ class DynamicGUIManager(QObject):
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setWidget(widget)
-        scroll.setMinimumWidth(350)
+        # Open the dock wide enough to show the widest content (e.g. the
+        # multi-column scale table) without the user having to drag it wider.
+        # Use the *minimum* size hint (SetMinimumSize + the table's explicit
+        # minimum width make it reflect the real column widths, unlike
+        # QTableView.sizeHint). Capped so simple steps stay compact.
+        try:
+            want = max(widget.minimumSizeHint().width(), widget.sizeHint().width())
+        except Exception:
+            want = 0
+        scroll.setMinimumWidth(max(360, min(want + 36, 720)))
         dock = self.viewer.window.add_dock_widget(
             scroll, area="right", name=f"Step: {name}"
         )
