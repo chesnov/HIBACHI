@@ -76,6 +76,11 @@ _STEP_FLOOR = {
 _MEASURABLE = 5e-3
 _PROBE_MULTS = (1.0, 3.0, 9.0)   # grow the step until the mask responds
 _MIN_REF_PIXELS = 20             # a crop whose reference mask is ~empty is unusable
+# Run the probe on the whole image when it fits in this budget; only crop
+# (foreground-dense) above it. Kept large so a crop, if ever needed, stays close
+# to the whole-image intensity normalization the absolute thresholds rely on.
+_MAX_2D_PIXELS = 12_000_000      # ~3460 x 3460
+_MAX_3D_VOXELS = 12_000_000
 
 
 # --------------------------------------------------------------------------- #
@@ -294,18 +299,36 @@ def _dice_distance(a: np.ndarray, b: np.ndarray) -> float:
 
 
 def _pick_crop(image: np.ndarray, is_2d: bool) -> Tuple[slice, ...]:
-    """A representative window centred on the brightest region (cheap proxy for
-    where structures are), so probing runs on real signal but stays small."""
+    """Choose the region to run the probe segmentations on.
+
+    Default to the WHOLE image. The segmenter normalizes intensity internally,
+    and absolute thresholds are calibrated against that whole-image
+    normalization, so cropping would change the normalization statistics and
+    de-calibrate the thresholds (a crop can segment to nothing even though the
+    full image is fine). Only fall back to a crop for images too large to run
+    repeatedly, and then pick a FOREGROUND-dense window (not merely bright) and
+    keep it large so the normalization stays close to the full image's.
+    """
+    budget = _MAX_2D_PIXELS if is_2d else _MAX_3D_VOXELS
+    if image.size <= budget:
+        return tuple(slice(0, s) for s in image.shape)
+
+    # Oversized: size a window to the budget, biased to keep full Z in 3D.
     if is_2d:
-        win = (min(image.shape[0], 512), min(image.shape[1], 512))
+        side = int(np.sqrt(budget))
+        win = (min(image.shape[0], side), min(image.shape[1], side))
     else:
-        win = (min(image.shape[0], 24), min(image.shape[1], 256),
-               min(image.shape[2], 256))
+        z = min(image.shape[0], 48)
+        side = int(np.sqrt(max(1, budget // max(1, z))))
+        win = (z, min(image.shape[1], side), min(image.shape[2], side))
     if all(w >= s for w, s in zip(win, image.shape)):
         return tuple(slice(0, s) for s in image.shape)
 
-    # Coarse search: score strided window origins by summed intensity.
+    # Score strided window origins by FOREGROUND count (image above a high
+    # percentile), so the crop locks onto structures rather than a bright edge.
     img = image.astype(np.float32)
+    thr = float(np.percentile(img, 92.0))
+    fg = (img > thr)
     best_origin = tuple(0 for _ in image.shape)
     best_score = -1.0
     steps = [max(1, (s - w) // 6) for s, w in zip(image.shape, win)]
@@ -317,14 +340,14 @@ def _pick_crop(image: np.ndarray, is_2d: bool) -> Tuple[slice, ...]:
                 for x in rs[1]:
                     yield (y, x)
         else:
-            for z in rs[0]:
+            for z0 in rs[0]:
                 for y in rs[1]:
                     for x in rs[2]:
-                        yield (z, y, x)
+                        yield (z0, y, x)
 
     for origin in _iter_origins(ranges):
         sl = tuple(slice(o, o + w) for o, w in zip(origin, win))
-        score = float(img[sl].sum())
+        score = float(fg[sl].sum())
         if score > best_score:
             best_score, best_origin = score, origin
     return tuple(slice(o, o + w) for o, w in zip(best_origin, win))
@@ -544,6 +567,15 @@ def optimize_initial_segmentation(
                  "deviation": round(dev, 4)})
 
     _check()
+    if len(empty_refs) == len(folders):
+        raise OptimizationError(
+            "Every image's reference segmentation came out essentially empty, so "
+            "there is nothing to measure. The images ran on their own optimal "
+            "configs, so this usually means the saved config's absolute "
+            "thresholds don't reproduce a mask here (e.g. a different pipeline "
+            "version) or min-size removed everything. Re-process one image and "
+            "confirm its raw segmentation is non-empty before optimizing."
+        )
     _tick(0.97, "Combining into a shared config…")
 
     # ---- Curvature-weighted compromise -> merged config --------------------- #
