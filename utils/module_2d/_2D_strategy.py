@@ -222,6 +222,7 @@ class Fluorescence2DStrategy(ProcessingStrategy):
                     params.get("subtract_background_radius", 0)
                 ),
                 coherence_floor=float(params.get("coherence_floor", 0.0)),
+                seed_min_size=int(params.get("seed_min_size", 0)),
                 temp_root_path=self.temp_dir
             )
 

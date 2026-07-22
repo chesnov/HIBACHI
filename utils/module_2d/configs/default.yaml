@@ -67,6 +67,16 @@ execute_raw_segmentation_fluorescence_2d:
         min: 0.0
         max: 1.0
         step: 0.05
+      seed_min_size:
+        label: Coherent Core Min (px)
+        hint: Tubular path, coherence on. Minimum connected size of an oriented
+          core before it can anchor a structure. Rejects short coherent noise
+          specks while keeping long real processes. 0 = off.
+        type: int
+        value: 0
+        min: 0
+        max: 5000
+        step: 1
 execute_trim_edges_fluorescence_2d:
   name: Execute Edge Trimming (2D)
   parameters:

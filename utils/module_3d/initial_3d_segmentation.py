@@ -300,6 +300,7 @@ def segment_cells_first_pass_raw(
     skip_tubular_enhancement: bool = False,
     subtract_background_radius: int = 0,
     coherence_floor: float = 0.0,
+    seed_min_size: int = 0,
     temp_root_path: Optional[str] = None,
     **kwargs: Any
 ) -> Tuple[Optional[str], Optional[str], float, Dict[str, Any]]:
@@ -549,14 +550,37 @@ def segment_cells_first_pass_raw(
                         coh = _orientation_coherence(
                             smoothed_mm, spacing, scale, chunks=(128, 512, 512)
                         )
-                        seed_dask = (coh > coherence_floor) & band
+                        coherent = (coh > coherence_floor) & band
+
+                        # Extent-aware seeding: a coherent core anchors a
+                        # structure only if it is SUSTAINED (connected extent
+                        # >= seed_min_size). Short oriented noise specks are
+                        # locally as coherent as a real process, so magnitude
+                        # and coherence alone can't reject them — but their
+                        # coherent core is tiny, while a real process's is long.
+                        # Cores are closed first (per-scale `struct`) so a real
+                        # core split by coherence dips is measured as one run.
+                        if seed_min_size > 0:
+                            cclosed = dask_image.ndmorph.binary_closing(coherent, structure=struct)
+                            slbl, sn = dask_image.ndmeasure.label(
+                                cclosed, structure=generate_binary_structure(3, 3))
+                            sn = int(sn.compute())
+                            if sn > 0:
+                                ssz = da.histogram(slbl, bins=sn + 1, range=[-0.5, sn + 0.5])[0].compute()
+                                big = np.zeros(sn + 1, dtype=bool)
+                                big[1:] = ssz[1:] >= seed_min_size
+                                coherent = da.map_blocks(lambda b, t=big: t[b], slbl, dtype=bool)
+                            else:
+                                coherent = coherent & False
+                            print(f"      [Scale {scale}] Coherent cores >= {seed_min_size}vox seed "
+                                  f"({int(big[1:].sum()) if sn > 0 else 0}/{sn} cores kept)")
+
+                        seed_dask = coherent
                         if seed_active:
                             seed_dask = seed_dask | (enh_dask > current_seed)
-                        print(f"      [Scale {scale}] Coherent-core seed (floor={coherence_floor})")
+                        print(f"      [Scale {scale}] Coherent-core seed (floor={coherence_floor}; "
+                              f"bright-seed OR {'ON @%.4f' % current_seed if seed_active else 'off'})")
                         # DIAGNOSTIC: coherence distribution over the foreground.
-                        # If p50/p90 sit near 1.0, coherence isn't discriminating
-                        # (integration scale too small); if it's spread out, the
-                        # floor is meaningful and any leftover noise is a flood.
                         try:
                             st = max(1, min(volume.shape[1:]) // 512)
                             cs = coh[:, ::st, ::st].compute()
