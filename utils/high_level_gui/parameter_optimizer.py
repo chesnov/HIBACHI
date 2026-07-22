@@ -70,6 +70,12 @@ _STEP_FLOOR = {
     "low": 2e-3, "high": 2e-3, "smooth_sigma": 0.05,
     "connect_max_gap_physical": 0.25, "min_size": 5.0, "trace_max_gap": 0.5,
 }
+# A deviation below this is treated as "the mask did not really change", so the
+# probe grows the perturbation (thresholding has flat plateaus; too small a step
+# yields an identical mask and a misleading zero curvature).
+_MEASURABLE = 5e-3
+_PROBE_MULTS = (1.0, 3.0, 9.0)   # grow the step until the mask responds
+_MIN_REF_PIXELS = 20             # a crop whose reference mask is ~empty is unusable
 
 
 # --------------------------------------------------------------------------- #
@@ -470,6 +476,40 @@ def optimize_initial_segmentation(
     wsum: Dict[Tuple[Any, str], float] = {lf: 0.0 for lf in optimizable}
     wnum: Dict[Tuple[Any, str], float] = {lf: 0.0 for lf in optimizable}
     curvature_report: Dict[str, List[Dict[str, float]]] = {}
+    empty_refs: List[str] = []
+    n_measurements = 0          # how many (image, leaf) probes yielded real signal
+
+    def _probe(image, spacing, params, ref, leaf, v0) -> Tuple[float, float]:
+        """Grow the perturbation until the segmentation actually changes; return
+        (curvature, deviation_at_that_step). (0, 0) if it never responds."""
+        nonlocal done
+        field = leaf[1]
+        base = _perturbation(field, v0)
+        last = (0.0, 0.0)
+        for mult in _PROBE_MULTS:
+            _check()
+            delta = base * mult
+            devs = []
+            for sign in (+1.0, -1.0):
+                _check()
+                trial = copy.deepcopy(params)
+                _set_leaf(trial, leaf, v0 + sign * delta)
+                try:
+                    m = _segment_mask(image, spacing, trial, is_2d)
+                    devs.append(_dice_distance(ref, m))
+                except OptimizationCancelled:
+                    raise
+                except Exception as exc:
+                    print(f"[optimize] probe {leaf} {sign:+g} failed: {exc}")
+                finally:
+                    done += 1
+            if not devs:
+                return 0.0, 0.0
+            dev = sum(devs) / len(devs)
+            last = (dev / (delta * delta), dev)
+            if dev >= _MEASURABLE:      # mask responded -> curvature is meaningful
+                return last
+        return last                     # never responded -> ~flat (h ~ 0)
 
     for i, (image, spacing, params) in enumerate(zip(images, spacings, params_list)):
         _check()
@@ -477,6 +517,13 @@ def optimize_initial_segmentation(
         _tick(0.05 + 0.9 * done / total_runs, f"[{name}] reference segmentation…")
         ref = _segment_mask(image, spacing, params, is_2d)
         done += 1
+        if int(ref.sum()) < _MIN_REF_PIXELS:
+            # No segmentable signal on this crop, so nothing can be measured from
+            # it; record and skip rather than contributing spurious zeros.
+            empty_refs.append(name)
+            print(f"[optimize] {name}: reference crop nearly empty "
+                  f"({int(ref.sum())} px) — skipping this image.")
+            continue
 
         for leaf in optimizable:
             v0 = per_image_vals[leaf][i]
@@ -484,35 +531,17 @@ def optimize_initial_segmentation(
                 continue
             _check()
             scale, field = leaf
-            delta = _perturbation(field, v0)
             label = field if scale == _SCALAR_KEY else f"scale{scale:g}.{field}"
-
-            devs = []
-            for sign in (+1.0, -1.0):
-                _check()
-                trial = copy.deepcopy(params)
-                _set_leaf(trial, leaf, v0 + sign * delta)
-                _tick(0.05 + 0.9 * done / total_runs,
-                      f"[{name}] probing {label} {'+' if sign > 0 else '-'}…")
-                try:
-                    m = _segment_mask(image, spacing, trial, is_2d)
-                    devs.append(_dice_distance(ref, m))
-                except OptimizationCancelled:
-                    raise
-                except Exception as exc:
-                    print(f"[optimize] {name} {label} {sign:+g} failed: {exc}")
-                finally:
-                    done += 1
-
-            if not devs:
-                continue
-            # Local curvature of the deviation bowl (min ~0 at v0).
-            h = (sum(devs) / len(devs)) / (delta * delta)
+            _tick(0.05 + 0.9 * done / total_runs, f"[{name}] probing {label}…")
+            h, dev = _probe(image, spacing, params, ref, leaf, v0)
             h = max(h, 0.0)
+            if dev >= _MEASURABLE:
+                n_measurements += 1
             wsum[leaf] += h
             wnum[leaf] += h * v0
             curvature_report.setdefault(label, []).append(
-                {"image": name, "optimum": v0, "curvature": h})
+                {"image": name, "optimum": v0, "curvature": round(h, 6),
+                 "deviation": round(dev, 4)})
 
     _check()
     _tick(0.97, "Combining into a shared config…")
@@ -549,7 +578,18 @@ def optimize_initial_segmentation(
         "optimized": report_values,
         "curvature": curvature_report,
         "n_optimized": len(optimizable),
+        "n_measurements": n_measurements,
+        "empty_refs": empty_refs,
     }
+    if n_measurements == 0:
+        report["warning"] = (
+            "No parameter changed the segmentation on any image's crop, so "
+            "sensitivity could not be measured and every value fell back to a "
+            "plain average. This usually means the probe crops had too little "
+            "signal (min-size filtered them out, or the threshold was above the "
+            "crop's intensities). The result is only a mean — not a "
+            "curvature-weighted optimum."
+        )
     _tick(1.0, "Done.")
     return merged_config, report
 
@@ -654,11 +694,21 @@ if _HAVE_QT:
         for label, info in report["optimized"].items():
             per = ", ".join("—" if v is None else f"{v:g}" for v in info["per_image"])
             lines.append(f"  • {label}: [{per}] → {info['shared']}  ({info['method']})")
+        if report.get("empty_refs"):
+            lines.append("\nSkipped (no signal on probe crop): "
+                         + ", ".join(report["empty_refs"]))
+        if report.get("warning"):
+            lines.append("\n⚠ " + report["warning"])
         return "\n".join(lines)
 
     def _present_and_save(parent, merged: Dict[str, Any], report: Dict[str, Any],
                           mode: str) -> None:
-        QMessageBox.information(parent, "Optimization complete", _summary_text(report))
+        box = QMessageBox(parent)
+        box.setWindowTitle("Optimization complete")
+        box.setIcon(QMessageBox.Warning if report.get("warning")
+                    else QMessageBox.Information)
+        box.setText(_summary_text(report))
+        box.exec_()
 
         name, ok = QInputDialog.getText(
             parent, "Name the shared config", "Config name:",
@@ -667,17 +717,66 @@ if _HAVE_QT:
             return
         name = name.strip()
         merged["config_name"] = name
+        merged.setdefault("mode", mode)
 
-        # Default save location: the config library folder for this mode if
-        # available, else the desktop.
-        default_dir = None
+        # Same choice as Export run config: a reusable preset in the Config
+        # Library, or a standalone file.
+        dest = QMessageBox(parent)
+        dest.setWindowTitle("Save shared config")
+        dest.setIcon(QMessageBox.Question)
+        dest.setText("Where should the shared config go?")
+        dest.setInformativeText(
+            "Save it as a preset in your Config Library to reuse it on other "
+            "images, or write it to a file.")
+        preset_btn = dest.addButton("Save to Config Library", QMessageBox.AcceptRole)
+        file_btn = dest.addButton("Save to file\u2026", QMessageBox.ActionRole)
+        dest.addButton("Cancel", QMessageBox.RejectRole)
+        dest.setDefaultButton(preset_btn)
+        dest.exec_()
+        clicked = dest.clickedButton()
+
+        if clicked == preset_btn:
+            _save_to_library(parent, merged, name, mode)
+        elif clicked == file_btn:
+            _save_to_file(parent, merged, name)
+
+    def _save_to_library(parent, merged: Dict[str, Any], name: str,
+                         mode: str) -> None:
+        try:
+            from . import config_library as cl
+            from .config_library import ConfigLibraryError
+        except Exception as exc:
+            QMessageBox.critical(parent, "Config Library unavailable", str(exc))
+            return
+        try:
+            entry = cl.save_to_library(merged, name=name, mode=mode)
+        except FileExistsError:
+            reply = QMessageBox.question(
+                parent, "Already exists",
+                f"A library preset named '{name}' already exists.\n\nOverwrite it?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            if reply != QMessageBox.Yes:
+                return
+            try:
+                entry = cl.save_to_library(merged, name=name, mode=mode, overwrite=True)
+            except (ConfigLibraryError, OSError) as exc:
+                QMessageBox.critical(parent, "Config error", str(exc))
+                return
+        except (ConfigLibraryError, OSError) as exc:
+            QMessageBox.critical(parent, "Config error", str(exc))
+            return
+        QMessageBox.information(
+            parent, "Saved to library",
+            f"Saved '{getattr(entry, 'name', name)}' to your Config Library. It "
+            "will now appear in the config picker for matching images.")
+
+    def _save_to_file(parent, merged: Dict[str, Any], name: str) -> None:
         try:
             from . import config_library as cl
             default_dir = cl.library_root()
         except Exception:
             default_dir = os.path.expanduser("~")
         default_path = os.path.join(default_dir, f"{name}.yaml")
-
         dst, _ = QFileDialog.getSaveFileName(
             parent, "Save shared config", default_path,
             "YAML Files (*.yaml *.yml);;All Files (*)")
@@ -690,5 +789,4 @@ if _HAVE_QT:
             QMessageBox.critical(parent, "Save failed", str(exc))
             return
         QMessageBox.information(
-            parent, "Saved",
-            f"Saved shared config '{name}' to:\n\n{dst}")
+            parent, "Saved", f"Saved shared config '{name}' to:\n\n{dst}")
