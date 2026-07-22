@@ -130,6 +130,50 @@ def _crest_weight(block, sigma, delta_factor: float = 2.0):
     return np.clip(best_two, 0.0, None) / (best_one + 1e-6)
 
 
+# --- Crest gate tuning (NOT GUI parameters) --------------------------------
+# Recovery radius factor: the crest validation is grown out to R = round(scale *
+# sigma) voxels before it is applied, so a process' one-sided shoulders inherit
+# the weight of their own centerline crest instead of being eroded away. R ~
+# sigma matches the half-width of a structure detected at that scale. Larger
+# values recover more width but let a little more edge response through.
+_CREST_RECOVER_SCALE = 1.0
+# Floor in [0, 1): response that is never near any validated crest survives at
+# this fraction of its raw strength. 0.0 = strict edge rejection (recommended);
+# raise slightly only if faint, genuinely un-crested processes are being lost.
+_CREST_FLOOR = 0.0
+
+
+def _crest_gated_response(scale_res, block, sigma, delta_factor: float = 2.0):
+    """Edge-suppressed tubular response that PRESERVES true process width.
+
+    The previous approach multiplied `scale_res` by the bilateral crest weight
+    pointwise. Because only the ridge *centerline* is a genuine two-sided crest,
+    that multiplication also drove the tube's one-sided shoulders to ~0 and
+    eroded every object toward its skeleton -- the mask ended up far thinner
+    than the real processes.
+
+    Here the crest weight is used to VALIDATE, not to attenuate. The weight is
+    grown by a grey dilation over a scale-matched disk (radius ~ sigma) so that
+    every voxel within one process half-width of a validated crest inherits that
+    crest's weight; the raw `scale_res` is then scaled by this widened weight.
+    Genuine tubes are restored to their full detected width, while edge/boundary
+    responses -- which have no validated crest anywhere in their neighbourhood --
+    stay suppressed. Unlike a morphological reconstruction the operation is
+    strictly local: a stray response can only lift weight within R voxels of
+    itself and can never flood a whole connected region.
+
+    Operates on a single 2D array, so it is byte-for-byte identical in the 2D
+    pipeline and in the 2D-per-slice 3D pipeline.
+    """
+    from skimage.morphology import disk
+    from scipy.ndimage import grey_dilation
+    w = _crest_weight(block, sigma, delta_factor=delta_factor).astype(np.float32)
+    radius = max(1, int(round(_CREST_RECOVER_SCALE * float(sigma))))
+    w = grey_dilation(w, footprint=disk(radius))
+    if _CREST_FLOOR > 0.0:
+        w = _CREST_FLOOR + (1.0 - _CREST_FLOOR) * w
+    return (scale_res * w).astype(np.float32)
+
 
 def _process_block_worker_2d(
     chunk_info: Tuple[Tuple[slice, ...], Tuple[slice, ...]],
@@ -169,9 +213,10 @@ def _process_block_worker_2d(
             scale_res = np.maximum(f_res, s_res)
 
             # Penalise edge/boundary responses the Hessian filter mistakes for
-            # tubes: keep only genuine two-sided crests (scale-aware, no GUI param).
+            # tubes, WITHOUT eroding true process width: validate on the crest,
+            # then reconstruct the full response (scale-aware, no GUI param).
             if _CREST_TEST:
-                scale_res = scale_res * _crest_weight(block_data, sigma)
+                scale_res = _crest_gated_response(scale_res, block_data, sigma)
 
             if sigma >= 2.0:
                 scale_res *= block_data
