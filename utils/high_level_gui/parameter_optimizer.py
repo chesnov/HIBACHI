@@ -232,7 +232,8 @@ def _segment_mask(image: np.ndarray, spacing: Tuple[float, ...],
     labels_dir = None
     try:
         if is_2d:
-            from .initial_2d_segmentation import segment_cells_first_pass_raw_2d as seg
+            from ..module_2d.initial_2d_segmentation import (
+                segment_cells_first_pass_raw_2d as seg)
             result = seg(
                 image=image, spacing=spacing,
                 tubular_scales=kw["tubular_scales"],
@@ -246,7 +247,8 @@ def _segment_mask(image: np.ndarray, spacing: Tuple[float, ...],
                 temp_root_path=run_tmp,
             )
         else:
-            from .initial_3d_segmentation import segment_cells_first_pass_raw as seg
+            from ..module_3d.initial_3d_segmentation import (
+                segment_cells_first_pass_raw as seg)
             result = seg(
                 volume=image, spacing=spacing,
                 tubular_scales=kw["tubular_scales"],
