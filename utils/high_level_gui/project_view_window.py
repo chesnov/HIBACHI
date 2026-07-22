@@ -756,6 +756,32 @@ class ProjectViewWindow(QMainWindow):
             return
         open_config_library(self)
 
+    def _stamp_config_name(self, folder: str, name: str) -> None:
+        """Record `name` as this folder's config name in its main YAML, so the
+        project view's Config column shows it. Also updates the processed run
+        config if present, keeping the two in sync."""
+        import yaml  # type: ignore
+        targets = []
+        try:
+            yml = next((f for f in os.listdir(folder)
+                        if f.lower().endswith((".yaml", ".yml"))), None)
+            if yml:
+                targets.append(os.path.join(folder, yml))
+        except OSError:
+            return
+        run_cfg = self._run_config_path(folder)
+        if run_cfg:
+            targets.append(run_cfg)
+        for path in targets:
+            try:
+                with open(path, "r", encoding="utf-8") as fh:
+                    data = yaml.safe_load(fh) or {}
+                data["config_name"] = name
+                with open(path, "w", encoding="utf-8") as fh:
+                    yaml.safe_dump(data, fh, default_flow_style=False, sort_keys=False)
+            except Exception:
+                pass
+
     def _run_config_path(self, folder: str):
         """Absolute path to a folder's processed run config, or None if absent.
 
@@ -852,6 +878,14 @@ class ProjectViewWindow(QMainWindow):
             except (ConfigLibraryError, OSError) as exc:
                 QMessageBox.critical(self, "Config error", str(exc))
                 return
+            # Record the chosen name on the source folder's config too, so the
+            # project view's Config column reflects the name you just gave it.
+            try:
+                self._stamp_config_name(checked[0], entry.name)
+                if self._content_view is not None:
+                    self._content_view.refresh()
+            except Exception:
+                pass
             QMessageBox.information(
                 self, "Saved to library",
                 f"Saved '{entry.name}' to your Config Library. It will now appear "

@@ -637,66 +637,44 @@ if _HAVE_QT:
             open_btn.clicked.connect(self._browse)
             root.addWidget(open_btn)
 
-            recent_label = QLabel("Recent projects")
-            recent_label.setStyleSheet("font-weight: bold; margin-top: 6px;")
-            root.addWidget(recent_label)
+            # Recent projects live behind a single dropdown button rather than an
+            # always-visible list, to give the project tree the vertical space.
+            self.recent_btn = QPushButton("Recent projects")
+            self.recent_btn.setToolTip("Open a recently used project.")
+            self.recent_menu = QMenu(self.recent_btn)
+            self.recent_btn.setMenu(self.recent_menu)
+            root.addWidget(self.recent_btn)
 
-            self.recent_list = QListWidget()
-            # Use only itemActivated (Enter / double-click, per platform). Connecting
-            # both itemActivated and itemDoubleClicked could fire the slot twice, and
-            # relying on the passed item is fragile -- we read the selection instead.
-            self.recent_list.itemActivated.connect(self._open_recent)
-            root.addWidget(self.recent_list)
-
-            tools = QHBoxLayout()
-            tools.addStretch(1)
-            self.forget_btn = QPushButton("Remove from list")
-            self.forget_btn.clicked.connect(self._forget_selected)
-            self.forget_btn.setEnabled(False)
-            tools.addWidget(self.forget_btn)
-            root.addLayout(tools)
-
-            self.recent_list.itemSelectionChanged.connect(
-                lambda: self.forget_btn.setEnabled(bool(self.recent_list.selectedItems()))
-            )
-
-        # ---- recent list ---------------------------------------------------- #
+        # ---- recent menu --------------------------------------------------- #
         def refresh_recents(self) -> None:
-            self.recent_list.clear()
+            self.recent_menu.clear()
             entries = self.recent.list()
             if not entries:
-                placeholder = QListWidgetItem("No recent projects yet.")
-                placeholder.setFlags(Qt.NoItemFlags)
-                self.recent_list.addItem(placeholder)
+                act = self.recent_menu.addAction("No recent projects yet.")
+                act.setEnabled(False)
+                self.recent_btn.setEnabled(False)
                 return
+            self.recent_btn.setEnabled(True)
             for e in entries:
-                label = f"{e.name}\n    {e.path}"
-                if not e.exists:
-                    label += "   (missing)"
-                item = QListWidgetItem(label)
-                item.setData(Qt.UserRole, e.path)
-                if not e.exists:
-                    item.setForeground(Qt.gray)
-                item.setToolTip(e.path)
-                self.recent_list.addItem(item)
+                text = e.name if e.exists else f"{e.name}   (missing)"
+                act = self.recent_menu.addAction(text)
+                act.setToolTip(e.path)
+                # Bind the path per-action; open on trigger.
+                act.triggered.connect(lambda _checked=False, p=e.path: self._open_recent(p))
+            # Compact removal, so the capability survives without panel space.
+            self.recent_menu.addSeparator()
+            remove_menu = self.recent_menu.addMenu("Remove from list")
+            for e in entries:
+                r = remove_menu.addAction(e.name)
+                r.triggered.connect(lambda _checked=False, p=e.path: self._forget(p))
 
-        def _open_recent(self, item: "QListWidgetItem" = None) -> None:
-            # Be defensive: some Qt builds/paths can invoke this without a valid
-            # item (the reported 'NoneType' has no attribute 'data'). Fall back to
-            # the current selection, and ignore the non-selectable placeholder row.
-            if item is None:
-                item = self.recent_list.currentItem()
-            if item is None:
-                return
-            path = item.data(Qt.UserRole)
+        def _open_recent(self, path: str) -> None:
             if path:
                 self.path_chosen.emit(path)
 
-        def _forget_selected(self) -> None:
-            for item in self.recent_list.selectedItems():
-                path = item.data(Qt.UserRole)
-                if path:
-                    self.recent.remove(path)
+        def _forget(self, path: str) -> None:
+            if path:
+                self.recent.remove(path)
             self.refresh_recents()
 
         # ---- browse dialog -------------------------------------------------- #
@@ -987,9 +965,21 @@ if _HAVE_QT:
 
         @staticmethod
         def _config_name(folder: str) -> str:
+            # Prefer the config's recorded name (stamped when a preset/template is
+            # applied), so the column reflects the actual config rather than the
+            # folder's YAML filename. Falls back to the filename stem.
             try:
                 for f in os.listdir(folder):
                     if f.lower().endswith((".yaml", ".yml")):
+                        try:
+                            import yaml  # type: ignore
+                            with open(os.path.join(folder, f), "r", encoding="utf-8") as fh:
+                                data = yaml.safe_load(fh) or {}
+                            name = data.get("config_name")
+                            if name:
+                                return str(name)
+                        except Exception:
+                            pass
                         return os.path.splitext(f)[0]
             except OSError:
                 pass

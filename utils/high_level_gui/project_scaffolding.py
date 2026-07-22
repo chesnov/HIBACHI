@@ -190,6 +190,12 @@ def apply_template_config_to_project(
 
     effective_filter_mode = target_mode or template.get('mode')
 
+    # The human-facing name of the config being applied = the template's file
+    # stem (e.g. a library preset "iMG_22Jul26.yaml" -> "iMG_22Jul26"). Stamped
+    # into each folder's config below so the project view's Config column shows
+    # the applied config, not just the folder's YAML filename.
+    applied_config_name = os.path.splitext(os.path.basename(template_yaml_path))[0]
+
     for folder_path in project_manager.image_folders:
         details = project_manager.get_image_details(folder_path)
         folder_name = os.path.basename(folder_path)
@@ -236,6 +242,10 @@ def apply_template_config_to_project(
             folder_mode if folder_mode != 'unknown'
             else template.get('mode', 'unknown')
         )
+
+        # Record which config this folder was configured with, so the project
+        # view can show the applied config name rather than the YAML filename.
+        merged_main['config_name'] = applied_config_name
 
         try:
             with open(yaml_path, 'w') as fh:
