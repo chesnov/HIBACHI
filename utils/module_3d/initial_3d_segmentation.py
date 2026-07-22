@@ -487,6 +487,50 @@ def _trace_link_fragments(final_mm, image, spacing, max_gap, step=1.0,
 
     objs = _ndi.find_objects(final_mm)       # streams the memmap; O(labels) memory
     bridges = []
+    n_soma_links = 0
+
+    # Precompute soma geometry once so a process endpoint can link straight to a
+    # nearby soma WITHOUT depending on the fragile ridge-walk surviving the dim,
+    # curved stretch up to the soma boundary. This is what makes process->soma
+    # gaps close: the walk often dies (fade/bend guards) long before it gets
+    # within `link_radius` of the soma, so the proximity test in _trace alone is
+    # not enough -- a direct geometric link from the endpoint is.
+    soma_info = []
+    if soma_lut is not None:
+        for _idx, _sl in enumerate(objs):
+            _lab = _idx + 1
+            if _sl is None or _lab >= soma_lut.size or not soma_lut[_lab]:
+                continue
+            _b = np.array([s.start for s in _sl], dtype=float)
+            _ext = np.array([s.stop - s.start for s in _sl], dtype=float)
+            soma_info.append((_lab, _sl, _b, _b + 0.5 * _ext, 0.5 * float(np.linalg.norm(_ext))))
+
+    def _link_to_soma(start, d):
+        """Nearest soma label reachable within `max_steps` of endpoint `start`,
+        preferring somata ahead of the outward tangent `d`. Returns (label,
+        target_voxel) or (0, None). Direction-gated (fwd >= 0) so an endpoint
+        does not link a soma lying back through its own fragment body; a very
+        close soma (<= link_radius) links regardless of direction (touching/rim
+        case). No ridge-walk, so a dim or curved connector cannot defeat it."""
+        best_lab, best_tgt, best_dist = 0, None, np.inf
+        for lab, sl, base_s, cen, rad in soma_info:
+            if np.linalg.norm(cen - start) > max_steps + rad + 2.0:
+                continue                                  # quick reject by bbox
+            sub = np.asarray(final_mm[sl]) == lab
+            pts = np.argwhere(sub).astype(float) + base_s
+            if pts.shape[0] == 0:
+                continue
+            diff = pts - start
+            dist = np.sqrt((diff ** 2).sum(1))
+            fwd = (diff @ d) / (dist + 1e-9)
+            ok = ((dist <= max_steps) & (fwd >= 0.0)) | (dist <= max(2.0, float(link_radius)))
+            if not ok.any():
+                continue
+            j = int(np.argmin(np.where(ok, dist, np.inf)))
+            if dist[j] < best_dist:
+                best_lab, best_tgt, best_dist = lab, pts[j], dist[j]
+        return best_lab, best_tgt
+
     for idx, sl in enumerate(objs):
         lab = idx + 1
         if sl is None:
@@ -513,10 +557,26 @@ def _trace_link_fragments(final_mm, image, spacing, max_gap, step=1.0,
             tn = np.linalg.norm(t)
             if tn < 1e-9:
                 continue
-            hit, path = _trace((epl + base).astype(float), t / tn, lab)
+            start_g = (epl + base).astype(float)
+            dir_g = t / tn
+            # Direct process->soma link first (robust to dim/curved connectors).
+            if soma_lut is not None:
+                slab, stgt = _link_to_soma(start_g, dir_g)
+                if slab and _find(slab) != _find(lab):
+                    parent[_find(lab)] = _find(slab)
+                    nseg = int(max(1, round(np.linalg.norm(stgt - start_g))))
+                    spath = [start_g + (stgt - start_g) * (k / nseg) for k in range(nseg + 1)]
+                    bridges.append((spath, lab))
+                    n_soma_links += 1
+                    continue
+            # Otherwise fall back to the orientation-following ridge walk.
+            hit, path = _trace(start_g, dir_g, lab)
             if hit and _find(hit) != _find(lab):
                 parent[_find(lab)] = _find(hit)
                 bridges.append((path, lab))
+
+    if soma_lut is not None:
+        print(f"    [DIAG] direct process->soma links: {n_soma_links}")
 
     if not parent:
         return None
