@@ -199,50 +199,6 @@ class SimpleTimer:
         print(f"    [Timer] Finished: {self.name} in {time.perf_counter()-self.start:.2f}s")
 
 
-def _orientation_coherence(smoothed_mm, spacing, scale, chunks):
-    """Structure-tensor orientation coherence in [0, 1].
-
-    0 = locally isotropic (texture / noise / flat); →1 = a single dominant
-    local gradient orientation (an edge or ridge flank). A general image
-    operator with no model of what is imaged: it is computed from the
-    gradient-covariance (structure) tensor and normalised fractional-anisotropy
-    style, so it is invariant to intensity scale. Dimension-generic — derives
-    ndim from the array — so 2D and 3D share identical logic. Fully elementwise
-    on dask arrays, so it is chunk-safe on large memmaps.
-    """
-    ndim = smoothed_mm.ndim
-    n = float(ndim)
-    d = da.from_array(smoothed_mm, chunks=chunks).astype(np.float32)
-
-    # Derivative (noise) and integration scales, in voxels, tied to `scale`.
-    sigma_grad = [max(1.0, 0.5 * scale / s) if s > 1e-9 else 1.0 for s in spacing]
-    rho = [max(1.5, 2.0 * scale / s) if s > 1e-9 else 1.5 for s in spacing]
-
-    sm = dask_image.ndfilters.gaussian_filter(d, sigma=sigma_grad)
-    grads = da.gradient(sm)
-    if ndim == 1:
-        grads = [grads]
-
-    # Structure-tensor components, integrated (smoothed) at scale rho.
-    diag = [dask_image.ndfilters.gaussian_filter(g * g, sigma=rho) for g in grads]
-    trace = diag[0]
-    jnorm2 = diag[0] * diag[0]
-    for dd in diag[1:]:
-        trace = trace + dd
-        jnorm2 = jnorm2 + dd * dd
-    for a in range(ndim):
-        for b in range(a + 1, ndim):
-            jab = dask_image.ndfilters.gaussian_filter(grads[a] * grads[b], sigma=rho)
-            jnorm2 = jnorm2 + 2.0 * (jab * jab)
-
-    # Fractional-anisotropy-style coherence from tensor invariants (no explicit
-    # eigen-decomposition): ||J_dev||^2 = ||J||^2 - trace^2 / n.
-    eps = 1e-12
-    dev2 = da.maximum(jnorm2 - (trace * trace) / n, 0.0)
-    coh = da.sqrt((n / (n - 1.0)) * dev2 / (jnorm2 + eps))
-    return da.clip(coh, 0.0, 1.0)
-
-
 def segment_cells_first_pass_raw_2d(
     image: np.ndarray,
     spacing: Union[Tuple[float, float], Tuple[float, float, float]],
@@ -252,12 +208,9 @@ def segment_cells_first_pass_raw_2d(
     min_size_pixels: Union[int, List[int]] = 50,
     low_threshold_percentile: Union[float, List[float]] = 95.0,
     high_threshold_percentile: Union[float, List[float]] = 100.0,
-    seed_threshold: Union[float, List[float]] = 0.0,
     threshold_mode: str = "Percentile",
     skip_tubular_enhancement: bool = False,
     subtract_background_radius: int = 0,
-    coherence_floor: float = 0.0,
-    seed_min_size: int = 0,
     temp_root_path: Optional[str] = None,
     **kwargs: Any
 ) -> Tuple[Optional[str], Optional[str], float, Dict[str, Any]]:
@@ -295,14 +248,6 @@ def segment_cells_first_pass_raw_2d(
 
     if len(low_thresh_list) != n_scales or len(high_thresh_list) != n_scales:
         raise ValueError("low/high_threshold_percentile lists must match length of tubular_scales.")
-
-    # Per-scale hysteresis seed (Absolute mode; 0 = off). Scalar broadcasts.
-    if isinstance(seed_threshold, (int, float)):
-        seed_thresh_list = [float(seed_threshold)] * n_scales
-    else:
-        seed_thresh_list = [float(x) for x in seed_threshold]
-    if len(seed_thresh_list) != n_scales:
-        raise ValueError("seed_threshold list must match length of tubular_scales.")
 
     # --- Per-scale filter parameters ---
     # Each entry below applies ONLY to its corresponding tubular scale.
@@ -376,18 +321,6 @@ def segment_cells_first_pass_raw_2d(
         master_mm = np.memmap(os.path.join(master_dir, 'm.dat'), dtype=np.uint8, mode='w+', shape=image.shape)
         master_mm[:] = 0
 
-        # Seed accumulator for hysteresis (Absolute mode). Marks confident
-        # (`high`) detections from hysteresis scales, plus ALL pixels from
-        # non-hysteresis scales. After the merge, a labelled object is kept only
-        # if it contains a seed — so an object made only of dim (`low`) pixels
-        # with no confident core is dropped, while dim processes that connect to
-        # a bright seed (or to a plain-threshold detection such as a soma) are
-        # retained. With no seed configured (all rows high>=1.0) every pixel is
-        # its own seed, so this reduces exactly to the previous size-only filter.
-        master_seed_dir = _get_safe_temp_dir(temp_root_path, 'master_seed'); temp_dirs_to_clean.append(master_seed_dir)
-        master_seed_mm = np.memmap(os.path.join(master_seed_dir, 'seed.dat'), dtype=np.uint8, mode='w+', shape=image.shape)
-        master_seed_mm[:] = 0
-
         # Use enumerate to index each scale's own parameters
         for i, scale in enumerate(tubular_scales):
             current_low_p = low_thresh_list[i]
@@ -421,7 +354,7 @@ def segment_cells_first_pass_raw_2d(
                         skip_enhancement=skip_tubular_enhancement,
                         subtract_background_radius=subtract_background_radius, temp_root_path=temp_root_path
                     )
-
+                
                 # Independent Thresholding
                 if threshold_mode == "Absolute":
                     thresh = current_low_p
@@ -434,30 +367,6 @@ def segment_cells_first_pass_raw_2d(
                     thresh = max(thresh, 1e-5); threshold_history[scale] = thresh
                     print(f"      [Scale {scale}] Isolated Threshold (p{current_low_p}): {thresh:.6f}")
 
-                # `high` is an intuitive UPPER bound (band-pass): reject
-                # response above it — too-bright structures (e.g. saturated
-                # autofluorescence). Absolute mode only; high >= 1.0 disables it.
-                # `seed` is a SEPARATE, opt-in hysteresis control: keep dim
-                # (`low`) regions only where they connect to a `seed`-bright
-                # pixel. Absolute mode only; 0 disables (scale seeds itself).
-                current_high = high_thresh_list[i]
-                current_seed = seed_thresh_list[i]
-                use_upper = (
-                    threshold_mode == "Absolute"
-                    and current_high < 1.0
-                    and current_high > thresh
-                )
-                seed_active = (
-                    threshold_mode == "Absolute"
-                    and current_seed > 0.0
-                    and current_seed > thresh
-                )
-                # Coherence now SEEDS (it no longer gates the grow): a component
-                # survives only if it contains an oriented (coherent) core, so
-                # incoherent background is dropped whole while real structure —
-                # grown by magnitude — is never fragmented. Tubular path only.
-                coh_active = (coherence_floor > 0.0 and scale != 0)
-
                 if thresh < 1e6:
                     enh_dask = da.from_array(enh_mm, chunks=(4096, 4096))
 
@@ -465,76 +374,7 @@ def segment_cells_first_pass_raw_2d(
                     radius_px = math.ceil((current_connect_gap / 2) / np.mean(spacing_2d))
                     struct = disk(radius_px) if radius_px > 0 else np.ones((1, 1), dtype=bool)
 
-                    band = enh_dask > thresh
-                    if use_upper:
-                        band = band & (enh_dask < current_high)
-                        print(f"      [Scale {scale}] Upper bound (reject > {current_high:.6f})")
-                    # Grow is magnitude-only: a structure fills contiguously
-                    # through its own faint/incoherent stretches, so coherence
-                    # can never fragment a real branch.
-                    clean_dask = dask_image.ndmorph.binary_closing(band, structure=struct)
-
-                    # Seed mask defines the confident cores a component must
-                    # contain to survive the hysteresis test below.
-                    #   coherence on  -> a coherent core (oriented structure);
-                    #                    optionally also a bright core if `seed`
-                    #                    is set. Incoherent background has no
-                    #                    coherent core and is dropped whole,
-                    #                    without cutting into real structure.
-                    #   coherence off -> the bright `seed` core (or self-seed).
-                    if coh_active:
-                        coh = _orientation_coherence(
-                            smoothed_mm, spacing_2d, scale, chunks=(4096, 4096)
-                        )
-                        coherent = (coh > coherence_floor) & band
-
-                        # Extent-aware seeding: a coherent core anchors a
-                        # structure only if it is SUSTAINED (connected extent
-                        # >= seed_min_size). Short oriented noise specks are
-                        # locally as coherent as a real process, so magnitude
-                        # and coherence alone can't reject them — but their
-                        # coherent core is tiny, while a real process's is long.
-                        # Cores are closed first (per-scale `struct`) so a real
-                        # core split by coherence dips is measured as one run.
-                        if seed_min_size > 0:
-                            cclosed = dask_image.ndmorph.binary_closing(coherent, structure=struct)
-                            slbl, sn = dask_image.ndmeasure.label(
-                                cclosed, structure=generate_binary_structure(2, 2))
-                            sn = int(sn.compute())
-                            if sn > 0:
-                                ssz = da.histogram(slbl, bins=sn + 1, range=[-0.5, sn + 0.5])[0].compute()
-                                big = np.zeros(sn + 1, dtype=bool)
-                                big[1:] = ssz[1:] >= seed_min_size
-                                coherent = da.map_blocks(lambda b, t=big: t[b], slbl, dtype=bool)
-                            else:
-                                coherent = coherent & False
-                            print(f"      [Scale {scale}] Coherent cores >= {seed_min_size}px seed "
-                                  f"({int(big[1:].sum()) if sn > 0 else 0}/{sn} cores kept)")
-
-                        seed_dask = coherent
-                        if seed_active:
-                            seed_dask = seed_dask | (enh_dask > current_seed)
-                        print(f"      [Scale {scale}] Coherent-core seed (floor={coherence_floor}; "
-                              f"bright-seed OR {'ON @%.4f' % current_seed if seed_active else 'off'})")
-                        # DIAGNOSTIC: coherence distribution over the foreground.
-                        try:
-                            st = max(1, min(image.shape) // 512)
-                            cs = coh[::st, ::st].compute()
-                            bs = (enh_dask[::st, ::st] > thresh).compute()
-                            fg = cs[bs]
-                            if fg.size:
-                                p = np.percentile(fg, [10, 50, 90, 99])
-                                print(f"      [DIAG] coherence over foreground "
-                                      f"p10/50/90/99 = {p[0]:.2f}/{p[1]:.2f}/{p[2]:.2f}/{p[3]:.2f}")
-                        except Exception:
-                            pass
-                    elif seed_active:
-                        seed_dask = enh_dask > current_seed
-                        if use_upper:
-                            seed_dask = seed_dask & (enh_dask < current_high)
-                        print(f"      [Scale {scale}] Hysteresis seed @ {current_seed:.6f}")
-                    else:
-                        seed_dask = clean_dask
+                    clean_dask = dask_image.ndmorph.binary_closing((enh_dask > thresh), structure=struct)
 
                     # Merge this scale's detections into the master mask. Size
                     # filtering is deferred to a single GLOBAL pass after all
@@ -542,10 +382,8 @@ def segment_cells_first_pass_raw_2d(
                     chunk_gen = list(_get_chunk_slices_2d(image.shape, (2048, 2048), overlap=0))
                     for read_sl, _ in tqdm(chunk_gen, desc="      Merging"):
                         master_mm[read_sl] |= clean_dask[read_sl].compute().astype(np.uint8)
-                        master_seed_mm[read_sl] |= seed_dask[read_sl].compute().astype(np.uint8)
-
+                
                 master_mm.flush()
-                master_seed_mm.flush()
 
                 # Clean up this scale's intermediate buffers. `enh_mm` is
                 # dropped first since, for scale==0 or smooth_sigma==0, it may
@@ -585,58 +423,26 @@ def segment_cells_first_pass_raw_2d(
         else:
             d_lbl = da.from_zarr(os.path.join(lab_dir, 'l.zarr'))
             counts, _ = da.histogram(d_lbl, bins=num_feats + 1, range=[-0.5, num_feats + 0.5])
-            csz = counts.compute()
-            size_ok = csz[1:] >= min_size_global  # position k -> label k+1
-
-            # DIAGNOSTIC: if one component holds most of the foreground, the mask
-            # is a single connected flood (coherence can't gate it by seeding);
-            # if foreground is spread over many components, seeding can.
-            try:
-                tot = float(csz[1:].sum())
-                if tot > 0:
-                    print(f"    [DIAG] {num_feats} components; largest holds "
-                          f"{100.0 * csz[1:].max() / tot:.0f}% of foreground")
-            except Exception:
-                pass
-
-            lz = zarr.open(os.path.join(lab_dir, 'l.zarr'), mode='r')
-
-            # Hysteresis resolution: an object survives only if it BOTH meets the
-            # global size floor AND contains at least one seed pixel. When no
-            # scale set a `high` seed, master_seed_mm == master_mm, so every
-            # object is seeded and this reduces to the plain size filter.
-            seeded = np.zeros(num_feats + 1, dtype=bool)
-            for rs, _ in chunk_gen:
-                seed_chunk = master_seed_mm[rs] > 0
-                if seed_chunk.any():
-                    seeded[np.unique(lz[rs][seed_chunk])] = True
-            seeded[0] = False
-
-            keep = np.zeros(num_feats + 1, dtype=bool)
-            keep[1:] = size_ok
-            keep &= seeded
+            valid = np.where(counts.compute()[1:] >= min_size_global)[0] + 1
 
             lookup = np.zeros(num_feats + 1, dtype=np.int32)
-            new_id = 0
-            for old_id in range(1, num_feats + 1):
-                if keep[old_id]:
-                    new_id += 1
-                    lookup[old_id] = new_id
+            for new_id, old_id in enumerate(valid):
+                lookup[old_id] = new_id + 1
 
+            lz = zarr.open(os.path.join(lab_dir, 'l.zarr'), mode='r')
             for rs, ws in tqdm(chunk_gen, desc="    Filtering"):
                 final_mm[ws] = lookup[lz[rs]]
         final_mm.flush()
 
-        # Explicitly release master buffers before returning
-        for _m in ('master_mm', 'master_seed_mm'):
-            if _m in locals():
-                del locals()[_m]
+        # Explicitly release master_mm before returning
+        if 'master_mm' in locals():
+            del master_mm
 
         return labels_path, labels_temp_dir, threshold_history.get(tubular_scales[0], 0.0), {'threshold_history': threshold_history}
 
     finally:
         # Close any local memmap handles to avoid PermissionError on cleanup
-        for var in ['final_mm', 'norm_mm', 'smoothed_mm', 'master_mm', 'master_seed_mm', 'input_mm']:
+        for var in ['final_mm', 'norm_mm', 'smoothed_mm', 'master_mm', 'input_mm']:
             if var in locals():
                 del locals()[var]
         
