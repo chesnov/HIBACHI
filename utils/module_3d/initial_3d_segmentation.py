@@ -356,7 +356,8 @@ class SimpleTimer:
 
 
 def _trace_link_fragments(final_mm, image, spacing, max_gap, step=1.0,
-                          angle_tol_deg=45.0, momentum=0.5, recenter_radius=3):
+                          angle_tol_deg=45.0, momentum=0.5, recenter_radius=3,
+                          soma_lut=None, link_radius=3):
     """Orientation-following gap tracing to reconnect a structure broken by a
     dim stretch. Walks the local intensity ridge outward from each fragment
     endpoint, branch-by-branch -- direction comes from the recentred path, and
@@ -372,6 +373,20 @@ def _trace_link_fragments(final_mm, image, spacing, max_gap, step=1.0,
     no-op upstream). Returns the new object count, or None if nothing linked.
     General: uses only intensity ridges and geometry, no model of the imaged
     object. Returns None quietly if scipy/skimage are unavailable.
+
+    Soma-aware linking (`soma_lut`): scale-0 detections are compact blobs
+    (somata), not tubular processes, so they are handled differently. Their
+    medial skeletons have no stable outward tangent, so they are NOT used as
+    trace sources; and a process ridge walking toward a soma tends to stall on
+    the soma's bright boundary rim (the big adjacent bright mass yanks the
+    transverse re-centre past the bend tolerance) a voxel or two before it ever
+    lands on a soma-labelled voxel. To fix both, `soma_lut` is a boolean array
+    indexed by label id (True where the label came from scale 0). A process
+    trace links to a soma as soon as it comes within `link_radius` voxels of
+    one, instead of having to land exactly on it -- so proximity, not exact
+    ridge contact, closes the process-to-soma gap. Process-to-process linking is
+    unchanged (still requires landing on the target label). When `soma_lut` is
+    None the routine behaves exactly as before.
     """
     try:
         from scipy import ndimage as _ndi
@@ -401,6 +416,26 @@ def _trace_link_fragments(final_mm, image, spacing, max_gap, step=1.0,
         off = off - (off @ d) * d          # keep only the transverse component
         return cur + off, float(w.max())
 
+    def _near_soma(cur, own):
+        """Return a soma label within `link_radius` of `cur` (0 if none). Lets a
+        process trace link to a soma on proximity, before the bend guard can
+        abort it at the soma's bright boundary rim."""
+        if soma_lut is None:
+            return 0
+        ci = np.round(cur).astype(int)
+        sl = tuple(slice(max(0, ci[k] - link_radius),
+                         min(int(shape[k]), ci[k] + link_radius + 1)) for k in range(ndim))
+        win = np.asarray(final_mm[sl])
+        m = soma_lut[win]
+        if not m.any():
+            return 0
+        cand = win[m]
+        cand = cand[cand != own]
+        if cand.size == 0:
+            return 0
+        vals, cnts = np.unique(cand, return_counts=True)
+        return int(vals[np.argmax(cnts)])   # nearest-dominant soma label
+
     def _trace(start, direction, own):
         cur = start.astype(float).copy()
         d = direction.astype(float).copy()
@@ -414,6 +449,10 @@ def _trace_link_fragments(final_mm, image, spacing, max_gap, step=1.0,
             prev = cur.copy()
             cur = cur + step * d
             cur, peak = _recenter(cur, d)
+            shit = _near_soma(cur, own)     # soma proximity link (before bend guard)
+            if shit:
+                path.append(cur.copy())
+                return shit, path
             disp = cur - prev
             dn = np.linalg.norm(disp)
             if dn > 1e-6:
@@ -452,6 +491,8 @@ def _trace_link_fragments(final_mm, image, spacing, max_gap, step=1.0,
         lab = idx + 1
         if sl is None:
             continue
+        if soma_lut is not None and lab < soma_lut.size and soma_lut[lab]:
+            continue        # somata are link *targets*, not trace sources
         sub = np.asarray(final_mm[sl]) == lab
         if sub.sum() < 3:
             continue
@@ -649,6 +690,16 @@ def segment_cells_first_pass_raw(
         master_mm = np.memmap(os.path.join(master_dir, 'm.dat'), dtype=np.uint8, mode='w+', shape=volume.shape)
         master_mm[:] = 0
 
+        # Scale-0 provenance: somata are detected by the scale-0 (non-tubular)
+        # pass. Accumulate their detections into a separate mask so the trace
+        # linker can treat those objects differently (see soma-aware linking).
+        # Allocated only when scale 0 is actually requested.
+        scale0_mm = None
+        if 0 in tubular_scales:
+            scale0_dir = _get_safe_temp_dir(temp_root_path, 'scale0'); temp_dirs_to_clean.append(scale0_dir)
+            scale0_mm = np.memmap(os.path.join(scale0_dir, 's0.dat'), dtype=np.uint8, mode='w+', shape=volume.shape)
+            scale0_mm[:] = 0
+
         for i, scale in enumerate(tubular_scales):
             current_low_p = low_thresh_list[i]
             current_smooth_sigma = smooth_sigma_list[i]
@@ -708,10 +759,16 @@ def segment_cells_first_pass_raw(
 
                     clean_dask = dask_image.ndmorph.binary_closing((enh_dask > thresh), structure=struct)
                     
+                    record_s0 = (scale == 0 and scale0_mm is not None)
                     for read_sl, _ in tqdm(list(_get_chunk_slices(volume.shape, (64, 512, 512))), desc="      Merging"):
-                        master_mm[read_sl] |= clean_dask[read_sl].compute().astype(np.uint8)
+                        blk = clean_dask[read_sl].compute().astype(np.uint8)
+                        master_mm[read_sl] |= blk
+                        if record_s0:
+                            scale0_mm[read_sl] |= blk
                 
                 master_mm.flush()
+                if scale0_mm is not None:
+                    scale0_mm.flush()
 
                 # Clean up this scale's intermediate buffers. `enh_mm` is dropped
                 # first since, for scale==0 or smooth_sigma==0, it may just be an
@@ -748,8 +805,26 @@ def segment_cells_first_pass_raw(
             for rs, ws in tqdm(list(_get_chunk_slices(volume.shape, (64, 512, 512))), desc="    Writing labels"):
                 final_mm[ws] = lz[rs]
             final_mm.flush()
+            # Flag which labels are somata (scale-0 objects): a label is a soma
+            # if the majority of its voxels came from the scale-0 mask. Streamed
+            # one z-slab at a time so the full arrays never sit in RAM.
+            soma_lut = None
+            if scale0_mm is not None:
+                maxid = int(final_mm.max())
+                tot = np.zeros(maxid + 1, dtype=np.int64)
+                s0 = np.zeros(maxid + 1, dtype=np.int64)
+                for z in range(int(volume.shape[0])):
+                    row = final_mm[z].ravel()
+                    tot += np.bincount(row, minlength=maxid + 1)
+                    sel = scale0_mm[z].ravel().astype(bool)
+                    if sel.any():
+                        s0 += np.bincount(row[sel], minlength=maxid + 1)
+                soma_lut = (s0 >= 0.5 * np.maximum(tot, 1)) & (tot > 0)
+                soma_lut[0] = False
+                print(f"    [DIAG] soma (scale-0) labels flagged: {int(soma_lut.sum())}")
             try:
-                n_obj = _trace_link_fragments(final_mm, volume, spacing, trace_max_gap)
+                n_obj = _trace_link_fragments(final_mm, volume, spacing, trace_max_gap,
+                                              soma_lut=soma_lut)
                 if n_obj is not None:
                     print(f"    [DIAG] orientation trace-link -> {n_obj} objects")
                     final_mm.flush()
@@ -790,7 +865,7 @@ def segment_cells_first_pass_raw(
     finally:
         if final_labels_memmap is not None: del final_labels_memmap
         # Close any local memmap handles to release file locks
-        for var in ['final_mm', 'norm_mm', 'smoothed_mm', 'master_mm', 'input_mm', 'enh_mm']:
+        for var in ['final_mm', 'norm_mm', 'smoothed_mm', 'master_mm', 'input_mm', 'enh_mm', 'scale0_mm']:
             if var in locals():
                 try: del locals()[var]
                 except: pass
