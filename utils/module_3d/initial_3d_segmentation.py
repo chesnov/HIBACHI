@@ -627,22 +627,14 @@ def segment_cells_first_pass_raw(
         labeled_dask.to_zarr(os.path.join(lab_dir, 'l.zarr'), overwrite=True)
         num_feats = num_feats_dask.compute()
 
-        d_lbl = da.from_zarr(os.path.join(lab_dir, 'l.zarr'))
-        counts, _ = da.histogram(d_lbl, bins=num_feats+1, range=[-0.5, num_feats+0.5])
-        valid = np.where(counts.compute()[1:] >= min_size_voxels)[0] + 1
-        
-        lookup = np.zeros(num_feats + 1, dtype=np.int32)
-        for i, old_id in enumerate(valid): lookup[old_id] = i + 1
-            
-        lz = zarr.open(os.path.join(lab_dir, 'l.zarr'), mode='r')
-        for rs, ws in tqdm(list(_get_chunk_slices(volume.shape, (64, 512, 512))), desc="    Filtering"):
-            final_mm[ws] = lookup[lz[rs]]
-        final_mm.flush()
-
-        # Orientation-following gap tracing (opt-in; 0 = off). Reconnects a
-        # structure broken by a dim stretch by walking the local intensity ridge
-        # across the gap. Memory-light (windowed memmap access).
         if trace_max_gap > 0.0:
+            # Trace-link BEFORE the size filter: write raw labels, reconnect
+            # fragments broken by dim gaps, THEN apply the global size filter to
+            # the merged labels. Memory-light throughout.
+            lz = zarr.open(os.path.join(lab_dir, 'l.zarr'), mode='r')
+            for rs, ws in tqdm(list(_get_chunk_slices(volume.shape, (64, 512, 512))), desc="    Writing labels"):
+                final_mm[ws] = lz[rs]
+            final_mm.flush()
             try:
                 n_obj = _trace_link_fragments(final_mm, volume, spacing, trace_max_gap)
                 if n_obj is not None:
@@ -650,6 +642,31 @@ def segment_cells_first_pass_raw(
                     final_mm.flush()
             except Exception as exc:
                 print(f"    [trace-link] skipped: {exc}")
+            maxid = int(final_mm.max())
+            csz = np.zeros(maxid + 1, dtype=np.int64)
+            for z in range(int(volume.shape[0])):
+                csz += np.bincount(final_mm[z].ravel(), minlength=maxid + 1)
+            lut = np.zeros(maxid + 1, dtype=np.int32)
+            nid = 0
+            for i in range(1, maxid + 1):
+                if csz[i] >= min_size_voxels:
+                    nid += 1
+                    lut[i] = nid
+            for z in range(int(volume.shape[0])):
+                final_mm[z] = lut[final_mm[z]]
+            final_mm.flush()
+        else:
+            d_lbl = da.from_zarr(os.path.join(lab_dir, 'l.zarr'))
+            counts, _ = da.histogram(d_lbl, bins=num_feats+1, range=[-0.5, num_feats+0.5])
+            valid = np.where(counts.compute()[1:] >= min_size_voxels)[0] + 1
+
+            lookup = np.zeros(num_feats + 1, dtype=np.int32)
+            for i, old_id in enumerate(valid): lookup[old_id] = i + 1
+
+            lz = zarr.open(os.path.join(lab_dir, 'l.zarr'), mode='r')
+            for rs, ws in tqdm(list(_get_chunk_slices(volume.shape, (64, 512, 512))), desc="    Filtering"):
+                final_mm[ws] = lookup[lz[rs]]
+            final_mm.flush()
 
         # Explicitly release large internal memmaps
         if 'master_mm' in locals():

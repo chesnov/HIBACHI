@@ -575,6 +575,35 @@ def segment_cells_first_pass_raw_2d(
         chunk_gen = list(_get_chunk_slices_2d(image.shape, (2048, 2048), overlap=0))
         if num_feats == 0:
             final_mm[:] = 0
+        elif trace_max_gap > 0.0:
+            # Trace-link BEFORE the size filter: write the raw labels, reconnect
+            # fragments broken by dim gaps (so two halves each below min_size can
+            # fuse and survive as one object), THEN apply the global size filter
+            # to the merged labels. Memory-light throughout.
+            lz = zarr.open(os.path.join(lab_dir, 'l.zarr'), mode='r')
+            for rs, ws in tqdm(chunk_gen, desc="    Writing labels"):
+                final_mm[ws] = lz[rs]
+            final_mm.flush()
+            try:
+                n_obj = _trace_link_fragments(final_mm, image, spacing_2d, trace_max_gap)
+                if n_obj is not None:
+                    print(f"    [DIAG] orientation trace-link -> {n_obj} objects")
+                    final_mm.flush()
+            except Exception as exc:
+                print(f"    [trace-link] skipped: {exc}")
+            # Global size filter on the merged labels, streamed one row-slab at a time.
+            maxid = int(final_mm.max())
+            csz = np.zeros(maxid + 1, dtype=np.int64)
+            for i0 in range(int(image.shape[0])):
+                csz += np.bincount(final_mm[i0].ravel(), minlength=maxid + 1)
+            lut = np.zeros(maxid + 1, dtype=np.int32)
+            nid = 0
+            for i in range(1, maxid + 1):
+                if csz[i] >= min_size_global:
+                    nid += 1
+                    lut[i] = nid
+            for i0 in range(int(image.shape[0])):
+                final_mm[i0] = lut[final_mm[i0]]
         else:
             d_lbl = da.from_zarr(os.path.join(lab_dir, 'l.zarr'))
             counts, _ = da.histogram(d_lbl, bins=num_feats + 1, range=[-0.5, num_feats + 0.5])
@@ -588,18 +617,6 @@ def segment_cells_first_pass_raw_2d(
             for rs, ws in tqdm(chunk_gen, desc="    Filtering"):
                 final_mm[ws] = lookup[lz[rs]]
         final_mm.flush()
-
-        # Orientation-following gap tracing (opt-in; 0 = off). Reconnects a
-        # structure broken by a dim stretch by walking the local intensity ridge
-        # across the gap. Memory-light (windowed memmap access).
-        if trace_max_gap > 0.0:
-            try:
-                n_obj = _trace_link_fragments(final_mm, image, spacing_2d, trace_max_gap)
-                if n_obj is not None:
-                    print(f"    [DIAG] orientation trace-link -> {n_obj} objects")
-                    final_mm.flush()
-            except Exception as exc:
-                print(f"    [trace-link] skipped: {exc}")
 
         # Explicitly release master_mm before returning
         if 'master_mm' in locals():
