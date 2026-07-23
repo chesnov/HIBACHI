@@ -9,26 +9,31 @@ per-image optima -- is wrong, because it ignores how *sensitive* each image is t
 the parameter. If A degrades sharply away from 0.013 while B barely notices
 around 0.02, the fair shared value sits closer to 0.013.
 
-Method (curvature-weighted compromise)
---------------------------------------
-For each image *i* we treat the deviation of its segmentation from its own
-desired result as a loss L_i(theta) with a minimum at that image's optimum
-theta_i* (there L_i ~ 0, since the desired result IS what theta_i* produces). We
-probe the step near theta_i* -- one small step up and down in each optimizable
-parameter -- and estimate the local curvature h_ij (how fast L_i rises when
-parameter j moves). Modelling each L_i as a local quadratic bowl gives a
-closed-form shared optimum, per parameter:
+Method (object-integrity, safe side of every cliff)
+---------------------------------------------------
+What matters most is not pixel overlap but whether every real cell still
+segments and no spurious object appears. Pixel-overlap metrics (Dice) miss this:
+losing a whole small cell barely moves Dice, and a lost cell can even be masked
+by a gained artifact of similar size. So the objective is object-level: compared
+to each image's own reference segmentation, count missed cells (a reference
+object no candidate covers) and spurious objects (a candidate object matching no
+reference), which is weighted far above the boundary (Dice) term.
 
-    theta*_j = sum_i h_ij * theta_ij*  /  sum_i h_ij
+Cell appearance/disappearance is a discrete threshold-crossing -- a cliff, not a
+smooth bowl -- so instead of estimating curvature we find, per image and per
+parameter, the SAFE INTERVAL: the range around that image's optimum within which
+no cell is lost and no artifact appears. We locate each cliff by scanning
+outward from the optimum to bracket it, then bisecting to localize it. The
+shared value is then placed in the INTERSECTION of all images' safe intervals --
+in the middle, for maximum margin to every cliff, so the shared config sits on
+the safe side for every image at once. If the safe intervals do not overlap (the
+images genuinely want different settings), we fall back to the value with the
+smallest worst-image object loss (minimax), and flag it.
 
-i.e. a curvature-weighted mean of the per-image optima. It reduces to the plain
-average when every image is equally sensitive, and pulls toward whichever image
-cares most otherwise. It naturally handles many parameters at once. (Parameters
-are treated independently here -- a diagonal-curvature approximation; genuine
-coupling would need a full joint search, which is a later tier.)
-
-Deviation metric: 1 - Dice on the foreground mask (labels > 0), evaluated on a
-representative crop of each image so the many re-segmentations stay cheap.
+Parameters are treated one at a time (each swept with the others held at each
+image's optimum); genuine coupling is out of scope here. Evaluation runs the real
+segmentation on the whole image (crops de-calibrate the intensity normalization
+that absolute thresholds depend on), so it is compute-heavy but faithful.
 
 The core (`optimize_initial_segmentation`) is GUI-agnostic: it takes progress and
 cancel callbacks. `OptimizeWorker` / `run_optimization_dialog` wrap it for the
@@ -81,6 +86,15 @@ _MIN_REF_PIXELS = 20             # a crop whose reference mask is ~empty is unus
 # to the whole-image intensity normalization the absolute thresholds rely on.
 _MAX_2D_PIXELS = 12_000_000      # ~3460 x 3460
 _MAX_3D_VOXELS = 12_000_000
+# Deviation blends object-level disagreement (lost cells / spurious artifacts)
+# with pixel-level Dice. Object error is weighted higher: whether a cell
+# segments at all matters more than its exact pixel extent.
+_W_OBJ = 1.0
+_W_PIX = 0.05
+_MATCH_FRAC = 0.25               # overlap needed to call an object matched
+_GRID_POINTS = 7                 # nominal scan budget per parameter (progress est.)
+_SCAN_MAXOUT = 5                 # geometric outward steps when bracketing a cliff
+_BISECT_ITERS = 3                # bisection steps to localize a cliff
 
 
 # --------------------------------------------------------------------------- #
@@ -230,12 +244,13 @@ def _params_to_kwargs(params: Dict[str, Any]) -> Dict[str, Any]:
 # --------------------------------------------------------------------------- #
 # Segmentation adapter (mode-dispatched, at parity)
 # --------------------------------------------------------------------------- #
-def _segment_mask(image: np.ndarray, spacing: Tuple[float, ...],
-                  params: Dict[str, Any], is_2d: bool) -> np.ndarray:
-    """Run raw segmentation on `image` with `params`; return a boolean mask.
+def _segment_labels(image: np.ndarray, spacing: Tuple[float, ...],
+                    params: Dict[str, Any], is_2d: bool) -> np.ndarray:
+    """Run raw segmentation on `image` with `params`; return the int32 LABEL
+    image (object identities preserved, not just a binary mask).
 
-    Reads the label memmap into RAM (crops are small) and removes all temp
-    output so repeated probing does not accumulate on disk.
+    Reads the label memmap into RAM (the run region is bounded) and removes all
+    temp output so repeated probing does not accumulate on disk.
     """
     kw = _params_to_kwargs(params)
     run_tmp = os.path.join(tempfile.gettempdir(), f"hibachi_opt_{uuid.uuid4().hex}")
@@ -276,9 +291,9 @@ def _segment_mask(image: np.ndarray, spacing: Tuple[float, ...],
         if not dat_path or not os.path.exists(dat_path):
             raise OptimizationError("Segmentation produced no output.")
         mm = np.memmap(dat_path, dtype=np.int32, mode="r", shape=image.shape)
-        mask = np.asarray(mm) > 0
+        labels = np.array(mm, dtype=np.int32)   # copy so the memmap can be freed
         del mm
-        return mask
+        return labels
     finally:
         if labels_dir and os.path.isdir(labels_dir):
             shutil.rmtree(labels_dir, ignore_errors=True)
@@ -296,6 +311,54 @@ def _dice_distance(a: np.ndarray, b: np.ndarray) -> float:
         return 0.0
     inter = int(np.logical_and(a, b).sum())
     return 1.0 - (2.0 * inter) / tot
+
+
+def _object_error(ref: np.ndarray, cand: np.ndarray) -> Tuple[float, int, int, int]:
+    """Object-level disagreement between two LABEL images.
+
+    A reference object counts as *missed* (a lost cell) if less than
+    `_MATCH_FRAC` of its pixels are covered by any candidate object; a candidate
+    object counts as *spurious* (a noise artifact) if less than `_MATCH_FRAC` of
+    its pixels overlap any reference object. Returns
+    (error, missed, spurious, n_ref) where error = (missed + spurious) / n_ref.
+
+    Unlike Dice, this does not scale with object area, so dropping one whole
+    small cell or gaining one small artifact registers as a full unit of error.
+    """
+    rf = ref.ravel(); cf = cand.ravel()
+    ref_fg = (rf > 0); cand_fg = (cf > 0)
+    n_ref = int(rf.max()) if rf.size else 0
+    n_cand = int(cf.max()) if cf.size else 0
+
+    missed = 0
+    if n_ref > 0:
+        size = np.bincount(rf, minlength=n_ref + 1).astype(float)
+        cov = np.bincount(rf, weights=cand_fg.astype(float), minlength=n_ref + 1)
+        frac = np.divide(cov, size, out=np.zeros_like(cov), where=size > 0)
+        # count only real objects (size > 0); label-id gaps are not objects
+        missed = int(np.sum((frac[1:] < _MATCH_FRAC) & (size[1:] > 0)))
+
+    spurious = 0
+    if n_cand > 0:
+        size_c = np.bincount(cf, minlength=n_cand + 1).astype(float)
+        cov_c = np.bincount(cf, weights=ref_fg.astype(float), minlength=n_cand + 1)
+        frac_c = np.divide(cov_c, size_c, out=np.zeros_like(cov_c), where=size_c > 0)
+        spurious = int(np.sum((frac_c[1:] < _MATCH_FRAC) & (size_c[1:] > 0)))
+
+    n_present = int(np.count_nonzero(np.bincount(rf)[1:])) if n_ref > 0 else 0
+    denom = max(1, n_present)
+    return (missed + spurious) / denom, missed, spurious, n_present
+
+
+def _deviation(ref: np.ndarray, cand: np.ndarray) -> Tuple[float, int, int]:
+    """Blended deviation of a candidate LABEL image from the reference:
+    object-level disagreement (lost cells + artifacts) plus pixel-level Dice.
+    Object error is weighted higher because *whether a cell segments at all*
+    matters more than exactly which pixels it occupies. Returns
+    (deviation, missed, spurious)."""
+    oe, missed, spurious, _n = _object_error(ref, cand)
+    pix = _dice_distance(ref > 0, cand > 0)
+    return _W_OBJ * oe + _W_PIX * pix, missed, spurious
 
 
 def _pick_crop(image: np.ndarray, is_2d: bool) -> Tuple[slice, ...]:
@@ -486,88 +549,24 @@ def optimize_initial_segmentation(
             "parameters — there is nothing to reconcile."
         )
 
-    # ---- Probe curvature around each image's optimum ------------------------ #
-    # Total segmentation runs = sum over images of (1 reference + 2 per leaf the
-    # image exposes). Track progress across all of them.
-    runs_per_image = [1 + 2 * sum(1 for lf in optimizable
-                                  if per_image_vals[lf][i] is not None)
-                      for i in range(len(images))]
-    total_runs = max(1, sum(runs_per_image))
-    done = 0
-
-    # weight[leaf] accumulates sum_i h_ij ; wnum[leaf] accumulates sum_i h_ij*theta_ij*
-    wsum: Dict[Tuple[Any, str], float] = {lf: 0.0 for lf in optimizable}
-    wnum: Dict[Tuple[Any, str], float] = {lf: 0.0 for lf in optimizable}
-    curvature_report: Dict[str, List[Dict[str, float]]] = {}
+    # ---- Reference segmentation per image (its own desired result) ---------- #
+    refs: List[Optional[np.ndarray]] = [None] * len(images)
     empty_refs: List[str] = []
-    n_measurements = 0          # how many (image, leaf) probes yielded real signal
-
-    def _probe(image, spacing, params, ref, leaf, v0) -> Tuple[float, float]:
-        """Grow the perturbation until the segmentation actually changes; return
-        (curvature, deviation_at_that_step). (0, 0) if it never responds."""
-        nonlocal done
-        field = leaf[1]
-        base = _perturbation(field, v0)
-        last = (0.0, 0.0)
-        for mult in _PROBE_MULTS:
-            _check()
-            delta = base * mult
-            devs = []
-            for sign in (+1.0, -1.0):
-                _check()
-                trial = copy.deepcopy(params)
-                _set_leaf(trial, leaf, v0 + sign * delta)
-                try:
-                    m = _segment_mask(image, spacing, trial, is_2d)
-                    devs.append(_dice_distance(ref, m))
-                except OptimizationCancelled:
-                    raise
-                except Exception as exc:
-                    print(f"[optimize] probe {leaf} {sign:+g} failed: {exc}")
-                finally:
-                    done += 1
-            if not devs:
-                return 0.0, 0.0
-            dev = sum(devs) / len(devs)
-            last = (dev / (delta * delta), dev)
-            if dev >= _MEASURABLE:      # mask responded -> curvature is meaningful
-                return last
-        return last                     # never responded -> ~flat (h ~ 0)
-
     for i, (image, spacing, params) in enumerate(zip(images, spacings, params_list)):
         _check()
         name = os.path.basename(folders[i])
-        _tick(0.05 + 0.9 * done / total_runs, f"[{name}] reference segmentation…")
-        ref = _segment_mask(image, spacing, params, is_2d)
-        done += 1
-        if int(ref.sum()) < _MIN_REF_PIXELS:
-            # No segmentable signal on this crop, so nothing can be measured from
-            # it; record and skip rather than contributing spurious zeros.
+        _tick(0.05 + 0.10 * (i + 1) / len(images),
+              f"[{name}] reference segmentation…")
+        ref = _segment_labels(image, spacing, params, is_2d)
+        if int((ref > 0).sum()) < _MIN_REF_PIXELS:
             empty_refs.append(name)
-            print(f"[optimize] {name}: reference crop nearly empty "
-                  f"({int(ref.sum())} px) — skipping this image.")
-            continue
-
-        for leaf in optimizable:
-            v0 = per_image_vals[leaf][i]
-            if v0 is None:
-                continue
-            _check()
-            scale, field = leaf
-            label = field if scale == _SCALAR_KEY else f"scale{scale:g}.{field}"
-            _tick(0.05 + 0.9 * done / total_runs, f"[{name}] probing {label}…")
-            h, dev = _probe(image, spacing, params, ref, leaf, v0)
-            h = max(h, 0.0)
-            if dev >= _MEASURABLE:
-                n_measurements += 1
-            wsum[leaf] += h
-            wnum[leaf] += h * v0
-            curvature_report.setdefault(label, []).append(
-                {"image": name, "optimum": v0, "curvature": round(h, 6),
-                 "deviation": round(dev, 4)})
+            print(f"[optimize] {name}: reference nearly empty "
+                  f"({int((ref > 0).sum())} px) — skipping this image.")
+        else:
+            refs[i] = ref
 
     _check()
-    if len(empty_refs) == len(folders):
+    if all(r is None for r in refs):
         raise OptimizationError(
             "Every image's reference segmentation came out essentially empty, so "
             "there is nothing to measure. The images ran on their own optimal "
@@ -576,51 +575,172 @@ def optimize_initial_segmentation(
             "version) or min-size removed everything. Re-process one image and "
             "confirm its raw segmentation is non-empty before optimizing."
         )
-    _tick(0.97, "Combining into a shared config…")
+    active = [i for i in range(len(images)) if refs[i] is not None]
 
-    # ---- Curvature-weighted compromise -> merged config --------------------- #
+    done = 0
+    total_scan = max(1, len(optimizable) * len(active) * _GRID_POINTS)
+
+    def _eval(i: int, leaf, x: float):
+        """Segment image i with leaf set to x (others at its optimum) and score
+        against its own reference. Returns (missed_cells, spurious, dice) or
+        None on failure."""
+        nonlocal done
+        done += 1
+        trial = copy.deepcopy(params_list[i])
+        _set_leaf(trial, leaf, x)
+        try:
+            lab = _segment_labels(images[i], spacings[i], trial, is_2d)
+        except OptimizationCancelled:
+            raise
+        except Exception as exc:
+            print(f"[optimize] eval {leaf}={x:g} on {os.path.basename(folders[i])} "
+                  f"failed: {exc}")
+            return None
+        _oe, miss, spur, _n = _object_error(refs[i], lab)
+        return miss, spur, _dice_distance(refs[i] > 0, lab > 0)
+
+    # ---- Per-parameter: safe interval per image, then the safe-side choice --- #
     merged_config = copy.deepcopy(base_configs[0])
     _merged_step = merged_config[step_keys[0]]
     merged_params = _merged_step.get("parameters", _merged_step)
     table_key, _ = _active_profiles(params_list[0])
     report_values: Dict[str, Dict[str, Any]] = {}
+    n_conflicts = 0
+
+    _NONNEG = ("low", "high", "smooth_sigma", "connect_max_gap_physical",
+               "min_size", "trace_max_gap")
 
     for leaf in optimizable:
+        _check()
         scale, field = leaf
-        vals = [v for v in per_image_vals[leaf] if v is not None]
-        if wsum[leaf] > 1e-12:
-            value = wnum[leaf] / wsum[leaf]
-            how = "curvature-weighted"
-        else:
-            value = float(np.mean(vals))       # all images flat -> plain mean
-            how = "mean (no sensitivity)"
-        # Never extrapolate beyond the range the images actually used.
-        value = float(np.clip(value, min(vals), max(vals)))
-        _write_leaf_into_config(merged_params, leaf, value, table_key)
         label = field if scale == _SCALAR_KEY else f"scale{scale:g}.{field}"
+        opt = {i: per_image_vals[leaf][i] for i in active
+               if per_image_vals[leaf][i] is not None}
+        per_image = [None if per_image_vals[leaf][i] is None
+                     else round(per_image_vals[leaf][i], 6)
+                     for i in range(len(images))]
+
+        if len(opt) < 2:
+            value = float(next(iter(opt.values()))) if opt else 0.0
+            _write_leaf_into_config(merged_params, leaf, value, table_key)
+            report_values[label] = {
+                "per_image": per_image,
+                "shared": int(round(value)) if field == "min_size" else round(value, 6),
+                "method": "single image (kept as-is)"}
+            continue
+
+        step = _perturbation(field, float(np.median(list(opt.values()))))
+        floor = (1.0 if field == "min_size" else 0.0) if field in _NONNEG else None
+
+        def _clamp(x: float) -> float:
+            return x if floor is None else max(floor, x)
+
+        evals: Dict[int, Dict[float, Optional[Tuple[int, int, float]]]] = {i: {} for i in opt}
+
+        def _ev(i: int, x: float):
+            x = round(_clamp(x), 9)
+            if x in evals[i]:
+                return evals[i][x]
+            _check()
+            _tick(0.15 + 0.8 * done / total_scan,
+                  f"[{os.path.basename(folders[i])}] scanning {label}…")
+            r = _eval(i, leaf, x)
+            evals[i][x] = r
+            return r
+
+        def _cliff(i: int, v0: float, direction: int) -> float:
+            """Furthest value from v0 (in `direction`) that keeps image i's cells
+            intact and adds no artifact. Geometric outward search to bracket the
+            cliff, then bisection to localize it."""
+            x_safe = v0
+            x_unsafe = None
+            for k in range(_SCAN_MAXOUT):
+                x = _clamp(v0 + direction * step * (2 ** k))
+                r = _ev(i, x)
+                if r is not None and r[0] == 0 and r[1] == 0:
+                    x_safe = x
+                    if x == floor:            # hit the physical bound; can't go on
+                        return x_safe
+                else:
+                    x_unsafe = x
+                    break
+            if x_unsafe is None:              # never cliffed within reach
+                return x_safe
+            for _ in range(_BISECT_ITERS):    # localize the cliff between safe/unsafe
+                mid = 0.5 * (x_safe + x_unsafe)
+                r = _ev(i, mid)
+                if r is not None and r[0] == 0 and r[1] == 0:
+                    x_safe = mid
+                else:
+                    x_unsafe = mid
+            return x_safe
+
+        safe: Dict[int, Tuple[float, float]] = {}
+        for i, v0 in opt.items():
+            evals[i][round(v0, 9)] = (0, 0, 0.0)   # optimum safe by construction
+            safe[i] = (_cliff(i, v0, -1), _cliff(i, v0, +1))
+
+        L = max(s[0] for s in safe.values())
+        H = min(s[1] for s in safe.values())
+        if L <= H + 1e-12:
+            # A window where every image keeps all its cells and gains no
+            # artifacts. Sit in the middle -> maximum margin to every cliff.
+            value = 0.5 * (L + H)
+            how = "safe (all cells kept in every image)"
+        else:
+            # No shared-safe window: pick the value with the smallest worst-image
+            # object loss (then fewest total, then best boundaries). Sample the
+            # gap between the images' safe intervals.
+            n_conflicts += 1
+            gap_lo = min(s[1] for s in safe.values())
+            gap_hi = max(s[0] for s in safe.values())
+            cands = list(np.linspace(gap_lo, gap_hi, 5)) + list(opt.values())
+            best_key, best_x = None, float(np.median(list(opt.values())))
+            for x in sorted(set(round(_clamp(float(c)), 9) for c in cands)):
+                worst = tot = 0
+                dsum = 0.0
+                ok = True
+                for i in opt:
+                    r = _ev(i, x)
+                    if r is None:
+                        ok = False
+                        break
+                    worst = max(worst, r[0] + r[1])
+                    tot += r[0] + r[1]
+                    dsum += r[2]
+                if not ok:
+                    continue
+                key = (worst, tot, round(dsum, 4))
+                if best_key is None or key < best_key:
+                    best_key, best_x = key, x
+            value = best_x
+            worst_loss = best_key[0] if best_key else -1
+            how = f"conflict: fewest worst-image objects lost ({worst_loss})"
+
+        value = _clamp(float(value))
+        _write_leaf_into_config(merged_params, leaf, value, table_key)
         report_values[label] = {
-            "per_image": [None if v is None else round(v, 6)
-                          for v in per_image_vals[leaf]],
-            "shared": round(value, 6) if field != "min_size" else int(round(value)),
+            "per_image": per_image,
+            "shared": int(round(value)) if field == "min_size" else round(value, 6),
             "method": how,
+            "safe_intervals": {
+                os.path.basename(folders[i]): [round(safe[i][0], 4),
+                                               round(safe[i][1], 4)] for i in opt},
         }
 
     report = {
         "images": [os.path.basename(f) for f in folders],
         "optimized": report_values,
-        "curvature": curvature_report,
         "n_optimized": len(optimizable),
-        "n_measurements": n_measurements,
+        "n_conflicts": n_conflicts,
         "empty_refs": empty_refs,
     }
-    if n_measurements == 0:
+    if n_conflicts:
         report["warning"] = (
-            "No parameter changed the segmentation on any image's crop, so "
-            "sensitivity could not be measured and every value fell back to a "
-            "plain average. This usually means the probe crops had too little "
-            "signal (min-size filtered them out, or the threshold was above the "
-            "crop's intensities). The result is only a mean — not a "
-            "curvature-weighted optimum."
+            f"{n_conflicts} parameter(s) had no value that keeps every cell in "
+            "every image at once — the images genuinely want different settings "
+            "there. The least-bad value (fewest cells lost in the worst image) "
+            "was chosen; see each parameter's method line."
         )
     _tick(1.0, "Done.")
     return merged_config, report
@@ -727,7 +847,7 @@ if _HAVE_QT:
             per = ", ".join("—" if v is None else f"{v:g}" for v in info["per_image"])
             lines.append(f"  • {label}: [{per}] → {info['shared']}  ({info['method']})")
         if report.get("empty_refs"):
-            lines.append("\nSkipped (no signal on probe crop): "
+            lines.append("\nSkipped (empty reference segmentation): "
                          + ", ".join(report["empty_refs"]))
         if report.get("warning"):
             lines.append("\n⚠ " + report["warning"])
