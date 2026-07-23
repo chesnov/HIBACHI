@@ -122,6 +122,27 @@ def _find_config_and_image(folder: str) -> Tuple[str, str]:
     return cfg, tif
 
 
+def _resolve_config(folder: str, mode: str) -> Tuple[Dict[str, Any], str, str]:
+    """Return (config, source, tif_path) for an image folder.
+
+    Prefers the PROCESSED run config -- ``<basename>_processed_<mode>/
+    processing_config_<mode>.yaml`` -- because that is where the values the user
+    actively tuned in the GUI are persisted (the widgets write straight into its
+    ``parameters[*].value`` fields on save). The plain folder ``.yaml`` is only
+    the initial template that was applied to the project, so reconciling it would
+    combine untouched defaults, not the tuned settings. Falls back to the
+    template only when no processed run exists. ``source`` is "tuned" or
+    "template".
+    """
+    template_path, tif = _find_config_and_image(folder)
+    basename = os.path.splitext(os.path.basename(tif))[0]
+    processed = os.path.join(
+        folder, f"{basename}_processed_{mode}", f"processing_config_{mode}.yaml")
+    if os.path.isfile(processed):
+        return _load_yaml(processed), "tuned", tif
+    return _load_yaml(template_path), "template", tif
+
+
 def _load_image(path: str) -> np.ndarray:
     try:
         import tifffile
@@ -512,10 +533,12 @@ def optimize_initial_segmentation(
     # ---- Load every image, config, crop, and per-image optimum -------------- #
     _tick(0.0, "Loading images and configs…")
     images, spacings, params_list, step_keys, base_configs = [], [], [], [], []
+    template_only: List[str] = []
     for k, folder in enumerate(folders):
         _check()
-        cfg_path, tif_path = _find_config_and_image(folder)
-        config = _load_yaml(cfg_path)
+        config, source, tif_path = _resolve_config(folder, mode)
+        if source == "template":
+            template_only.append(os.path.basename(folder))
         step_key = _raw_seg_step_key(config)
         params = _flatten_params(config[step_key].get("parameters", config[step_key]))
         image = _load_image(tif_path)
@@ -528,7 +551,7 @@ def optimize_initial_segmentation(
         params_list.append(copy.deepcopy(params)); step_keys.append(step_key)
         base_configs.append(config)
         _tick(0.05 * (k + 1) / len(folders),
-              f"Loaded {os.path.basename(folder)} (crop {tuple(image.shape)})")
+              f"Loaded {os.path.basename(folder)} [{source}] (region {tuple(image.shape)})")
 
     leaves = _collect_leaves(params_list)
 
@@ -734,6 +757,7 @@ def optimize_initial_segmentation(
         "n_optimized": len(optimizable),
         "n_conflicts": n_conflicts,
         "empty_refs": empty_refs,
+        "template_only": template_only,
     }
     if n_conflicts:
         report["warning"] = (
@@ -849,6 +873,9 @@ if _HAVE_QT:
         if report.get("empty_refs"):
             lines.append("\nSkipped (empty reference segmentation): "
                          + ", ".join(report["empty_refs"]))
+        if report.get("template_only"):
+            lines.append("\nUsed template (no processed run found, so no tuned "
+                         "values): " + ", ".join(report["template_only"]))
         if report.get("warning"):
             lines.append("\n⚠ " + report["warning"])
         return "\n".join(lines)
