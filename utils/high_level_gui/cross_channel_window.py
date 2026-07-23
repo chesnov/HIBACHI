@@ -431,8 +431,12 @@ class CrossChannelAnalyzerWindow(QMainWindow):
             for layer in viewer.layers:
                 layer.scale = (z_scale, 1, 1)
 
-        # One-click bulk visibility toggle for all channels/layers.
-        _add_layer_visibility_controls(viewer)
+        # One-click hide/show-all toggle under the layer list.
+        try:
+            from .app_launch import add_channel_visibility_toggle
+            add_channel_visibility_toggle(viewer)
+        except Exception as exc:
+            print(f"Could not add channel visibility toggle: {exc}")
 
     def _draw_proximity_bridges(self, viewer, df, shape, spacing):
         """Delegate to the module-level bridge drawer (used by preview_recipe)."""
@@ -534,40 +538,6 @@ def list_relational_analyses(project_root: str):
         )
     except OSError:
         return []
-
-
-def _add_layer_visibility_controls(viewer):
-    """Dock a small panel with one-click Hide All / Show All buttons.
-
-    Multi-channel overlays add one layer per channel (plus segmentation and
-    derived layers), and toggling each layer's eye icon individually is tedious.
-    These buttons flip every layer's visibility at once.
-    """
-    panel = QWidget()
-    layout = QVBoxLayout(panel)
-    layout.setContentsMargins(6, 6, 6, 6)
-    row = QHBoxLayout()
-    btn_hide = QPushButton("🙈 Hide All")
-    btn_show = QPushButton("👁️ Show All")
-    row.addWidget(btn_hide)
-    row.addWidget(btn_show)
-    layout.addLayout(row)
-    layout.addStretch(1)
-
-    def _set_all(visible):
-        for layer in list(viewer.layers):
-            try:
-                layer.visible = visible
-            except Exception:
-                pass
-
-    btn_hide.clicked.connect(lambda: _set_all(False))
-    btn_show.clicked.connect(lambda: _set_all(True))
-    try:
-        viewer.window.add_dock_widget(panel, area='left', name='Layer visibility')
-    except Exception as exc:
-        print(f"Could not dock visibility controls: {exc}")
-    return panel
 
 
 def draw_proximity_bridges(viewer, df, shape, spacing):
@@ -702,6 +672,11 @@ def open_sample_overlay(project_manager, sample_name, analysis_name=None, parent
         for layer in viewer.layers:
             layer.scale = (z_scale, 1, 1)
 
-    # One-click bulk visibility toggle for all channels/layers.
-    _add_layer_visibility_controls(viewer)
+    # One-click hide/show-all toggle under the layer list (shared with the
+    # per-channel segmenter view). Lazy import avoids a circular import.
+    try:
+        from .app_launch import add_channel_visibility_toggle
+        add_channel_visibility_toggle(viewer)
+    except Exception as exc:
+        print(f"Could not add channel visibility toggle: {exc}")
     return True

@@ -37,6 +37,77 @@ def _check_if_last_window() -> None:
     if not valid:
         app.quit()
 
+def _layer_list_dock(viewer):
+    """Locate napari's layer-list dock widget across versions, so we can place
+    the toggle directly beneath it. Returns the QDockWidget or None."""
+    for accessor in (lambda: viewer.window._qt_viewer.dockLayerList,
+                     lambda: viewer.window.qt_viewer.dockLayerList):
+        try:
+            d = accessor()
+            if d is not None:
+                return d
+        except Exception:
+            pass
+    try:
+        from PyQt5.QtWidgets import QDockWidget
+        for d in viewer.window._qt_window.findChildren(QDockWidget):
+            if "layer list" in d.windowTitle().lower():
+                return d
+    except Exception:
+        pass
+    return None
+
+
+def add_channel_visibility_toggle(viewer):
+    """Add one button, docked immediately under the channel (layer) list, that
+    toggles every layer between all-hidden and all-shown. The label reflects the
+    action it will perform next."""
+    btn = QPushButton()
+    btn.setToolTip("Hide or show every channel at once, instead of toggling each "
+                   "layer's eye icon individually.")
+
+    def _any_visible():
+        return any(getattr(l, "visible", False) for l in viewer.layers)
+
+    def _refresh():
+        btn.setText("🙈 Hide All Channels" if _any_visible()
+                    else "👁️ Show All Channels")
+
+    def _toggle():
+        hide = _any_visible()          # something is visible -> hide everything
+        for layer in list(viewer.layers):
+            try:
+                layer.visible = not hide
+            except Exception:
+                pass
+        _refresh()
+
+    btn.clicked.connect(_toggle)
+    _refresh()
+    # Keep the label correct as layers are added/removed (e.g. after processing).
+    try:
+        viewer.layers.events.inserted.connect(lambda e: _refresh())
+        viewer.layers.events.removed.connect(lambda e: _refresh())
+    except Exception:
+        pass
+
+    container = QWidget()
+    lay = QVBoxLayout(container)
+    lay.setContentsMargins(5, 3, 5, 3)
+    lay.addWidget(btn)
+
+    dock = viewer.window.add_dock_widget(container, area="left", name="Channels")
+    # Move it to sit directly below the layer list.
+    ll = _layer_list_dock(viewer)
+    if ll is not None:
+        try:
+            from PyQt5.QtCore import Qt
+            viewer.window._qt_window.splitDockWidget(ll, dock, Qt.Vertical)
+        except Exception:
+            pass
+    return dock
+
+
 def _handle_napari_close() -> None:
     """Callback when Napari closes."""
     QTimer.singleShot(100, _check_if_last_window)
@@ -91,6 +162,9 @@ def interactive_segmentation_with_config(selected_folder: str = None, project_ma
         viewer.window.add_dock_widget(
             create_back_to_project_button(viewer, gui_manager), area="left", name="Navigation"
         )
+
+        # One-click toggle to hide/show every channel, docked under the layer list.
+        add_channel_visibility_toggle(viewer)
 
         # --- Processing control -------------------------------------------
         # Navigation (Back / Forward) is non-destructive: it never deletes
