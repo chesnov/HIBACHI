@@ -505,18 +505,42 @@ def _perturbation(field: str, value: float) -> float:
 # --------------------------------------------------------------------------- #
 # Core optimization
 # --------------------------------------------------------------------------- #
+def _bias_label(bias: float) -> str:
+    if bias >= 0.9:
+        return "never delete cells"
+    if bias > 0.6:
+        return "lean: keep cells"
+    if bias >= 0.4:
+        return "balanced"
+    if bias > 0.1:
+        return "lean: avoid noise"
+    return "never add cells"
+
+
 def optimize_initial_segmentation(
     folders: List[str],
     mode: str,
+    bias: float = 0.5,
     progress: Optional[Callable[[float, str], None]] = None,
     is_cancelled: Optional[Callable[[], bool]] = None,
 ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     """Find one shared raw-segmentation config that minimizes deviation from
     each image's own desired result.
 
+    `bias` in [0, 1] sets the preference used only when a value must trade a lost
+    cell against a spurious one (a genuine conflict): 0.5 weighs them equally,
+    1.0 = "never delete cells" (avoid missed cells at the cost of tolerating
+    noise), 0.0 = "never add cells" (avoid noise at the cost of dropping cells).
+    It does not affect parameters that have a conflict-free (safe) value.
+
     Returns (merged_config_dict, report). Raises OptimizationCancelled if the
     user cancels, or OptimizationError on bad input.
     """
+    bias = float(min(1.0, max(0.0, bias)))
+    w_miss = bias            # penalty per lost real cell
+    w_fp = 1.0 - bias        # penalty per spurious object (noise)
+    bias_txt = _bias_label(bias)
+
     def _tick(frac: float, msg: str) -> None:
         if progress is not None:
             progress(max(0.0, min(1.0, frac)), msg)
@@ -707,20 +731,32 @@ def optimize_initial_segmentation(
         H = min(s[1] for s in safe.values())
         if L <= H + 1e-12:
             # A window where every image keeps all its cells and gains no
-            # artifacts. Sit in the middle -> maximum margin to every cliff.
-            value = 0.5 * (L + H)
+            # artifacts. Default to the consensus of the images' tuned values and
+            # stay there -- moving off it is only justified to gain margin from a
+            # real cliff. If the parameter is insensitive the window balloons, so
+            # its midpoint is meaningless; the consensus keeps us near what the
+            # images actually used. Only when the consensus falls OUTSIDE a
+            # genuinely narrow window do we retreat to the midpoint (max margin,
+            # so we don't sit on a cliff edge).
+            consensus = float(np.median(list(opt.values())))
+            if L - 1e-12 <= consensus <= H + 1e-12:
+                value = consensus
+            else:
+                value = 0.5 * (L + H)
             how = "safe (all cells kept in every image)"
         else:
-            # No shared-safe window: pick the value with the smallest worst-image
-            # object loss (then fewest total, then best boundaries). Sample the
-            # gap between the images' safe intervals.
+            # No shared-safe window: a lost cell must be traded against a
+            # spurious one somewhere. Weigh them by `bias` (worst image first),
+            # then minimize the weighted total, then boundaries. Sample the gap
+            # between the images' safe intervals.
             n_conflicts += 1
             gap_lo = min(s[1] for s in safe.values())
             gap_hi = max(s[0] for s in safe.values())
             cands = list(np.linspace(gap_lo, gap_hi, 5)) + list(opt.values())
-            best_key, best_x = None, float(np.median(list(opt.values())))
+            best_key, best_x, best_ms = None, float(np.median(list(opt.values()))), (0, 0)
             for x in sorted(set(round(_clamp(float(c)), 9) for c in cands)):
-                worst = tot = 0
+                worst = 0.0
+                tmiss = tspur = 0
                 dsum = 0.0
                 ok = True
                 for i in opt:
@@ -728,17 +764,20 @@ def optimize_initial_segmentation(
                     if r is None:
                         ok = False
                         break
-                    worst = max(worst, r[0] + r[1])
-                    tot += r[0] + r[1]
-                    dsum += r[2]
+                    miss, spur, dc = r
+                    worst = max(worst, w_miss * miss + w_fp * spur)
+                    tmiss += miss
+                    tspur += spur
+                    dsum += dc
                 if not ok:
                     continue
-                key = (worst, tot, round(dsum, 4))
+                key = (round(worst, 6), round(w_miss * tmiss + w_fp * tspur, 6),
+                       tmiss + tspur, round(dsum, 4))
                 if best_key is None or key < best_key:
-                    best_key, best_x = key, x
+                    best_key, best_x, best_ms = key, x, (tmiss, tspur)
             value = best_x
-            worst_loss = best_key[0] if best_key else -1
-            how = f"conflict: fewest worst-image objects lost ({worst_loss})"
+            how = (f"conflict [{bias_txt}]: {best_ms[0]} cell(s) lost, "
+                   f"{best_ms[1]} spurious")
 
         value = _clamp(float(value))
         _write_leaf_into_config(merged_params, leaf, value, table_key)
@@ -758,6 +797,8 @@ def optimize_initial_segmentation(
         "n_conflicts": n_conflicts,
         "empty_refs": empty_refs,
         "template_only": template_only,
+        "bias": round(bias, 3),
+        "bias_label": bias_txt,
     }
     if n_conflicts:
         report["warning"] = (
@@ -777,6 +818,7 @@ try:
     from PyQt5.QtCore import QThread, pyqtSignal, Qt
     from PyQt5.QtWidgets import (
         QProgressDialog, QInputDialog, QFileDialog, QMessageBox,
+        QDialog, QVBoxLayout, QHBoxLayout, QLabel, QSlider, QDialogButtonBox,
     )
     _HAVE_QT = True
 except Exception:  # headless / import-time safety
@@ -792,10 +834,11 @@ if _HAVE_QT:
         failed = pyqtSignal(str)
         cancelled = pyqtSignal()
 
-        def __init__(self, folders: List[str], mode: str, parent=None):
+        def __init__(self, folders: List[str], mode: str, bias: float = 0.5, parent=None):
             super().__init__(parent)
             self._folders = list(folders)
             self._mode = mode
+            self._bias = float(bias)
             self._cancel = False
 
         def cancel(self) -> None:
@@ -804,7 +847,7 @@ if _HAVE_QT:
         def run(self) -> None:
             try:
                 merged, report = optimize_initial_segmentation(
-                    self._folders, self._mode,
+                    self._folders, self._mode, bias=self._bias,
                     progress=lambda f, m: self.progress.emit(f, m),
                     is_cancelled=lambda: self._cancel,
                 )
@@ -817,9 +860,58 @@ if _HAVE_QT:
             else:
                 self.finished_ok.emit(merged, report)
 
+    def _ask_bias(parent) -> Optional[float]:
+        """Slider preference for the missed-vs-spurious trade-off. Returns a
+        bias in [0, 1] (0 = never add cells, 1 = never delete cells) or None if
+        cancelled."""
+        dlg = QDialog(parent)
+        dlg.setWindowTitle("Optimization preference")
+        dlg.setMinimumWidth(460)
+        lay = QVBoxLayout(dlg)
+        lay.addWidget(QLabel(
+            "When no single setting can keep every real cell AND avoid every\n"
+            "noise artifact, which mistake should the optimizer avoid more?\n"
+            "(This only affects parameters where the images genuinely conflict.)"))
+        slider = QSlider(Qt.Horizontal)
+        slider.setMinimum(0)
+        slider.setMaximum(100)
+        slider.setValue(50)
+        slider.setTickPosition(QSlider.TicksBelow)
+        slider.setTickInterval(10)
+        lay.addWidget(slider)
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Never add cells\n(avoid noise)"))
+        row.addStretch(1)
+        row.addWidget(QLabel("Equal"))
+        row.addStretch(1)
+        row.addWidget(QLabel("Never delete cells\n(keep all)"))
+        lay.addLayout(row)
+        live = QLabel("")
+        live.setAlignment(Qt.AlignCenter)
+        lay.addWidget(live)
+
+        def _upd(v):
+            t = v / 100.0
+            live.setText(f"keep-cell weight {t:.2f}   ·   avoid-noise weight {1 - t:.2f}"
+                         f"   —   {_bias_label(t)}")
+        slider.valueChanged.connect(_upd)
+        _upd(50)
+        bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        bb.accepted.connect(dlg.accept)
+        bb.rejected.connect(dlg.reject)
+        lay.addWidget(bb)
+        if dlg.exec_() != QDialog.Accepted:
+            return None
+        return slider.value() / 100.0
+
     def run_optimization_dialog(parent, folders: List[str], mode: str) -> None:
-        """Show a cancellable progress dialog, run the optimization, and on
-        success prompt for a name + save location and write the merged config."""
+        """Ask the missed-vs-spurious preference, then show a cancellable
+        progress dialog, run the optimization, and on success prompt for a name +
+        save location and write the merged config."""
+        bias = _ask_bias(parent)
+        if bias is None:
+            return
+
         dlg = QProgressDialog("Preparing…", "Cancel", 0, 100, parent)
         dlg.setWindowTitle("Optimize Initial-Segmentation Parameters")
         dlg.setWindowModality(Qt.WindowModal)
@@ -828,7 +920,7 @@ if _HAVE_QT:
         dlg.setAutoReset(False)
         dlg.setValue(0)
 
-        worker = OptimizeWorker(folders, mode, parent)
+        worker = OptimizeWorker(folders, mode, bias, parent)
 
         def _on_progress(frac: float, msg: str) -> None:
             dlg.setValue(int(frac * 100))
@@ -866,7 +958,8 @@ if _HAVE_QT:
 
     def _summary_text(report: Dict[str, Any]) -> str:
         lines = [f"Reconciled {report['n_optimized']} parameter(s) across "
-                 f"{len(report['images'])} images:\n"]
+                 f"{len(report['images'])} images "
+                 f"(preference: {report.get('bias_label', 'balanced')}):\n"]
         for label, info in report["optimized"].items():
             per = ", ".join("—" if v is None else f"{v:g}" for v in info["per_image"])
             lines.append(f"  • {label}: [{per}] → {info['shared']}  ({info['method']})")
