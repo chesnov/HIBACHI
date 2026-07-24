@@ -362,13 +362,27 @@ class ProjectViewWindow(QMainWindow):
         """Open one image/channel folder in the interactive segmentation view."""
         if not folder:
             return
-        # Processing may change this folder's status/outputs; refresh the tree
-        # when we come back so it doesn't show stale "in progress / N ago".
-        self._pending_content_refresh = True
-        self._last_opened_folder = folder
-        self.hide()
-        from .app_launch import interactive_segmentation_with_config  # lazy: avoid cycle
-        interactive_segmentation_with_config(folder, project_manager=self.project_manager)
+        # Re-entrancy guard. Launching the segmentation viewer runs its setup --
+        # including a nested modal dialog (restore-from-checkpoint's "View
+        # results / Restart") -- SYNCHRONOUSLY inside this double-click handler.
+        # That modal spins a nested Qt event loop; without this guard, an event
+        # delivered during that loop (e.g. a queued/duplicate open) can re-invoke
+        # this method and open another viewer whose setup opens another modal,
+        # stacking dialogs without bound until the machine is unresponsive.
+        # Ignoring re-entrant calls while a launch is in flight prevents that.
+        if getattr(self, "_launching_viewer", False):
+            return
+        self._launching_viewer = True
+        try:
+            # Processing may change this folder's status/outputs; refresh the tree
+            # when we come back so it doesn't show stale "in progress / N ago".
+            self._pending_content_refresh = True
+            self._last_opened_folder = folder
+            self.hide()
+            from .app_launch import interactive_segmentation_with_config  # lazy: avoid cycle
+            interactive_segmentation_with_config(folder, project_manager=self.project_manager)
+        finally:
+            self._launching_viewer = False
 
     def _open_overlay(self, sample_name: str) -> None:
         """Open a sample's multi-channel viewer (parent row double-click).
