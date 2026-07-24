@@ -315,35 +315,38 @@ class SimpleTimer:
 def _trace_link_fragments(final_mm, image, spacing, max_gap, step=1.0,
                           angle_tol_deg=45.0, momentum=0.5, recenter_radius=3,
                           soma_lut=None, link_radius=3):
-    """Orientation-following gap tracing to reconnect a structure broken by a
-    dim stretch. Walks the local intensity ridge outward from each fragment
-    endpoint, branch-by-branch -- direction comes from the recentred path, and
-    each step re-snaps transversally onto the local ridge -- so it follows a
-    process across a faint gap and handles arbors (every endpoint has its own
-    local heading; no global cell axis). Fragments whose traces reach one
-    another are merged and the traced path is painted so the object is
-    spatially contiguous.
+    """Tensor-voting gap linker: reconnect the pieces of one process by
+    perceptual good-continuation rather than an intensity walk.
 
-    Memory-light: the label and image arrays stay on disk (memmaps); only small
-    local windows are read per endpoint/step, and relabelling streams one slab
-    at a time -- the full mask is never held in RAM. Opt-in (max_gap <= 0 is a
-    no-op upstream). Returns the new object count, or None if nothing linked.
-    General: uses only intensity ridges and geometry, no model of the imaged
-    object. Returns None quietly if scipy/skimage are unavailable.
+    Each fragment becomes a set of tokens: an oriented "stick" at every skeleton
+    endpoint (pointing along the local axis) or, when the fragment is too small
+    to have a stable direction, a single orientation-less "ball" token at its
+    centroid. Tokens then vote for one another with the standard tensor-voting
+    field -- a token propagates the orientation of the smoothest (co-circular)
+    curve that could pass through a neighbour, with a strength that decays with
+    gap length and curvature. Votes accumulate into a structure tensor at each
+    token; the eigen-gap (lambda1 - lambda2) is the curve saliency and the
+    leading eigenvector the emergent orientation.
 
-    Soma-aware linking (`soma_lut`): scale-0 detections are compact blobs
-    (somata), not tubular processes, so they are handled differently. Their
-    medial skeletons have no stable outward tangent, so they are NOT used as
-    trace sources; and a process ridge walking toward a soma tends to stall on
-    the soma's bright boundary rim (the big adjacent bright mass yanks the
-    transverse re-centre past the bend tolerance) a voxel or two before it ever
-    lands on a soma-labelled voxel. To fix both, `soma_lut` is a boolean array
-    indexed by label id (True where the label came from scale 0). A process
-    trace links to a soma as soon as it comes within `link_radius` voxels of
-    one, instead of having to land exactly on it -- so proximity, not exact
-    ridge contact, closes the process-to-soma gap. Process-to-process linking is
-    unchanged (still requires landing on the target label). When `soma_lut` is
-    None the routine behaves exactly as before.
+    This inverts the old ridge-walk's bias. Orientation is an *ensemble*
+    property, so a chain of dots -- each individually too small to have a
+    direction -- takes on a shared orientation from its neighbours and links into
+    a line ("connect the dots"), while a fragment collinear with nothing accrues
+    little saliency. A link is accepted only between tokens whose orientations
+    *both* point along the connecting chord (bidirectional good continuation) and
+    that are each other's strongest available partner, so an off-line noise
+    branch is rejected even when it is nearer than the true continuation --
+    because it is not on the same line. `max_gap` sets the voting scale / maximum
+    link distance; `angle_tol_deg` is the association-field half-angle. (`step`,
+    `momentum`, `recenter_radius` are retained for signature compatibility.)
+
+    Memory-light (per-fragment skeletons; the full mask is never held in RAM),
+    nD-generic (2D and 3D identical), opt-in (max_gap <= 0 is a no-op upstream).
+    Returns the new object count, or None if nothing linked / SciPy unavailable.
+
+    Soma-aware linking (`soma_lut`) is unchanged: somata (scale-0 blobs) are not
+    used as voting tokens, and each process endpoint first tries a direct
+    proximity link to a nearby soma before entering the voting pool.
     """
     try:
         from scipy import ndimage as _ndi
@@ -354,84 +357,12 @@ def _trace_link_fragments(final_mm, image, spacing, max_gap, step=1.0,
     ndim = final_mm.ndim
     sp = np.asarray(spacing[-ndim:], dtype=float)
     mean_sp = float(sp.mean())
-    max_steps = max(1, int(round(max_gap / (step * max(mean_sp, 1e-9)))))
+    max_dist = max(1.0, max_gap / max(mean_sp, 1e-9))   # gap budget, in voxels
     shape = np.asarray(final_mm.shape)
     cos_tol = float(np.cos(np.deg2rad(angle_tol_deg)))
-
-    def _recenter(cur, d):
-        ci = np.round(cur).astype(int)
-        sl = tuple(slice(max(0, ci[k] - recenter_radius),
-                         min(int(shape[k]), ci[k] + recenter_radius + 1)) for k in range(ndim))
-        w = np.asarray(image[sl], dtype=float)
-        s = w.sum()
-        if s <= 1e-9:
-            return cur, 0.0
-        coords = np.indices(w.shape).reshape(ndim, -1)
-        base = np.array([x.start for x in sl])
-        cen = base + (coords * w.ravel()).sum(1) / s
-        off = cen - cur
-        off = off - (off @ d) * d          # keep only the transverse component
-        return cur + off, float(w.max())
-
-    def _near_soma(cur, own):
-        """Return a soma label within `link_radius` of `cur` (0 if none). Lets a
-        process trace link to a soma on proximity, before the bend guard can
-        abort it at the soma's bright boundary rim."""
-        if soma_lut is None:
-            return 0
-        ci = np.round(cur).astype(int)
-        sl = tuple(slice(max(0, ci[k] - link_radius),
-                         min(int(shape[k]), ci[k] + link_radius + 1)) for k in range(ndim))
-        win = np.asarray(final_mm[sl])
-        m = soma_lut[win]
-        if not m.any():
-            return 0
-        cand = win[m]
-        cand = cand[cand != own]
-        if cand.size == 0:
-            return 0
-        vals, cnts = np.unique(cand, return_counts=True)
-        return int(vals[np.argmax(cnts)])   # nearest-dominant soma label
-
-    def _trace(start, direction, own):
-        cur = start.astype(float).copy()
-        d = direction.astype(float).copy()
-        try:
-            min_int = 0.25 * float(image[tuple(np.round(start).astype(int))])
-        except Exception:
-            min_int = 0.0
-        path = [cur.copy()]
-        lost = 0
-        for _ in range(max_steps):
-            prev = cur.copy()
-            cur = cur + step * d
-            cur, peak = _recenter(cur, d)
-            shit = _near_soma(cur, own)     # soma proximity link (before bend guard)
-            if shit:
-                path.append(cur.copy())
-                return shit, path
-            disp = cur - prev
-            dn = np.linalg.norm(disp)
-            if dn > 1e-6:
-                nd = disp / dn
-                if nd @ d < cos_tol:
-                    return 0, None          # path bent too sharply -> stop
-                d = momentum * d + (1 - momentum) * nd
-                d /= (np.linalg.norm(d) + 1e-12)
-            ci = np.round(cur).astype(int)
-            if np.any(ci < 0) or np.any(ci >= shape):
-                return 0, None
-            path.append(cur.copy())
-            lab = int(final_mm[tuple(ci)])
-            if lab != 0 and lab != own:
-                return lab, path            # reached another fragment
-            if peak < min_int:
-                lost += 1
-                if lost > 5:
-                    return 0, None          # trail faded out
-            else:
-                lost = 0
-        return 0, None
+    sigma = float(max_dist)                             # tensor-voting scale
+    bend_w = 1.5                                        # curvature penalty in vote decay
+    A_min = 0.20                                        # min affinity to accept a link
 
     parent = {}
 
@@ -446,12 +377,7 @@ def _trace_link_fragments(final_mm, image, spacing, max_gap, step=1.0,
     bridges = []
     n_soma_links = 0
 
-    # Precompute soma geometry once so a process endpoint can link straight to a
-    # nearby soma WITHOUT depending on the fragile ridge-walk surviving the dim,
-    # curved stretch up to the soma boundary. This is what makes process->soma
-    # gaps close: the walk often dies (fade/bend guards) long before it gets
-    # within `link_radius` of the soma, so the proximity test in _trace alone is
-    # not enough -- a direct geometric link from the endpoint is.
+    # Soma geometry (unchanged): process endpoints link straight to a nearby soma.
     soma_info = []
     if soma_lut is not None:
         for _idx, _sl in enumerate(objs):
@@ -463,16 +389,12 @@ def _trace_link_fragments(final_mm, image, spacing, max_gap, step=1.0,
             soma_info.append((_lab, _sl, _b, _b + 0.5 * _ext, 0.5 * float(np.linalg.norm(_ext))))
 
     def _link_to_soma(start, d):
-        """Nearest soma label reachable within `max_steps` of endpoint `start`,
-        preferring somata ahead of the outward tangent `d`. Returns (label,
-        target_voxel) or (0, None). Direction-gated (fwd >= 0) so an endpoint
-        does not link a soma lying back through its own fragment body; a very
-        close soma (<= link_radius) links regardless of direction (touching/rim
-        case). No ridge-walk, so a dim or curved connector cannot defeat it."""
+        """Nearest soma label within `max_dist` of endpoint `start`, preferring
+        somata ahead of the outward tangent `d`. Returns (label, target) or (0, None)."""
         best_lab, best_tgt, best_dist = 0, None, np.inf
         for lab, sl, base_s, cen, rad in soma_info:
-            if np.linalg.norm(cen - start) > max_steps + rad + 2.0:
-                continue                                  # quick reject by bbox
+            if np.linalg.norm(cen - start) > max_dist + rad + 2.0:
+                continue
             sub = np.asarray(final_mm[sl]) == lab
             pts = np.argwhere(sub).astype(float) + base_s
             if pts.shape[0] == 0:
@@ -480,7 +402,7 @@ def _trace_link_fragments(final_mm, image, spacing, max_gap, step=1.0,
             diff = pts - start
             dist = np.sqrt((diff ** 2).sum(1))
             fwd = (diff @ d) / (dist + 1e-9)
-            ok = ((dist <= max_steps) & (fwd >= 0.0)) | (dist <= max(2.0, float(link_radius)))
+            ok = ((dist <= max_dist) & (fwd >= 0.0)) | (dist <= max(2.0, float(link_radius)))
             if not ok.any():
                 continue
             j = int(np.argmin(np.where(ok, dist, np.inf)))
@@ -488,52 +410,171 @@ def _trace_link_fragments(final_mm, image, spacing, max_gap, step=1.0,
                 best_lab, best_tgt, best_dist = lab, pts[j], dist[j]
         return best_lab, best_tgt
 
+    # ---- Build tokens (stick at each endpoint; ball at a dot's centroid) ---- #
+    pos, ori, is_ball, frag = [], [], [], []
     for idx, sl in enumerate(objs):
         lab = idx + 1
         if sl is None:
             continue
         if soma_lut is not None and lab < soma_lut.size and soma_lut[lab]:
-            continue        # somata are link *targets*, not trace sources
+            continue                              # somata are targets, not tokens
         sub = np.asarray(final_mm[sl]) == lab
-        if sub.sum() < 3:
+        if int(sub.sum()) < 1:
             continue
+        base = np.array([x.start for x in sl], dtype=float)
         try:
             sk = _skel(sub)
         except Exception:
-            continue
-        pts = np.argwhere(sk)
-        if len(pts) < 3:
-            continue
-        nb = _ndi.convolve(sk.astype(int), np.ones((3,) * ndim, dtype=int), mode='constant') - 1
-        base = np.array([x.start for x in sl])
-        for epl in np.argwhere(sk & (nb == 1)):
-            dd = pts - epl
-            near = pts[(dd ** 2).sum(1) <= 100]      # ~10 px for a stable tangent
-            c = near.mean(0)
-            t = epl - c
-            tn = np.linalg.norm(t)
-            if tn < 1e-9:
-                continue
-            start_g = (epl + base).astype(float)
-            dir_g = t / tn
-            # Direct process->soma link first (robust to dim/curved connectors).
-            if soma_lut is not None:
-                slab, stgt = _link_to_soma(start_g, dir_g)
-                if slab and _find(slab) != _find(lab):
-                    parent[_find(lab)] = _find(slab)
-                    nseg = int(max(1, round(np.linalg.norm(stgt - start_g))))
-                    spath = [start_g + (stgt - start_g) * (k / nseg) for k in range(nseg + 1)]
-                    bridges.append((spath, lab))
-                    n_soma_links += 1
+            sk = sub
+        skpts = np.argwhere(sk).astype(float)
+        endpoints = []
+        if len(skpts) >= 3:
+            nb = _ndi.convolve(sk.astype(int), np.ones((3,) * ndim, dtype=int),
+                               mode='constant') - 1
+            tan_r2 = max(3.0, 0.5 * sigma) ** 2
+            for epl in np.argwhere(sk & (nb == 1)).astype(float):
+                nearpts = skpts[((skpts - epl) ** 2).sum(1) <= tan_r2]
+                if len(nearpts) < 2:
                     continue
-            # Otherwise fall back to the orientation-following ridge walk.
-            hit, path = _trace(start_g, dir_g, lab)
-            if hit and _find(hit) != _find(lab):
-                parent[_find(lab)] = _find(hit)
-                bridges.append((path, lab))
+                t = epl - nearpts.mean(0)
+                tn = np.linalg.norm(t)
+                if tn < 1e-9:
+                    continue
+                endpoints.append((epl + base, t / tn))
+        if endpoints:
+            for gpos, gdir in endpoints:
+                if soma_lut is not None:
+                    slab, stgt = _link_to_soma(gpos, gdir)
+                    if slab and _find(slab) != _find(lab):
+                        parent[_find(lab)] = _find(slab)
+                        nseg = int(max(1, round(np.linalg.norm(stgt - gpos))))
+                        bridges.append(([gpos + (stgt - gpos) * (k / nseg)
+                                         for k in range(nseg + 1)], lab))
+                        n_soma_links += 1
+                        continue
+                pos.append(gpos); ori.append(gdir); is_ball.append(False); frag.append(lab)
+        else:
+            cen = (skpts.mean(0) + base) if len(skpts) else \
+                  (np.argwhere(sub).astype(float).mean(0) + base)
+            pos.append(cen); ori.append(np.zeros(ndim)); is_ball.append(True); frag.append(lab)
 
     if soma_lut is not None:
         print(f"    [DIAG] direct process->soma links: {n_soma_links}")
+
+    M = len(pos)
+    if M >= 2:
+        pos = np.asarray(pos, dtype=float)
+        ori = np.asarray(ori, dtype=float)
+        is_ball = np.asarray(is_ball, dtype=bool)
+        frag = np.asarray(frag, dtype=int)
+
+        def _vote(orient, ball):
+            """One tensor-voting pass -> (emergent_orientation, curve_saliency)."""
+            S = np.zeros((M, ndim, ndim), dtype=float)
+            for i in range(M):
+                d = pos - pos[i]
+                s = np.sqrt((d ** 2).sum(1))
+                m = (s > 1e-6) & (s <= max_dist)
+                if not m.any():
+                    continue
+                idxs = np.where(m)[0]
+                u = d[idxs] / s[idxs][:, None]
+                if ball[i]:
+                    vv = u.copy()                          # ball voter: radial
+                    cosang = np.ones(len(idxs))
+                else:
+                    vi = orient[i]
+                    cosang = np.abs(u @ vi)
+                    keep = cosang >= cos_tol
+                    if not keep.any():
+                        continue
+                    idxs = idxs[keep]; u = u[keep]; cosang = cosang[keep]
+                    vv = 2.0 * (u @ vi)[:, None] * u - vi   # co-circular tangent
+                nrm = np.linalg.norm(vv, axis=1)
+                good = nrm > 1e-9
+                if not good.any():
+                    continue
+                idxs = idxs[good]; u = u[good]; cosang = cosang[good]
+                vv = vv[good] / nrm[good][:, None]
+                sij = s[idxs]
+                sin2 = np.clip(1.0 - cosang ** 2, 0.0, 1.0)
+                kappa2 = 4.0 * sin2 / (sij ** 2 + 1e-12)
+                DF = np.exp(-(sij ** 2) / (sigma ** 2) - bend_w * kappa2)
+                contrib = DF[:, None, None] * (vv[:, :, None] * vv[:, None, :])
+                np.add.at(S, idxs, contrib)
+            evals, evecs = np.linalg.eigh(S)               # ascending eigenvalues
+            emergent = evecs[:, :, -1]
+            sal = (evals[:, -1] - evals[:, -2]) if ndim >= 2 else evals[:, -1]
+            return emergent, np.clip(sal, 0.0, None)
+
+        # Pass 1: sticks vote along their tangent, balls radially -> dots acquire
+        # an orientation from their neighbours. Pass 2: everyone votes as a stick
+        # with the emergent orientation, sharpening dot chains.
+        emer, sal = _vote(ori, is_ball)
+        stick_ori = np.where(is_ball[:, None], emer, ori)
+        emer, sal = _vote(stick_ori, np.zeros(M, dtype=bool))
+
+        sal_ref = float(np.median(sal[sal > 0])) if np.any(sal > 0) else 1.0
+        sal_ref = max(sal_ref, 1e-9)
+
+        # ---- Candidate links (bidirectional good continuation) -------------- #
+        A_list, I_list, J_list, Si_list, Sj_list = [], [], [], [], []
+        for i in range(M):
+            d = pos[i + 1:] - pos[i]
+            if len(d) == 0:
+                continue
+            s = np.sqrt((d ** 2).sum(1))
+            jj = np.arange(i + 1, M)
+            m = (s > 1e-6) & (s <= max_dist) & (frag[jj] != frag[i])
+            if not m.any():
+                continue
+            jj = jj[m]; u = d[m] / s[m][:, None]; ss = s[m]
+            di = ori[i] if not is_ball[i] else emer[i]
+            dj = np.where(is_ball[jj][:, None], emer[jj], ori[jj])
+            ai = u @ di
+            aj = -(u * dj).sum(1)                    # j should point back along -chord
+            align_i = np.abs(ai) if is_ball[i] else ai
+            align_j = np.where(is_ball[jj], np.abs(aj), aj)
+            keep = (align_i >= cos_tol) & (align_j >= cos_tol)
+            if not keep.any():
+                continue
+            jj = jj[keep]; ss = ss[keep]; u = u[keep]
+            align_i = align_i[keep]; align_j = align_j[keep]
+            ai = ai[keep]; aj = aj[keep]
+            satw = 0.5 + 0.5 * np.minimum(1.0, np.minimum(sal[i], sal[jj]) / sal_ref)
+            A = align_i * align_j * np.exp(-(ss ** 2) / (sigma ** 2)) * satw
+            good = A >= A_min
+            if not good.any():
+                continue
+            jj = jj[good]; A = A[good]; ai = ai[good]; aj = aj[good]
+            side_i = np.where(ai >= 0, 1, -1)
+            side_j = np.where(aj >= 0, 1, -1)        # aj = (-chord).dj already
+            for k in range(len(jj)):
+                A_list.append(float(A[k])); I_list.append(i); J_list.append(int(jj[k]))
+                Si_list.append(int(side_i[k])); Sj_list.append(int(side_j[k]))
+
+        order = np.argsort(A_list)[::-1] if A_list else []
+        used = {}   # token -> occupied sides (+1 forward, -1 back)
+
+        def _free(tok, side, ball):
+            occ = used.get(tok, set())
+            return (side not in occ) if ball else (len(occ) == 0)
+
+        n_link = 0
+        for k in order:
+            i = I_list[k]; j = J_list[k]; si = Si_list[k]; sj = Sj_list[k]
+            if _find(frag[i]) == _find(frag[j]):
+                continue
+            if not _free(i, si, bool(is_ball[i])) or not _free(j, sj, bool(is_ball[j])):
+                continue
+            parent[_find(frag[i])] = _find(frag[j])
+            used.setdefault(i, set()).add(si)
+            used.setdefault(j, set()).add(sj)
+            nseg = int(max(1, round(float(np.linalg.norm(pos[j] - pos[i])))))
+            bridges.append(([pos[i] + (pos[j] - pos[i]) * (k2 / nseg)
+                             for k2 in range(nseg + 1)], int(frag[i])))
+            n_link += 1
+        print(f"    [DIAG] tensor-voting links: {n_link}")
 
     if not parent:
         return None
@@ -548,14 +589,14 @@ def _trace_link_fragments(final_mm, image, spacing, max_gap, step=1.0,
     for i in range(1, maxid + 1):
         lut[i] = compact[int(root_of[i])]
 
-    # Paint traced bridges with a small radius so each path is solid & contiguous.
+    # Paint bridges with a small radius so each link is solid & contiguous.
     br = 1
-    ball = np.argwhere(np.ones((2 * br + 1,) * ndim)) - br
-    ball = ball[(ball ** 2).sum(1) <= br * br + 1]
+    ball_off = np.argwhere(np.ones((2 * br + 1,) * ndim)) - br
+    ball_off = ball_off[(ball_off ** 2).sum(1) <= br * br + 1]
     for path, lab in bridges:
         for p in path:
             ci = np.round(p).astype(int)
-            for o in ball:
+            for o in ball_off:
                 q = ci + o
                 if np.all(q >= 0) and np.all(q < shape):
                     final_mm[tuple(q)] = lab
