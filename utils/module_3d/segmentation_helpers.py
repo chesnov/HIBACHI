@@ -202,7 +202,13 @@ def distance_transform_edt(
             dt = np.add.reduce(dt, axis=0)
             dt = np.sqrt(dt)
 
-        del ft # Release the large intermediate int32 array
+        # Release the large intermediate int32 array -- UNLESS it is the feature
+        # transform that must still be returned as `indices` below (return_indices
+        # with no caller-provided output array). Deleting it unconditionally made
+        # the return_distances=True + return_indices=True combination crash with an
+        # UnboundLocalError.
+        if not (return_indices and not ft_inplace):
+            del ft
 
     # Construct Return
     result = []
