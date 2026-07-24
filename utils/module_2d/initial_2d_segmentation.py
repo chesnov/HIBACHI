@@ -373,6 +373,23 @@ def _trace_link_fragments(final_mm, image, spacing, max_gap, step=1.0,
             x = parent[x]
         return x
 
+    def _crosses_foreign(pa, pb, fa, fb):
+        """True if the straight segment pa->pb passes through a voxel belonging
+        to a DIFFERENT mask (not background, not either fragment being joined).
+        Used to refuse links that would cut across another structure -- which
+        both corrupts that structure and yields a discontinuous merged label."""
+        ra, rb = _find(int(fa)), _find(int(fb))
+        pa = np.asarray(pa, dtype=float); pb = np.asarray(pb, dtype=float)
+        n = int(max(1, round(float(np.linalg.norm(pb - pa)))))
+        for k in range(n + 1):
+            ci = np.round(pa + (pb - pa) * (k / n)).astype(int)
+            if np.any(ci < 0) or np.any(ci >= shape):
+                continue
+            v = int(final_mm[tuple(ci)])
+            if v != 0 and _find(v) not in (ra, rb):
+                return True
+        return False
+
     objs = _ndi.find_objects(final_mm)       # streams the memmap; O(labels) memory
     bridges = []
     n_soma_links = 0
@@ -445,7 +462,8 @@ def _trace_link_fragments(final_mm, image, spacing, max_gap, step=1.0,
             for gpos, gdir in endpoints:
                 if soma_lut is not None:
                     slab, stgt = _link_to_soma(gpos, gdir)
-                    if slab and _find(slab) != _find(lab):
+                    if (slab and _find(slab) != _find(lab)
+                            and not _crosses_foreign(gpos, stgt, lab, slab)):
                         parent[_find(lab)] = _find(slab)
                         nseg = int(max(1, round(np.linalg.norm(stgt - gpos))))
                         bridges.append(([gpos + (stgt - gpos) * (k / nseg)
@@ -567,6 +585,8 @@ def _trace_link_fragments(final_mm, image, spacing, max_gap, step=1.0,
                 continue
             if not _free(i, si, bool(is_ball[i])) or not _free(j, sj, bool(is_ball[j])):
                 continue
+            if _crosses_foreign(pos[i], pos[j], int(frag[i]), int(frag[j])):
+                continue                     # would cut across a different mask
             parent[_find(frag[i])] = _find(frag[j])
             used.setdefault(i, set()).add(si)
             used.setdefault(j, set()).add(sj)
@@ -598,7 +618,7 @@ def _trace_link_fragments(final_mm, image, spacing, max_gap, step=1.0,
             ci = np.round(p).astype(int)
             for o in ball_off:
                 q = ci + o
-                if np.all(q >= 0) and np.all(q < shape):
+                if np.all(q >= 0) and np.all(q < shape) and final_mm[tuple(q)] == 0:
                     final_mm[tuple(q)] = lab
 
     # Relabel in place, streaming one leading-axis slab at a time.
