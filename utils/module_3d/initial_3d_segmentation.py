@@ -406,6 +406,9 @@ def _trace_link_fragments(final_mm, image, spacing, max_gap, step=1.0,
     sigma = float(max_dist)                             # tensor-voting scale
     bend_w = 1.5                                        # curvature penalty in vote decay
     A_min = 0.20                                        # min affinity to accept a link
+    near_scale = max(4.0, 2.0 * float(link_radius))     # below this gap, proximity
+    #                                                     dominates and the angle
+    #                                                     requirement is relaxed
 
     parent = {}
 
@@ -491,7 +494,7 @@ def _trace_link_fragments(final_mm, image, spacing, max_gap, step=1.0,
         if len(skpts) >= 3:
             nb = _ndi.convolve(sk.astype(int), np.ones((3,) * ndim, dtype=int),
                                mode='constant') - 1
-            tan_r2 = max(3.0, 0.5 * sigma) ** 2
+            tan_r2 = max(3.0, min(0.5 * sigma, 8.0)) ** 2   # local heading, not over-smoothed
             for epl in np.argwhere(sk & (nb == 1)).astype(float):
                 nearpts = skpts[((skpts - epl) ** 2).sum(1) <= tan_r2]
                 if len(nearpts) < 2:
@@ -594,16 +597,23 @@ def _trace_link_fragments(final_mm, image, spacing, max_gap, step=1.0,
             dj = np.where(is_ball[jj][:, None], emer[jj], ori[jj])
             ai = u @ di
             aj = -(u * dj).sum(1)                    # j should point back along -chord
+            # Forward sense: a stick endpoint may only link to a partner ahead of
+            # it (never backward through its own body); a ball has no sign.
+            fwd = (ai >= 0.0) if not is_ball[i] else np.ones(len(jj), bool)
+            fwd = fwd & np.where(is_ball[jj], True, aj >= 0.0)
+            if not fwd.any():
+                continue
+            jj = jj[fwd]; ss = ss[fwd]; u = u[fwd]; ai = ai[fwd]; aj = aj[fwd]
             align_i = np.abs(ai) if is_ball[i] else ai
             align_j = np.where(is_ball[jj], np.abs(aj), aj)
-            keep = (align_i >= cos_tol) & (align_j >= cos_tol)
-            if not keep.any():
-                continue
-            jj = jj[keep]; ss = ss[keep]; u = u[keep]
-            align_i = align_i[keep]; align_j = align_j[keep]
-            ai = ai[keep]; aj = aj[keep]
+            # Distance-graded good continuation: closeness raises confidence, so
+            # collinearity is (almost) ignored for a few-pixel gap between large
+            # fragments and fully enforced at long range (to still reject off-line
+            # noise). w = 0 near -> angle irrelevant; w = 1 far -> full alignment.
+            w = np.clip(ss / near_scale, 0.0, 1.0)
+            geom = (1.0 - w) + w * (align_i * align_j)
             satw = 0.5 + 0.5 * np.minimum(1.0, np.minimum(sal[i], sal[jj]) / sal_ref)
-            A = align_i * align_j * np.exp(-(ss ** 2) / (sigma ** 2)) * satw
+            A = geom * np.exp(-(ss ** 2) / (sigma ** 2)) * satw
             good = A >= A_min
             if not good.any():
                 continue
