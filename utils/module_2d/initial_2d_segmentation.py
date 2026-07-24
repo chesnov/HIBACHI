@@ -905,28 +905,37 @@ def segment_cells_first_pass_raw_2d(
                         win = 0
 
                 plane = image[...].astype(np.float32)
+                # Local background: removes the (possibly structured) pedestal while
+                # preserving structures smaller than the window.
                 if win > 0:
                     bg = ndimage.grey_opening(plane, size=(win, win))
-                    resid = plane - bg
-                    scale = np.sqrt(np.maximum(ndimage.uniform_filter(resid * resid, size=win), 0.0))
                     bg_center = float(np.median(bg))
                 else:
-                    bg_val = float(np.median(plane))
-                    resid = plane - bg_val
-                    scale = np.full_like(plane, 1.4826 * float(np.median(np.abs(resid))))
-                    bg_center = bg_val
-                # Floor the local scale by a fraction of the plane's robust spread
-                # so flat / near-empty windows can't amplify texture into spurious
-                # speckle (parameter-free safeguard).
-                slice_scale = 1.4826 * float(np.median(np.abs(resid)))
-                floor = max(slice_scale * 0.25, 1e-6)
-                scale = np.maximum(scale, floor)
-                norm_mm[...] = np.clip(resid / scale, 0.0, None)
+                    bg = float(np.median(plane))
+                    bg_center = bg
+                resid = plane - bg
+
+                # Noise scale: a SINGLE robust GLOBAL value, NOT a spatially-varying
+                # local RMS. A local RMS is dominated by the signal itself -- it
+                # inflates around bright cells (suppressing them and haloing) and, on
+                # clean backgrounds, its floor collapses toward zero and amplifies
+                # noise into large "clouds". MAD is robust to the sparse bright tail,
+                # so it estimates the background noise even with cells present.
+                # Fallback covers the degenerate case of a large constant region
+                # (e.g. zero-padding outside the FOV) where MAD would otherwise be 0.
+                absr = np.abs(resid)
+                sigma = 1.4826 * float(np.median(absr))
+                if not np.isfinite(sigma) or sigma < 1e-6:
+                    nz = absr[absr > 0]
+                    sigma = float(np.mean(nz)) if nz.size else 1.0
+                sigma = max(sigma, 1e-6)
+
+                norm_mm[...] = np.clip(resid, 0.0, None) / sigma
                 norm_mm.flush()
                 win_desc = str(win) if win > 0 else "global"
                 print(f"    [Relative/local-SNR] window={win_desc}px | "
                       f"median local background={bg_center:.3f}, "
-                      f"median local scale={float(np.median(scale)):.3f} "
+                      f"noise sigma={sigma:.3f} "
                       f"(map is now in noise-sigma units)")
 
         # --- Multi-Scale Logic (Independent Smoothing/Gap + Threshold-then-OR) ---

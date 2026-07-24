@@ -944,32 +944,41 @@ def segment_cells_first_pass_raw(
                     out = np.empty_like(block)
                     for i in range(block.shape[0]):
                         s2d = block[i]
+                        # Local background: removes the (possibly structured) pedestal
+                        # while preserving structures smaller than the window.
                         if win > 0:
                             bg = ndimage.grey_opening(s2d, size=(win, win))
-                            resid = s2d - bg
-                            local_var = ndimage.uniform_filter(resid * resid, size=win)
-                            scale = np.sqrt(np.maximum(local_var, 0.0))
                             bg_center = float(np.median(bg))
                         else:
-                            bg_val = float(np.median(s2d))
-                            resid = s2d - bg_val
-                            scale = np.full_like(s2d, 1.4826 * float(np.median(np.abs(resid))))
-                            bg_center = bg_val
-                        # Floor the local scale by a fraction of the slice's robust
-                        # spread so flat / near-empty windows can't amplify texture
-                        # into spurious speckle (parameter-free safeguard).
-                        slice_scale = 1.4826 * float(np.median(np.abs(resid)))
-                        floor = max(slice_scale * 0.25, 1e-6)
-                        scale = np.maximum(scale, floor)
-                        out[i] = np.clip(resid / scale, 0.0, None)
+                            bg = float(np.median(s2d))
+                            bg_center = bg
+                        resid = s2d - bg
+
+                        # Noise scale: a SINGLE robust GLOBAL value per slice, NOT a
+                        # spatially-varying local RMS. A local RMS is dominated by the
+                        # signal itself -- it inflates around bright cells (suppressing
+                        # them and haloing) and, on clean backgrounds, its floor
+                        # collapses toward zero and amplifies noise into large "clouds".
+                        # MAD is robust to the sparse bright tail, so it estimates the
+                        # background noise even with cells present. Fallback covers the
+                        # degenerate case of a large constant region (e.g. zero-padding
+                        # outside the FOV) where the MAD would otherwise be 0.
+                        absr = np.abs(resid)
+                        sigma = 1.4826 * float(np.median(absr))
+                        if not np.isfinite(sigma) or sigma < 1e-6:
+                            nz = absr[absr > 0]
+                            sigma = float(np.mean(nz)) if nz.size else 1.0
+                        sigma = max(sigma, 1e-6)
+
+                        out[i] = np.clip(resid, 0.0, None) / sigma
                         bg_report.append(bg_center)
-                        sc_report.append(float(np.median(scale)))
+                        sc_report.append(sigma)
                     norm_mm[read_sl] = out
                 norm_mm.flush()
                 win_desc = str(win) if win > 0 else "global(per-slice)"
                 print(f"    [Relative/local-SNR] window={win_desc}px | "
                       f"median local background={np.median(bg_report):.3f}, "
-                      f"median local scale={np.median(sc_report):.3f} "
+                      f"median noise sigma={np.median(sc_report):.3f} "
                       f"(map is now in noise-sigma units)")
 
         # --- Stage 2 & 3: Multi-Scale Logic (per-scale smoothing + gap-closing,
