@@ -406,9 +406,10 @@ def _trace_link_fragments(final_mm, image, spacing, max_gap, step=1.0,
     sigma = float(max_dist)                             # tensor-voting scale
     bend_w = 1.5                                        # curvature penalty in vote decay
     A_min = 0.20                                        # min affinity to accept a link
-    near_scale = max(4.0, 2.0 * float(link_radius))     # below this gap, proximity
+    near_scale = max(8.0, 3.0 * float(link_radius))     # below this gap, proximity
     #                                                     dominates and the angle
-    #                                                     requirement is relaxed
+    #                                                     (and forward-sense) tests
+    #                                                     are relaxed
     absorb_reach = max(3.0, float(link_radius) + 2.0)   # swallow specks within this
     #                                                     many px of a link bridge
 
@@ -668,21 +669,28 @@ def _trace_link_fragments(final_mm, image, spacing, max_gap, step=1.0,
             dj = np.where(is_ball[jj][:, None], emer[jj], ori[jj])
             ai = u @ di
             aj = -(u * dj).sum(1)                    # j should point back along -chord
-            # Forward sense: a stick endpoint may only link to a partner ahead of
-            # it (never backward through its own body); a ball has no sign.
-            fwd = (ai >= 0.0) if not is_ball[i] else np.ones(len(jj), bool)
-            fwd = fwd & np.where(is_ball[jj], True, aj >= 0.0)
+            # Forward-sense gate, graded by distance: at long range a stick must
+            # point ahead (ai>=0, never backward through its own body); at short
+            # range proximity overrules a slightly backward-pointing (bent/hooked)
+            # tip, so the allowed backward margin `back` relaxes the sign the same
+            # way the magnitude is relaxed, decaying to strict at near_scale.
+            back = np.clip(1.0 - ss / near_scale, 0.0, 1.0)
+            fwd = (ai >= -back) if not is_ball[i] else np.ones(len(jj), bool)
+            fwd = fwd & np.where(is_ball[jj], True, aj >= -back)
             rej_facing += int((~fwd).sum())      # partner not ahead of endpoint
             if not fwd.any():
                 continue
             jj = jj[fwd]; ss = ss[fwd]; u = u[fwd]; ai = ai[fwd]; aj = aj[fwd]
-            align_i = np.abs(ai) if is_ball[i] else ai
-            align_j = np.where(is_ball[jj], np.abs(aj), aj)
-            # Distance-graded good continuation: closeness raises confidence, so
-            # collinearity is (almost) ignored for a few-pixel gap between large
-            # fragments and fully enforced at long range (to still reject off-line
-            # noise). w = 0 near -> angle irrelevant; w = 1 far -> full alignment.
-            w = np.clip(ss / near_scale, 0.0, 1.0)
+            # Alignment MAGNITUDE only: direction is already handled by the graded
+            # forward-sense gate above, so a slightly-backward (bent) tip the gate
+            # admitted is not additionally penalised in the affinity.
+            align_i = np.abs(ai)
+            align_j = np.abs(aj)
+            # Distance-graded good continuation, with proximity dominance falling
+            # off QUADRATICALLY: for a few-pixel gap the angle barely matters
+            # (geom ~ 1), ramping to full collinearity at near_scale (still rejects
+            # off-line noise at range). w = 0 near -> angle irrelevant; w = 1 far.
+            w = np.clip(ss / near_scale, 0.0, 1.0) ** 2
             geom = (1.0 - w) + w * (align_i * align_j)
             satw = 0.5 + 0.5 * np.minimum(1.0, np.minimum(sal[i], sal[jj]) / sal_ref)
             A = geom * np.exp(-(ss ** 2) / (sigma ** 2)) * satw
