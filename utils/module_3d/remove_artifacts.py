@@ -78,7 +78,9 @@ def relabel_and_filter_fragments(
     # dask_image handles the stitching of chunks to resolve global labels without
     # loading the full brain into RAM.
     print("    Resolving global connectivity (this may take a while)...")
-    structure_3d = generate_binary_structure(3, 1)
+    # Full (26-)connectivity, matching step 1's labeling, so relabeling does not
+    # re-split objects merged across a diagonal contact or a thin link bridge.
+    structure_3d = generate_binary_structure(3, 3)
     
     # This builds the graph but doesn't compute yet
     labeled_dask, num_features_dask = dask_image.ndmeasure.label(
@@ -99,8 +101,9 @@ def relabel_and_filter_fragments(
 
     # 4. Global Size Histogram
     # dask.histogram computes volume of every label index globally
+    # Integer-aligned bins so every label id (including the highest) is counted.
     counts, _ = da.histogram(
-        labeled_dask, bins=num_features + 1, range=[0, num_features]
+        labeled_dask, bins=num_features + 1, range=[-0.5, num_features + 0.5]
     )
     counts_val = counts.compute()
 

@@ -79,7 +79,11 @@ def relabel_and_filter_fragments_2d(
     # 2. Re-Label Connected Components
     # Logic Parity: Matches the use of dask_image.ndmeasure.label
     # 2D 4-connectivity corresponds to 3D 6-connectivity (rank 1)
-    structure = generate_binary_structure(2, 1)
+    # Full (8-)connectivity, matching step 1's labeling, so relabeling does NOT
+    # re-split objects that step 1 merged across a diagonal contact or a thin
+    # 1-px link bridge (which face connectivity would sever, after which the size
+    # filter could delete the severed piece even though the whole object is large).
+    structure = generate_binary_structure(2, 2)
     labeled_dask, num_features_dask = dask_image.ndmeasure.label(
         binary_mask, structure=structure
     )
@@ -96,8 +100,11 @@ def relabel_and_filter_fragments_2d(
     # 3. Calculate Sizes (Histogram)
     # Logic Parity: Matches the use of da.histogram for area calculation
     print(f"    Analyzing {num_features} fragments...")
+    # Integer-aligned bins ([-0.5 .. n+0.5]) so every label id -- including the
+    # highest -- gets its own bin and its true count (the old [0, n] range
+    # mis-binned labels and could under-count the top id, dropping that object).
     counts, _ = da.histogram(
-        labeled_dask, bins=num_features + 1, range=[0, num_features]
+        labeled_dask, bins=num_features + 1, range=[-0.5, num_features + 0.5]
     )
     counts_val = counts.compute()
 
