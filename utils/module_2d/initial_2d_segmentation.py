@@ -696,6 +696,54 @@ def _trace_link_fragments(final_mm, image, spacing, max_gap, step=1.0,
               f"weak-affinity:{rej_weak} already-joined:{rej_joined} "
               f"endpoint-taken:{rej_taken} crossing:{rej_cross}")
 
+        # ---- Fallback: attach an unlinked tip to a nearby mask BODY --------- #
+        # Tensor voting pairs endpoint-to-endpoint; a tip that lands on the
+        # *flank* of another mask has no endpoint to pair with, so it is never a
+        # candidate above. Such an orphan tip is attached here by proximity to
+        # that mask's body, using the SAME `max_dist` budget as all other linking
+        # (no new distance constant). A tip meeting a flank is an attachment, not
+        # a continuation, so there is deliberately no collinearity/forward test --
+        # but it is still `_bridge_check`-gated, so it cannot cut across a third
+        # structure, and it only fires for tips the collinear linker left unlinked.
+        R = int(np.ceil(max_dist))
+        n_tip_body = 0
+        for i in range(M):
+            if is_ball[i] or i in used:
+                continue                        # only tips left unlinked by voting
+            ci = np.round(pos[i]).astype(int)
+            lo = np.maximum(ci - R, 0)
+            hi = np.minimum(ci + R + 1, shape)
+            sl = tuple(slice(int(lo[k]), int(hi[k])) for k in range(ndim))
+            win = np.asarray(final_mm[sl])
+            fg = win != 0
+            if not fg.any():
+                continue
+            ri = _find(int(frag[i]))
+            labs = win[fg]
+            good = {int(l) for l in np.unique(labs)
+                    if _find(int(l)) != ri
+                    and (absorb_below <= 0 or _label_size(int(l)) >= absorb_below)}
+            if not good:
+                continue
+            keep = np.isin(labs, list(good))
+            gco = (np.argwhere(fg) + lo)[keep]
+            d2 = ((gco - ci) ** 2).sum(1)
+            within = d2 <= max_dist * max_dist
+            if not within.any():
+                continue
+            k = int(np.argmin(np.where(within, d2, np.inf)))
+            tgt = gco[k].astype(float); vlab = int(win[fg][keep][k])
+            blocked, absorb = _bridge_check(pos[i], tgt, int(frag[i]), vlab)
+            if blocked:
+                continue
+            parent[_find(int(frag[i]))] = _find(vlab)
+            for _a in absorb:
+                parent[_find(int(_a))] = _find(vlab); absorbed_labels.add(int(_a))
+            used.setdefault(i, set()).add(1)
+            _emit_bridge(_route(pos[i], tgt, absorb), int(frag[i]))
+            n_tip_body += 1
+        print(f"    [DIAG] tip->body attachments: {n_tip_body}")
+
     if not parent:
         return None
 
