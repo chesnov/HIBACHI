@@ -909,43 +909,68 @@ def segment_cells_first_pass_raw(
                     norm_mm[read_sl] = volume[read_sl].astype(np.float32) / norm_factor
                 norm_mm.flush()
             else:
-                # ORIGINAL PERCENTILE NORMALIZATION LOGIC REMAINS HERE
-                global_high_p = max(high_thresh_list)
-                
-                z_stats = {}
-                stride_xy = max(1, min(16, min(volume.shape[1:]) // 128))
-                
-                for read_sl, _ in tqdm(list(_get_chunk_slices(volume.shape, (64, 512, 512))), desc="    Sampling"):
-                    sub = volume[read_sl][:, ::stride_xy, ::stride_xy]
-                    for i in range(sub.shape[0]):
-                        vals = sub[i].ravel(); vals = vals[vals > 0]
-                        if vals.size > 0:
-                            idx = read_sl[0].start + i
-                            if idx not in z_stats: z_stats[idx] = []
-                            z_stats[idx].extend(vals[:5000])
+                # --- Relative mode: LOCAL background + LOCAL-noise standardization ---
+                # (Item 1) Replaces the old per-z global brightness gain. Each voxel
+                # becomes its height above the LOCAL background divided by the LOCAL
+                # response scale, i.e. a per-region SNR. This flattens patchy /
+                # structured background (e.g. nonspecific antibody staining) per
+                # region instead of assuming a single uniform noise level, so the
+                # threshold stage sees comparable statistics across clean and noisy
+                # images. The window reuses the SAME `subtract_background_radius`
+                # knob already used by the tophat step (double duty -- no new knob).
+                # radius == 0 falls back to a per-slice global standardization
+                # (still noise-referenced, just not spatially adaptive).
+                # Window selection (no new GUI knob):
+                #  - if a background radius is explicitly provided, honor it;
+                #  - else auto-derive a window a few times the LARGEST tubular scale
+                #    (converted to xy pixels), so the opening removes regional
+                #    background while preserving real processes;
+                #  - else (no usable scale) fall back to per-slice global stats.
+                r = int(subtract_background_radius)
+                if r > 0:
+                    win = 2 * r + 1
+                else:
+                    phys = max([s for s in tubular_scales if s and s > 0], default=0.0)
+                    xy_spacing = max(min(spacing[1], spacing[2]), 1e-9)
+                    if phys > 0:
+                        win = int(np.clip(round(6.0 * phys / xy_spacing) * 2 + 1, 15, 151))
+                    else:
+                        win = 0
 
-                z_indices = np.arange(volume.shape[0])
-                hp = np.array([np.percentile(z_stats[z], global_high_p) if z in z_stats else np.nan for z in z_indices])
-
-                ideal = np.ones(volume.shape[0])
-                if np.any(~np.isnan(hp)):
-                    valid = ~np.isnan(hp)
-                    p = np.poly1d(np.polyfit(z_indices[valid], hp[valid], 2))
-                    raw_ideal = p(z_indices)
-                    max_amplification = 3.0
-                    hp_valid = hp[valid]
-                    median_hp = float(np.median(hp_valid))
-                    amp_floor = median_hp / max_amplification
-                    abs_floor = np.nanpercentile(hp, 10)
-                    ideal = np.maximum(raw_ideal, max(amp_floor, abs_floor))
-                    print(f"    Normalization: median brightness={median_hp:.2f}, "
-                          f"amp floor={amp_floor:.2f} (≤{max_amplification:.0f}× boost), "
-                          f"abs floor={abs_floor:.2f}")
-
-                for read_sl, _ in tqdm(list(_get_chunk_slices(volume.shape, (64, 512, 512))), desc="    Applying"):
-                    factors = ideal[read_sl[0].start:read_sl[0].stop][:, np.newaxis, np.newaxis]
-                    norm_mm[read_sl] = volume[read_sl].astype(np.float32) / np.where(factors > 1e-9, factors, 1.0)
+                bg_report: List[float] = []
+                sc_report: List[float] = []
+                for read_sl, _ in tqdm(list(_get_chunk_slices(volume.shape, (64, 512, 512))), desc="    Standardizing"):
+                    block = volume[read_sl].astype(np.float32)
+                    out = np.empty_like(block)
+                    for i in range(block.shape[0]):
+                        s2d = block[i]
+                        if win > 0:
+                            bg = ndimage.grey_opening(s2d, size=(win, win))
+                            resid = s2d - bg
+                            local_var = ndimage.uniform_filter(resid * resid, size=win)
+                            scale = np.sqrt(np.maximum(local_var, 0.0))
+                            bg_center = float(np.median(bg))
+                        else:
+                            bg_val = float(np.median(s2d))
+                            resid = s2d - bg_val
+                            scale = np.full_like(s2d, 1.4826 * float(np.median(np.abs(resid))))
+                            bg_center = bg_val
+                        # Floor the local scale by a fraction of the slice's robust
+                        # spread so flat / near-empty windows can't amplify texture
+                        # into spurious speckle (parameter-free safeguard).
+                        slice_scale = 1.4826 * float(np.median(np.abs(resid)))
+                        floor = max(slice_scale * 0.25, 1e-6)
+                        scale = np.maximum(scale, floor)
+                        out[i] = np.clip(resid / scale, 0.0, None)
+                        bg_report.append(bg_center)
+                        sc_report.append(float(np.median(scale)))
+                    norm_mm[read_sl] = out
                 norm_mm.flush()
+                win_desc = str(win) if win > 0 else "global(per-slice)"
+                print(f"    [Relative/local-SNR] window={win_desc}px | "
+                      f"median local background={np.median(bg_report):.3f}, "
+                      f"median local scale={np.median(sc_report):.3f} "
+                      f"(map is now in noise-sigma units)")
 
         # --- Stage 2 & 3: Multi-Scale Logic (per-scale smoothing + gap-closing,
         # threshold-then-OR). Smoothing and gap-closing now run independently per
@@ -969,8 +994,19 @@ def segment_cells_first_pass_raw(
             scale0_mm = np.memmap(os.path.join(scale0_dir, 's0.dat'), dtype=np.uint8, mode='w+', shape=volume.shape)
             scale0_mm[:] = 0
 
+        # Seed mask for significance-referenced hysteresis (Item 2), relative mode
+        # only. `high` (sigma) voxels are accumulated here; in the labeling stage a
+        # merged component survives only if it contains at least one seed voxel.
+        # Absolute mode leaves this None and behaves exactly as before.
+        seed_mm = None
+        if threshold_mode != "Absolute":
+            seed_dir = _get_safe_temp_dir(temp_root_path, 'seed'); temp_dirs_to_clean.append(seed_dir)
+            seed_mm = np.memmap(os.path.join(seed_dir, 'seed.dat'), dtype=np.uint8, mode='w+', shape=volume.shape)
+            seed_mm[:] = 0
+
         for i, scale in enumerate(tubular_scales):
             current_low_p = low_thresh_list[i]
+            current_high_p = high_thresh_list[i]
             current_smooth_sigma = smooth_sigma_list[i]
             current_connect_gap = connect_gap_list[i]
 
@@ -1008,25 +1044,46 @@ def segment_cells_first_pass_raw(
                 stride_z = max(1, min(4, volume.shape[0] // 32))
                 stride_xy = max(1, min(16, min(volume.shape[1:]) // 128))
                 
+                seed_thresh = None
                 if threshold_mode == "Absolute":
-                    thresh = current_low_p
-                    thresh = max(thresh, 1e-5); threshold_history[scale] = thresh
-                    print(f"      [Scale {scale}] Absolute Threshold: {thresh:.6f}")
+                    grow_thresh = current_low_p
+                    grow_thresh = max(grow_thresh, 1e-5); threshold_history[scale] = grow_thresh
+                    print(f"      [Scale {scale}] Absolute Threshold: {grow_thresh:.6f}")
                 else:
-                    samples = enh_mm[::stride_z, ::stride_xy, ::stride_xy].ravel(); samples = samples[samples > 1e-7]
-                    thresh = float(np.percentile(samples, current_low_p)) if samples.size > 1000 else 1e9
-                    thresh = max(thresh, 1e-5); threshold_history[scale] = thresh
-                    print(f"      [Scale {scale}] Isolated Threshold (p{current_low_p}): {thresh:.6f}")
+                    # (Item 2) `low`/`high` are now sigma-multiples above the
+                    # local-noise-flattened response background (NOT percentiles):
+                    # `low` grows, `high` seeds. Only grow-regions connected to a
+                    # seed survive (enforced in the labeling stage). Because both the
+                    # response and its noise scale rescale together, thresholding in
+                    # sigma units is insensitive to the map's absolute magnitude.
+                    samples = enh_mm[::stride_z, ::stride_xy, ::stride_xy].ravel()
+                    samples = samples[samples > 1e-7]
+                    if samples.size > 1000:
+                        bg_c = float(np.median(samples))
+                        bg_s = max(1.4826 * float(np.median(np.abs(samples - bg_c))), 1e-6)
+                        low_k = float(current_low_p)
+                        high_k = max(float(current_high_p), low_k)  # seed never below grow
+                        grow_thresh = max(bg_c + low_k * bg_s, 1e-5)
+                        seed_thresh = max(bg_c + high_k * bg_s, grow_thresh)
+                        occ_grow = float(np.mean(samples > grow_thresh)) * 100.0
+                        occ_seed = float(np.mean(samples > seed_thresh)) * 100.0
+                        print(f"      [Scale {scale}] response bg={bg_c:.5f}, scale(MAD)={bg_s:.5f} | "
+                              f"grow(>{low_k:.1f}\u03c3)={grow_thresh:.5f} [{occ_grow:.2f}% of sampled], "
+                              f"seed(>{high_k:.1f}\u03c3)={seed_thresh:.5f} [{occ_seed:.3f}%]")
+                    else:
+                        grow_thresh = 1e9
+                        print(f"      [Scale {scale}] too few voxels to estimate noise; scale skipped.")
+                    threshold_history[scale] = grow_thresh
 
                 # Binary Creation, Closing, and OR-ing
-                if thresh < 1e6:
+                if grow_thresh < 1e6:
                     enh_dask = da.from_array(enh_mm, chunks=(128, 512, 512))
 
                     # Per-scale gap-closing structure
                     rv = [math.ceil((current_connect_gap / 2) / s) if s > 1e-9 else 0 for s in spacing]
                     struct = np.ones(tuple(max(1, 2 * r + 1) for r in rv), dtype=bool)
 
-                    clean_dask = dask_image.ndmorph.binary_closing((enh_dask > thresh), structure=struct)
+                    clean_dask = dask_image.ndmorph.binary_closing((enh_dask > grow_thresh), structure=struct)
                     
                     record_s0 = (scale == 0 and scale0_mm is not None)
                     for read_sl, _ in tqdm(list(_get_chunk_slices(volume.shape, (64, 512, 512))), desc="      Merging"):
@@ -1034,10 +1091,14 @@ def segment_cells_first_pass_raw(
                         master_mm[read_sl] |= blk
                         if record_s0:
                             scale0_mm[read_sl] |= blk
+                        if seed_mm is not None and seed_thresh is not None:
+                            seed_mm[read_sl] |= (enh_mm[read_sl] > seed_thresh).astype(np.uint8)
                 
                 master_mm.flush()
                 if scale0_mm is not None:
                     scale0_mm.flush()
+                if seed_mm is not None:
+                    seed_mm.flush()
 
                 # Clean up this scale's intermediate buffers. `enh_mm` is dropped
                 # first since, for scale==0 or smooth_sigma==0, it may just be an
@@ -1101,26 +1162,60 @@ def segment_cells_first_pass_raw(
                 print(f"    [trace-link] skipped: {exc}")
             maxid = int(final_mm.max())
             csz = np.zeros(maxid + 1, dtype=np.int64)
+            shits = np.zeros(maxid + 1, dtype=np.int64) if seed_mm is not None else None
             for z in range(int(volume.shape[0])):
-                csz += np.bincount(final_mm[z].ravel(), minlength=maxid + 1)
+                row = final_mm[z].ravel()
+                csz += np.bincount(row, minlength=maxid + 1)
+                if shits is not None:
+                    sel = seed_mm[z].ravel().astype(bool)
+                    if sel.any():
+                        shits += np.bincount(row[sel], minlength=maxid + 1)
+            # Hysteresis gate: a label must contain a seed (high-sigma) voxel. If no
+            # seeds exist at all (e.g. thresholds mis-tuned), skip the gate rather
+            # than wipe the image, and warn.
+            seed_gate = shits
+            if shits is not None and int(shits[1:].sum()) == 0:
+                print("    [WARN] no seed voxels; skipping significance (seed) gate this run.")
+                seed_gate = None
             lut = np.zeros(maxid + 1, dtype=np.int32)
             nid = 0
             for i in range(1, maxid + 1):
-                if csz[i] >= min_size_voxels:
+                if csz[i] >= min_size_voxels and (seed_gate is None or seed_gate[i] > 0):
                     nid += 1
                     lut[i] = nid
             for z in range(int(volume.shape[0])):
                 final_mm[z] = lut[final_mm[z]]
+            if seed_gate is not None:
+                print(f"    [DIAG] hysteresis: kept {nid} seeded objects "
+                      f"(of {int((csz[1:] >= min_size_voxels).sum())} size-passing).")
             final_mm.flush()
         else:
             d_lbl = da.from_zarr(os.path.join(lab_dir, 'l.zarr'))
             counts, _ = da.histogram(d_lbl, bins=num_feats+1, range=[-0.5, num_feats+0.5])
-            valid = np.where(counts.compute()[1:] >= min_size_voxels)[0] + 1
+            size_counts = counts.compute()[1:]
+            size_ok = size_counts >= min_size_voxels
+
+            # Hysteresis gate: keep only components containing a seed (high-sigma)
+            # voxel. Streamed one z-slab at a time so full arrays never sit in RAM.
+            lz = zarr.open(os.path.join(lab_dir, 'l.zarr'), mode='r')
+            keep = size_ok
+            if seed_mm is not None:
+                shits = np.zeros(num_feats + 1, dtype=np.int64)
+                for z in range(int(volume.shape[0])):
+                    sel = seed_mm[z].ravel().astype(bool)
+                    if sel.any():
+                        shits += np.bincount(np.asarray(lz[z]).ravel()[sel], minlength=num_feats + 1)
+                if int(shits[1:].sum()) == 0:
+                    print("    [WARN] no seed voxels; skipping significance (seed) gate this run.")
+                else:
+                    keep = size_ok & (shits[1:] > 0)
+                    print(f"    [DIAG] hysteresis: kept {int(keep.sum())} seeded objects "
+                          f"(of {int(size_ok.sum())} size-passing).")
+            valid = np.where(keep)[0] + 1
 
             lookup = np.zeros(num_feats + 1, dtype=np.int32)
             for i, old_id in enumerate(valid): lookup[old_id] = i + 1
 
-            lz = zarr.open(os.path.join(lab_dir, 'l.zarr'), mode='r')
             for rs, ws in tqdm(list(_get_chunk_slices(volume.shape, (64, 512, 512))), desc="    Filtering"):
                 final_mm[ws] = lookup[lz[rs]]
             final_mm.flush()
@@ -1128,13 +1223,15 @@ def segment_cells_first_pass_raw(
         # Explicitly release large internal memmaps
         if 'master_mm' in locals():
             del master_mm
+        if seed_mm is not None:
+            del seed_mm; seed_mm = None
 
         return labels_path, labels_temp_dir, threshold_history.get(tubular_scales[0], 0.0), {'threshold_history': threshold_history}
 
     finally:
         if final_labels_memmap is not None: del final_labels_memmap
         # Close any local memmap handles to release file locks
-        for var in ['final_mm', 'norm_mm', 'smoothed_mm', 'master_mm', 'input_mm', 'enh_mm', 'scale0_mm']:
+        for var in ['final_mm', 'norm_mm', 'smoothed_mm', 'master_mm', 'input_mm', 'enh_mm', 'scale0_mm', 'seed_mm']:
             if var in locals():
                 try: del locals()[var]
                 except: pass
