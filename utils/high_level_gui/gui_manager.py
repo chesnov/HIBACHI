@@ -1090,84 +1090,122 @@ class DynamicGUIManager(QObject):
 
     def restore_from_checkpoint(self) -> None:
         """
-        Checks for existing outputs and prompts user to Resume or Restart.
+        Checks for existing outputs and prompts the user to Resume/View or Restart.
+
+        The choice is offered in an explicit loop rather than by mutual recursion
+        with _confirm_restart(). Declining the restart confirmation comes back
+        here to re-offer the choice, but a dismissal that is NOT an explicit
+        button press -- Escape, the window's close box, or a stray queued event
+        closing the modal -- is treated as the safe, non-destructive "just show
+        what's on disk" and ends the loop.
+
+        This matters because QMessageBox.clickedButton() returns None on such a
+        dismissal. The previous code routed None into the `else` (Restart) path,
+        and _confirm_restart() then recursed back into this method, so a repeated
+        or automatic dismissal (a held Escape key, or an event delivered while
+        the dialog is shown right after the viewer window is raised/activated)
+        bounced between the two methods, stacking a new modal dialog and two
+        nested exec_() event loops each round until the machine became
+        unresponsive. Terminating on dismissal and looping instead of recursing
+        makes that runaway impossible.
         """
         checkpoint_step = self.strategy.get_last_completed_step()
-        
-        if checkpoint_step > 0:
-            # Load saved config
-            files = self.strategy.get_checkpoint_files()
-            if files.get("config") and os.path.exists(files["config"]):
-                try:
-                    with open(files["config"], 'r') as f:
-                        saved = yaml.safe_load(f)
-                        if saved:
-                            self.config.update(saved)
-                            self.strategy.config = self.config
-                            # Restore intermediate state (e.g. threshold)
-                            if 'saved_state' in self.config:
-                                s = self.config['saved_state']
-                                if 'segmentation_threshold' in s:
-                                    self.strategy.intermediate_state['segmentation_threshold'] = \
-                                        float(s['segmentation_threshold'])
-                except Exception:
-                    pass
 
+        if checkpoint_step <= 0:
+            self.create_step_widgets(self.processing_steps[0])
+            return
+
+        # Load saved config (once, before prompting).
+        files = self.strategy.get_checkpoint_files()
+        if files.get("config") and os.path.exists(files["config"]):
+            try:
+                with open(files["config"], 'r') as f:
+                    saved = yaml.safe_load(f)
+                    if saved:
+                        self.config.update(saved)
+                        self.strategy.config = self.config
+                        # Restore intermediate state (e.g. threshold)
+                        if 'saved_state' in self.config:
+                            s = self.config['saved_state']
+                            if 'segmentation_threshold' in s:
+                                self.strategy.intermediate_state['segmentation_threshold'] = \
+                                    float(s['segmentation_threshold'])
+            except Exception:
+                pass
+
+        is_complete = (checkpoint_step == self.num_steps)
+
+        def _accept_existing() -> None:
+            """Non-destructive outcome: load what's on disk and settle there."""
+            if not is_complete:
+                self.strategy.intermediate_state['original_volume_ref'] = self.image_stack
+            self.load_checkpoint_data(checkpoint_step)
+            self.current_step["value"] = checkpoint_step
+            if not is_complete and checkpoint_step < self.num_steps:
+                self.create_step_widgets(self.processing_steps[checkpoint_step])
+
+        while True:
             msg = QMessageBox()
-            if checkpoint_step == self.num_steps:
+            if is_complete:
                 msg.setText("All steps complete.")
                 msg.setInformativeText("View results or restart from beginning?")
-                view = msg.addButton("View Results", QMessageBox.YesRole)
-                msg.addButton("Restart", QMessageBox.NoRole)
-                msg.exec_()
-                
-                if msg.clickedButton() == view:
-                    self.load_checkpoint_data(checkpoint_step)
-                    self.current_step["value"] = checkpoint_step
-                else:
-                    self._confirm_restart()
+                accept_btn = msg.addButton("View Results", QMessageBox.YesRole)
             else:
                 msg.setText("Resume previous session?")
                 msg.setInformativeText(f"Found data up to Step {checkpoint_step}.\n"
                                        f"Resume from Step {checkpoint_step + 1}?")
-                res = msg.addButton("Resume", QMessageBox.YesRole)
-                msg.addButton("Restart", QMessageBox.NoRole)
-                msg.exec_()
-                
-                if msg.clickedButton() == res:
-                    # Restore state
-                    self.strategy.intermediate_state['original_volume_ref'] = self.image_stack
-                    self.load_checkpoint_data(checkpoint_step)
-                    self.current_step["value"] = checkpoint_step
-                    
-                    if checkpoint_step < self.num_steps:
-                        self.create_step_widgets(
-                            self.processing_steps[checkpoint_step]
-                        )
-                else:
-                    self._confirm_restart()
-        else:
-            self.create_step_widgets(self.processing_steps[0])
+                accept_btn = msg.addButton("Resume", QMessageBox.YesRole)
+            restart_btn = msg.addButton("Restart", QMessageBox.NoRole)
+            # Escape / closing the dialog maps to the non-destructive choice, so
+            # a dismissal can never fall through to the destructive Restart path
+            # or re-open this prompt.
+            msg.setDefaultButton(accept_btn)
+            msg.setEscapeButton(accept_btn)
+            msg.exec_()
 
-    def _confirm_restart(self) -> None:
-        """Deletes old files and restarts from Step 1."""
+            if msg.clickedButton() is restart_btn:
+                # Explicit Restart request: confirm it. If the reset goes ahead
+                # we're done; if the user declines (or dismisses the confirm),
+                # loop once to re-offer the choice. _confirm_restart() no longer
+                # calls back into this method, so no recursive dialog stack can
+                # build up.
+                if self._confirm_restart():
+                    return
+                continue
+
+            # "View Results" / "Resume", or any dismissal (clickedButton() is
+            # None): settle on the existing results without re-prompting.
+            _accept_existing()
+            return
+
+    def _confirm_restart(self) -> bool:
+        """Confirm, then delete old files and restart from Step 1.
+
+        Returns True if the pipeline was actually reset, False if the user
+        declined or dismissed the confirmation. This method deliberately does
+        NOT re-open the resume/restart prompt itself: the caller decides what to
+        do next. Recursing back into restore_from_checkpoint() here is what let a
+        repeated/automatic dismissal spawn an unbounded chain of dialogs.
+        """
         reply = QMessageBox.question(
             self.viewer.window._qt_window,
             "Confirm Restart",
             "This will delete all existing processing files for this mode.\nAre you sure?",
-            QMessageBox.Yes | QMessageBox.No
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,   # default, and Escape/close, map to No
         )
-        
-        if reply == QMessageBox.Yes:
-            self.delete_all_checkpoint_files()
-            self.current_step["value"] = 0
-            self.strategy.intermediate_state = {}
-            self.config = self.initial_config.copy()
-            self.strategy.config = self.config
-            self._initialize_layers()
-            self.create_step_widgets(self.processing_steps[0])
-        else:
-            self.restore_from_checkpoint()
+
+        if reply != QMessageBox.Yes:
+            return False
+
+        self.delete_all_checkpoint_files()
+        self.current_step["value"] = 0
+        self.strategy.intermediate_state = {}
+        self.config = self.initial_config.copy()
+        self.strategy.config = self.config
+        self._initialize_layers()
+        self.create_step_widgets(self.processing_steps[0])
+        return True
 
     def delete_all_checkpoint_files(self) -> None:
         """Helper to clear disk artifacts."""
