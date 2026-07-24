@@ -25,7 +25,7 @@ from typing import List, Dict, Optional, Tuple, Set, Iterator, Any
 import numpy as np
 from scipy import ndimage
 from skimage.morphology import binary_dilation, footprint_rectangle, disk  # type: ignore
-from skimage.segmentation import relabel_sequential, watershed  # type: ignore
+from skimage.segmentation import relabel_sequential  # type: ignore
 from tqdm import tqdm
 
 # Import shared helpers from the 3D module where available.
@@ -307,82 +307,53 @@ def _build_adjacency_graph_for_cell_2d(
 def _reassign_disconnected_islands_2d(
     segmentation: np.ndarray,
     soma_mask: np.ndarray,
-    input_foreground: np.ndarray,
-    spacing: Optional[Tuple[float, ...]] = None,
 ) -> np.ndarray:
     """
-    Make every label a single CONNECTED component, and conserve all foreground (2D).
-
-    Cell splitting can leave a label in disconnected pieces (chunk boundaries, or
-    a watershed cut that stranded a process), and earlier steps can drop a few
-    foreground pixels. Both are repaired by CONNECTIVITY -- never by Euclidean
-    distance, which was the bug that produced disconnected same-label fragments
-    (a fragment took the label of the nearest cell even across a gap it did not
-    touch).
-
-      1. A connected fragment of a label that contains no soma is an "orphan": it
-         is not a cell in its own right, so it is un-anchored.
-      2. Every soma-anchored cell body is kept as a fixed marker.
-      3. Orphan pixels AND any dropped foreground pixels are re-assigned by a
-         geodesic (mask-constrained) watershed grown from those markers, so each
-         pixel takes the label of the cell it is actually CONNECTED to through the
-         foreground. Watershed basins are connected by construction, so a label
-         can never end up in two disconnected places.
-      4. Foreground not reachable from any cell body (a truly isolated island)
-         becomes its own new label -- never merged across a gap, never deleted.
+    Post-processing (2D): Detects disconnected satellite fragments.
+    Keeps the fragment with the seed; reassigns orphans to neighbors.
     """
-    flush_print("  [Refine] Enforcing connected labels (geodesic reattachment, 2D)...")
-
-    ndim = segmentation.ndim
-    struct = ndimage.generate_binary_structure(ndim, 1)
-    fg = np.asarray(input_foreground) > 0
-
-    # --- Pass 1: flag soma-less connected fragments of each label as orphans. ---
-    orphan_mask = np.zeros(segmentation.shape, dtype=bool)
+    flush_print("  [Refine] Checking for disconnected satellite fragments (2D)...")
     objs = ndimage.find_objects(segmentation)
-    for idx, sl in enumerate(tqdm(objs, desc="Finding orphan fragments")):
+    struct = ndimage.generate_binary_structure(2, 1)
+    dilate_struct = ndimage.generate_binary_structure(2, 1)
+
+    for idx, sl in enumerate(tqdm(objs, desc="Reassigning Islands")):
         if sl is None:
             continue
         label_id = idx + 1
-        sl_pad = tuple(slice(max(0, s.start - 1), min(d, s.stop + 1))
-                       for s, d in zip(sl, segmentation.shape))
-        frags, nfrag = ndimage.label(segmentation[sl_pad] == label_id, structure=struct)
-        if nfrag <= 1:
-            continue  # single connected piece -> fine
+
+        sl_pad = tuple(
+            slice(max(0, s.start - 1), min(d, s.stop + 1))
+            for s, d in zip(sl, segmentation.shape)
+        )
+
+        target_view = segmentation[sl_pad]
         local_soma = soma_mask[sl_pad]
-        orphan_view = orphan_mask[sl_pad]  # view: writes propagate to orphan_mask
-        for c in range(1, nfrag + 1):
-            frag = (frags == c)
-            if not np.any(local_soma[frag] > 0):
-                orphan_view[frag] = True  # soma-less fragment -> reassign by connectivity
 
-    # Pixels needing (re)assignment: orphan fragments + any dropped foreground.
-    anchor = segmentation.copy()
-    anchor[orphan_mask] = 0
-    to_fill = fg & (anchor == 0)
-    if not to_fill.any():
-        return segmentation
+        obj_mask = (target_view == label_id)
+        labeled_frags, num_frags = ndimage.label(obj_mask, structure=struct)
 
-    # --- Passes 2-3: geodesic fill from the anchored cell bodies. A flat
-    # landscape makes the watershed a pure connectivity (geodesic-nearest-marker)
-    # assignment within the foreground mask. Marker pixels keep their label; only
-    # `to_fill` pixels are assigned, and each label's region is a connected basin.
-    if np.any(anchor):
-        mask = fg | (anchor > 0)
-        segmentation = watershed(
-            np.zeros(segmentation.shape, dtype=np.uint8),
-            markers=anchor, mask=mask, connectivity=1,
-        ).astype(segmentation.dtype)
+        if num_frags <= 1:
+            continue
 
-    # --- Pass 4: foreground unreachable from any cell body -> its own new label. ---
-    leftover = fg & (segmentation == 0)
-    n_left = int(leftover.sum())
-    if n_left:
-        cc, _ = ndimage.label(leftover, structure=struct)
-        segmentation[leftover] = cc[leftover].astype(segmentation.dtype) + int(segmentation.max())
+        for i in range(1, num_frags + 1):
+            frag_mask = (labeled_frags == i)
+            has_seed = np.any(local_soma[frag_mask] > 0)
 
-    flush_print(f"  [Refine] geodesically reattached {int(to_fill.sum()) - n_left} pixels to "
-                f"their connected cell; {n_left} isolated foreground pixels became new objects.")
+            if has_seed:
+                continue
+
+            # Reassign to largest touching neighbor
+            dilated_frag = ndimage.binary_dilation(frag_mask, structure=dilate_struct)
+            neighbor_ids = target_view[dilated_frag]
+            neighbor_ids = neighbor_ids[(neighbor_ids != 0) & (neighbor_ids != label_id)]
+
+            if neighbor_ids.size > 0:
+                counts = np.bincount(neighbor_ids)
+                target_view[frag_mask] = np.argmax(counts)
+            else:
+                target_view[frag_mask] = 0
+
     return segmentation
 
 
@@ -657,10 +628,8 @@ def _separate_multi_soma_cells_chunk_2d(
                         best_neighbor = n_ids[np.argmax(n_counts)]
                         final_local_mask[frag_mask] = best_neighbor
                     else:
-                        # No labeled neighbor to merge into. Do NOT delete: keep the
-                        # fragment as its own object (uid) so no foreground is lost.
-                        # Conservation is enforced globally after stitching.
-                        pass
+                        if min_size_thresh > 0 and np.sum(frag_mask) < min_size_thresh:
+                            final_local_mask[frag_mask] = 0
 
         # D. Map to Global IDs
         final_local_mask_clean, _, _ = relabel_sequential(final_local_mask)
@@ -1158,15 +1127,9 @@ def separate_multi_soma_cells_2d(
         if os.path.exists(final_path):
             os.remove(final_path)
 
-        # Enforce connected labels and conserve all foreground in one geodesic
-        # pass: soma-less fragments and any dropped foreground are re-assigned to
-        # the cell they are CONNECTED to (never the Euclidean-nearest one), so no
-        # label can be left in two disconnected pieces and no foreground is lost.
-        ret = _reassign_disconnected_islands_2d(
-            ret, soma_mask, np.asarray(segmentation_mask) > 0, spacing=spacing
-        )
+        ret = _reassign_disconnected_islands_2d(ret, soma_mask)
 
-        flush_print("  Refining (Relabeling)...")
+        flush_print("  Refining (Filling voids + Relabeling)...")
         ret, _, _ = relabel_sequential(ret)
 
         return ret
