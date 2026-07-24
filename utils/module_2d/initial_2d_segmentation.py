@@ -607,6 +607,9 @@ def _trace_link_fragments(final_mm, image, spacing, max_gap, step=1.0,
         sal_ref = max(sal_ref, 1e-9)
 
         # ---- Candidate links (bidirectional good continuation) -------------- #
+        # Decision tally (always on): why candidate pairs are/aren't linked, so a
+        # single summary line explains the linker's behaviour on any image.
+        rej_facing = rej_weak = rej_joined = rej_taken = rej_cross = 0
         A_list, I_list, J_list, Si_list, Sj_list = [], [], [], [], []
         for i in range(M):
             d = pos[i + 1:] - pos[i]
@@ -626,6 +629,7 @@ def _trace_link_fragments(final_mm, image, spacing, max_gap, step=1.0,
             # it (never backward through its own body); a ball has no sign.
             fwd = (ai >= 0.0) if not is_ball[i] else np.ones(len(jj), bool)
             fwd = fwd & np.where(is_ball[jj], True, aj >= 0.0)
+            rej_facing += int((~fwd).sum())      # partner not ahead of endpoint
             if not fwd.any():
                 continue
             jj = jj[fwd]; ss = ss[fwd]; u = u[fwd]; ai = ai[fwd]; aj = aj[fwd]
@@ -640,6 +644,7 @@ def _trace_link_fragments(final_mm, image, spacing, max_gap, step=1.0,
             satw = 0.5 + 0.5 * np.minimum(1.0, np.minimum(sal[i], sal[jj]) / sal_ref)
             A = geom * np.exp(-(ss ** 2) / (sigma ** 2)) * satw
             good = A >= A_min
+            rej_weak += int((~good).sum())       # affinity below A_min
             if not good.any():
                 continue
             jj = jj[good]; A = A[good]; ai = ai[good]; aj = aj[good]
@@ -660,12 +665,15 @@ def _trace_link_fragments(final_mm, image, spacing, max_gap, step=1.0,
         for k in order:
             i = I_list[k]; j = J_list[k]; si = Si_list[k]; sj = Sj_list[k]
             if _find(frag[i]) == _find(frag[j]):
+                rej_joined += 1              # fragments already in the same object
                 continue
             if not _free(i, si, bool(is_ball[i])) or not _free(j, sj, bool(is_ball[j])):
+                rej_taken += 1               # an endpoint side is already used
                 continue
             blocked, absorb = _bridge_check(pos[i], pos[j], int(frag[i]), int(frag[j]))
             if blocked:
-                continue                     # would cut across a real structure
+                rej_cross += 1               # bridge would cross a real structure
+                continue
             parent[_find(frag[i])] = _find(frag[j])
             for _a in absorb:                # swallow tiny specks lying in the gap
                 parent[_find(int(_a))] = _find(int(frag[j]))
@@ -674,8 +682,11 @@ def _trace_link_fragments(final_mm, image, spacing, max_gap, step=1.0,
             used.setdefault(j, set()).add(sj)
             _emit_bridge(_route(pos[i], pos[j], absorb), int(frag[i]))
             n_link += 1
-        print(f"    [DIAG] tensor-voting links: {n_link}")
-        print(f"    [DIAG] absorbed specks: {len(absorbed_labels)}")
+        print(f"    [DIAG] tensor-voting links: {n_link} | absorbed specks: "
+              f"{len(absorbed_labels)} | tokens: {M}")
+        print(f"    [DIAG] link rejections -> facing-away:{rej_facing} "
+              f"weak-affinity:{rej_weak} already-joined:{rej_joined} "
+              f"endpoint-taken:{rej_taken} crossing:{rej_cross}")
 
     if not parent:
         return None
