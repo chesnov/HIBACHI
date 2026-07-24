@@ -314,7 +314,7 @@ class SimpleTimer:
 
 def _trace_link_fragments(final_mm, image, spacing, max_gap, step=1.0,
                           angle_tol_deg=45.0, momentum=0.5, recenter_radius=3,
-                          soma_lut=None, link_radius=3):
+                          soma_lut=None, link_radius=3, absorb_below=0):
     """Tensor-voting gap linker: reconnect the pieces of one process by
     perceptual good-continuation rather than an intensity walk.
 
@@ -366,6 +366,8 @@ def _trace_link_fragments(final_mm, image, spacing, max_gap, step=1.0,
     near_scale = max(4.0, 2.0 * float(link_radius))     # below this gap, proximity
     #                                                     dominates and the angle
     #                                                     requirement is relaxed
+    absorb_reach = max(3.0, float(link_radius) + 2.0)   # swallow specks within this
+    #                                                     many px of a link bridge
 
     parent = {}
 
@@ -376,26 +378,90 @@ def _trace_link_fragments(final_mm, image, spacing, max_gap, step=1.0,
             x = parent[x]
         return x
 
-    def _crosses_foreign(pa, pb, fa, fb):
-        """True if the straight segment pa->pb passes through a voxel belonging
-        to a DIFFERENT mask (not background, not either fragment being joined).
-        Used to refuse links that would cut across another structure -- which
-        both corrupts that structure and yields a discontinuous merged label."""
+    _size_cache = {}
+    _cen_cache = {}
+    _absorb_off = [None]   # lazy small-ball offsets for off-centerline absorption
+
+    def _label_size(lab):
+        lab = int(lab)
+        if lab not in _size_cache:
+            sl = objs[lab - 1] if 1 <= lab <= len(objs) else None
+            _size_cache[lab] = 0 if sl is None else \
+                int((np.asarray(final_mm[sl]) == lab).sum())
+        return _size_cache[lab]
+
+    def _label_centroid(lab):
+        lab = int(lab)
+        if lab not in _cen_cache:
+            sl = objs[lab - 1] if 1 <= lab <= len(objs) else None
+            if sl is None:
+                _cen_cache[lab] = None
+            else:
+                base = np.array([s.start for s in sl], dtype=float)
+                pts = np.argwhere(np.asarray(final_mm[sl]) == lab)
+                _cen_cache[lab] = None if len(pts) == 0 else pts.mean(0) + base
+        return _cen_cache[lab]
+
+    def _bridge_check(pa, pb, fa, fb):
+        """Inspect the straight segment pa->pb. Returns (blocked, absorb):
+        a LARGE foreign mask on the centerline blocks the link (never cut across a
+        real structure); SMALL foreign specks on or within `absorb_reach` of the
+        bridge -- ones the size filter would delete anyway -- are collected in
+        `absorb` so the link swallows them into the merged process rather than
+        being vetoed by them."""
+        if _absorb_off[0] is None:
+            r = int(max(1, round(absorb_reach)))
+            off = np.argwhere(np.ones((2 * r + 1,) * ndim)) - r
+            _absorb_off[0] = off[(off ** 2).sum(1) <= r * r + 1]
         ra, rb = _find(int(fa)), _find(int(fb))
         pa = np.asarray(pa, dtype=float); pb = np.asarray(pb, dtype=float)
         n = int(max(1, round(float(np.linalg.norm(pb - pa)))))
+        blocked = False
+        absorb = set()
         for k in range(n + 1):
             ci = np.round(pa + (pb - pa) * (k / n)).astype(int)
-            if np.any(ci < 0) or np.any(ci >= shape):
-                continue
-            v = int(final_mm[tuple(ci)])
-            if v != 0 and _find(v) not in (ra, rb):
-                return True
-        return False
+            if np.all(ci >= 0) and np.all(ci < shape):
+                v = int(final_mm[tuple(ci)])
+                if v != 0 and _find(v) not in (ra, rb):
+                    if absorb_below > 0 and _label_size(v) < absorb_below:
+                        absorb.add(v)
+                    else:
+                        blocked = True
+            if absorb_below > 0:
+                for o in _absorb_off[0]:
+                    q = ci + o
+                    if np.all(q >= 0) and np.all(q < shape):
+                        w = int(final_mm[tuple(q)])
+                        if w != 0 and _find(w) not in (ra, rb) and _label_size(w) < absorb_below:
+                            absorb.add(w)
+        return blocked, absorb
 
     objs = _ndi.find_objects(final_mm)       # streams the memmap; O(labels) memory
     bridges = []
     n_soma_links = 0
+    absorbed_labels = set()
+
+    def _emit_bridge(waypoints, lab):
+        for a, b in zip(waypoints[:-1], waypoints[1:]):
+            a = np.asarray(a, dtype=float); b = np.asarray(b, dtype=float)
+            nseg = int(max(1, round(float(np.linalg.norm(b - a)))))
+            bridges.append(([a + (b - a) * (t / nseg) for t in range(nseg + 1)], lab))
+
+    def _route(pa, pb, absorb):
+        # Route the bridge THROUGH absorbed specks (ordered along the chord) so the
+        # merged label stays a single connected component even when a speck sits
+        # off the straight line.
+        pa = np.asarray(pa, dtype=float); pb = np.asarray(pb, dtype=float)
+        chord = pb - pa; L2 = float(chord @ chord) + 1e-9
+        mids = []
+        for a in absorb:
+            c = _label_centroid(int(a))
+            if c is None:
+                continue
+            t = float((np.asarray(c, dtype=float) - pa) @ chord) / L2
+            mids.append((min(1.0, max(0.0, t)), np.asarray(c, dtype=float)))
+        mids.sort(key=lambda z: z[0])
+        return [pa] + [c for _, c in mids] + [pb]
 
     # Soma geometry (unchanged): process endpoints link straight to a nearby soma.
     soma_info = []
@@ -465,14 +531,16 @@ def _trace_link_fragments(final_mm, image, spacing, max_gap, step=1.0,
             for gpos, gdir in endpoints:
                 if soma_lut is not None:
                     slab, stgt = _link_to_soma(gpos, gdir)
-                    if (slab and _find(slab) != _find(lab)
-                            and not _crosses_foreign(gpos, stgt, lab, slab)):
-                        parent[_find(lab)] = _find(slab)
-                        nseg = int(max(1, round(np.linalg.norm(stgt - gpos))))
-                        bridges.append(([gpos + (stgt - gpos) * (k / nseg)
-                                         for k in range(nseg + 1)], lab))
-                        n_soma_links += 1
-                        continue
+                    if slab and _find(slab) != _find(lab):
+                        blocked, absorb = _bridge_check(gpos, stgt, lab, slab)
+                        if not blocked:
+                            parent[_find(lab)] = _find(slab)
+                            for _a in absorb:
+                                parent[_find(int(_a))] = _find(int(slab))
+                                absorbed_labels.add(int(_a))
+                            _emit_bridge(_route(gpos, stgt, absorb), lab)
+                            n_soma_links += 1
+                            continue
                 pos.append(gpos); ori.append(gdir); is_ball.append(False); frag.append(lab)
         else:
             cen = (skpts.mean(0) + base) if len(skpts) else \
@@ -595,16 +663,19 @@ def _trace_link_fragments(final_mm, image, spacing, max_gap, step=1.0,
                 continue
             if not _free(i, si, bool(is_ball[i])) or not _free(j, sj, bool(is_ball[j])):
                 continue
-            if _crosses_foreign(pos[i], pos[j], int(frag[i]), int(frag[j])):
-                continue                     # would cut across a different mask
+            blocked, absorb = _bridge_check(pos[i], pos[j], int(frag[i]), int(frag[j]))
+            if blocked:
+                continue                     # would cut across a real structure
             parent[_find(frag[i])] = _find(frag[j])
+            for _a in absorb:                # swallow tiny specks lying in the gap
+                parent[_find(int(_a))] = _find(int(frag[j]))
+                absorbed_labels.add(int(_a))
             used.setdefault(i, set()).add(si)
             used.setdefault(j, set()).add(sj)
-            nseg = int(max(1, round(float(np.linalg.norm(pos[j] - pos[i])))))
-            bridges.append(([pos[i] + (pos[j] - pos[i]) * (k2 / nseg)
-                             for k2 in range(nseg + 1)], int(frag[i])))
+            _emit_bridge(_route(pos[i], pos[j], absorb), int(frag[i]))
             n_link += 1
         print(f"    [DIAG] tensor-voting links: {n_link}")
+        print(f"    [DIAG] absorbed specks: {len(absorbed_labels)}")
 
     if not parent:
         return None
@@ -903,7 +974,7 @@ def segment_cells_first_pass_raw_2d(
                 soma_lut[0] = False
                 print(f"    [DIAG] soma (scale-0) labels flagged: {int(soma_lut.sum())}")
             try:
-                n_obj = _trace_link_fragments(final_mm, image, spacing_2d, trace_max_gap,
+                n_obj = _trace_link_fragments(final_mm, image, spacing_2d, trace_max_gap, absorb_below=min_size_global,
                                               soma_lut=soma_lut)
                 if n_obj is not None:
                     print(f"    [DIAG] orientation trace-link -> {n_obj} objects")
