@@ -352,7 +352,12 @@ def _reassign_disconnected_islands_2d(
                 counts = np.bincount(neighbor_ids)
                 target_view[frag_mask] = np.argmax(counts)
             else:
-                target_view[frag_mask] = 0
+                # Touches no other label. Do NOT delete it: cell splitting must
+                # re-partition the mask, never erase foreground that earlier steps
+                # already produced (deleting here was cropping ramified processes
+                # that the watershed cut stranded from their soma). Keep the
+                # fragment as its own object (it retains label_id).
+                pass
 
     return segmentation
 
@@ -628,8 +633,10 @@ def _separate_multi_soma_cells_chunk_2d(
                         best_neighbor = n_ids[np.argmax(n_counts)]
                         final_local_mask[frag_mask] = best_neighbor
                     else:
-                        if min_size_thresh > 0 and np.sum(frag_mask) < min_size_thresh:
-                            final_local_mask[frag_mask] = 0
+                        # No labeled neighbor to merge into. Do NOT delete: keep the
+                        # fragment as its own object (uid) so no foreground is lost.
+                        # Conservation is enforced globally after stitching.
+                        pass
 
         # D. Map to Global IDs
         final_local_mask_clean, _, _ = relabel_sequential(final_local_mask)
@@ -1128,6 +1135,29 @@ def separate_multi_soma_cells_2d(
             os.remove(final_path)
 
         ret = _reassign_disconnected_islands_2d(ret, soma_mask)
+
+        # Conservation guarantee: cell splitting re-partitions cells but must NEVER
+        # remove foreground that earlier steps produced. Restore any input-foreground
+        # pixel that ended up unlabeled by assigning it to the nearest labeled cell;
+        # if nothing is labeled anywhere, fall back to its original label. This makes
+        # the output mask a strict superset-in-coverage of the input (only the
+        # partition changes), which is the property the previous code violated.
+        input_fg = np.asarray(segmentation_mask) > 0
+        lost = input_fg & (ret == 0)
+        if np.any(lost):
+            n_lost = int(lost.sum())
+            if np.any(ret > 0):
+                # EDT on (ret == 0): nearest "background" here is the nearest
+                # LABELED pixel, so this fills each lost pixel with the closest cell.
+                _, nearest = distance_transform_edt(
+                    ret == 0, return_distances=True, return_indices=True
+                )
+                ret[lost] = ret[tuple(nearest)][lost]
+            still = input_fg & (ret == 0)
+            if np.any(still):
+                ret[still] = np.asarray(segmentation_mask)[still]
+            flush_print(f"  [Conserve] restored {n_lost} foreground pixels that "
+                        f"splitting had dropped (mask is now conserved).")
 
         flush_print("  Refining (Filling voids + Relabeling)...")
         ret, _, _ = relabel_sequential(ret)
