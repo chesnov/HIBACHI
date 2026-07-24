@@ -307,58 +307,73 @@ def _build_adjacency_graph_for_cell_2d(
 def _reassign_disconnected_islands_2d(
     segmentation: np.ndarray,
     soma_mask: np.ndarray,
+    spacing: Optional[Tuple[float, ...]] = None,
+    max_merge_dist: float = 40.0,
 ) -> np.ndarray:
     """
-    Post-processing (2D): Detects disconnected satellite fragments.
-    Keeps the fragment with the seed; reassigns orphans to neighbors.
-    """
-    flush_print("  [Refine] Checking for disconnected satellite fragments (2D)...")
-    objs = ndimage.find_objects(segmentation)
-    struct = ndimage.generate_binary_structure(2, 1)
-    dilate_struct = ndimage.generate_binary_structure(2, 1)
+    Post-processing (2D): reattach disconnected, soma-less fragments to the correct cell.
 
-    for idx, sl in enumerate(tqdm(objs, desc="Reassigning Islands")):
+    A label can end up split into disconnected pieces (chunk boundaries, or a
+    watershed cut that stranded a process). A fragment WITHOUT a soma is not a
+    cell in its own right -- it belongs to a neighbour. Each such orphan fragment
+    is reassigned to the NEAREST soma-anchored cell, not merely a directly-
+    touching one, so a piece separated from its true parent by a small gap still
+    merges with the right cell (e.g. cell 4) instead of remaining mislabeled.
+
+    Fragments farther than `max_merge_dist` (in the units of `spacing`, or pixels
+    if spacing is None) from any anchored cell are left on their current label.
+    Nothing is ever deleted: cell splitting must re-partition the mask, not erase
+    foreground the earlier steps produced.
+    """
+    flush_print("  [Refine] Reattaching disconnected satellite fragments (2D)...")
+
+    ndim = segmentation.ndim
+    struct = ndimage.generate_binary_structure(ndim, 1)
+    samp = spacing if (spacing is not None and len(spacing) == ndim) else None
+    objs = ndimage.find_objects(segmentation)
+
+    # Pass 1: flag every soma-less fragment of every label as an "orphan".
+    orphan_mask = np.zeros(segmentation.shape, dtype=bool)
+    for idx, sl in enumerate(tqdm(objs, desc="Finding orphan fragments")):
         if sl is None:
             continue
         label_id = idx + 1
-
-        sl_pad = tuple(
-            slice(max(0, s.start - 1), min(d, s.stop + 1))
-            for s, d in zip(sl, segmentation.shape)
-        )
-
-        target_view = segmentation[sl_pad]
-        local_soma = soma_mask[sl_pad]
-
-        obj_mask = (target_view == label_id)
+        sl_pad = tuple(slice(max(0, s.start - 1), min(d, s.stop + 1))
+                       for s, d in zip(sl, segmentation.shape))
+        obj_mask = (segmentation[sl_pad] == label_id)
         labeled_frags, num_frags = ndimage.label(obj_mask, structure=struct)
-
         if num_frags <= 1:
-            continue
-
+            continue  # single connected piece -> fine
+        local_soma = soma_mask[sl_pad]
+        orphan_view = orphan_mask[sl_pad]  # view: writes propagate to orphan_mask
         for i in range(1, num_frags + 1):
-            frag_mask = (labeled_frags == i)
-            has_seed = np.any(local_soma[frag_mask] > 0)
+            frag = (labeled_frags == i)
+            if np.any(local_soma[frag] > 0):
+                continue  # soma-anchored main body: keep as-is
+            orphan_view[frag] = True
 
-            if has_seed:
-                continue
+    if not orphan_mask.any():
+        return segmentation
 
-            # Reassign to largest touching neighbor
-            dilated_frag = ndimage.binary_dilation(frag_mask, structure=dilate_struct)
-            neighbor_ids = target_view[dilated_frag]
-            neighbor_ids = neighbor_ids[(neighbor_ids != 0) & (neighbor_ids != label_id)]
+    # Pass 2: reassign each orphan pixel to the nearest ANCHORED cell. Orphans are
+    # removed from the anchor set first so they cannot seed each other; the true
+    # cell bodies (soma-anchored) remain and win. Single global nearest-label fill.
+    anchor = segmentation.copy()
+    anchor[orphan_mask] = 0
+    if not np.any(anchor):
+        return segmentation  # no anchored cell to merge into; leave orphans in place
 
-            if neighbor_ids.size > 0:
-                counts = np.bincount(neighbor_ids)
-                target_view[frag_mask] = np.argmax(counts)
-            else:
-                # Touches no other label. Do NOT delete it: cell splitting must
-                # re-partition the mask, never erase foreground that earlier steps
-                # already produced (deleting here was cropping ramified processes
-                # that the watershed cut stranded from their soma). Keep the
-                # fragment as its own object (it retains label_id).
-                pass
+    dist, nearest_idx = distance_transform_edt(
+        anchor == 0, sampling=samp, return_distances=True, return_indices=True
+    )
+    nearest_label = anchor[tuple(nearest_idx)]
+    within = orphan_mask & (dist <= max_merge_dist)
+    segmentation[within] = nearest_label[within]
 
+    n_merged = int(within.sum())
+    n_kept = int((orphan_mask & ~within).sum())
+    flush_print(f"  [Refine] reattached {n_merged} orphan pixels to the nearest cell; "
+                f"{n_kept} left in place (no cell within {max_merge_dist:g}).")
     return segmentation
 
 
@@ -1134,7 +1149,10 @@ def separate_multi_soma_cells_2d(
         if os.path.exists(final_path):
             os.remove(final_path)
 
-        ret = _reassign_disconnected_islands_2d(ret, soma_mask)
+        ret = _reassign_disconnected_islands_2d(
+            ret, soma_mask, spacing=spacing,
+            max_merge_dist=float(kwargs.get('max_seed_centroid_dist', 40.0))
+        )
 
         # Conservation guarantee: cell splitting re-partitions cells but must NEVER
         # remove foreground that earlier steps produced. Restore any input-foreground
