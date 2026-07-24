@@ -609,10 +609,11 @@ def _separate_multi_soma_cells_chunk_2d(
         # to detect seed presence — matches 3D logic exactly.
         unique_result_ids = np.unique(final_local_mask[final_local_mask > 0])
         dilation_struct = footprint_rectangle((3, 3))
+        cc_struct = ndimage.generate_binary_structure(2, 2)  # 8-conn incl. diagonals
 
         for uid in unique_result_ids:
             cell_mask = (final_local_mask == uid)
-            cc_labels, num_cc = ndimage.label(cell_mask)
+            cc_labels, num_cc = ndimage.label(cell_mask, structure=cc_struct)
 
             if num_cc <= 1:
                 continue
