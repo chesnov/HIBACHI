@@ -956,12 +956,16 @@ def segment_cells_first_pass_raw_2d(
             scale0_mm = np.memmap(os.path.join(scale0_dir, 's0.dat'), dtype=np.uint8, mode='w+', shape=image.shape)
             scale0_mm[:] = 0
 
-        # Seed mask for significance-referenced hysteresis (Item 2), relative mode
-        # only. `high` (sigma) pixels are accumulated here; in the labeling stage a
-        # merged component survives only if it contains at least one seed pixel.
-        # Absolute mode leaves this None and behaves exactly as before.
+        # Optional hysteresis seed gate, OFF by default. It is enabled only when
+        # `high` is a STRICTER percentile than `low` and below 100. With the shipped
+        # default (high = 100) detection is a single percentile threshold on `low`
+        # and nothing can be dropped by seeding. When enabled, only components
+        # containing a `high`-percentile seed survive (connectivity-based rejection).
+        use_seed_gate = any(
+            low_thresh_list[i] < high_thresh_list[i] < 100.0 for i in range(n_scales)
+        )
         seed_mm = None
-        if threshold_mode != "Absolute":
+        if threshold_mode != "Absolute" and use_seed_gate:
             seed_dir = _get_safe_temp_dir(temp_root_path, 'seed'); temp_dirs_to_clean.append(seed_dir)
             seed_mm = np.memmap(os.path.join(seed_dir, 'seed.dat'), dtype=np.uint8, mode='w+', shape=image.shape)
             seed_mm[:] = 0
@@ -1008,29 +1012,28 @@ def segment_cells_first_pass_raw_2d(
                     grow_thresh = max(grow_thresh, 1e-5); threshold_history[scale] = grow_thresh
                     print(f"      [Scale {scale}] Absolute Threshold: {grow_thresh:.6f}")
                 else:
-                    # (Item 2) `low`/`high` are now sigma-multiples above the
-                    # local-noise-flattened response background (NOT percentiles):
-                    # `low` grows, `high` seeds. Only grow-regions connected to a
-                    # seed survive (enforced in the labeling stage). Because both the
-                    # response and its noise scale rescale together, thresholding in
-                    # sigma units is insensitive to the map's absolute magnitude.
+                    # Relative: `low`/`high` are PERCENTILES (intuitive). They are
+                    # applied to the item-1 SNR-normalized response, so a fixed
+                    # percentile lands at a consistent level across images of
+                    # different noise (item 1 flattened the noise scale). `low` is
+                    # the detection threshold; `high` optionally adds a stricter
+                    # connectivity seed (only when low < high < 100; off at high=100).
                     stride = max(1, min(16, min(image.shape) // 128))
                     samples = enh_mm[::stride, ::stride].ravel(); samples = samples[samples > 1e-7]
                     if samples.size > 1000:
-                        bg_c = float(np.median(samples))
-                        bg_s = max(1.4826 * float(np.median(np.abs(samples - bg_c))), 1e-6)
-                        low_k = float(current_low_p)
-                        high_k = max(float(current_high_p), low_k)  # seed never below grow
-                        grow_thresh = max(bg_c + low_k * bg_s, 1e-5)
-                        seed_thresh = max(bg_c + high_k * bg_s, grow_thresh)
-                        occ_grow = float(np.mean(samples > grow_thresh)) * 100.0
-                        occ_seed = float(np.mean(samples > seed_thresh)) * 100.0
-                        print(f"      [Scale {scale}] response bg={bg_c:.5f}, scale(MAD)={bg_s:.5f} | "
-                              f"grow(>{low_k:.1f}\u03c3)={grow_thresh:.5f} [{occ_grow:.2f}% of sampled], "
-                              f"seed(>{high_k:.1f}\u03c3)={seed_thresh:.5f} [{occ_seed:.3f}%]")
+                        low_p = min(max(float(current_low_p), 0.0), 100.0)
+                        grow_thresh = max(float(np.percentile(samples, low_p)), 1e-5)
+                        high_p = float(current_high_p)
+                        if low_p < high_p < 100.0:
+                            seed_thresh = max(float(np.percentile(samples, high_p)), grow_thresh)
+                        occ = float(np.mean(samples > grow_thresh)) * 100.0
+                        seed_msg = (f", seed(p{high_p:g})={seed_thresh:.5f}"
+                                    if seed_thresh is not None else ", seed OFF")
+                        print(f"      [Scale {scale}] grow(p{low_p:g})={grow_thresh:.5f} "
+                              f"[{occ:.2f}% of sampled]{seed_msg}")
                     else:
                         grow_thresh = 1e9
-                        print(f"      [Scale {scale}] too few pixels to estimate noise; scale skipped.")
+                        print(f"      [Scale {scale}] too few pixels to estimate threshold; scale skipped.")
                     threshold_history[scale] = grow_thresh
 
                 if grow_thresh < 1e6:

@@ -6,7 +6,7 @@ from typing import List, Dict, Optional, Tuple, Set, Iterator, Any
 import numpy as np
 from scipy import ndimage
 from skimage.morphology import binary_dilation, footprint_rectangle, ball  # type: ignore
-from skimage.segmentation import relabel_sequential  # type: ignore
+from skimage.segmentation import relabel_sequential, watershed  # type: ignore
 from tqdm import tqdm
 
 # Import shared helpers
@@ -588,77 +588,82 @@ def _separate_multi_soma_cells_chunk(
 def _reassign_disconnected_islands(
     segmentation: np.ndarray,
     soma_mask: np.ndarray,
+    input_foreground: np.ndarray,
     spacing: Optional[Tuple[float, ...]] = None,
-    max_merge_dist: float = 40.0,
 ) -> np.ndarray:
     """
-    Post-processing: reattach disconnected, soma-less fragments to the correct cell.
+    Make every label a single CONNECTED component, and conserve all foreground.
 
-    A label can end up split into disconnected pieces (chunk boundaries, or a
-    watershed cut that stranded a process). A fragment WITHOUT a soma is not a
-    cell in its own right -- it belongs to a neighbour. Each such orphan fragment
-    is reassigned to the NEAREST soma-anchored cell, not merely a directly-
-    touching one, so a piece separated from its true parent by a small gap still
-    merges with the right cell (e.g. cell 4) instead of remaining mislabeled.
+    Cell splitting can leave a label in disconnected pieces (chunk boundaries, or
+    a watershed cut that stranded a process), and earlier steps can drop a few
+    foreground voxels. Both are repaired by CONNECTIVITY -- never by Euclidean
+    distance, which was the bug that produced disconnected same-label fragments
+    (a fragment took the label of the nearest cell even across a gap it did not
+    touch).
 
-    Fragments farther than `max_merge_dist` (in the units of `spacing`, or voxels
-    if spacing is None) from any anchored cell are left on their current label.
-    Nothing is ever deleted: cell splitting must re-partition the mask, not erase
-    foreground the earlier steps produced.
+      1. A connected fragment of a label that contains no soma is an "orphan": it
+         is not a cell in its own right, so it is un-anchored.
+      2. Every soma-anchored cell body is kept as a fixed marker.
+      3. Orphan voxels AND any dropped foreground voxels are re-assigned by a
+         geodesic (mask-constrained) watershed grown from those markers, so each
+         voxel takes the label of the cell it is actually CONNECTED to through the
+         foreground. Watershed basins are connected by construction, so a label
+         can never end up in two disconnected places.
+      4. Foreground not reachable from any cell body (a truly isolated island)
+         becomes its own new label -- never merged across a gap, never deleted.
     """
-    flush_print("  [Refine] Reattaching disconnected satellite fragments...")
+    flush_print("  [Refine] Enforcing connected labels (geodesic reattachment)...")
 
     ndim = segmentation.ndim
     struct = ndimage.generate_binary_structure(ndim, 1)
-    samp = spacing if (spacing is not None and len(spacing) == ndim) else None
-    objs = ndimage.find_objects(segmentation)
+    fg = np.asarray(input_foreground) > 0
 
-    # Pass 1: flag every soma-less fragment of every label as an "orphan".
+    # --- Pass 1: flag soma-less connected fragments of each label as orphans. ---
     orphan_mask = np.zeros(segmentation.shape, dtype=bool)
+    objs = ndimage.find_objects(segmentation)
     for idx, sl in enumerate(tqdm(objs, desc="Finding orphan fragments")):
         if sl is None:
             continue
         label_id = idx + 1
         sl_pad = tuple(slice(max(0, s.start - 1), min(d, s.stop + 1))
                        for s, d in zip(sl, segmentation.shape))
-        obj_mask = (segmentation[sl_pad] == label_id)
-        labeled_frags, num_frags = ndimage.label(obj_mask, structure=struct)
-        if num_frags <= 1:
+        frags, nfrag = ndimage.label(segmentation[sl_pad] == label_id, structure=struct)
+        if nfrag <= 1:
             continue  # single connected piece -> fine
         local_soma = soma_mask[sl_pad]
         orphan_view = orphan_mask[sl_pad]  # view: writes propagate to orphan_mask
-        for i in range(1, num_frags + 1):
-            frag = (labeled_frags == i)
-            if np.any(local_soma[frag] > 0):
-                continue  # soma-anchored main body: keep as-is
-            orphan_view[frag] = True
+        for c in range(1, nfrag + 1):
+            frag = (frags == c)
+            if not np.any(local_soma[frag] > 0):
+                orphan_view[frag] = True  # soma-less fragment -> reassign by connectivity
 
-    if not orphan_mask.any():
-        return segmentation
-
-    # Pass 2: reassign each orphan voxel to the nearest ANCHORED cell. Orphans are
-    # removed from the anchor set first so they cannot seed each other; the true
-    # cell bodies (soma-anchored) remain and win. This is a single global nearest-
-    # label fill, so proximity is judged across the whole volume, not just within
-    # one label's bounding box.
+    # Voxels needing (re)assignment: orphan fragments + any dropped foreground.
     anchor = segmentation.copy()
     anchor[orphan_mask] = 0
-    if not np.any(anchor):
-        return segmentation  # no anchored cell to merge into; leave orphans in place
+    to_fill = fg & (anchor == 0)
+    if not to_fill.any():
+        return segmentation
 
-    dist, nearest_idx = distance_transform_edt(
-        anchor == 0, sampling=samp, return_distances=True, return_indices=True
-    )
-    nearest_label = anchor[tuple(nearest_idx)]
-    within = orphan_mask & (dist <= max_merge_dist)
-    segmentation[within] = nearest_label[within]
+    # --- Passes 2-3: geodesic fill from the anchored cell bodies. A flat
+    # landscape makes the watershed a pure connectivity (geodesic-nearest-marker)
+    # assignment within the foreground mask. Marker voxels keep their label; only
+    # `to_fill` voxels are assigned, and each label's region is a connected basin.
+    if np.any(anchor):
+        mask = fg | (anchor > 0)
+        segmentation = watershed(
+            np.zeros(segmentation.shape, dtype=np.uint8),
+            markers=anchor, mask=mask, connectivity=1,
+        ).astype(segmentation.dtype)
 
-    n_merged = int(within.sum())
-    n_kept = int((orphan_mask & ~within).sum())
-    flush_print(f"  [Refine] reattached {n_merged} orphan voxels to the nearest cell; "
-                f"{n_kept} left in place (no cell within {max_merge_dist:g}).")
-    return segmentation
+    # --- Pass 4: foreground unreachable from any cell body -> its own new label. ---
+    leftover = fg & (segmentation == 0)
+    n_left = int(leftover.sum())
+    if n_left:
+        cc, _ = ndimage.label(leftover, structure=struct)
+        segmentation[leftover] = cc[leftover].astype(segmentation.dtype) + int(segmentation.max())
 
+    flush_print(f"  [Refine] geodesically reattached {int(to_fill.sum()) - n_left} voxels to "
+                f"their connected cell; {n_left} isolated foreground voxels became new objects.")
     return segmentation
 
 
@@ -1106,35 +1111,15 @@ def separate_multi_soma_cells(
         if os.path.exists(final_path):
             os.remove(final_path)
 
+        # Enforce connected labels and conserve all foreground in one geodesic
+        # pass: soma-less fragments and any dropped foreground are re-assigned to
+        # the cell they are CONNECTED to (never the Euclidean-nearest one), so no
+        # label can be left in two disconnected pieces and no foreground is lost.
         ret = _reassign_disconnected_islands(
-            ret, soma_mask, spacing=spacing,
-            max_merge_dist=float(kwargs.get('max_seed_centroid_dist', 40.0))
+            ret, soma_mask, np.asarray(segmentation_mask) > 0, spacing=spacing
         )
 
-        # Conservation guarantee: cell splitting re-partitions cells but must NEVER
-        # remove foreground that earlier steps produced. Restore any input-foreground
-        # voxel that ended up unlabeled by assigning it to the nearest labeled cell;
-        # if nothing is labeled anywhere, fall back to its original label. This makes
-        # the output mask a strict superset-in-coverage of the input (only the
-        # partition changes), which is the property the previous code violated.
-        input_fg = np.asarray(segmentation_mask) > 0
-        lost = input_fg & (ret == 0)
-        if np.any(lost):
-            n_lost = int(lost.sum())
-            if np.any(ret > 0):
-                # EDT on (ret == 0): nearest "background" here is the nearest
-                # LABELED voxel, so this fills each lost voxel with the closest cell.
-                _, nearest = distance_transform_edt(
-                    ret == 0, return_distances=True, return_indices=True
-                )
-                ret[lost] = ret[tuple(nearest)][lost]
-            still = input_fg & (ret == 0)
-            if np.any(still):
-                ret[still] = np.asarray(segmentation_mask)[still]
-            flush_print(f"  [Conserve] restored {n_lost} foreground voxels that "
-                        f"splitting had dropped (mask is now conserved).")
-
-        flush_print("  Refining (Filling voids + Relabeling)...")
+        flush_print("  Refining (Relabeling)...")
         ret, _, _ = relabel_sequential(ret)
 
         return ret
