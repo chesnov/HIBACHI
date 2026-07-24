@@ -314,8 +314,14 @@ def _reassign_disconnected_islands_2d(
     """
     flush_print("  [Refine] Checking for disconnected satellite fragments (2D)...")
     objs = ndimage.find_objects(segmentation)
-    struct = ndimage.generate_binary_structure(2, 1)
-    dilate_struct = ndimage.generate_binary_structure(2, 1)
+    # Full 8-connectivity (incl. diagonals) for BOTH defining fragments and
+    # finding neighbours -- must match the connectivity the rest of the pipeline
+    # labels objects with (generate_binary_structure(2, 2)). With the old
+    # face-only (4-conn) structure, a piece attached to its cell on a diagonal was
+    # split off as a separate fragment AND judged to touch nothing, so it was
+    # deleted -- cropping mask that the pipeline considers part of the object.
+    struct = ndimage.generate_binary_structure(2, 2)
+    dilate_struct = ndimage.generate_binary_structure(2, 2)
 
     for idx, sl in enumerate(tqdm(objs, desc="Reassigning Islands")):
         if sl is None:

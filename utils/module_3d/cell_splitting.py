@@ -598,11 +598,16 @@ def _reassign_disconnected_islands(
     # Get bounding boxes for all objects
     objs = ndimage.find_objects(segmentation)
     
-    # 6-connectivity (faces) for defining "connected"
-    struct = ndimage.generate_binary_structure(3, 1)
-    
-    # Dilation struct for finding neighbors
-    dilate_struct = ndimage.generate_binary_structure(3, 1)
+    # Full 26-connectivity (faces + edges + corners) for BOTH defining fragments
+    # and finding neighbours -- must match the connectivity the rest of the
+    # pipeline labels objects with (generate_binary_structure(3, 3)). With the old
+    # face-only (6-conn) structure, a piece attached to its cell on a diagonal was
+    # split off as a separate fragment AND judged to touch nothing, so it was
+    # deleted -- cropping mask that the pipeline considers part of the object.
+    struct = ndimage.generate_binary_structure(3, 3)
+
+    # Dilation struct for finding neighbors (also full connectivity)
+    dilate_struct = ndimage.generate_binary_structure(3, 3)
 
     for idx, sl in enumerate(tqdm(objs, desc="Reassigning Islands")):
         if sl is None: continue
