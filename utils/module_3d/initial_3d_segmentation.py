@@ -914,7 +914,7 @@ def segment_cells_first_pass_raw(
         
         lab_dir = _get_safe_temp_dir(temp_root_path, 'lab_zarr'); temp_dirs_to_clean.append(lab_dir)
         m_dask = da.from_array(master_mm, chunks=(128, 512, 512))
-        labeled_dask, num_feats_dask = dask_image.ndmeasure.label((m_dask > 0), structure=generate_binary_structure(3, 1))
+        labeled_dask, num_feats_dask = dask_image.ndmeasure.label((m_dask > 0), structure=generate_binary_structure(3, 3))
         labeled_dask.to_zarr(os.path.join(lab_dir, 'l.zarr'), overwrite=True)
         num_feats = num_feats_dask.compute()
 
