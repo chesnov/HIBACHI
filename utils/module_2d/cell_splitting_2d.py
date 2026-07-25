@@ -309,19 +309,31 @@ def _reassign_disconnected_islands_2d(
     soma_mask: np.ndarray,
 ) -> np.ndarray:
     """
-    Post-processing (2D): Detects disconnected satellite fragments.
-    Keeps the fragment with the seed; reassigns orphans to neighbors.
+    Post-processing: detect labels split into disconnected fragments by chunk
+    boundaries. Keep the seed-bearing fragment, reassign orphans to their largest
+    touching neighbour, delete orphans that touch nothing.
+
+    NOTE: behaviour is UNCHANGED from before. This version only adds diagnostics
+    so any foreground loss can be read directly from the run output. Every
+    deletion is logged, and the delete branch records whether the orphan's ONLY
+    neighbour was its own cell body (label_id) -- the suspected false-delete
+    case -- versus being genuinely isolated debris.
     """
-    flush_print("  [Refine] Checking for disconnected satellite fragments (2D)...")
+    flush_print("  [Refine] Checking for disconnected satellite fragments...")
+
     objs = ndimage.find_objects(segmentation)
-    # Full 8-connectivity (incl. diagonals) for BOTH defining fragments and
-    # finding neighbours -- must match the connectivity the rest of the pipeline
-    # labels objects with (generate_binary_structure(2, 2)). With the old
-    # face-only (4-conn) structure, a piece attached to its cell on a diagonal was
-    # split off as a separate fragment AND judged to touch nothing, so it was
-    # deleted -- cropping mask that the pipeline considers part of the object.
     struct = ndimage.generate_binary_structure(2, 2)
     dilate_struct = ndimage.generate_binary_structure(2, 2)
+
+    # [PROFILE|ISLAND] Foreground-loss accounting.
+    fg_before = int(np.count_nonzero(segmentation))
+    n_multi = n_orphans = n_reassigned = n_deleted = 0
+    px_reassigned = px_deleted = 0
+    del_touch_own = 0      # deleted orphans whose ONLY neighbour was their own body
+    del_isolated = 0       # deleted orphans that truly touched nothing
+    fully_removed = []     # labels whose every pixel is gone after this pass
+    detail_cap = 80
+    detail_shown = 0
 
     for idx, sl in enumerate(tqdm(objs, desc="Reassigning Islands")):
         if sl is None:
@@ -342,23 +354,86 @@ def _reassign_disconnected_islands_2d(
         if num_frags <= 1:
             continue
 
+        n_multi += 1
+        label_had_deletion = False
+        label_has_any_seed = bool(np.any(local_soma[obj_mask] > 0))
+
         for i in range(1, num_frags + 1):
             frag_mask = (labeled_frags == i)
             has_seed = np.any(local_soma[frag_mask] > 0)
 
             if has_seed:
-                continue
+                continue  # main body, keep it.
 
-            # Reassign to largest touching neighbor
+            n_orphans += 1
+            frag_size = int(np.sum(frag_mask))
+
             dilated_frag = ndimage.binary_dilation(frag_mask, structure=dilate_struct)
-            neighbor_ids = target_view[dilated_frag]
-            neighbor_ids = neighbor_ids[(neighbor_ids != 0) & (neighbor_ids != label_id)]
+
+            # Unfiltered neighbourhood -- lets us distinguish "isolated debris"
+            # from "only touches its own body" (the latter is excluded below).
+            raw_neighbors = target_view[dilated_frag]
+            touches_own = bool(np.any(raw_neighbors == label_id))
+            neighbor_ids = raw_neighbors[(raw_neighbors != 0) & (raw_neighbors != label_id)]
 
             if neighbor_ids.size > 0:
                 counts = np.bincount(neighbor_ids)
-                target_view[frag_mask] = np.argmax(counts)
+                best_neighbor = int(np.argmax(counts))
+                target_view[frag_mask] = best_neighbor
+                n_reassigned += 1
+                px_reassigned += frag_size
+                if detail_shown < detail_cap:
+                    flush_print(
+                        f"    [PROFILE|ISLAND] label={label_id} frag={i} "
+                        f"size={frag_size} seedless -> REASSIGN to {best_neighbor} "
+                        f"| touches_own_body={touches_own}"
+                    )
+                    detail_shown += 1
             else:
+                # No differently-labelled neighbour -> delete (unchanged behaviour).
                 target_view[frag_mask] = 0
+                n_deleted += 1
+                px_deleted += frag_size
+                label_had_deletion = True
+                if touches_own:
+                    del_touch_own += 1
+                else:
+                    del_isolated += 1
+                raw_nz = np.unique(raw_neighbors[raw_neighbors != 0]).tolist()
+                flush_print(
+                    f"    [PROFILE|ISLAND] *** DELETE *** label={label_id} frag={i} "
+                    f"size={frag_size} | touches_own_body={touches_own} | "
+                    f"label_has_any_seed={label_has_any_seed} | "
+                    f"raw_nonzero_neighbors={raw_nz[:10]}"
+                    + ("  <-- SUSPECT FALSE DELETE: only neighbour is its own body"
+                       if touches_own else "  (genuinely isolated debris)")
+                )
+
+        # Did this label lose ALL of its pixels in this pass?
+        if label_had_deletion and not np.any(target_view == label_id):
+            fully_removed.append(int(label_id))
+
+    fg_after = int(np.count_nonzero(segmentation))
+
+    flush_print(
+        f"  [PROFILE|ISLAND|SUMMARY] multi_frag_labels={n_multi} | orphans={n_orphans} "
+        f"(reassigned={n_reassigned}, deleted={n_deleted}) | "
+        f"pixels_reassigned={px_reassigned} | pixels_deleted={px_deleted}"
+    )
+    flush_print(
+        f"  [PROFILE|ISLAND|SUMMARY] delete_breakdown: only_touched_own_body={del_touch_own} "
+        f"(SUSPECTED FALSE DELETES) | truly_isolated={del_isolated}"
+    )
+    flush_print(
+        f"  [PROFILE|ISLAND|SUMMARY] foreground pixels before={fg_before} "
+        f"after={fg_after} delta={fg_after - fg_before}"
+        + ("  *** FOREGROUND LOST IN ISLAND STEP ***" if fg_after < fg_before else "")
+    )
+    if fully_removed:
+        flush_print(
+            f"  [PROFILE|ISLAND|SUMMARY] whole labels erased ({len(fully_removed)}): "
+            f"{fully_removed[:30]}"
+        )
 
     return segmentation
 
@@ -635,8 +710,20 @@ def _separate_multi_soma_cells_chunk_2d(
                         best_neighbor = n_ids[np.argmax(n_counts)]
                         final_local_mask[frag_mask] = best_neighbor
                     else:
-                        if min_size_thresh > 0 and np.sum(frag_mask) < min_size_thresh:
+                        _frag_sz = int(np.sum(frag_mask))
+                        if min_size_thresh > 0 and _frag_sz < min_size_thresh:
                             final_local_mask[frag_mask] = 0
+                            flush_print(
+                                f"  [PROFILE|ORPHAN] worker DELETE: cell={cell_label} "
+                                f"uid={uid} orphan_size={_frag_sz} < min_size="
+                                f"{min_size_thresh} (no differently-labelled neighbour)"
+                            )
+                        else:
+                            flush_print(
+                                f"  [PROFILE|ORPHAN] worker KEEP orphan: cell={cell_label} "
+                                f"uid={uid} orphan_size={_frag_sz} (no neighbour; kept "
+                                f"because min_size_thresh={min_size_thresh})"
+                            )
 
         # D. Map to Global IDs
         final_local_mask_clean, _, _ = relabel_sequential(final_local_mask)
@@ -689,6 +776,13 @@ def separate_multi_soma_cells_2d(
         np.ndarray: Refined 2D segmentation mask.
     """
     flush_print("[SepMultiSoma_2D] Starting (Chunked + Seed-Aware)...")
+
+    # [PROFILE|CONSERVE] Input inventory for end-to-end foreground accounting.
+    _fg_in = int(np.count_nonzero(segmentation_mask))
+    _nobj_in = int(np.unique(segmentation_mask[segmentation_mask > 0]).size)
+    flush_print(
+        f"  [PROFILE|CONSERVE] INPUT: foreground_pixels={_fg_in} | objects={_nobj_in}"
+    )
 
     # 1. Identify Multi-Soma Cells (Global Check)
     unique_labels = np.unique(segmentation_mask[segmentation_mask > 0])
@@ -1134,10 +1228,38 @@ def separate_multi_soma_cells_2d(
         if os.path.exists(final_path):
             os.remove(final_path)
 
+        # [PROFILE|CONSERVE] Post-stitch, pre-refinement inventory.
+        _fg_stitch = int(np.count_nonzero(ret))
+        _nobj_stitch = int(np.unique(ret[ret > 0]).size)
+        flush_print(
+            f"  [PROFILE|CONSERVE] POST-STITCH (pre-island): foreground_pixels={_fg_stitch} "
+            f"| objects={_nobj_stitch} | delta_vs_input={_fg_stitch - _fg_in}"
+        )
+
         ret = _reassign_disconnected_islands_2d(ret, soma_mask)
+
+        # [PROFILE|CONSERVE] Post-island inventory.
+        _fg_island = int(np.count_nonzero(ret))
+        _nobj_island = int(np.unique(ret[ret > 0]).size)
+        flush_print(
+            f"  [PROFILE|CONSERVE] POST-ISLAND: foreground_pixels={_fg_island} "
+            f"| objects={_nobj_island} | delta_vs_stitch={_fg_island - _fg_stitch}"
+        )
 
         flush_print("  Refining (Filling voids + Relabeling)...")
         ret, _, _ = relabel_sequential(ret)
+
+        # [PROFILE|CONSERVE] Final inventory + end-to-end verdict.
+        _fg_out = int(np.count_nonzero(ret))
+        _nobj_out = int(np.unique(ret[ret > 0]).size)
+        flush_print(
+            f"  [PROFILE|CONSERVE] OUTPUT: foreground_pixels={_fg_out} | objects={_nobj_out}"
+        )
+        flush_print(
+            f"  [PROFILE|CONSERVE] END-TO-END: foreground delta={_fg_out - _fg_in} "
+            f"(input={_fg_in} -> output={_fg_out})"
+            + ("  *** NET FOREGROUND LOSS ***" if _fg_out < _fg_in else "")
+        )
 
         return ret
 
