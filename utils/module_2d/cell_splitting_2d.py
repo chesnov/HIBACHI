@@ -310,14 +310,17 @@ def _reassign_disconnected_islands_2d(
 ) -> np.ndarray:
     """
     Post-processing: detect labels split into disconnected fragments by chunk
-    boundaries. Keep the seed-bearing fragment, reassign orphans to their largest
-    touching neighbour, delete orphans that touch nothing.
+    boundaries. Keep the seed-bearing fragment; reassign a seedless fragment to
+    its largest DIFFERENTLY-labelled touching neighbour when one exists.
 
-    NOTE: behaviour is UNCHANGED from before. This version only adds diagnostics
-    so any foreground loss can be read directly from the run output. Every
-    deletion is logged, and the delete branch records whether the orphan's ONLY
-    neighbour was its own cell body (label_id) -- the suspected false-delete
-    case -- versus being genuinely isolated debris.
+    A seedless fragment with no differently-labelled neighbour is an isolated
+    satellite of its OWN cell (it is already labelled ``label_id`` and that cell
+    carries its seed on another fragment). It is left untouched -- it is genuine
+    foreground and must not be removed here. Deliberate size-based noise removal
+    lives upstream (the worker's ``min_size_threshold``) and in artifact removal;
+    this refinement pass is strictly foreground-conserving.
+
+    Instrumented so foreground conservation is visible in the run log.
     """
     flush_print("  [Refine] Checking for disconnected satellite fragments...")
 
@@ -325,13 +328,10 @@ def _reassign_disconnected_islands_2d(
     struct = ndimage.generate_binary_structure(2, 2)
     dilate_struct = ndimage.generate_binary_structure(2, 2)
 
-    # [PROFILE|ISLAND] Foreground-loss accounting.
+    # [PROFILE|ISLAND] Foreground accounting (must net to zero after the fix).
     fg_before = int(np.count_nonzero(segmentation))
-    n_multi = n_orphans = n_reassigned = n_deleted = 0
-    px_reassigned = px_deleted = 0
-    del_touch_own = 0      # deleted orphans whose ONLY neighbour was their own body
-    del_isolated = 0       # deleted orphans that truly touched nothing
-    fully_removed = []     # labels whose every pixel is gone after this pass
+    n_multi = n_orphans = n_reassigned = n_kept = 0
+    px_reassigned = px_kept = 0
     detail_cap = 80
     detail_shown = 0
 
@@ -355,8 +355,6 @@ def _reassign_disconnected_islands_2d(
             continue
 
         n_multi += 1
-        label_had_deletion = False
-        label_has_any_seed = bool(np.any(local_soma[obj_mask] > 0))
 
         for i in range(1, num_frags + 1):
             frag_mask = (labeled_frags == i)
@@ -370,13 +368,14 @@ def _reassign_disconnected_islands_2d(
 
             dilated_frag = ndimage.binary_dilation(frag_mask, structure=dilate_struct)
 
-            # Unfiltered neighbourhood -- lets us distinguish "isolated debris"
-            # from "only touches its own body" (the latter is excluded below).
+            # Neighbours of a DIFFERENT label. NOTE: the dilation includes the
+            # fragment itself, so raw values always contain label_id; excluding
+            # label_id here is what leaves only genuine other-label neighbours.
             raw_neighbors = target_view[dilated_frag]
-            touches_own = bool(np.any(raw_neighbors == label_id))
             neighbor_ids = raw_neighbors[(raw_neighbors != 0) & (raw_neighbors != label_id)]
 
             if neighbor_ids.size > 0:
+                # Seedless fragment abutting another cell -> hand it over.
                 counts = np.bincount(neighbor_ids)
                 best_neighbor = int(np.argmax(counts))
                 target_view[frag_mask] = best_neighbor
@@ -385,55 +384,36 @@ def _reassign_disconnected_islands_2d(
                 if detail_shown < detail_cap:
                     flush_print(
                         f"    [PROFILE|ISLAND] label={label_id} frag={i} "
-                        f"size={frag_size} seedless -> REASSIGN to {best_neighbor} "
-                        f"| touches_own_body={touches_own}"
+                        f"size={frag_size} seedless -> REASSIGN to {best_neighbor}"
                     )
                     detail_shown += 1
             else:
-                # No differently-labelled neighbour -> delete (unchanged behaviour).
-                target_view[frag_mask] = 0
-                n_deleted += 1
-                px_deleted += frag_size
-                label_had_deletion = True
-                if touches_own:
-                    del_touch_own += 1
-                else:
-                    del_isolated += 1
-                raw_nz = np.unique(raw_neighbors[raw_neighbors != 0]).tolist()
-                flush_print(
-                    f"    [PROFILE|ISLAND] *** DELETE *** label={label_id} frag={i} "
-                    f"size={frag_size} | touches_own_body={touches_own} | "
-                    f"label_has_any_seed={label_has_any_seed} | "
-                    f"raw_nonzero_neighbors={raw_nz[:10]}"
-                    + ("  <-- SUSPECT FALSE DELETE: only neighbour is its own body"
-                       if touches_own else "  (genuinely isolated debris)")
-                )
-
-        # Did this label lose ALL of its pixels in this pass?
-        if label_had_deletion and not np.any(target_view == label_id):
-            fully_removed.append(int(label_id))
+                # Isolated satellite of its own cell -> KEEP (do not delete).
+                # This is the fix: previously this branch zeroed the fragment,
+                # silently dropping real foreground from a seeded cell.
+                n_kept += 1
+                px_kept += frag_size
+                if detail_shown < detail_cap:
+                    flush_print(
+                        f"    [PROFILE|ISLAND] label={label_id} frag={i} "
+                        f"size={frag_size} isolated seedless satellite -> KEEP "
+                        f"(retained as label {label_id}; not deleted)"
+                    )
+                    detail_shown += 1
 
     fg_after = int(np.count_nonzero(segmentation))
 
     flush_print(
         f"  [PROFILE|ISLAND|SUMMARY] multi_frag_labels={n_multi} | orphans={n_orphans} "
-        f"(reassigned={n_reassigned}, deleted={n_deleted}) | "
-        f"pixels_reassigned={px_reassigned} | pixels_deleted={px_deleted}"
-    )
-    flush_print(
-        f"  [PROFILE|ISLAND|SUMMARY] delete_breakdown: only_touched_own_body={del_touch_own} "
-        f"(SUSPECTED FALSE DELETES) | truly_isolated={del_isolated}"
+        f"(reassigned={n_reassigned}, kept_isolated={n_kept}) | "
+        f"pixels_reassigned={px_reassigned} | pixels_kept={px_kept}"
     )
     flush_print(
         f"  [PROFILE|ISLAND|SUMMARY] foreground pixels before={fg_before} "
         f"after={fg_after} delta={fg_after - fg_before}"
-        + ("  *** FOREGROUND LOST IN ISLAND STEP ***" if fg_after < fg_before else "")
+        + ("  *** FOREGROUND LOST -- UNEXPECTED ***" if fg_after < fg_before
+           else "  (conserved)")
     )
-    if fully_removed:
-        flush_print(
-            f"  [PROFILE|ISLAND|SUMMARY] whole labels erased ({len(fully_removed)}): "
-            f"{fully_removed[:30]}"
-        )
 
     return segmentation
 
