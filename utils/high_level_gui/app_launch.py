@@ -32,6 +32,107 @@ except Exception:  # pragma: no cover
         log.info("%s %s", event, " ".join(f"{k}={v!r}" for k, v in fields.items()))
 
 
+_shutdown_hook_connected = False
+
+
+def _stop_running_qthreads_before_teardown() -> None:
+    """Stop every still-running QThread before Qt's C++ objects are destroyed.
+
+    This is the fix for the "exited with an error (code -6)" crash. Code -6 is a
+    SIGABRT, and the diagnostics traced it to this exact sequence at exit:
+
+        Application closed normally (exit 0)
+        QThread: Destroyed while thread is still running   <- Qt fatal -> abort()
+
+    When the app quits while a napari viewer is still open (e.g. the user closes
+    the project window rather than clicking "Back to Project"), that viewer's
+    background StatusChecker QThread is still running. When the QThread's C++
+    object is later destroyed during interpreter teardown while it is still
+    running, Qt calls abort(). We pre-empt that here, in aboutToQuit -- which
+    fires the instant app.quit() is called, while every object is still alive --
+    by stopping each running QThread so nothing is running when it is destroyed.
+
+    napari parents its StatusChecker to the viewer's main window (not to the
+    QApplication), so we search under every top-level window, not just the app.
+    """
+    from PyQt5.QtCore import QThread  # local import: keep module top light
+
+    app = QApplication.instance()
+    if app is None:
+        return
+
+    threads = set()
+    try:
+        for w in app.topLevelWidgets():
+            try:
+                threads.update(w.findChildren(QThread))
+            except Exception:
+                pass
+    except Exception:
+        return
+
+    for th in threads:
+        try:
+            if not th.isRunning():
+                continue
+        except Exception:
+            continue
+
+        lifecycle("shutdown.qthread.stop", thread=type(th).__name__)
+
+        # 1) Cooperative stop. napari's StatusChecker loops until interruption is
+        #    requested but blocks on a Python Event, so requestInterruption()
+        #    alone won't wake it -- we also set that Event. Older variants use a
+        #    private _terminate flag; set it too. All best-effort.
+        try:
+            th.requestInterruption()
+        except Exception:
+            pass
+        ev = getattr(th, "_need_status_update", None)
+        if ev is not None and hasattr(ev, "set"):
+            try:
+                ev.set()
+            except Exception:
+                pass
+        if hasattr(th, "_terminate"):
+            try:
+                th._terminate = True
+            except Exception:
+                pass
+        try:
+            th.quit()  # no-op for non-event-loop threads, harmless
+        except Exception:
+            pass
+
+        # 2) Wait for a clean exit.
+        try:
+            if th.wait(1500):
+                continue
+        except Exception:
+            pass
+
+        # 3) Last resort: hard-terminate so the C++ destructor won't see a
+        #    running thread and abort(). Acceptable only because we are exiting.
+        try:
+            log.warning("Force-terminating unresponsive %s thread at shutdown.",
+                        type(th).__name__)
+            th.terminate()
+            th.wait(500)
+        except Exception:
+            pass
+
+
+def _install_shutdown_hook(app) -> None:
+    """Connect the QThread-stopping cleanup to aboutToQuit (exactly once)."""
+    global _shutdown_hook_connected
+    if _shutdown_hook_connected or app is None:
+        return
+    try:
+        app.aboutToQuit.connect(_stop_running_qthreads_before_teardown)
+        _shutdown_hook_connected = True
+    except Exception:
+        pass
+
 
 def _check_if_last_window() -> None:
     """Checks if the project window is closed; if so, quits the app."""
@@ -355,6 +456,11 @@ def launch_image_segmentation_tool() -> QApplication:
     # Prevent Napari from attempting to shut down the global app lifecycle 
     # when a viewer closes. This prevents the `_close_app` TypeError on macOS.
     app.setQuitOnLastWindowClosed(False)
+
+    # Stop any still-running QThreads (notably napari's StatusChecker) the moment
+    # we quit, so they aren't destroyed while running -> prevents the SIGABRT
+    # (code -6) crash on exit. See _stop_running_qthreads_before_teardown.
+    _install_shutdown_hook(app)
 
     def show_pv():
         if not app_state.project_view_window:
