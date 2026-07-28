@@ -17,6 +17,32 @@ import traceback
 import multiprocessing
 
 # -----------------------------------------------------------------------------
+# 0. Diagnostics FIRST -- before anything heavy (Qt / vispy / napari) imports.
+# -----------------------------------------------------------------------------
+# The app can die with a bare "exited with an error (code -6)". Code -6 is a
+# SIGABRT: a native (C/C++) abort from Qt/vispy/OpenGL or a memmap being freed
+# under a worker. It kills the process instantly, so sys.excepthook never runs
+# and stdout prints are lost. logging_setup arms faulthandler (which dumps every
+# thread's traceback on such an abort, to <logdir>/faulthandler.log), plus file
+# logging, a Qt message handler, and exception hooks. Arming it here -- before
+# the GUI stack is even imported -- means a crash *during* startup is captured
+# too. Import is best-effort so a diagnostics problem can never stop the app.
+try:
+    from utils.high_level_gui.logging_setup import configure_logging, get_logger
+    _LOG_DIR = configure_logging(role="app")
+    log = get_logger("segment")
+    log.info("segment.py starting; diagnostics active.")
+except Exception as _diag_exc:  # pragma: no cover - diagnostics must never block launch
+    print(f"[segment] WARNING: could not initialise logging ({_diag_exc}); "
+          "continuing without file diagnostics.")
+
+    def get_logger(_name):  # type: ignore
+        import logging
+        return logging.getLogger(_name)
+
+    log = get_logger("segment")
+
+# -----------------------------------------------------------------------------
 # Windows: make the conda env's MSVC runtime (MSVCP140.dll & friends) findable
 # -----------------------------------------------------------------------------
 # pip-built extensions (PyQt5, vispy, numba, ...) are compiled against the
@@ -51,9 +77,9 @@ try:
 
     # Apply the patch
     arcball_module._arcball = _patched_arcball
-    print("Applied Vispy Arcball camera patch.")
+    log.info("Applied Vispy Arcball camera patch.")
 except Exception as e:
-    print(f"Warning: Could not apply Vispy patch: {e}")
+    log.warning("Could not apply Vispy patch: %s", e)
 
 # PyQt5 is the GUI framework used. 
 # QApplication is the singleton that manages the GUI control flow and main settings.
@@ -97,8 +123,7 @@ def global_exception_hook(exctype, value, tb):
     This is critical for memory-heavy apps where OOM (Out of Memory) errors might occur.
     """
     error_msg = "".join(traceback.format_exception(exctype, value, tb))
-    print("Uncaught Exception detected:")
-    print(error_msg)
+    log.critical("Uncaught exception reached the top level:\n%s", error_msg)
     
     # Try to show a GUI popup so the user knows what happened
     app = QApplication.instance()
@@ -124,7 +149,7 @@ def main():
     """
     Main application function. 
     """
-    print("--- Starting HIBACHI ---")
+    log.info("--- Starting HIBACHI ---")
 
     # Guard for Windows Multiprocessing
     # If this app is ever frozen (PyInstaller) or run on Windows, this prevents 
@@ -138,7 +163,7 @@ def main():
     except Exception as e:
         # If we fail here, the app didn't even start (e.g., config error, missing lib).
         error_msg = f"Critical error during application launch:\n{str(e)}\n\nFull Traceback:\n{traceback.format_exc()}"
-        print(error_msg)
+        log.critical(error_msg)
         
         # Attempt to create a temporary app just to show the error message box
         try:
@@ -150,20 +175,19 @@ def main():
 
     # B. Validation
     if app is None:
-        print("Error: Application instance is None. Launch failed gracefully.")
+        log.error("Application instance is None. Launch failed gracefully.")
         sys.exit(1)
 
     # C. Start the Event Loop
     # The event loop waits for user input (clicks, keypresses).
     # Processing stops here until the user closes the window.
-    print("GUI Initialized. Starting Qt Event Loop...")
+    log.info("GUI initialized. Starting Qt event loop...")
     try:
         exit_code = app.exec_()
-        print(f"Application closed normally with exit code: {exit_code}")
+        log.info("Application closed normally with exit code: %s", exit_code)
         sys.exit(exit_code)
     except Exception as e:
-        print(f"Error during Qt event loop: {e}")
-        print(traceback.format_exc())
+        log.critical("Error during Qt event loop: %s\n%s", e, traceback.format_exc())
         sys.exit(1)
 
 if __name__ == "__main__":

@@ -37,10 +37,86 @@ Command line:
 
 from __future__ import annotations
 
+import logging
 import os
 import shutil
+import signal
 import subprocess
 import sys
+import time
+
+# --------------------------------------------------------------------------- #
+# Launcher-side logging (stdlib only -- the launcher deliberately avoids the
+# heavy GUI stack). We write a small log of our own AND capture the child's
+# stdout/stderr, because the native "Aborted" message that accompanies a
+# "code -6" crash is printed by the C runtime to the *child's* stderr; teeing it
+# here preserves it even when the in-process faulthandler can't (e.g. the macOS
+# exec path). The child (segment.py) writes its own richer logs via
+# logging_setup; we point it at the same directory with HIBACHI_LOG_DIR.
+# --------------------------------------------------------------------------- #
+def _log_dir() -> str:
+    """Mirror logging_setup.log_dir()/updater state-dir convention (stdlib only)."""
+    explicit = os.environ.get("HIBACHI_LOG_DIR")
+    if explicit:
+        base = explicit
+    else:
+        state = os.environ.get("HIBACHI_STATE_DIR")
+        base = os.path.join(state, "logs") if state else \
+            os.path.join(os.path.expanduser("~"), ".hibachi", "logs")
+    try:
+        os.makedirs(base, exist_ok=True)
+    except Exception:
+        import tempfile
+        base = os.path.join(tempfile.gettempdir(), "hibachi-logs")
+        os.makedirs(base, exist_ok=True)
+    return base
+
+
+def _get_launcher_logger() -> logging.Logger:
+    lg = logging.getLogger("hibachi.launcher")
+    if lg.handlers:  # already configured
+        return lg
+    lg.setLevel(logging.INFO)
+    fmt = logging.Formatter("%(asctime)s %(levelname)-7s [launcher] %(message)s",
+                            datefmt="%Y-%m-%d %H:%M:%S")
+    try:
+        fh = logging.FileHandler(os.path.join(_log_dir(), "hibachi-launcher.log"),
+                                 encoding="utf-8")
+        fh.setFormatter(fmt)
+        lg.addHandler(fh)
+    except Exception:
+        pass
+    if sys.stderr is not None:
+        sh = logging.StreamHandler(sys.stderr)
+        sh.setFormatter(fmt)
+        lg.addHandler(sh)
+    return lg
+
+
+def _describe_exit(code: int) -> str:
+    """Turn a subprocess return code into something a human can act on.
+
+    On POSIX a negative code means "killed by signal N"; e.g. -6 is SIGABRT,
+    which is the mysterious "code -6" the user reported. Name the signal so the
+    log says WHAT killed it, not just a number.
+    """
+    if code is None:
+        return "unknown"
+    if code < 0:
+        signo = -code
+        try:
+            name = signal.Signals(signo).name
+        except (ValueError, AttributeError):
+            name = f"signal {signo}"
+        note = " (native abort -- see faulthandler.log)" if signo == signal.SIGABRT else ""
+        return f"killed by {name}{note}"
+    if code == 0:
+        return "clean exit"
+    return f"exit code {code}"
+
+
+_LAUNCHER_LOG = _get_launcher_logger()
+
 
 # Make sibling modules importable whether run as a script or a module.
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -169,8 +245,13 @@ def _launch_app(repo_root: str) -> int:
     """Launch the real application and return its exit code (POSIX/Windows)."""
     entry = os.path.join(repo_root, APP_ENTRY)
     if not os.path.isfile(entry):
-        print(f"[startup] ERROR: cannot find {entry}")
+        _LAUNCHER_LOG.error("cannot find %s", entry)
         return 1
+
+    # Tell the child where to put its logs so parent and child agree, and so the
+    # user only has one folder to send us. The child reads this in logging_setup.
+    os.environ.setdefault("HIBACHI_LOG_DIR", _log_dir())
+    _LAUNCHER_LOG.info("Launching %s (logs -> %s)", entry, os.environ["HIBACHI_LOG_DIR"])
 
     # macOS: REPLACE this process with the GUI instead of spawning a child. The
     # .app bundle already owns a Dock tile ("HIBACHI"); if we launch segment.py
@@ -182,6 +263,17 @@ def _launch_app(repo_root: str) -> int:
     # users reach rollback via `--rollback` instead.
     if sys.platform == "darwin":
         os.chdir(repo_root)  # so `import utils` resolves (mirrors cwd= below)
+        # exec REPLACES this process, so we can't observe the child's exit code
+        # or tee its output from here. That's fine: the child arms faulthandler
+        # itself (logging_setup), so a native abort still lands in
+        # faulthandler.log. Record the handoff before we vanish.
+        _LAUNCHER_LOG.info("macOS: exec-ing into the app (single-process mode); "
+                           "crash diagnostics handled in-process by the app.")
+        for h in list(_LAUNCHER_LOG.handlers):
+            try:
+                h.flush()
+            except Exception:
+                pass
         os.execv(sys.executable, [sys.executable, entry])
         # os.execv does not return on success.
 
@@ -193,9 +285,58 @@ def _launch_app(repo_root: str) -> int:
     # registers the env's DLL directories itself, at its very top, before Qt is
     # imported (see the os.add_dll_directory block in segment.py). Running a real
     # file on disk is both cleaner and far less likely to trip a false positive.
-    return subprocess.run(
-        [sys.executable, entry], cwd=repo_root, creationflags=_CREATE_NO_WINDOW
-    ).returncode
+    # Capture the child's combined stdout+stderr and tee it to a log while still
+    # echoing to the console. This preserves the C-runtime "Aborted" line and any
+    # last-gasp output that precedes a native crash -- output that would be lost
+    # if we simply inherited the parent's streams and the process then vanished.
+    child_log_path = os.path.join(_log_dir(), "hibachi-child.log")
+    try:
+        child_log = open(child_log_path, "a", buffering=1, encoding="utf-8", errors="replace")
+        child_log.write(f"\n===== child launch {time.strftime('%Y-%m-%d %H:%M:%S')} =====\n")
+    except Exception:
+        child_log = None
+
+    try:
+        proc = subprocess.Popen(
+            [sys.executable, entry],
+            cwd=repo_root,
+            creationflags=_CREATE_NO_WINDOW,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            bufsize=1,
+            universal_newlines=True,
+        )
+    except Exception as exc:
+        _LAUNCHER_LOG.error("failed to start child process: %s", exc)
+        if child_log:
+            child_log.close()
+        return 1
+
+    try:
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            if sys.stdout is not None:
+                try:
+                    sys.stdout.write(line)
+                    sys.stdout.flush()
+                except Exception:
+                    pass
+            if child_log:
+                try:
+                    child_log.write(line)
+                except Exception:
+                    pass
+    except Exception as exc:  # never let a tee error mask the real exit code
+        _LAUNCHER_LOG.warning("error while streaming child output: %s", exc)
+    finally:
+        code = proc.wait()
+        if child_log:
+            try:
+                child_log.write(f"===== child exited: {_describe_exit(code)} (raw={code}) =====\n")
+                child_log.close()
+            except Exception:
+                pass
+    return code
 
 
 def _activate_env_path() -> None:
@@ -346,6 +487,17 @@ def main() -> int:
             splash.close()
 
     code = _launch_app(repo_root)
+
+    # Record how the app exited. A negative code is a signal death (e.g. -6 =
+    # SIGABRT); _describe_exit names it and points at faulthandler.log.
+    if code == 0:
+        _LAUNCHER_LOG.info("HIBACHI exited cleanly.")
+    else:
+        _LAUNCHER_LOG.error(
+            "HIBACHI exited abnormally: %s. Diagnostics in %s "
+            "(hibachi-app.log, faulthandler.log, hibachi-child.log).",
+            _describe_exit(code), _log_dir(),
+        )
 
     # If the app failed to start / crashed, offer a way back to a good version.
     if code != 0:

@@ -19,6 +19,18 @@ from .gui_text_utils import app_icon_path
 from .project_manager import ProjectManager, app_state
 from .project_view_window import ProjectViewWindow
 
+# Diagnostics. Best-effort: if logging_setup is unavailable for any reason we
+# fall back to a plain logger so this module still imports and runs.
+try:
+    from .logging_setup import get_logger, lifecycle
+    log = get_logger("app_launch")
+except Exception:  # pragma: no cover
+    import logging
+    log = logging.getLogger("hibachi.app_launch")
+
+    def lifecycle(event, **fields):
+        log.info("%s %s", event, " ".join(f"{k}={v!r}" for k, v in fields.items()))
+
 
 
 def _check_if_last_window() -> None:
@@ -35,6 +47,7 @@ def _check_if_last_window() -> None:
         pass
     
     if not valid:
+        lifecycle("app.quit", reason="project window closed")
         app.quit()
 
 def _layer_list_dock(viewer):
@@ -110,6 +123,7 @@ def add_channel_visibility_toggle(viewer):
 
 def _handle_napari_close() -> None:
     """Callback when Napari closes."""
+    lifecycle("napari.destroyed", note="qt window destroyed signal fired")
     QTimer.singleShot(100, _check_if_last_window)
 
 def interactive_segmentation_with_config(selected_folder: str = None, project_manager=None) -> None:
@@ -143,6 +157,11 @@ def interactive_segmentation_with_config(selected_folder: str = None, project_ma
         mode = config.get('mode')
 
         image_stack = tiff.memmap(file_loc, mode='r') 
+        lifecycle("viewer.open",
+                  folder=os.path.basename(selected_folder),
+                  mode=mode,
+                  shape=getattr(image_stack, "shape", None),
+                  dtype=str(getattr(image_stack, "dtype", "?")))
         viewer = napari.Viewer(title=f"Segmentation: {os.path.basename(selected_folder)}")
 
         qt_window = viewer.window._qt_window
@@ -302,6 +321,7 @@ def interactive_segmentation_with_config(selected_folder: str = None, project_ma
         )
 
     except Exception as e:
+        log.exception("Failed to open segmentation viewer for %r", selected_folder)
         QMessageBox.critical(None, "Error", str(e))
         app_state.show_project_view_signal.emit()
 
@@ -353,34 +373,43 @@ def create_back_to_project_button(viewer: napari.Viewer, gui_manager: Any) -> QW
     """Creates the 'Back to Project List' button widget."""
     def _do():
         nonlocal viewer, gui_manager
-        
+
+        # Each numbered step below is logged so that if the process aborts
+        # (SIGABRT / "code -6") during teardown, the last breadcrumb in the log
+        # tells us exactly which step it died on -- the faulthandler dump then
+        # names the thread/line.
+        lifecycle("back_to_project.click")
+
         # 1. Clean up background tasks and data
         if gui_manager:
+            lifecycle("cleanup.begin")
             gui_manager.shutdown_and_cleanup()
             gui_manager = None
-            
+            lifecycle("cleanup.end")
+
         # 2. Show project view first
         app_state.show_project_view_signal.emit()
-        
+
         # 3. Safely close Napari
         if viewer:
             v = viewer
             viewer = None  # Break Python reference cycle
-            
+
             try:
                 # Hide immediately for responsiveness
                 if hasattr(v.window, '_qt_window'):
                     v.window._qt_window.hide()
-                
+
                 # CRITICAL FIX: Use Napari's native close() instead of qt_win.close().
                 # This ensures the internal app_model deregisters its actions properly
                 # and prevents the 'in_n_out missing window' TypeError on macOS.
-                QTimer.singleShot(50, v.close)
+                lifecycle("napari.close.scheduled", delay_ms=50)
+                QTimer.singleShot(50, lambda: (lifecycle("napari.close.invoke"), v.close()))
             except Exception:
-                pass
-            
+                log.exception("Error while closing napari viewer")
+
             # Force GC to collect the Python Napari viewer object
-            QTimer.singleShot(200, gc.collect)
+            QTimer.singleShot(200, lambda: (lifecycle("gc.collect.post_close"), gc.collect()))
 
     btn = QPushButton("Back to Project List")
     btn.clicked.connect(_do)

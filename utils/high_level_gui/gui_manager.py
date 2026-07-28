@@ -28,6 +28,18 @@ except ImportError as e:
     print(f"Error importing dependencies in gui_manager.py: {e}")
     raise
 
+# Diagnostics. Best-effort with a plain-logger fallback so this module always
+# imports even if logging_setup is somehow absent.
+try:
+    from .logging_setup import get_logger, lifecycle
+    log = get_logger("gui_manager")
+except Exception:  # pragma: no cover
+    import logging as _logging
+    log = _logging.getLogger("hibachi.gui_manager")
+
+    def lifecycle(event, **fields):
+        log.info("%s %s", event, " ".join(f"{k}={v!r}" for k, v in fields.items()))
+
 
 # =============================================================================
 # 1. Output Redirector
@@ -57,13 +69,17 @@ _quit_hook_connected = False
 
 def _cleanup_all_orphans():
     """Forcefully terminate any lingering background threads on app exit to prevent C++ aborts."""
+    pending = [w for w in _orphan_threads if w is not None]
+    if pending:
+        lifecycle("orphan_threads.cleanup", count=len(pending))
     for worker in list(_orphan_threads):
         try:
             if worker is not None and worker.isRunning():
+                log.warning("Terminating still-running orphan worker thread at exit: %r", worker)
                 worker.terminate()
                 worker.wait(200) # Give it time to cleanly exit C++ scope
         except Exception:
-            pass
+            log.exception("Error terminating orphan thread")
     _orphan_threads.clear()
 
 def _register_quit_hook():
@@ -161,6 +177,7 @@ class StepWorker(QThread):
         self.params = params
 
     def run(self) -> None:
+        lifecycle("worker.run.start", step=self.step_index)
         try:
             success = self.strategy.execute_step(
                 step_index=self.step_index,
@@ -168,9 +185,10 @@ class StepWorker(QThread):
                 image_stack_or_none=self.image_stack,
                 params=self.params
             )
+            lifecycle("worker.run.finish", step=self.step_index, success=bool(success))
             self.finished_signal.emit(success)
         except Exception as e:
-            traceback.print_exc()
+            log.exception("Worker step %s failed", self.step_index)
             self.error_signal.emit(str(e))
             self.finished_signal.emit(False)
 
@@ -975,7 +993,8 @@ class DynamicGUIManager(QObject):
         detaches the (now quickly-unwinding) thread so it can't crash the app on
         destruction."""
         if getattr(self, 'worker', None) and self.worker.isRunning():
-            print("    [Thread] Stopping background worker and its child processes...")
+            lifecycle("worker.stop.begin",
+                      baseline_pids=len(getattr(self, '_worker_child_baseline', set())))
             _register_quit_hook()  # Ensure cleanup happens at shutdown
 
             # Kill the multiprocessing.Pool workers this step spawned. Once they
@@ -1009,19 +1028,27 @@ class DynamicGUIManager(QObject):
             _orphan_threads.append(self.worker)
             self.worker.finished.connect(lambda w=self.worker: _cleanup_orphan_thread(w))
             self.worker = None
+            lifecycle("worker.stop.detached", orphan_count=len(_orphan_threads))
 
     def shutdown_and_cleanup(self) -> None:
         """Forcefully clears all data references and Napari internal buffers."""
         # Check if worker is running BEFORE we stop it
         is_worker_running = getattr(self, 'worker', None) and self.worker.isRunning()
+        try:
+            n_layers = len(self.viewer.layers) if self.viewer else 0
+        except Exception:
+            n_layers = "?"
+        lifecycle("cleanup.shutdown.begin",
+                  worker_running=bool(is_worker_running), layers=n_layers)
         self._stop_worker_safely()
 
         # 1. Clear Napari layers and buffers first
         if self.viewer:
+            lifecycle("cleanup.layers.clear")
             try:
                 self.viewer.layers.clear() 
             except Exception:
-                pass
+                log.exception("Error clearing napari layers")
         
         # 2. Clear strategy and large data references
         if hasattr(self, 'strategy') and self.strategy is not None:
@@ -1029,15 +1056,20 @@ class DynamicGUIManager(QObject):
                 # CRITICAL FIX: DO NOT clear the dictionary in-place if a worker is running!
                 # Doing so rips the memory-mapped file out from under the Loky process pool, causing a crash.
                 if not is_worker_running:
+                    lifecycle("cleanup.intermediate_state.clear")
                     self.strategy.intermediate_state.clear() 
+                else:
+                    lifecycle("cleanup.intermediate_state.skip", reason="worker still running")
             self.strategy = None
         
+        lifecycle("cleanup.refs.release")  # dropping image_stack / viewer refs
         self.image_stack = None 
         self.viewer = None 
         
         gc.collect()
         gc.collect()
-        print("    [RAM] Deep cleanup complete. All heavy references released.")
+        lifecycle("cleanup.shutdown.end")
+        log.info("Deep cleanup complete. All heavy references released.")
 
     def _calculate_spacing(self) -> None:
         """Parses spacing from config or defaults to 1.0."""
@@ -1571,6 +1603,8 @@ class DynamicGUIManager(QObject):
         # Record existing children first so _stop_worker_safely can later kill
         # only the pool workers *this* step spawns.
         self._worker_child_baseline = _snapshot_child_pids()
+        lifecycle("worker.start", step=step_index,
+                  baseline_children=len(self._worker_child_baseline))
         self.worker = StepWorker(
             self.strategy, step_index, self.image_stack, current_values
         )
