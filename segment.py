@@ -125,14 +125,41 @@ def global_exception_hook(exctype, value, tb):
     error_msg = "".join(traceback.format_exception(exctype, value, tb))
     log.critical("Uncaught exception reached the top level:\n%s", error_msg)
     
-    # Try to show a GUI popup so the user knows what happened
+    # Try to show a GUI popup so the user knows what happened. Include the log
+    # location and a Copy button so the user can hand the details over -- the
+    # same "copy from the crash window" affordance the launcher's crash dialog
+    # provides for native (code -6) crashes.
     app = QApplication.instance()
     if app:
+        log_note = ""
+        try:
+            log_note = f"\n\nLogs saved to:\n{_LOG_DIR}"
+        except Exception:
+            pass
+        detailed = error_msg + log_note
         error_box = QMessageBox()
         error_box.setIcon(QMessageBox.Critical)
         error_box.setWindowTitle("Critical Application Error")
         error_box.setText("An unexpected error occurred.")
-        error_box.setDetailedText(error_msg)
+        error_box.setInformativeText(
+            "Please send the details below to the developers. "
+            "Use 'Copy to clipboard', or attach the log files from:\n"
+            f"{_LOG_DIR if '_LOG_DIR' in globals() else '(see console)'}"
+        )
+        error_box.setDetailedText(detailed)
+        try:
+            from PyQt5.QtWidgets import QPushButton  # type: ignore
+            copy_btn = error_box.addButton("Copy to clipboard", QMessageBox.ActionRole)
+            error_box.addButton(QMessageBox.Close)
+
+            def _copy():
+                try:
+                    QApplication.clipboard().setText(detailed)
+                except Exception:
+                    pass
+            copy_btn.clicked.connect(_copy)
+        except Exception:
+            pass
         error_box.exec_()
 
     # Call the default handler to ensure proper exit code

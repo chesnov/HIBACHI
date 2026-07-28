@@ -225,20 +225,92 @@ def _run_rollback(repo_root: str) -> None:
         dialogs.notify("HIBACHI", f"Rollback failed:\n{msg}")
 
 
+def _tail(path: str, max_lines: int, max_chars: int = 20000) -> str:
+    """Return the last *max_lines* lines of a file (also capped at *max_chars*).
+
+    The interesting part of every HIBACHI log is at the END: faulthandler
+    appends its crash dump last, and the lifecycle breadcrumbs run chronologically
+    -- so the tail is exactly what a debugger wants to see.
+    """
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            lines = fh.readlines()
+    except FileNotFoundError:
+        return "(not present)"
+    except Exception as exc:
+        return f"(could not read: {exc})"
+    text = "".join(lines[-max_lines:])
+    if len(text) > max_chars:
+        text = "\u2026(truncated)\u2026\n" + text[-max_chars:]
+    return text.rstrip() or "(empty)"
+
+
+def _collect_crash_report(code: int) -> tuple[str, str | None]:
+    """Assemble a single diagnostics blob from the log files and save a copy.
+
+    Returns (text_to_show, saved_report_path_or_None). The saved file is the
+    reliable artefact the user can attach even after the window closes.
+    """
+    directory = _log_dir()
+    files = [
+        # (filename, human label, how many trailing lines to include)
+        ("faulthandler.log", "NATIVE CRASH TRACEBACK (faulthandler)", 250),
+        ("hibachi-child.log", "APP CONSOLE OUTPUT (captured by launcher)", 150),
+        ("hibachi-app.log", "APP LOG / LIFECYCLE BREADCRUMBS", 250),
+        ("hibachi-launcher.log", "LAUNCHER LOG", 80),
+    ]
+    header = (
+        "HIBACHI crash report\n"
+        f"  when      : {time.strftime('%Y-%m-%d %H:%M:%S')}\n"
+        f"  platform  : {sys.platform}, Python {sys.version.split()[0]}\n"
+        f"  exit      : {_describe_exit(code)} (raw code {code})\n"
+        f"  logs dir  : {directory}\n"
+        "\nPlease send this whole report to the developers. The most useful part is\n"
+        "the NATIVE CRASH TRACEBACK below, which names the thread and line the app\n"
+        "was on when it aborted.\n"
+    )
+    sections = [header]
+    for fname, label, n in files:
+        body = _tail(os.path.join(directory, fname), n)
+        sections.append(f"\n{'=' * 72}\n{label}  [{fname}]\n{'=' * 72}\n{body}\n")
+    text = "".join(sections)
+
+    saved_path = None
+    try:
+        saved_path = os.path.join(directory, "crash-report.txt")
+        with open(saved_path, "w", encoding="utf-8") as fh:
+            fh.write(text)
+    except Exception as exc:
+        _LAUNCHER_LOG.warning("could not save consolidated crash report: %s", exc)
+        saved_path = None
+    return text, saved_path
+
+
 def _offer_rollback_after_crash(repo_root: str, code: int) -> None:
-    """After a failed launch, offer to roll back to a previous version."""
+    """After a failed launch, show the crash window with copyable diagnostics and
+    (if there is an earlier version) offer to roll back to it."""
     import dialogs
 
-    versions = updater.list_versions(repo_root, limit=15)
-    if len(versions) < 2:
-        return  # nothing earlier to go to
-    if not dialogs.ask_yes_no(
-        "HIBACHI stopped unexpectedly",
-        f"HIBACHI exited with an error (code {code}).\n\n"
-        "Would you like to roll back to a previous version?",
-    ):
-        return
-    _run_rollback(repo_root)
+    try:
+        versions = updater.list_versions(repo_root, limit=15)
+    except Exception:
+        versions = []
+    can_rollback = len(versions) >= 2
+
+    details, report_path = _collect_crash_report(code)
+    summary = f"HIBACHI stopped unexpectedly \u2014 {_describe_exit(code)} (raw exit code {code})."
+
+    # Always surface the diagnostics, even when rollback isn't possible, so the
+    # user can copy the logs from the crash window itself.
+    want_rollback = dialogs.crash_report(
+        summary=summary,
+        details=details,
+        log_dir=_log_dir(),
+        report_path=report_path,
+        offer_rollback=can_rollback,
+    )
+    if want_rollback and can_rollback:
+        _run_rollback(repo_root)
 
 
 def _launch_app(repo_root: str) -> int:

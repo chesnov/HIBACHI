@@ -301,6 +301,139 @@ def ask_yes_no(title: str, message: str) -> bool:
     return result["yes"]
 
 
+def _open_path(path: str) -> None:
+    """Open a file/folder in the OS file manager (best-effort, no heavy deps)."""
+    import subprocess
+    import sys
+    try:
+        if sys.platform == "darwin":
+            subprocess.Popen(["open", path])
+        elif sys.platform.startswith("win"):
+            os.startfile(path)  # type: ignore[attr-defined]
+        else:
+            subprocess.Popen(["xdg-open", path])
+    except Exception as exc:
+        print(f"[dialogs] could not open {path}: {exc}")
+
+
+def crash_report(
+    summary: str,
+    details: str,
+    log_dir: str,
+    report_path: Optional[str] = None,
+    offer_rollback: bool = False,
+) -> bool:
+    """The crash window shown after HIBACHI exits abnormally.
+
+    Displays the collected diagnostics in a scrollable, selectable box and gives
+    the user one-click ways to hand them over: a **Copy** button, an **Open logs
+    folder** button, and (when written) the path to a consolidated
+    ``crash-report.txt``. When *offer_rollback* is True a "Roll back" action is
+    included.
+
+    Parameters
+    ----------
+    summary : str
+        One-line human summary, e.g. "HIBACHI stopped unexpectedly - killed by
+        SIGABRT (raw exit code -6)".
+    details : str
+        The full diagnostic text to show and to copy to the clipboard.
+    log_dir : str
+        Folder the "Open logs folder" button opens.
+    report_path : str, optional
+        Path to a saved consolidated report, shown so the user can find it even
+        after this window closes (the reliable cross-platform artefact: some
+        Linux clipboards are cleared when the owning app exits).
+    offer_rollback : bool
+        Whether to include the "Roll back to a previous version" action.
+
+    Returns
+    -------
+    bool
+        True if the user chose to roll back; otherwise False. With no display it
+        prints the summary and report path to the console and returns False.
+    """
+    tk, root, ui = _new_root()
+    if tk is None:
+        # Headless / no display: make sure the user still learns where to look.
+        print(f"[crash] {summary}")
+        if report_path:
+            print(f"[crash] Full report saved to: {report_path}")
+        print(f"[crash] Logs folder: {log_dir}")
+        return False
+    from tkinter import ttk
+
+    result = {"rollback": False}
+    root.resizable(True, True)  # let the user enlarge to read the trace
+    _header(tk, root, ui, "HIBACHI stopped unexpectedly")
+    body = _body(tk, root)
+
+    ttk.Label(
+        body,
+        text=(summary + "\n\nThe details below help us find the cause. Please send "
+              "them to the developers \u2014 use Copy, or attach the saved report file."),
+        wraplength=620, justify="left",
+    ).pack(anchor="w", padx=22, pady=(18, 10))
+
+    # --- diagnostics box (monospace, scrollable, selectable) --------------- #
+    box_wrap = tk.Frame(body, bg=_BORDER)
+    box_wrap.pack(fill="both", expand=True, padx=22)
+    sb = ttk.Scrollbar(box_wrap, orient="vertical")
+    box = tk.Text(box_wrap, width=92, height=18, wrap="none", relief="flat",
+                  bg=_CARD, fg=_TEXT, font=ui["mono"], padx=10, pady=8,
+                  highlightthickness=1, highlightbackground=_BORDER,
+                  yscrollcommand=sb.set)
+    sb.config(command=box.yview)
+    sb.pack(side="right", fill="y")
+    box.pack(side="left", fill="both", expand=True)
+    box.insert("1.0", details)
+    box.see("end")  # scroll to the crash itself, which is appended last
+    # Native selection + Ctrl/Cmd-C still work; the Copy button copies the
+    # canonical `details` string regardless of any stray edits, so leaving the
+    # widget editable is harmless and gives the best manual-copy behaviour.
+
+    if report_path:
+        ttk.Label(body, text=f"A copy was saved to:  {report_path}",
+                  style="Muted.TLabel").pack(anchor="w", padx=22, pady=(8, 0))
+
+    # --- actions ----------------------------------------------------------- #
+    btns = ttk.Frame(body)
+    btns.pack(fill="x", padx=22, pady=(14, 18))
+
+    def do_copy() -> None:
+        try:
+            root.clipboard_clear()
+            root.clipboard_append(details)
+            root.update()  # flush to the X selection while we're still alive
+            copy_btn.configure(text="Copied \u2713")
+            root.after(1500, lambda: copy_btn.configure(text="Copy details"))
+        except Exception as exc:
+            print(f"[dialogs] clipboard copy failed: {exc}")
+
+    copy_btn = ttk.Button(btns, text="Copy details", style="Accent.TButton", command=do_copy)
+    copy_btn.pack(side="left")
+    ttk.Button(btns, text="Open logs folder",
+               command=lambda: _open_path(log_dir)).pack(side="left", padx=(8, 0))
+
+    def close() -> None:
+        result["rollback"] = False
+        _finish(root)
+
+    if offer_rollback:
+        def roll_back() -> None:
+            result["rollback"] = True
+            _finish(root)
+        ttk.Button(btns, text="Roll back to a previous version",
+                   command=roll_back).pack(side="right")
+        ttk.Button(btns, text="Close", command=close).pack(side="right", padx=(0, 8))
+    else:
+        ttk.Button(btns, text="Close", command=close).pack(side="right")
+
+    root.protocol("WM_DELETE_WINDOW", close)
+    _run(root)
+    return result["rollback"]
+
+
 def notify(title: str, message: str) -> None:
     tk, root, ui = _new_root()
     if tk is None:
