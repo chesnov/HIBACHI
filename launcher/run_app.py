@@ -270,9 +270,31 @@ def _collect_crash_report(code: int) -> tuple[str, str | None]:
         "was on when it aborted.\n"
     )
     sections = [header]
+    app_side_present = False  # did the child (segment.py/logging_setup) write anything?
     for fname, label, n in files:
         body = _tail(os.path.join(directory, fname), n)
+        if fname in ("faulthandler.log", "hibachi-app.log") and body not in ("(not present)", "(empty)"):
+            app_side_present = True
         sections.append(f"\n{'=' * 72}\n{label}  [{fname}]\n{'=' * 72}\n{body}\n")
+
+    # If the app-side logs are absent, the crash window would otherwise look
+    # empty of anything useful. Say so plainly and point at the likely cause so
+    # the report is self-explanatory rather than mysteriously blank.
+    if not app_side_present:
+        note = (
+            "\n" + "!" * 72 + "\n"
+            "NOTE: No app-side diagnostics were found (faulthandler.log / "
+            "hibachi-app.log\nare missing or empty in the logs directory above).\n\n"
+            "That means the in-app logging isn't active. Check that the child-side\n"
+            "files are installed and being run:\n"
+            "  - segment.py                       (should import logging_setup)\n"
+            "  - utils/high_level_gui/logging_setup.py\n"
+            "  - utils/high_level_gui/app_launch.py, gui_manager.py\n"
+            "The LAUNCHER LOG and APP CONSOLE OUTPUT below still apply.\n"
+            + "!" * 72 + "\n"
+        )
+        sections.insert(1, note)  # right after the header, before the log sections
+
     text = "".join(sections)
 
     saved_path = None

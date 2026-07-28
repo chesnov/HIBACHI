@@ -387,7 +387,8 @@ def crash_report(
     sb.pack(side="right", fill="y")
     box.pack(side="left", fill="both", expand=True)
     box.insert("1.0", details)
-    box.see("end")  # scroll to the crash itself, which is appended last
+    box.mark_set("insert", "1.0")
+    box.see("1.0")  # show the top (header + crash traceback), not the short tail
     # Native selection + Ctrl/Cmd-C still work; the Copy button copies the
     # canonical `details` string regardless of any stray edits, so leaving the
     # widget editable is harmless and gives the best manual-copy behaviour.
