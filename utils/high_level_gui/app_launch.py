@@ -134,8 +134,40 @@ def _install_shutdown_hook(app) -> None:
         pass
 
 
+def _has_open_napari_viewer() -> bool:
+    """True if any napari viewer window is currently open/visible.
+
+    napari's main window is a top-level widget whose class lives in a napari
+    module, so we look for a visible top-level widget from the napari package.
+    """
+    app = QApplication.instance()
+    if app is None:
+        return False
+    try:
+        for w in app.topLevelWidgets():
+            try:
+                if not w.isVisible():
+                    continue
+                if "napari" in (type(w).__module__ or ""):
+                    return True
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return False
+
+
 def _check_if_last_window() -> None:
-    """Checks if the project window is closed; if so, quits the app."""
+    """Quit the app only when the project window is gone AND no viewer is open.
+
+    This runs 100 ms after any napari window is destroyed (see
+    _handle_napari_close). It must NOT quit just because the project window
+    isn't the visible window at that instant: when the user closes one sample
+    and opens another, the freshly-opened napari viewer is what's visible and
+    the project window is not -- quitting there would tear the app down right as
+    the user opens a sample (the "code -6 on open" crash). So we also require
+    that no napari viewer is open before quitting.
+    """
     app = QApplication.instance()
     if not app:
         return
@@ -146,10 +178,17 @@ def _check_if_last_window() -> None:
             valid = pv.isVisible()
     except Exception:
         pass
-    
-    if not valid:
-        lifecycle("app.quit", reason="project window closed")
-        app.quit()
+
+    if valid:
+        return  # project window is up; nothing to do
+
+    if _has_open_napari_viewer():
+        # A viewer is open (e.g. the user just opened a sample). Do not quit.
+        lifecycle("app.quit.skipped", reason="napari viewer still open")
+        return
+
+    lifecycle("app.quit", reason="no project window and no open viewer")
+    app.quit()
 
 def _layer_list_dock(viewer):
     """Locate napari's layer-list dock widget across versions, so we can place
