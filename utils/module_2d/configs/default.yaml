@@ -6,21 +6,21 @@ execute_raw_segmentation_fluorescence_2d:
         type: bool
         value: true
       scale_profiles_percentile:
-        label: Tubularity Profiles (Percentiles + Per-Scale Filters)
+        label: "Tubularity Profiles (Relative: low/high = detection/seed percentiles; high=100 disables seed)"
         type: scale_table
         value:
         - scale: 1.0
           low: 95.0
-          high: 99.0
+          high: 100.0
           smooth_sigma: 0.1
           connect_max_gap_physical: 0.0
         - scale: 1.5
-          low: 98.0
+          low: 95.0
           high: 100.0
           smooth_sigma: 0.1
           connect_max_gap_physical: 0.0
         - scale: 3.0
-          low: 98.0
+          low: 95.0
           high: 100.0
           smooth_sigma: 0.1
           connect_max_gap_physical: 0.0
@@ -42,7 +42,7 @@ execute_raw_segmentation_fluorescence_2d:
         label: Minimum Size (Pixels, Raw Seg - GLOBAL)
         type: int
         value: 200
-        min: 10
+        min: 1
         max: 50000
         step: 1
       trace_max_gap:

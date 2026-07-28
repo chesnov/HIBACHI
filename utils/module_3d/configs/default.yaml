@@ -32,7 +32,7 @@ execute_raw_segmentation_fluorescence:
       label: Minimum Size (Voxels, Raw Seg - GLOBAL)
       type: int
       value: 1000
-      min: 10
+      min: 1
       max: 50000
       step: 1
     # smooth_sigma and connect_max_gap_physical are now set PER SCALE in the
