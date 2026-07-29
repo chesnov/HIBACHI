@@ -27,6 +27,9 @@ Public API
 from __future__ import annotations
 
 import os
+import sys
+import shutil
+import subprocess
 import time
 import logging
 from dataclasses import dataclass, asdict, field
@@ -43,6 +46,10 @@ from PyQt5.QtWidgets import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Suppress the console window that would flash when a GUI (pythonw) process
+# spawns ffmpeg on Windows. 0 (no flag) on other platforms.
+_CREATE_NO_WINDOW = 0x08000000 if sys.platform.startswith("win") else 0
 
 # Axis choices: label -> index of the napari camera.angles component we sweep.
 # napari's camera.angles is a 3-tuple of Euler angles (degrees). Which one reads
@@ -129,21 +136,115 @@ def _as_bool(v) -> bool:
 
 
 # --------------------------------------------------------------------------- #
-# ffmpeg discovery (cross-OS, no system install required)
+# ffmpeg discovery (cross-OS)
 # --------------------------------------------------------------------------- #
-def _ensure_ffmpeg() -> bool:
-    """Make a bundled ffmpeg binary discoverable to imageio. Returns True if an
-    mp4-capable ffmpeg is available."""
-    if os.environ.get("IMAGEIO_FFMPEG_EXE"):
-        return True
+# The app launches the environment's Python directly (no `conda activate`), so
+# the env's bin/ directory is usually NOT on PATH. A perfectly good ffmpeg living
+# inside the env can therefore be invisible to imageio unless we point at it
+# explicitly. _ensure_ffmpeg checks, in order: an existing env var, the
+# imageio-ffmpeg managed binary, a real ffmpeg inside the active env, and finally
+# a system ffmpeg on PATH -- and records *why* it failed so the UI can say
+# something actionable.
+_FFMPEG_REASON = ""
+
+
+def _env_ffmpeg_candidates() -> List[str]:
+    """Possible ffmpeg locations inside the active environment (which may not be
+    on PATH because the app runs the env interpreter without activation)."""
+    prefix = sys.prefix
+    if os.name == "nt":
+        dirs = (os.path.join(prefix, "Library", "bin"),
+                os.path.join(prefix, "Scripts"),
+                prefix)
+        names = ("ffmpeg.exe",)
+    else:
+        dirs = (os.path.join(prefix, "bin"),)
+        names = ("ffmpeg",)
+    return [os.path.join(d, n) for d in dirs for n in names]
+
+
+def _which_via_login_shell(binary: str) -> Optional[str]:
+    """Resolve `binary` through the user's *login* shell PATH.
+
+    A GUI-launched process inherits a minimal PATH that often omits the
+    directories a package manager installs into (e.g. Homebrew on macOS). The
+    login shell loads the user's real PATH exactly as an interactive terminal
+    would, so this finds the binary wherever it actually lives -- without this
+    code hardcoding any directory. Windows GUI processes already inherit the
+    full user PATH, so this is a POSIX-only fallback. Best-effort; returns None
+    on any failure (e.g. an exotic shell that lacks `command -v`).
+    """
+    if os.name == "nt":
+        return None
+    shell = os.environ.get("SHELL") or "/bin/sh"
     try:
-        import imageio_ffmpeg  # bundled static binary, all platforms
-        exe = imageio_ffmpeg.get_ffmpeg_exe()
+        proc = subprocess.run(
+            [shell, "-l", "-c", f"command -v {binary}"],
+            capture_output=True, text=True, timeout=10,
+        )
+    except Exception:
+        return None
+    for line in reversed(proc.stdout.splitlines()):
+        cand = line.strip()
+        if cand and os.path.isabs(cand) and os.path.exists(cand):
+            return cand
+    return None
+
+
+def _ensure_ffmpeg() -> bool:
+    """Locate an mp4-capable ffmpeg and point imageio at it. Returns True on
+    success; on failure sets _FFMPEG_REASON to a human-readable explanation."""
+    global _FFMPEG_REASON
+
+    # 1. Already configured and present.
+    exe = os.environ.get("IMAGEIO_FFMPEG_EXE")
+    if exe and os.path.exists(exe):
+        return True
+
+    tried: List[str] = []
+
+    # 2. imageio-ffmpeg's managed binary (bundled in recent wheels).
+    try:
+        import imageio_ffmpeg
+        try:
+            exe = imageio_ffmpeg.get_ffmpeg_exe()
+        except Exception as exc:
+            exe = None
+            tried.append(f"imageio-ffmpeg installed but no usable binary ({exc})")
         if exe and os.path.exists(exe):
             os.environ["IMAGEIO_FFMPEG_EXE"] = exe
             return True
-    except Exception as exc:
-        logger.info("imageio-ffmpeg unavailable (%s); mp4 export may be disabled.", exc)
+    except Exception:
+        tried.append("imageio-ffmpeg not importable in this environment")
+
+    # 3. A real ffmpeg inside the active env (env bin is often not on PATH).
+    for cand in _env_ffmpeg_candidates():
+        if os.path.exists(cand):
+            os.environ["IMAGEIO_FFMPEG_EXE"] = cand
+            return True
+
+    # 4. System ffmpeg on the current PATH.
+    w = shutil.which("ffmpeg")
+    if w and os.path.exists(w):
+        os.environ["IMAGEIO_FFMPEG_EXE"] = w
+        return True
+
+    # 5. A system ffmpeg that is installed but off our (possibly stripped) PATH.
+    #    A GUI-launched process (desktop icon / Finder / .desktop) inherits a
+    #    minimal PATH. Rather than hardcode install directories -- which differ
+    #    by OS, distro and package manager and would not replicate elsewhere --
+    #    resolve portably: (a) the OS's own default binary path, and (b) whatever
+    #    the user's login shell resolves, without us ever naming a directory.
+    defpath = os.pathsep.join(p for p in os.defpath.split(os.pathsep) if p)
+    for cand in (shutil.which("ffmpeg", path=defpath) if defpath else None,
+                 _which_via_login_shell("ffmpeg")):
+        if cand and os.path.exists(cand):
+            os.environ["IMAGEIO_FFMPEG_EXE"] = cand
+            return True
+
+    _FFMPEG_REASON = ("; ".join(tried)
+                      or "no ffmpeg found on PATH, in the environment, or via the login shell")
+    logger.info("ffmpeg unavailable: %s", _FFMPEG_REASON)
     return False
 
 
@@ -365,8 +466,12 @@ class TurntableDialog(QDialog):
         if self.combo_fmt.currentIndex() == _FORMATS.index("mp4") and not self._mp4_ok:
             QMessageBox.warning(
                 self, "MP4 unavailable",
-                "No ffmpeg binary was found, so MP4 can't be written.\n"
-                "Install the 'imageio-ffmpeg' package, or choose GIF instead.",
+                "No ffmpeg binary could be found, so MP4 can't be written.\n\n"
+                f"Reason: {_FFMPEG_REASON or 'unknown'}\n\n"
+                "Install ffmpeg so it's on your PATH (via your system or conda "
+                "package manager), or install the 'imageio-ffmpeg' Python package "
+                "into this environment, then reopen this dialog.\n\n"
+                "Or choose GIF, which needs no ffmpeg.",
             )
             return
         parent = os.path.dirname(path) or "."
@@ -487,20 +592,53 @@ def _even(a: np.ndarray) -> np.ndarray:
 
 
 def _write_mp4(out_path: str, frames: List[np.ndarray], fps: int) -> None:
-    _ensure_ffmpeg()
-    try:
-        import imageio.v2 as iio
-    except Exception:
-        import imageio as iio  # older imageio without the .v2 shim
-    writer = iio.get_writer(
-        out_path, fps=fps, codec="libx264", quality=8,
-        macro_block_size=None, pixelformat="yuv420p",
-    )
-    try:
-        for f in frames:
-            writer.append_data(_even(f))
-    finally:
-        writer.close()
+    """Encode frames to H.264 MP4 by piping raw RGB to the ffmpeg binary.
+
+    Uses the executable located by _ensure_ffmpeg (system, env, or the copy
+    bundled with imageio-ffmpeg). This needs only an ffmpeg *binary* -- not the
+    imageio or imageio-ffmpeg Python packages, which may be missing in some
+    environments even when a system ffmpeg is present.
+    """
+    if not _ensure_ffmpeg():
+        raise RuntimeError(_FFMPEG_REASON or "no ffmpeg binary available")
+    exe = os.environ["IMAGEIO_FFMPEG_EXE"]
+
+    # Uniform, contiguous, even-sized RGB uint8 frames (yuv420p needs even dims).
+    prepared = [np.ascontiguousarray(_even(f)[..., :3].astype(np.uint8)) for f in frames]
+    h, w = prepared[0].shape[:2]
+
+    def _run(codec: str):
+        cmd = [exe, "-y", "-loglevel", "error",
+               "-f", "rawvideo", "-pix_fmt", "rgb24",
+               "-s", f"{w}x{h}", "-r", str(fps), "-i", "-",
+               "-an", "-c:v", codec, "-pix_fmt", "yuv420p"]
+        if codec == "libx264":
+            cmd += ["-crf", "18", "-preset", "medium"]
+        cmd.append(out_path)
+        proc = subprocess.Popen(
+            cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE, creationflags=_CREATE_NO_WINDOW,
+        )
+        try:
+            for fr in prepared:
+                proc.stdin.write(fr.tobytes())
+        except (BrokenPipeError, OSError):
+            pass  # ffmpeg exited early; the error is captured from stderr below
+        try:
+            proc.stdin.close()
+        except OSError:
+            pass
+        err = proc.stderr.read().decode("utf-8", "replace") if proc.stderr else ""
+        proc.wait()
+        return proc.returncode, err
+
+    # Prefer H.264; fall back to a near-universal codec if this ffmpeg build
+    # lacks libx264 (some minimal system builds do).
+    rc, err = _run("libx264")
+    if rc != 0 and ("x264" in err.lower() or "encoder" in err.lower()):
+        rc, err = _run("mpeg4")
+    if rc != 0:
+        raise RuntimeError(f"ffmpeg failed (code {rc}): {err.strip()[:500] or 'no error output'}")
 
 
 def _write_gif(out_path: str, frames: List[np.ndarray], fps: int) -> None:
