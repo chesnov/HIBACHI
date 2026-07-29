@@ -190,6 +190,14 @@ def generate_synthetic_channel(pm, template_ch, rel_filter, out_dir):
             continue
             
         ch_path = ch_dict[template_ch]
+        # NB: `sample_name` (the registry key) is a lowercased, cleaned MATCHING
+        # key. The real on-disk sample folder keeps its original case. Name the
+        # output after the ORIGINAL so the project-view tree -- which groups
+        # channels by case-sensitive folder basename -- nests this synthetic
+        # channel under the existing sample instead of listing it as a separate
+        # image. (The clean key is still used below for RELATIONAL_ANALYSIS
+        # lookups, whose folders are named with the clean key.)
+        orig_sample_name = os.path.basename(os.path.normpath(ch_path))
         
         # Find raw TIF to get background/shape
         tif_file = next((f for f in os.listdir(ch_path) if f.lower().endswith(('.tif', '.tiff'))), None)
@@ -250,10 +258,11 @@ def generate_synthetic_channel(pm, template_ch, rel_filter, out_dir):
         max_val = np.iinfo(real_img.dtype).max if np.issubdtype(real_img.dtype, np.integer) else 1.0
         synth_img = np.clip(synth_float, 0, max_val).astype(real_img.dtype)
         
-        # Save exact folder structure
-        sample_out = os.path.join(out_dir, sample_name)
+        # Save exact folder structure, preserving the original sample name's case
+        # so it matches the other channels in the project-view tree (see above).
+        sample_out = os.path.join(out_dir, orig_sample_name)
         os.makedirs(sample_out, exist_ok=True)
-        tiff.imwrite(os.path.join(sample_out, f"{sample_name}.tif"), synth_img)
+        tiff.imwrite(os.path.join(sample_out, f"{orig_sample_name}.tif"), synth_img)
         
         # Copy YAML configuration, tagging it as procedurally generated so the
         # channel can be robustly identified later (e.g. cleaned up on re-setup).
