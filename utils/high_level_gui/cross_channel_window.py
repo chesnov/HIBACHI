@@ -438,6 +438,14 @@ class CrossChannelAnalyzerWindow(QMainWindow):
         except Exception as exc:
             print(f"Could not add channel visibility toggle: {exc}")
 
+        # 3D rotation recorder (3D samples only), docked beneath the layer list.
+        if shape and len(shape) == 3:
+            try:
+                from ..module_3d.turntable import add_turntable_button
+                add_turntable_button(viewer)
+            except Exception as exc:
+                print(f"Could not add 3D rotation recorder: {exc}")
+
     def _draw_proximity_bridges(self, viewer, df, shape, spacing):
         """Delegate to the module-level bridge drawer (used by preview_recipe)."""
         draw_proximity_bridges(viewer, df, shape, spacing)
@@ -679,4 +687,12 @@ def open_sample_overlay(project_manager, sample_name, analysis_name=None, parent
         add_channel_visibility_toggle(viewer)
     except Exception as exc:
         print(f"Could not add channel visibility toggle: {exc}")
+
+    # 3D rotation recorder (3D samples only), docked beneath the layer list.
+    if shape and len(shape) == 3:
+        try:
+            from ..module_3d.turntable import add_turntable_button
+            add_turntable_button(viewer)
+        except Exception as exc:
+            print(f"Could not add 3D rotation recorder: {exc}")
     return True

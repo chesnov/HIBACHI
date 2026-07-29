@@ -325,6 +325,14 @@ def interactive_segmentation_with_config(selected_folder: str = None, project_ma
         # One-click toggle to hide/show every channel, docked under the layer list.
         add_channel_visibility_toggle(viewer)
 
+        # 3D rotation recorder (3D mode only), docked just beneath the layer list.
+        if not str(mode or "").endswith("_2d"):
+            try:
+                from ..module_3d.turntable import add_turntable_button
+                add_turntable_button(viewer)
+            except Exception as exc:
+                print(f"Could not add 3D rotation recorder: {exc}")
+
         # --- Processing control -------------------------------------------
         # Navigation (Back / Forward) is non-destructive: it never deletes
         # results. Computing is a separate, explicit action (Process), which is
