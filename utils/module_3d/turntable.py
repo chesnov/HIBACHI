@@ -546,12 +546,13 @@ def render_turntable(viewer, settings: TurntableSettings, out_path: str,
             angles[axis] = base[axis] + delta * i
             viewer.camera.angles = tuple(angles)
             QApplication.processEvents()  # let the canvas redraw at the new angle
-            shot = viewer.screenshot(
-                canvas_only=settings.canvas_only,
-                scale=settings.scale,
-                flash=False,
-            )
-            frames.append(np.asarray(shot)[..., :3])  # drop alpha
+            # NB: do NOT pass `scale` to napari.screenshot. Internally it does an
+            # in-place `size *= scale` on an int array, which raises under
+            # numpy>=2 for any float scale (even 1.0). We capture at native size
+            # and apply the resolution multiplier ourselves below.
+            shot = viewer.screenshot(canvas_only=settings.canvas_only, flash=False)
+            frame = np.asarray(shot)[..., :3]  # drop alpha
+            frames.append(_resize_rgb(frame, settings.scale))
             progress.setValue(i + 1)
     finally:
         # Always restore the viewer to how the user left it.
@@ -583,6 +584,19 @@ def render_turntable(viewer, settings: TurntableSettings, out_path: str,
     QMessageBox.information(parent, "Rotation saved",
                             f"Saved {len(frames)} frames to:\n{out_path}")
     return True
+
+
+def _resize_rgb(arr: np.ndarray, scale: float) -> np.ndarray:
+    """Scale an RGB frame by `scale`. Done here rather than via napari's
+    screenshot `scale` argument, which multiplies an int size array by a float
+    in place and raises under numpy>=2."""
+    if not scale or abs(scale - 1.0) < 1e-6:
+        return arr
+    from PIL import Image
+    h, w = arr.shape[:2]
+    new_w = max(2, int(round(w * scale)))
+    new_h = max(2, int(round(h * scale)))
+    return np.asarray(Image.fromarray(arr).resize((new_w, new_h), Image.LANCZOS))
 
 
 def _even(a: np.ndarray) -> np.ndarray:
