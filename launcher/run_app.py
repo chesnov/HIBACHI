@@ -149,26 +149,78 @@ def _find_env_manager() -> tuple[str, list[str]] | tuple[None, None]:
 _CREATE_NO_WINDOW = 0x08000000 if sys.platform.startswith("win") else 0
 
 
+def _pip_requirements_from_env(env_file: str) -> list[str]:
+    """Return the packages listed under the `pip:` subsection of environment.yml.
+
+    These are pip-managed and must be applied with pip explicitly (see
+    _update_environment): `micromamba env update` does not reliably re-run the
+    pip subsection when the conda-level solve finds nothing to do, so pip-only
+    additions would otherwise be silently skipped on update.
+    """
+    try:
+        import yaml
+        with open(env_file) as fh:
+            spec = yaml.safe_load(fh) or {}
+    except Exception:
+        return []
+    reqs: list[str] = []
+    for dep in (spec.get("dependencies") or []):
+        if isinstance(dep, dict) and dep.get("pip"):
+            reqs.extend(str(x) for x in dep["pip"])
+    return reqs
+
+
 def _update_environment(repo_root: str, splash) -> bool:
-    """Run `<mgr> env update` for the *currently active* prefix. Best-effort."""
-    exe, _ = _find_env_manager()
+    """Bring the *currently active* env in line with environment.yml. Best-effort.
+
+    Two passes, because they cover different dependency classes:
+      1. `<mgr> env update` applies the conda-level packages.
+      2. an explicit `pip install` of the env file's `pip:` subsection, run with
+         the env's own interpreter. This second pass is essential: micromamba's
+         `env update` may skip the pip subsection entirely when the conda solve
+         finds nothing to do, so pip-only additions (e.g. imageio-ffmpeg) never
+         land on update without it. Version specifiers in the file mean pip
+         no-ops on already-satisfied packages, so this is safe to run every time.
+    """
     env_file = os.path.join(repo_root, "install", "environment.yml")
-    if not exe or not os.path.isfile(env_file):
-        _msg(splash, "Skipping dependency update (no environment manager found).")
+    if not os.path.isfile(env_file):
+        _msg(splash, "Skipping dependency update (environment.yml not found).")
         return False
 
+    did_something = False
+
+    # --- Pass 1: conda-level packages via the environment manager -------- #
+    exe, _ = _find_env_manager()
     prefix = sys.prefix  # the active env we are running inside
-    cmd = [exe, "env", "update", "--prefix", prefix, "--file", env_file, "--yes"]
-    _msg(splash, "Updating dependencies (this may take a few minutes)...")
-    try:
-        subprocess.run(cmd, check=True, creationflags=_CREATE_NO_WINDOW)
-        return True
-    except subprocess.CalledProcessError as exc:
-        _msg(splash, f"Dependency update failed ({exc.returncode}); using existing packages.")
-        return False
-    except Exception as exc:  # pragma: no cover - defensive
-        _msg(splash, f"Dependency update error: {exc}; using existing packages.")
-        return False
+    if exe:
+        cmd = [exe, "env", "update", "--prefix", prefix, "--file", env_file, "--yes"]
+        _msg(splash, "Updating dependencies (this may take a few minutes)...")
+        try:
+            subprocess.run(cmd, check=True, creationflags=_CREATE_NO_WINDOW)
+            did_something = True
+        except subprocess.CalledProcessError as exc:
+            _msg(splash, f"conda-level update failed ({exc.returncode}); continuing with pip.")
+        except Exception as exc:  # pragma: no cover - defensive
+            _msg(splash, f"conda-level update error: {exc}; continuing with pip.")
+    else:
+        _msg(splash, "No environment manager found; applying pip dependencies only.")
+
+    # --- Pass 2: pip subsection via the env's own interpreter ------------ #
+    reqs = _pip_requirements_from_env(env_file)
+    if reqs:
+        pip_cmd = [sys.executable, "-m", "pip", "install", "--no-input", *reqs]
+        _msg(splash, "Installing/verifying pip dependencies...")
+        try:
+            subprocess.run(pip_cmd, check=True, creationflags=_CREATE_NO_WINDOW)
+            did_something = True
+        except subprocess.CalledProcessError as exc:
+            _msg(splash, f"pip dependency install failed ({exc.returncode}); using existing packages.")
+        except Exception as exc:  # pragma: no cover - defensive
+            _msg(splash, f"pip dependency error: {exc}; using existing packages.")
+
+    if not did_something:
+        _msg(splash, "Dependency update did nothing; using existing packages.")
+    return did_something
 
 
 def _msg(splash, text: str) -> None:
