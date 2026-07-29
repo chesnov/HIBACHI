@@ -86,7 +86,7 @@ class SyntheticDataDialog(QDialog):
         try:
             generate_synthetic_channel(self.pm, template_ch, rel_filter, out_channel_dir)
             QApplication.restoreOverrideCursor()
-            QMessageBox.information(self, "Success", f"Synthetic data generated!\nSaved to: {out_channel_dir}\n\nPlease reload the project to see it.")
+            QMessageBox.information(self, "Success", f"Synthetic data generated!\nSaved to: {out_channel_dir}\n\nIt will appear in the project view automatically when you return to it.")
             self.accept()
         except Exception as e:
             QApplication.restoreOverrideCursor()

@@ -48,6 +48,7 @@ class ProjectViewWindow(QMainWindow):
         self._content_view = None       # the unified ProjectContentsView (or None)
         self._cross_scan_dir = None     # dir the cross-channel analyzer should scan
         self._project_root = None       # project root that holds RELATIONAL_ANALYSIS
+        self._channel_dirs = []          # channel folders currently shown (to detect new ones)
         self._batch_dialog = None       # live batch progress dialog (if running)
         # Set when we open a sample in the napari view; on returning (window
         # re-activates) we refresh the tree so status / "last edited" reflect any
@@ -351,6 +352,7 @@ class ProjectViewWindow(QMainWindow):
         self._install_content_view(view)
 
         self._project_root = info.path
+        self._channel_dirs = list(info.channel_dirs or [])
         # Anchor cross-channel scanning at a channel dir so its parent (the
         # project root) is what gets scanned for sibling channels.
         self._cross_scan_dir = info.channel_dirs[0] if info.channel_dirs else info.path
@@ -418,6 +420,28 @@ class ProjectViewWindow(QMainWindow):
         except Exception as exc:
             QMessageBox.critical(self, "Overlay Error", f"Could not open overlay:\n{exc}")
 
+    def _maybe_rediscover_channels(self) -> None:
+        """Rebuild the multi-channel tree if channel folders were added or removed
+        on disk since it was last built (e.g. a newly generated synthetic
+        channel). Cheap no-op when the set of channel folders is unchanged, so
+        it's safe to call on every re-activation."""
+        view = self._content_view
+        if view is None or not getattr(view, "_multichannel", False) or not self._project_root:
+            return
+        try:
+            info = classify_path(self._project_root)
+        except Exception as exc:
+            print(f"[project view] channel rediscover failed: {exc}")
+            return
+        if getattr(info, "kind", None) != MULTICHANNEL_PROJECT:
+            return
+        new_dirs = set(info.channel_dirs or [])
+        if new_dirs and new_dirs != set(self._channel_dirs):
+            # The structure changed; rebuild from the fresh discovery. This
+            # re-renders the whole tree, so it only runs when something actually
+            # changed rather than on every focus event.
+            self.open_multichannel(info)
+
     def _rescan_analyses(self) -> None:
         """Refresh the overlay picker from disk (cheap; called on re-activation)."""
         view = self._content_view
@@ -433,6 +457,9 @@ class ProjectViewWindow(QMainWindow):
         # overlay viewer), rescan so freshly-run analyses appear in the picker.
         if event.type() == QEvent.ActivationChange and self.isActiveWindow():
             self._rescan_analyses()
+            # Pick up channel folders added while we were away (e.g. a synthetic
+            # channel generated from the analyzer) without a manual reload.
+            self._maybe_rediscover_channels()
             # If we just came back from processing a sample, recompute the tree so
             # status ("Step k/n …") and "last edited" reflect what's now on disk.
             if self._pending_content_refresh:
