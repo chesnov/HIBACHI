@@ -939,41 +939,44 @@ def segment_cells_first_pass_raw(
 
                 bg_report: List[float] = []
                 sc_report: List[float] = []
-                for read_sl, _ in tqdm(list(_get_chunk_slices(volume.shape, (64, 512, 512))), desc="    Standardizing"):
-                    block = volume[read_sl].astype(np.float32)
-                    out = np.empty_like(block)
-                    for i in range(block.shape[0]):
-                        s2d = block[i]
-                        # Local background: removes the (possibly structured) pedestal
-                        # while preserving structures smaller than the window.
-                        if win > 0:
-                            bg = ndimage.grey_opening(s2d, size=(win, win))
-                            bg_center = float(np.median(bg))
-                        else:
-                            bg = float(np.median(s2d))
-                            bg_center = bg
-                        resid = s2d - bg
+                # Normalize per FULL z-slice. We iterate z directly instead of tiling
+                # the XY plane into (…, 512, 512) blocks: the background and the noise
+                # sigma below are slice-GLOBAL statistics, so any XY tiling here would
+                # estimate a *different* sigma per tile and bake a visible per-tile
+                # strictness seam into the downstream (global) percentile threshold.
+                # Z-slices are independent, so looping z is both correct and
+                # memory-safe -- only one full XY plane is resident at a time.
+                for z in tqdm(range(volume.shape[0]), desc="    Standardizing"):
+                    s2d = volume[z].astype(np.float32)
+                    # Local background: removes the (possibly structured) pedestal
+                    # while preserving structures smaller than the window.
+                    if win > 0:
+                        bg = ndimage.grey_opening(s2d, size=(win, win))
+                        bg_center = float(np.median(bg))
+                    else:
+                        bg = float(np.median(s2d))
+                        bg_center = bg
+                    resid = s2d - bg
 
-                        # Noise scale: a SINGLE robust GLOBAL value per slice, NOT a
-                        # spatially-varying local RMS. A local RMS is dominated by the
-                        # signal itself -- it inflates around bright cells (suppressing
-                        # them and haloing) and, on clean backgrounds, its floor
-                        # collapses toward zero and amplifies noise into large "clouds".
-                        # MAD is robust to the sparse bright tail, so it estimates the
-                        # background noise even with cells present. Fallback covers the
-                        # degenerate case of a large constant region (e.g. zero-padding
-                        # outside the FOV) where the MAD would otherwise be 0.
-                        absr = np.abs(resid)
-                        sigma = 1.4826 * float(np.median(absr))
-                        if not np.isfinite(sigma) or sigma < 1e-6:
-                            nz = absr[absr > 0]
-                            sigma = float(np.mean(nz)) if nz.size else 1.0
-                        sigma = max(sigma, 1e-6)
+                    # Noise scale: a SINGLE robust GLOBAL value per FULL slice, NOT a
+                    # spatially-varying local RMS. A local RMS is dominated by the
+                    # signal itself -- it inflates around bright cells (suppressing
+                    # them and haloing) and, on clean backgrounds, its floor
+                    # collapses toward zero and amplifies noise into large "clouds".
+                    # MAD is robust to the sparse bright tail, so it estimates the
+                    # background noise even with cells present. Fallback covers the
+                    # degenerate case of a large constant region (e.g. zero-padding
+                    # outside the FOV) where the MAD would otherwise be 0.
+                    absr = np.abs(resid)
+                    sigma = 1.4826 * float(np.median(absr))
+                    if not np.isfinite(sigma) or sigma < 1e-6:
+                        nz = absr[absr > 0]
+                        sigma = float(np.mean(nz)) if nz.size else 1.0
+                    sigma = max(sigma, 1e-6)
 
-                        out[i] = np.clip(resid, 0.0, None) / sigma
-                        bg_report.append(bg_center)
-                        sc_report.append(sigma)
-                    norm_mm[read_sl] = out
+                    norm_mm[z] = np.clip(resid, 0.0, None) / sigma
+                    bg_report.append(bg_center)
+                    sc_report.append(sigma)
                 norm_mm.flush()
                 win_desc = str(win) if win > 0 else "global(per-slice)"
                 print(f"    [Relative/local-SNR] window={win_desc}px | "
