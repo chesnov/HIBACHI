@@ -439,6 +439,14 @@ class FluorescenceStrategy(ProcessingStrategy):
         cell_bodies_path = files["cell_bodies"]
         final_seg_path = files["final_segmentation"]
 
+        # Dedicated, isolated temp dir for this step's on-disk chunk arrays. It is
+        # defined ONCE here and reused for cleanup in `finally` so the write dir
+        # and cleanup dir can never drift apart. It must NOT be the shared
+        # `self.temp_dir` (temp_artifacts): other steps and the pipeline
+        # create/clear that directory, which can delete these chunks mid-stitch
+        # and cause a FileNotFoundError when the stitch phase reloads them.
+        temp_chunk_dir = os.path.join(self.processed_dir, "sep_multi_soma_temp")
+
         if not os.path.exists(trimmed_seg_path) or not os.path.exists(cell_bodies_path):
             return False
 
@@ -471,10 +479,7 @@ class FluorescenceStrategy(ProcessingStrategy):
                 "local_analysis_radius": int(
                     params.get("local_analysis_radius", 10)
                 ),
-                "memmap_dir": os.path.join(
-                    self.processed_dir, "sep_multi_soma_temp"
-                ),
-                "memmap_dir": self.temp_dir,
+                "memmap_dir": temp_chunk_dir,
                 "memmap_voxel_threshold": int(
                     params.get("memmap_voxel_threshold", 25_000_000)
                 )
@@ -512,9 +517,6 @@ class FluorescenceStrategy(ProcessingStrategy):
             if 'final_separated_cells' in locals():
                 del final_separated_cells
 
-            temp_chunk_dir = os.path.join(
-                self.processed_dir, "sep_multi_soma_temp"
-            )
             if os.path.exists(temp_chunk_dir):
                 shutil.rmtree(temp_chunk_dir, ignore_errors=True)
             gc.collect()
