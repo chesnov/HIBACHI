@@ -408,6 +408,13 @@ class Fluorescence2DStrategy(ProcessingStrategy):
         cell_bodies_path = files["cell_bodies"]
         final_seg_path = files["final_segmentation"]
 
+        # Dedicated, isolated temp dir for this step's on-disk chunk arrays,
+        # defined ONCE and reused for cleanup in `finally` (mirrors the 3D path).
+        # It must NOT be the shared `self.temp_dir` (temp_artifacts): other steps
+        # and the pipeline create/clear that directory, which can delete these
+        # chunks mid-stitch and raise FileNotFoundError when they are reloaded.
+        temp_chunk_dir = os.path.join(self.processed_dir, "sep_multi_soma_temp")
+
         if not os.path.exists(trimmed_seg_path) or not os.path.exists(cell_bodies_path):
             return False
 
@@ -430,7 +437,7 @@ class Fluorescence2DStrategy(ProcessingStrategy):
                 intensity_volume=original_image,
                 soma_mask=cell_bodies_ref,
                 spacing=spacing_yx,
-                memmap_dir=self.temp_dir,
+                memmap_dir=temp_chunk_dir,
                 min_size_threshold=int(params.get("min_size_threshold", 100)),
                 max_seed_centroid_dist=float(params.get("max_seed_centroid_dist", 20.0)),
                 min_path_intensity_ratio=float(params.get("min_path_intensity_ratio", 0.8)),
@@ -462,6 +469,8 @@ class Fluorescence2DStrategy(ProcessingStrategy):
         finally:
             self._close_memmap(trimmed_labels_memmap)
             self._close_memmap(cell_bodies_ref)
+            if os.path.exists(temp_chunk_dir):
+                shutil.rmtree(temp_chunk_dir, ignore_errors=True)
             gc.collect()
 
     def execute_calculate_features(
