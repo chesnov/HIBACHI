@@ -37,9 +37,15 @@ def _init_worker() -> None:
 
 def _get_safe_temp_dir(base_path: Optional[str], suffix: str = "") -> str:
     """Creates a temporary directory in the project folder."""
-    scratch_root = base_path if (base_path and os.path.isdir(base_path)) else tempfile.gettempdir()
-    
-    return tempfile.mkdtemp(prefix=f"step1_2d_{suffix}_", dir=scratch_root)
+    # Temporary files MUST live in the project directory (see 3D path). No
+    # hidden or OS-temp fallback: a missing base_path is a bug, so fail loudly.
+    if not base_path:
+        raise ValueError(
+            "_get_safe_temp_dir requires a project temp directory (temp_root_path); "
+            "temporary files must live in the project directory."
+        )
+    os.makedirs(base_path, exist_ok=True)
+    return tempfile.mkdtemp(prefix=f"step1_2d_{suffix}_", dir=base_path)
 
 
 def _get_chunk_slices_2d(

@@ -266,15 +266,17 @@ def _params_to_kwargs(params: Dict[str, Any]) -> Dict[str, Any]:
 # Segmentation adapter (mode-dispatched, at parity)
 # --------------------------------------------------------------------------- #
 def _segment_labels(image: np.ndarray, spacing: Tuple[float, ...],
-                    params: Dict[str, Any], is_2d: bool) -> np.ndarray:
+                    params: Dict[str, Any], is_2d: bool, temp_root: str) -> np.ndarray:
     """Run raw segmentation on `image` with `params`; return the int32 LABEL
     image (object identities preserved, not just a binary mask).
 
     Reads the label memmap into RAM (the run region is bounded) and removes all
-    temp output so repeated probing does not accumulate on disk.
+    temp output so repeated probing does not accumulate on disk. `temp_root` is
+    the project image folder: all scratch lives inside the project directory
+    (never the OS temp dir) and is cleaned up here per call.
     """
     kw = _params_to_kwargs(params)
-    run_tmp = os.path.join(tempfile.gettempdir(), f"hibachi_opt_{uuid.uuid4().hex}")
+    run_tmp = os.path.join(temp_root, f"hibachi_opt_{uuid.uuid4().hex}")
     os.makedirs(run_tmp, exist_ok=True)
     labels_dir = None
     try:
@@ -604,7 +606,7 @@ def optimize_initial_segmentation(
         name = os.path.basename(folders[i])
         _tick(0.05 + 0.10 * (i + 1) / len(images),
               f"[{name}] reference segmentation…")
-        ref = _segment_labels(image, spacing, params, is_2d)
+        ref = _segment_labels(image, spacing, params, is_2d, folders[i])
         if int((ref > 0).sum()) < _MIN_REF_PIXELS:
             empty_refs.append(name)
             print(f"[optimize] {name}: reference nearly empty "
@@ -636,7 +638,7 @@ def optimize_initial_segmentation(
         trial = copy.deepcopy(params_list[i])
         _set_leaf(trial, leaf, x)
         try:
-            lab = _segment_labels(images[i], spacings[i], trial, is_2d)
+            lab = _segment_labels(images[i], spacings[i], trial, is_2d, folders[i])
         except OptimizationCancelled:
             raise
         except Exception as exc:

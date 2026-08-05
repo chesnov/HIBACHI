@@ -164,7 +164,15 @@ def shortest_distance(
 
     # --- 2. Pass 1: Disk-Backed Matrix ---
     # Redirect to the project-specific temp_dir to keep system temp clean
-    target_dir = temp_dir if (temp_dir and os.path.isdir(temp_dir)) else tempfile.gettempdir()
+    # Temporary files MUST live in the project directory (temp_dir). No
+    # hidden/OS-temp fallback: a missing temp_dir is a bug, so fail loudly.
+    if not temp_dir:
+        raise ValueError(
+            "Feature calculation requires a project temp directory (temp_dir); "
+            "temporary files must live in the project directory."
+        )
+    os.makedirs(temp_dir, exist_ok=True)
+    target_dir = temp_dir
     mmap_path = os.path.join(target_dir, f"dist_mat_3d_{os.getpid()}.dat")
     
     dist_mat_mm = np.memmap(mmap_path, dtype='float32', mode='w+', shape=(n_valid, n_valid))

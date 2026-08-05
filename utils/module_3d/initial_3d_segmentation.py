@@ -36,13 +36,17 @@ def _init_worker() -> None:
 
 def _get_safe_temp_dir(base_path: Optional[str], suffix: str = "") -> str:
     """Creates a temporary directory strictly inside the project temp folder."""
-    if base_path and os.path.isdir(base_path):
-        scratch_root = base_path # Use the project's temp_artifacts folder
-    else:
-        scratch_root = os.path.join(tempfile.gettempdir(), "hibachi_scratch")
-    
-    os.makedirs(scratch_root, exist_ok=True)
-    return tempfile.mkdtemp(prefix=f"step1_{suffix}_", dir=scratch_root)
+    # Temporary files MUST live in the project directory. The caller passes the
+    # project's temp folder as base_path; there is deliberately NO hidden or
+    # OS-temp fallback (that risks silent junk accumulation and RAM-backed
+    # tmpfs). A missing base_path is a bug, so fail loudly instead.
+    if not base_path:
+        raise ValueError(
+            "_get_safe_temp_dir requires a project temp directory (temp_root_path); "
+            "temporary files must live in the project directory."
+        )
+    os.makedirs(base_path, exist_ok=True)
+    return tempfile.mkdtemp(prefix=f"step1_{suffix}_", dir=base_path)
 
 
 def _get_chunk_slices(
