@@ -55,6 +55,9 @@ class ProjectViewWindow(QMainWindow):
         # processing just done, instead of showing stale values.
         self._pending_content_refresh = False
         self._last_opened_folder = None  # re-highlighted on return from an image
+        # Folder currently being set up, used to break the organize -> open_path ->
+        # organize cycle if setup ever reports success without creating anything.
+        self._organizing = None
         self.initUI()
         self.setAttribute(Qt.WA_QuitOnClose)
 
@@ -607,12 +610,35 @@ class ProjectViewWindow(QMainWindow):
                 os.path.isfile(os.path.join(selected_path, f))
             ]
             if raw_files:
+                # Re-entry guard. When setup succeeds, this folder is a project, so
+                # the open_path() below routes it to a project view and never comes
+                # back here. Arriving here twice for the same folder means setup
+                # reported success while creating nothing -- previously that spun
+                # forever, re-opening the wizard on every pass. Report it once
+                # instead.
+                if self._organizing == os.path.abspath(selected_path):
+                    self._organizing = None
+                    QMessageBox.warning(
+                        self, "Setup didn't create a project",
+                        "Project setup finished but this folder still contains "
+                        f"only unorganized images:\n\n{selected_path}\n\n"
+                        "Your images were not modified. Check that they can be "
+                        "read, then try setting the project up again."
+                    )
+                    self._install_content_view(None)
+                    self._update_action_buttons()
+                    return
+
                 from .organize_wizard import run_organize_wizard
-                if run_organize_wizard(self, selected_path, mode="new",
-                                       project_dir=selected_path):
-                    # After setup the folder is a single- or multi-channel project;
-                    # re-route so it opens in the right view (list or tree).
-                    self.open_path(selected_path)
+                self._organizing = os.path.abspath(selected_path)
+                try:
+                    if run_organize_wizard(self, selected_path, mode="new",
+                                           project_dir=selected_path):
+                        # After setup the folder is a single- or multi-channel
+                        # project; re-route so it opens in the right view.
+                        self.open_path(selected_path)
+                finally:
+                    self._organizing = None
                 return
 
             # Nothing organized and nothing to organize.

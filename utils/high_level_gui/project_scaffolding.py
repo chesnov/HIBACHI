@@ -421,6 +421,16 @@ def organize_processing_dir(drctry: str, preset_details: Dict[str, str]) -> None
     csv_files = [f for f in all_files if f.lower().endswith('.csv')]
 
     if not raw_images:
+        # Single-channel setup reads TIFFs directly; .czi is only handled by the
+        # multi-channel path, which extracts each channel to a TIFF first. Say so,
+        # rather than reporting a bare "no files found" over a folder of .czi.
+        czi = [f for f in all_files if f.lower().endswith('.czi')]
+        if czi:
+            raise ValueError(
+                f"This folder contains {len(czi)} .czi file(s) but no .tif/.tiff "
+                "files. Set it up as a multi-channel project so each channel is "
+                "extracted to a TIFF first."
+            )
         raise ValueError('No .tif or .tiff files found.')
 
     # 1. Handle DataFrame
@@ -455,40 +465,88 @@ def organize_processing_dir(drctry: str, preset_details: Dict[str, str]) -> None
     generated_rows = []
 
     # 3. Generate Metadata (if needed)
-    if df is not None and 'Filename' not in df.columns: # Fallback if empty CSV
+    #
+    # "Needed" means there are no usable per-image rows to drive step 4. That is
+    # true in two cases: no CSV was found (the placeholder frame built above has
+    # the right columns but ZERO rows), or a CSV was found that carries no
+    # 'Filename' column to match on.
+    #
+    # This used to test only `'Filename' not in df.columns`, which never fired
+    # for the no-CSV case because the placeholder frame is constructed *with* a
+    # 'Filename' column. A 0-row frame then reached step 4, whose loop iterated
+    # nothing: no folders created, no configs written, no images moved -- and no
+    # error raised. Setup "succeeded" having done nothing, so the caller
+    # re-classified the folder, still found only loose raw images, and re-opened
+    # the setup wizard: the endless project-creation loop.
+    if df is None or df.empty or 'Filename' not in df.columns:
         for img_file in raw_images:
             full_path = os.path.join(drctry, img_file)
             basename = os.path.splitext(img_file)[0]
             print(f"  Analyzing: {img_file}")
-            meta = MetadataExtractor.read_tiff_metadata(full_path)
+
+            try:
+                meta = MetadataExtractor.read_tiff_metadata(full_path)
+            except Exception:
+                meta = {'found': False, 'x': 1.0, 'y': 1.0, 'z': 1.0}
+
+            # Pixel counts come from the array, physical scale from the metadata.
+            # If the array can't be read we still emit a row with neutral
+            # dimensions so the image is organized (and its dimensions can be
+            # corrected later in the UI) rather than silently dropped from the
+            # project -- dropping every image is what produced an empty frame and
+            # the loop above.
+            width = height = z_slices = 1
             try:
                 mem = tiff.imread(full_path)
                 z_slices = mem.shape[0] if mem.ndim == 3 else 1
-                spacing_x = float(meta['x']) if meta['found'] else 1.0
-                spacing_y = float(meta['y']) if meta['found'] else 1.0
-                spacing_z = float(meta['z']) if meta['found'] else 1.0
-                generated_rows.append({
-                    'Filename': img_file,
-                    'Width (um)': spacing_x * (mem.shape[-1]),
-                    'Height (um)': spacing_y * (mem.shape[-2]),
-                    'Depth (um)': spacing_z * z_slices,
-                    'Slices': z_slices,
-                    'Basename': basename
-                })
+                height, width = mem.shape[-2], mem.shape[-1]
                 del mem
-            except Exception: pass
+                gc.collect()  # release promptly during heavy batch organization
+            except Exception as exc:
+                print(f"    Warning: could not read pixel data of {img_file} "
+                      f"({exc}); using neutral dimensions.")
+
+            found = bool(meta.get('found'))
+            spacing_x = float(meta.get('x', 1.0)) if found else 1.0
+            spacing_y = float(meta.get('y', 1.0)) if found else 1.0
+            spacing_z = float(meta.get('z', 1.0)) if found else 1.0
+
+            generated_rows.append({
+                'Filename': img_file,
+                'Width (um)': spacing_x * width,
+                'Height (um)': spacing_y * height,
+                'Depth (um)': spacing_z * z_slices,
+                'Slices': z_slices,
+                'Basename': basename,
+            })
 
         if generated_rows:
             df = pd.DataFrame(generated_rows)
-            df.to_csv(os.path.join(drctry, "auto_generated_metadata.csv"), index=False)
-            print("  Saved 'auto_generated_metadata.csv'.")
+            try:
+                df.to_csv(os.path.join(drctry, "auto_generated_metadata.csv"),
+                          index=False)
+                print("  Saved 'auto_generated_metadata.csv'.")
+            except OSError as exc:
+                # A read-only project folder must not abort setup: the rows are
+                # already in memory, which is all step 4 needs.
+                print(f"  Warning: could not write auto_generated_metadata.csv "
+                      f"({exc}).")
 
     if 'Basename' not in df.columns and 'Filename' in df.columns:
         df['Basename'] = df['Filename'].apply(lambda x: os.path.splitext(str(x))[0])
 
+    # Nothing below can organize anything from an empty frame, and returning
+    # quietly here is exactly what let the caller loop back into the wizard.
+    if df is None or df.empty:
+        raise ValueError(
+            f"Found {len(raw_images)} image file(s) in this folder but could not "
+            "build metadata for any of them, so there was nothing to organize."
+        )
+
     # 4. Create Folder Structure (Robust Matching)
     files_moved = 0
     missing_files = []
+    organized_dirs = []
 
     # Prepare file map for fast lookup
     # Map cleaned_name -> real_filename
@@ -530,6 +588,11 @@ def organize_processing_dir(drctry: str, preset_details: Dict[str, str]) -> None
             shutil.move(src, dst)
             files_moved += 1
 
+        # Tracked separately from files_moved: re-running setup over a folder
+        # whose images are already in place moves nothing, but those folders are
+        # still legitimately organized.
+        organized_dirs.append(new_dir)
+
         new_config_path = os.path.join(new_dir, os.path.basename(config_template_path))
         if not os.path.exists(new_config_path):
             shutil.copy2(config_template_path, new_config_path)
@@ -558,3 +621,23 @@ def organize_processing_dir(drctry: str, preset_details: Dict[str, str]) -> None
         # Debug Help
         print("Available files on disk (cleaned):")
         print(list(disk_files_map.keys())[:10])
+
+    # Setup must leave behind at least one organized image folder. If every row
+    # matched nothing on disk (e.g. a metadata CSV listing filenames that don't
+    # correspond to the actual images) the loop above completes having done
+    # nothing at all. Returning normally there reports success to the caller,
+    # which re-classifies the still-unorganized folder and re-opens the wizard --
+    # the reported loop. Raise so the user sees what went wrong instead.
+    if not organized_dirs:
+        detail = ""
+        if missing_files:
+            examples = ", ".join(missing_files[:3])
+            detail = (
+                f"\n\nNone of the {len(missing_files)} filename(s) listed in the "
+                f"metadata CSV matched an image on disk (e.g. {examples})."
+            )
+        raise ValueError(
+            "Nothing was organized: no image folders could be created from the "
+            f"{len(raw_images)} image file(s) in this folder.{detail}\n\n"
+            "Your images were left untouched."
+        )

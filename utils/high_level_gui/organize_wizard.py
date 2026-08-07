@@ -495,22 +495,82 @@ if _HAVE_QT:
 
             single = (self.mode != "add") and not self.is_multichannel
 
-            for i, (ch_idx, preset_key) in enumerate(steps):
-                progress.setValue(i)
-                QApplication.processEvents()
-                preset = self.presets[preset_key]
-                if single:
-                    progress.setLabelText("Organizing project…")
-                    organize_processing_dir(self.raw_dir, preset)
+            # Where each step was supposed to write, so the result can be checked.
+            targets: List[str] = []
+            try:
+                for i, (ch_idx, preset_key) in enumerate(steps):
+                    progress.setValue(i)
+                    QApplication.processEvents()
+                    preset = self.presets[preset_key]
+                    if single:
+                        progress.setLabelText("Organizing project…")
+                        organize_processing_dir(self.raw_dir, preset)
+                        targets.append(self.raw_dir)
+                    else:
+                        target = os.path.join(
+                            self.project_dir, channel_target_name(ch_idx, preset_key)
+                        )
+                        progress.setLabelText(f"Extracting channel {ch_idx}…")
+                        organize_channel_project(
+                            raw_files, self.raw_dir, target, ch_idx, preset
+                        )
+                        targets.append(target)
+                progress.setValue(len(steps))
+            finally:
+                # Without this, a failing step leaves the modal progress dialog
+                # on screen underneath the error box (it's parented to the
+                # wizard, so going out of scope doesn't destroy it).
+                progress.close()
+
+            self._verify_created(targets)
+
+        def _verify_created(self, targets: List[str]) -> None:
+            """Confirm setup actually produced something openable.
+
+            Every organize step can decline work for individually benign reasons:
+            an image that doesn't have the requested channel, a metadata row
+            matching no file on disk, an unreadable file. When *all* of them
+            decline, the step still returns normally -- so accept() reported
+            success, the caller re-classified the folder, found the same loose raw
+            images, and re-opened this wizard. That was the endless
+            project-creation loop, with no project and no error message.
+
+            Checking the on-disk result closes that hole for good: whatever the
+            underlying reason, "nothing was created" now surfaces as a message the
+            user can act on instead of a wizard that reappears forever.
+            """
+            from .project_selection import (  # lazy: pure logic, no Qt at import
+                classify_path, MULTICHANNEL_PROJECT, PROJECT,
+            )
+
+            openable = {PROJECT, MULTICHANNEL_PROJECT}
+            made, failed = [], []
+            for target in dict.fromkeys(targets):  # de-duplicated, order kept
+                if classify_path(target).kind in openable:
+                    made.append(target)
                 else:
-                    target = os.path.join(
-                        self.project_dir, channel_target_name(ch_idx, preset_key)
-                    )
-                    progress.setLabelText(f"Extracting channel {ch_idx}…")
-                    organize_channel_project(
-                        raw_files, self.raw_dir, target, ch_idx, preset
-                    )
-            progress.setValue(len(steps))
+                    failed.append(target)
+
+            if not made:
+                where = "\n".join(f"\u2022 {t}" for t in (failed or targets))
+                raise ValueError(
+                    "Setup finished without creating any image folders, so there "
+                    "is no project to open.\n\nNothing usable was written to:\n"
+                    f"{where}\n\nYour raw images were left untouched. Check that "
+                    "the images can be read, and that any metadata CSV in the "
+                    "folder lists filenames matching the files on disk."
+                )
+
+            # Partial success (e.g. one channel of several came up empty) is worth
+            # reporting, but not worth discarding the channels that did work.
+            if failed:
+                names = "\n".join(f"\u2022 {os.path.basename(t)}" for t in failed)
+                QMessageBox.warning(
+                    self, "Some channels were empty",
+                    f"{len(made)} of {len(made) + len(failed)} channels were set "
+                    f"up. No images were written for:\n\n{names}\n\nThis usually "
+                    "means the source images don't contain that channel."
+                )
 
     def run_organize_wizard(parent, raw_dir: str, mode: str = "new",
                             project_dir: Optional[str] = None) -> bool:
