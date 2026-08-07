@@ -178,22 +178,47 @@ class OverlayROIPanel:
             )
             return
 
+        # Breadcrumb: if pressing Draw ROI prints nothing, the button's connection
+        # is dead (see add_overlay_roi_panel) rather than napari misbehaving.
+        print(f"  [ROI] draw_roi on '{self.sample_name}', shape={self.full_shape}")
+
         if ROI_LAYER_NAME in self.viewer.layers:
             self.viewer.layers.remove(ROI_LAYER_NAME)
 
         is_3d = len(self.full_shape) == 3
+        # Shapes cannot be drawn while napari is in 3D display mode, and
+        # open_sample_overlay puts 3D samples there. Drop to 2D slice view, which
+        # is also the only way to tag each polygon with the slice it was drawn on.
         if is_3d:
             self.viewer.dims.ndisplay = 2
 
-        self.viewer.add_shapes(
+        # Adopt the scale the overlay applied to its image layers.
+        # open_sample_overlay sets layer.scale = (z_scale, 1, 1) on 3D samples. A
+        # shapes layer left at unit scale would live in a different world space,
+        # which changes the Z slider's step mapping -- so current_step[0] would no
+        # longer be the data slice index and polygons would be recorded against
+        # the wrong Z.
+        ref_scale = None
+        for existing in self.viewer.layers:
+            if existing.name != ROI_LAYER_NAME:
+                try:
+                    ref_scale = tuple(float(v) for v in existing.scale)
+                except Exception:
+                    ref_scale = None
+                break
+
+        layer = self.viewer.add_shapes(
             name=ROI_LAYER_NAME,
             shape_type="polygon",
             edge_color="yellow",
             face_color=[1, 1, 0, 0.08],
             edge_width=3,
         )
-        layer = self.viewer.layers[ROI_LAYER_NAME]
-        layer.mode = "add_polygon"
+        if ref_scale is not None and len(ref_scale) == len(self.full_shape):
+            try:
+                layer.scale = ref_scale
+            except Exception:
+                pass
 
         self._z_polygons = {}
         self._last_count = 0
@@ -206,10 +231,17 @@ class OverlayROIPanel:
             if count <= self._last_count:
                 return  # an edit or deletion, not a new polygon
             self._last_count = count
-            z = int(self.viewer.dims.current_step[0]) if is_3d else 0
+            z = 0
+            if is_3d:
+                try:
+                    z = int(self.viewer.dims.current_step[0])
+                except Exception:
+                    z = 0
             raw = np.array(shapes.data[-1], dtype=float)
             # In 3D, ndisplay=2 still yields (N,3) vertices; drop the Z column.
             self._z_polygons[z] = raw[:, 1:] if raw.shape[1] > 2 else raw
+            print(f"  [ROI] Polygon recorded at Z={z} "
+                  f"({len(self._z_polygons)} total)")
 
         layer.events.data.connect(_on_data_changed)
 
@@ -230,6 +262,20 @@ class OverlayROIPanel:
                 "When finished, click  \u2713 Apply to channels\u2026"
             )
         QMessageBox.information(None, "Draw ROI", msg)
+
+        # Arm the layer AFTER the modal dialog. A modal steals focus, and
+        # dismissing it can leave the canvas without an interactive mode, so the
+        # first clicks land on nothing. Selecting the layer explicitly matters
+        # too: napari routes canvas mouse events to the ACTIVE layer, and the
+        # overlay has several image layers competing to be it.
+        try:
+            self.viewer.layers.selection.active = layer
+        except Exception:
+            try:
+                self.viewer.active_layer = layer  # pre-0.4.x napari
+            except Exception:
+                pass
+        layer.mode = "add_polygon"
 
     def _collect_polygons(self) -> Dict[int, np.ndarray]:
         """Drawn polygons, preferring the Z-tagged map built while drawing.
@@ -491,6 +537,20 @@ def add_overlay_roi_panel(viewer, sample_name: str, sample_dirs: Sequence[str],
     outer.addWidget(btn_clear)
 
     dock = viewer.window.add_dock_widget(container, area="left", name="ROI")
+
+    # Keep the panel alive for as long as the dock exists.
+    #
+    # This is load-bearing, not tidiness. OverlayROIPanel is a plain Python
+    # object, and PyQt5 holds only a WEAK reference to the instance behind a
+    # bound method passed to connect(). With the panel referenced only by this
+    # function's local variable, it was garbage collected as soon as the function
+    # returned, and all three buttons silently became no-ops -- they rendered,
+    # clicked, and did nothing, with no error.
+    #
+    # The container is owned by the dock, which is owned by the napari window, so
+    # attaching the panel here ties its lifetime to the viewer's.
+    container._hibachi_roi_panel = panel
+
     if _lock_panel_height is not None:
         _lock_panel_height(container, dock)
     if _give_layer_list_room is not None:
