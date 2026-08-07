@@ -307,14 +307,152 @@ def apply_template_config_to_project(
 
     return results
 
+
+def _find_dimension_csv(source_root: str) -> Optional[str]:
+    """The one metadata CSV to import dimensions from, or None.
+
+    Only files sitting *directly* in ``source_root`` are considered, so the
+    per-channel ``metadata.csv`` that ``organize_channel_project`` writes into
+    each ``Channel_*`` folder is never mistaken for an input on a re-run.
+    """
+    try:
+        entries = sorted(os.listdir(source_root))
+    except OSError:
+        return None
+    csvs = [f for f in entries
+            if f.lower().endswith('.csv')
+            and os.path.isfile(os.path.join(source_root, f))]
+    if not csvs:
+        return None
+    if len(csvs) == 1:
+        return os.path.join(source_root, csvs[0])
+    # Several CSVs: prefer an obviously-named one rather than guessing.
+    for f in csvs:
+        if 'metadata' in f.lower():
+            return os.path.join(source_root, f)
+    print(f"  Warning: {len(csvs)} CSV files found; skipping CSV dimension "
+          "import. Keep only one, or name it 'metadata.csv'.")
+    return None
+
+
+def load_dimension_overrides(source_root: str) -> Dict[str, Dict[str, Optional[float]]]:
+    """Map cleaned source filename -> physical dimensions from a metadata CSV.
+
+    Multi-channel setup derives each channel's dimensions from the source image's
+    own scale metadata, but plenty of TIFFs carry no usable calibration -- or
+    carry a meaningless 1-per-unit resolution tag that reads as exactly
+    1 micron/pixel. A CSV sitting next to the images is how the user supplies the
+    real numbers, and it is authoritative when present: the same precedence
+    ``organize_processing_dir`` already gives it for single-channel projects.
+
+    ONE ROW PER SOURCE IMAGE is all that's needed, even for a multi-channel file.
+    Every channel extracted from one acquisition shares that acquisition's
+    physical extent, so the row is reused for each channel rather than needing to
+    be repeated per channel.
+
+    Values are read as TOTAL microns per axis (matching the 'Width (um)' /
+    'Height (um)' / 'Depth (um)' columns the single-channel path writes and
+    reads). Blank, non-numeric and non-positive cells are ignored per-axis, so a
+    CSV that only pins down X and Y still lets Z come from the file. Returns {}
+    when there is no usable CSV, leaving metadata-derived values untouched.
+    """
+    path = _find_dimension_csv(source_root)
+    if not path:
+        return {}
+    try:
+        # comment=None so a '#' inside a filename doesn't truncate the field.
+        df = pd.read_csv(path, comment=None)
+    except Exception as exc:
+        print(f"  Warning: could not read {os.path.basename(path)} ({exc}); "
+              "falling back to each file's own metadata.")
+        return {}
+    if 'Filename' not in df.columns:
+        print(f"  Warning: {os.path.basename(path)} has no 'Filename' column; "
+              "falling back to each file's own metadata.")
+        return {}
+
+    def _positive(row, key) -> Optional[float]:
+        try:
+            val = float(row.get(key))
+        except (TypeError, ValueError):
+            return None
+        # val == val rejects NaN (an empty cell), which must never become a size.
+        return val if (val == val and val > 0) else None
+
+    out: Dict[str, Dict[str, Optional[float]]] = {}
+    for _, row in df.iterrows():
+        name = str(row.get('Filename', '')).strip()
+        if not name:
+            continue
+        entry = {
+            'x': _positive(row, 'Width (um)'),
+            'y': _positive(row, 'Height (um)'),
+            'z': _positive(row, 'Depth (um)'),
+        }
+        if any(v is not None for v in entry.values()):
+            out[clean_filename_for_matching(name)] = entry
+
+    if out:
+        print(f"  Importing dimensions for {len(out)} image(s) from "
+              f"{os.path.basename(path)}.")
+    else:
+        print(f"  Warning: {os.path.basename(path)} contained no usable "
+              "Width/Height/Depth values.")
+    return out
+
+
+def _match_dimension_override(
+    overrides: Dict[str, Dict[str, Optional[float]]], src_file: str
+) -> Optional[Dict[str, Optional[float]]]:
+    """Find a CSV row for a source filename.
+
+    Mirrors the matcher in ``organize_processing_dir`` -- exact cleaned match
+    first, then a substring match either way -- so a CSV listing 'sample1.czi'
+    still matches 'sample1.tif', and the two paths behave the same way.
+    """
+    if not overrides:
+        return None
+    key = clean_filename_for_matching(src_file)
+    if key in overrides:
+        return overrides[key]
+    for cand, entry in overrides.items():
+        if cand and (cand in key or key in cand):
+            return entry
+    return None
+
+
+def _has_real_scale(meta: Dict[str, Any]) -> bool:
+    """True if `meta` carries a physical scale worth trusting.
+
+    The ``found`` flag alone is not enough. Many writers (tifffile included)
+    store XResolution=(1,1) with ResolutionUnit=NONE on an uncalibrated image,
+    which ``read_tiff_metadata`` resolves to exactly 1.0 micron/pixel and reports
+    as found=True. That is indistinguishable from "no calibration at all", so a
+    unit x/y spacing is treated as missing and reported to the user instead of
+    silently producing dimensions that are really just pixel counts.
+    """
+    if not meta.get('found'):
+        return False
+    try:
+        return not (float(meta.get('x', 1.0)) == 1.0
+                    and float(meta.get('y', 1.0)) == 1.0)
+    except (TypeError, ValueError):
+        return False
+
 def organize_channel_project(
     source_files: List[str],
     source_root: str,
     target_root_dir: str,
     channel_idx: int,
     preset_details: Dict[str, str]
-) -> None:
-    """Setup Logic for MULTI-CHANNEL mode."""
+) -> Dict[str, Any]:
+    """Setup Logic for MULTI-CHANNEL mode.
+
+    Returns a summary: ``{'organized': [...], 'missing_channel': [...],
+    'failed': [...], 'unscaled': [...], 'csv': name|None}``. ``unscaled`` lists
+    source images that had neither usable scale metadata nor a CSV row, so the
+    caller can tell the user their dimensions are effectively pixel counts.
+    """
     config_template_path = preset_details['path']
     fallback_mode = preset_details['default_mode']
 
@@ -328,13 +466,22 @@ def organize_channel_project(
     is_2d_mode = mode.endswith('_2d')
     dimension_key = 'pixel_dimensions' if is_2d_mode else 'voxel_dimensions'
 
+    # A metadata CSV next to the raw images overrides what the files claim.
+    csv_path = _find_dimension_csv(source_root)
+    overrides = load_dimension_overrides(source_root)
+
     metadata_rows = []
+    summary: Dict[str, Any] = {
+        'organized': [], 'missing_channel': [], 'failed': [],
+        'unscaled': [], 'csv': os.path.basename(csv_path) if csv_path else None,
+    }
 
     for src_file in source_files:
         src_path = os.path.join(source_root, src_file)
         
         # Ensure file has the requested channel
         if MetadataExtractor.get_channel_count(src_path) <= channel_idx:
+            summary['missing_channel'].append(src_file)
             continue
 
         basename = os.path.splitext(src_file)[0]
@@ -349,6 +496,7 @@ def organize_channel_project(
             MetadataExtractor.extract_channel_to_tiff(src_path, target_tif_path, channel_idx)
         except Exception as e:
             print(f"    Error extracting channel {channel_idx} from {src_file}: {e}")
+            summary['failed'].append(src_file)
             continue
 
         # Extract metadata from original source (richer metadata than extracted single channel)
@@ -372,6 +520,31 @@ def organize_channel_project(
         total_w = float(meta['x']) * width
         total_h = float(meta['y']) * height
         total_d = float(meta['z']) * z_slices
+
+        # A metadata CSV is the user's explicit statement of physical size, so it
+        # wins over whatever the file claims -- the same precedence the
+        # single-channel path gives it. Its columns are already TOTAL microns per
+        # axis, so they replace the products above rather than scaling them. One
+        # row per source image covers every channel extracted from that image.
+        override = _match_dimension_override(overrides, src_file)
+        if override:
+            if override['x'] is not None:
+                total_w = override['x']
+            if override['y'] is not None:
+                total_h = override['y']
+            if override['z'] is not None:
+                total_d = override['z']
+            axes = ", ".join(a for a in ('x', 'y', 'z') if override[a] is not None)
+            print(f"      Dimensions ({axes}) taken from CSV.")
+        elif not _has_real_scale(meta):
+            # Neither source has real scale: total_* are pixel counts in micron
+            # clothing. Record it so the caller can tell the user, instead of
+            # letting silently wrong physical measurements flow downstream.
+            summary['unscaled'].append(src_file)
+            print(f"      Warning: no usable scale metadata and no CSV row for "
+                  f"{src_file}; dimensions recorded in PIXELS.")
+
+        summary['organized'].append(img_subdir)
 
         metadata_rows.append({
             'Filename': target_tif_name,
@@ -402,9 +575,13 @@ def organize_channel_project(
     if metadata_rows:
         df = pd.DataFrame(metadata_rows)
         df.sort_values('Filename', key=lambda col: col.map(natural_sort_key), inplace=True)
-        csv_path = os.path.join(target_root_dir, "metadata.csv")
-        df.to_csv(csv_path, index=False)
-        print(f"    Saved metadata summary to {csv_path}")
+        # Named distinctly from the *input* csv_path above: this is the summary
+        # this channel writes, not the CSV dimensions were imported from.
+        out_csv_path = os.path.join(target_root_dir, "metadata.csv")
+        df.to_csv(out_csv_path, index=False)
+        print(f"    Saved metadata summary to {out_csv_path}")
+
+    return summary
 
 def organize_processing_dir(drctry: str, preset_details: Dict[str, str]) -> None:
     """

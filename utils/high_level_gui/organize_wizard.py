@@ -497,6 +497,7 @@ if _HAVE_QT:
 
             # Where each step was supposed to write, so the result can be checked.
             targets: List[str] = []
+            summaries: List[dict] = []
             try:
                 for i, (ch_idx, preset_key) in enumerate(steps):
                     progress.setValue(i)
@@ -511,10 +512,12 @@ if _HAVE_QT:
                             self.project_dir, channel_target_name(ch_idx, preset_key)
                         )
                         progress.setLabelText(f"Extracting channel {ch_idx}…")
-                        organize_channel_project(
+                        summary = organize_channel_project(
                             raw_files, self.raw_dir, target, ch_idx, preset
                         )
                         targets.append(target)
+                        if isinstance(summary, dict):
+                            summaries.append(summary)
                 progress.setValue(len(steps))
             finally:
                 # Without this, a failing step leaves the modal progress dialog
@@ -523,6 +526,46 @@ if _HAVE_QT:
                 progress.close()
 
             self._verify_created(targets)
+            self._report_unscaled(summaries)
+
+        def _report_unscaled(self, summaries: List[dict]) -> None:
+            """Tell the user when images ended up with pixel counts for dimensions.
+
+            An image with no usable scale metadata and no matching CSV row still
+            organizes fine, but its recorded size is really its pixel count. Left
+            unsaid, that silently propagates into every downstream measurement, so
+            it's worth one dialog naming the files and how to fix them.
+            """
+            unscaled, csvs = [], set()
+            for summary in summaries:
+                unscaled.extend(summary.get('unscaled') or [])
+                if summary.get('csv'):
+                    csvs.add(summary['csv'])
+            if not unscaled:
+                return
+
+            names = sorted(set(unscaled))
+            shown = "\n".join(f"\u2022 {n}" for n in names[:8])
+            if len(names) > 8:
+                shown += f"\n\u2026 and {len(names) - 8} more"
+            if csvs:
+                csv_note = (
+                    f"{', '.join(sorted(csvs))} was read, but it has no row "
+                    "matching these files."
+                )
+            else:
+                csv_note = "No metadata CSV was found next to the images."
+
+            QMessageBox.warning(
+                self, "Image dimensions are in pixels",
+                f"{len(names)} image(s) had no usable scale metadata:\n\n{shown}"
+                f"\n\n{csv_note}\n\nTheir dimensions were recorded as pixel "
+                "counts, which will make physical measurements wrong. To fix "
+                "this, put a CSV next to your raw images with 'Filename', "
+                "'Width (um)', 'Height (um)' and 'Depth (um)' columns (one row "
+                "per source image covers all of its channels) and re-set up the "
+                "project, or correct the dimensions per image in the project view."
+            )
 
         def _verify_created(self, targets: List[str]) -> None:
             """Confirm setup actually produced something openable.

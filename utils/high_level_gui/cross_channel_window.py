@@ -695,4 +695,18 @@ def open_sample_overlay(project_manager, sample_name, analysis_name=None, parent
             add_turntable_button(viewer)
         except Exception as exc:
             print(f"Could not add 3D rotation recorder: {exc}")
+
+    # Shared sub-region controls. Every channel of a sample has the same pixel
+    # dimensions, so a polygon drawn here is valid in all of them -- this is the
+    # one place an ROI can be defined once and handed to several channels.
+    # Requires `shape`, which is the coordinate frame the polygon is stored in.
+    if shape:
+        try:
+            from .roi_overlay_panel import add_overlay_roi_panel
+            add_overlay_roi_panel(
+                viewer, sample_name, list(sample_data.values()), shape
+            )
+        except Exception as exc:
+            print(f"Could not add shared ROI panel: {exc}")
+
     return True
