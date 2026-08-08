@@ -12,6 +12,7 @@ from typing import Dict, Any, List, Optional, Callable
 from .gui_text_utils import (
     clean_filename_for_matching, is_os_sidecar, natural_sort_key,
 )
+from .slide_reader import SetupCancelled  # re-exported for callers
 from .metadata import MetadataExtractor
 
 
@@ -447,9 +448,15 @@ def organize_channel_project(
     source_root: str,
     target_root_dir: str,
     channel_idx: int,
-    preset_details: Dict[str, str]
+    preset_details: Dict[str, str],
+    progress=None,
+    should_cancel=None,
 ) -> Dict[str, Any]:
     """Setup Logic for MULTI-CHANNEL mode.
+
+    `progress` is called as progress(message, done, total) so a caller can show
+    what is happening during what may be a multi-minute extraction; `should_cancel`
+    is polled and raises SetupCancelled when it returns True.
 
     Returns a summary: ``{'organized': [...], 'missing_channel': [...],
     'failed': [...], 'unscaled': [...], 'csv': name|None}``. ``unscaled`` lists
@@ -482,7 +489,14 @@ def organize_channel_project(
         'target': target_root_dir, 'source_root': source_root,
     }
 
-    for src_file in source_files:
+    total_files = len(source_files)
+    for file_index, src_file in enumerate(source_files):
+        if should_cancel is not None and should_cancel():
+            from .slide_reader import SetupCancelled
+            raise SetupCancelled("setup cancelled by the user")
+        if progress is not None:
+            progress(f"Channel {channel_idx}: {src_file}",
+                     file_index, total_files)
         src_path = os.path.join(source_root, src_file)
 
         # Defensive: detect_raw already filters these, but organize_channel_project
@@ -519,10 +533,22 @@ def organize_channel_project(
         extracted = False
         reason = ''
         try:
+            # Tile-level progress: a single 997 megapixel channel can take
+            # minutes, so the file-level message above is not granular enough to
+            # show that anything is happening.
+            def _tile_progress(done, total, _name=src_file, _i=file_index):
+                if progress is not None:
+                    progress(f"Channel {channel_idx}: {_name}  "
+                             f"(tile {done}/{total})", _i, total_files)
+
             extracted = bool(MetadataExtractor.extract_channel_to_tiff(
-                src_path, target_tif_path, channel_idx
+                src_path, target_tif_path, channel_idx,
+                progress=_tile_progress, should_cancel=should_cancel,
             ))
         except Exception as e:
+            from .slide_reader import SetupCancelled
+            if isinstance(e, SetupCancelled):
+                raise
             reason = str(e)
             print(f"    Error extracting channel {channel_idx} from {src_file}: {e}")
 

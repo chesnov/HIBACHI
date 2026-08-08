@@ -184,7 +184,8 @@ class MetadataExtractor:
         return scales
 
     @staticmethod
-    def extract_channel_to_tiff(src_path: str, dest_path: str, channel_idx: int) -> bool:
+    def extract_channel_to_tiff(src_path: str, dest_path: str, channel_idx: int,
+                                progress=None, should_cancel=None) -> bool:
         """Extracts a channel and preserves the spatial resolution tags.
 
         Returns True on success and raises ChannelExtractionError otherwise.
@@ -201,13 +202,18 @@ class MetadataExtractor:
             # a channel in memory would mean a 2 GB allocation.
             from .slide_reader import extract_scene_channel
             try:
-                if extract_scene_channel(key, dest_path, channel_idx):
+                if extract_scene_channel(key, dest_path, channel_idx,
+                                         progress=progress,
+                                         should_cancel=should_cancel):
                     return True
                 raise ChannelExtractionError(
                     "slide extraction produced no image data")
             except ChannelExtractionError:
                 raise
             except Exception as exc:
+                from .slide_reader import SetupCancelled
+                if isinstance(exc, SetupCancelled):
+                    raise  # user-initiated, not a failure to report
                 raise ChannelExtractionError(
                     f"{type(exc).__name__}: {exc}") from exc
 

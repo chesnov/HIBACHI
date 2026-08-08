@@ -27,7 +27,7 @@ import os
 import re
 import shutil
 import yaml
-from typing import Dict, List, Optional, Sequence
+from typing import Dict, List, Optional, Sequence, Tuple
 
 _RAW_EXTS = (".tif", ".tiff", ".czi")
 
@@ -321,12 +321,13 @@ def detect_default_mode(raw_dir: str) -> Optional[str]:
 # Qt wizard (only if PyQt5 is present)
 # --------------------------------------------------------------------------- #
 try:
-    from PyQt5.QtCore import Qt  # type: ignore
+    from PyQt5.QtCore import QEventLoop, Qt, QThread, pyqtSignal  # type: ignore
     from PyQt5.QtWidgets import (  # type: ignore
         QApplication, QComboBox, QFormLayout, QLabel, QMessageBox, QProgressDialog,
         QRadioButton, QVBoxLayout, QButtonGroup, QWizard, QWizardPage, QWidget,
     )
-    from .project_scaffolding import (  # type: ignore
+    from .project_scaffolding import (
+        SetupCancelled,
         organize_channel_project, organize_processing_dir, scan_available_presets,
     )
     _HAVE_QT = True
@@ -451,6 +452,75 @@ if _HAVE_QT:
         def nextId(self) -> int:  # noqa: N802
             return -1
 
+    class _SetupWorker(QThread):
+        """Runs project setup off the GUI thread.
+
+        Mirrors StepWorker/OptimizeWorker: no Qt widgets are touched here, only
+        signals are emitted, so every dialog stays on the main thread. Results are
+        left on the instance for the caller to read once `done` has fired.
+        """
+
+        progress = pyqtSignal(str, int, int)   # message, done, total
+        done = pyqtSignal()
+
+        def __init__(self, raw_files: List[str], raw_dir: str,
+                     plan: List[Tuple], single: bool):
+            super().__init__()
+            self.raw_files = raw_files
+            self.raw_dir = raw_dir
+            self.plan = plan
+            self.single = single
+            self.targets: List[str] = []
+            self.summaries: List[dict] = []
+            self.error: str = ""
+            self.cancelled: bool = False
+            self.current_step: int = 0
+            self._cancel_requested = False
+
+        def request_cancel(self) -> None:
+            """Ask the run to stop at the next tile or file boundary.
+
+            Called from the GUI thread; only ever sets a flag, which the worker
+            polls. A running read_block cannot be interrupted, so the stop happens
+            at the next boundary rather than instantly.
+            """
+            self._cancel_requested = True
+
+        def _should_cancel(self) -> bool:
+            return self._cancel_requested
+
+        def run(self) -> None:
+            try:
+                for index, (ch_idx, preset, target) in enumerate(self.plan):
+                    self.current_step = index
+                    if self._cancel_requested:
+                        self.cancelled = True
+                        break
+                    if self.single:
+                        self.progress.emit("Organizing project…", 0, 1)
+                        organize_processing_dir(self.raw_dir, preset)
+                        self.targets.append(target)
+                    else:
+                        self.progress.emit(
+                            f"Extracting channel {ch_idx}…", 0, 1)
+                        summary = organize_channel_project(
+                            self.raw_files, self.raw_dir, target, ch_idx, preset,
+                            progress=lambda msg, d, t: self.progress.emit(msg, d, t),
+                            should_cancel=self._should_cancel,
+                        )
+                        self.targets.append(target)
+                        if isinstance(summary, dict):
+                            self.summaries.append(summary)
+            except SetupCancelled:
+                self.cancelled = True
+            except Exception as exc:
+                import traceback
+                traceback.print_exc()
+                self.error = f"{type(exc).__name__}: {exc}"
+            finally:
+                self.done.emit()
+
+
     class OrganizeWizard(QWizard):
         """
         Guided setup. Construct with the raw project dir; call exec_() and check
@@ -541,55 +611,99 @@ if _HAVE_QT:
             try:
                 self._collect_selections()
                 self._run()
+            except SetupCancelled as exc:
+                # The user asked for this, so it is not a failure. A red critical
+                # box here would read as a crash. The wizard stays open so they
+                # can adjust their choices and try again.
+                QMessageBox.information(self, "Setup cancelled", str(exc))
+                return
             except Exception as exc:  # pragma: no cover - surfaced to user
                 QMessageBox.critical(self, "Setup failed", str(exc))
                 return
             super().accept()
 
         def _run(self) -> None:
+            """Run setup on a worker thread, keeping the GUI alive throughout.
+
+            Setup used to run inline on the main thread with a single
+            processEvents() per channel. For a plain TIFF folder that is
+            imperceptible, but a whole-slide project extracts one ~2 GB channel
+            per scene, so the event loop could be starved for many minutes and the
+            window was reported as "not responding" by the OS -- which is a
+            liveness problem, not an unavoidable cost of large images.
+
+            The work now runs in a QThread (matching StepWorker and
+            OptimizeWorker elsewhere in the app) while a nested QEventLoop keeps
+            painting and lets Cancel through. The nested loop is what allows
+            accept() to stay synchronous, which the caller relies on for its
+            return value.
+            """
             if not self.selections:
                 raise ValueError("No presets were chosen.")
 
             raw_files = list(self.detect["files"])  # type: ignore[index]
             steps = sorted(self.selections.items())
-            progress = QProgressDialog("Setting up project…", None, 0, len(steps), self)
-            progress.setWindowModality(Qt.WindowModal)
-            progress.setMinimumDuration(0)
-
             single = (self.mode != "add") and not self.is_multichannel
 
-            # Where each step was supposed to write, so the result can be checked.
-            targets: List[str] = []
-            summaries: List[dict] = []
-            try:
-                for i, (ch_idx, preset_key) in enumerate(steps):
-                    progress.setValue(i)
-                    QApplication.processEvents()
-                    preset = self.presets[preset_key]
-                    if single:
-                        progress.setLabelText("Organizing project…")
-                        organize_processing_dir(self.raw_dir, preset)
-                        targets.append(self.raw_dir)
-                    else:
-                        target = os.path.join(
-                            self.project_dir, channel_target_name(ch_idx, preset_key)
-                        )
-                        progress.setLabelText(f"Extracting channel {ch_idx}…")
-                        summary = organize_channel_project(
-                            raw_files, self.raw_dir, target, ch_idx, preset
-                        )
-                        targets.append(target)
-                        if isinstance(summary, dict):
-                            summaries.append(summary)
-                progress.setValue(len(steps))
-            finally:
-                # Without this, a failing step leaves the modal progress dialog
-                # on screen underneath the error box (it's parented to the
-                # wizard, so going out of scope doesn't destroy it).
-                progress.close()
+            plan: List[tuple] = []
+            for ch_idx, preset_key in steps:
+                target = (self.raw_dir if single else os.path.join(
+                    self.project_dir, channel_target_name(ch_idx, preset_key)))
+                plan.append((ch_idx, self.presets[preset_key], target))
 
-            self._verify_created(targets, summaries)
-            self._report_unscaled(summaries)
+            dialog = QProgressDialog("Setting up project…", "Cancel", 0, 100, self)
+            dialog.setWindowModality(Qt.WindowModal)
+            dialog.setMinimumDuration(0)
+            dialog.setAutoClose(False)
+            dialog.setAutoReset(False)
+            dialog.setValue(0)
+
+            worker = _SetupWorker(raw_files, self.raw_dir, plan, single)
+            loop = QEventLoop()
+
+            def _on_progress(message: str, done: int, total: int) -> None:
+                dialog.setLabelText(message)
+                # Overall progress spans all channels; `done/total` is progress
+                # within the current one.
+                span = 100.0 / max(1, len(plan))
+                base = worker.current_step * span
+                frac = (done / total) if total else 0.0
+                dialog.setValue(int(min(99, base + frac * span)))
+
+            worker.progress.connect(_on_progress)
+            worker.done.connect(lambda: loop.quit())
+            dialog.canceled.connect(worker.request_cancel)
+
+            worker.start()
+            loop.exec_()          # GUI stays responsive here
+            worker.wait()
+            dialog.close()
+
+            if worker.cancelled:
+                # Remove the channel folders this run created. Left behind, a
+                # half-finished set of Channel_* folders classifies as a valid
+                # multi-channel project and would open with channels silently
+                # missing. The single-channel target is the raw folder itself, so
+                # it is never touched.
+                removed = 0
+                if not single:
+                    for target in worker.targets:
+                        try:
+                            if os.path.isdir(target):
+                                shutil.rmtree(target)
+                                removed += 1
+                        except OSError as exc:
+                            print(f"  Could not remove {target}: {exc}")
+                raise SetupCancelled(
+                    "Project setup was cancelled."
+                    + (f"\n\n{removed} partly written channel folder(s) were "
+                       "removed." if removed else "")
+                    + "\n\nYour raw images were not modified.")
+            if worker.error:
+                raise ValueError(worker.error)
+
+            self._verify_created(worker.targets, worker.summaries)
+            self._report_unscaled(worker.summaries)
 
         def _report_unscaled(self, summaries: List[dict]) -> None:
             """Tell the user when images ended up with pixel counts for dimensions.

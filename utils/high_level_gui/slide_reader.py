@@ -35,6 +35,16 @@ from .slide_formats import spec_for_path, inspect_slide
 # appear in a filename on Windows and is vanishingly rare on POSIX.
 SOURCE_SEP = "::"
 
+
+class SetupCancelled(Exception):
+    """Raised by a long operation when the caller asks it to stop.
+
+    Lives here rather than in project_scaffolding because slide_reader sits below
+    it in the import order; both re-export it so callers can catch cancellation
+    separately from a genuine failure and avoid reporting an error the user caused
+    deliberately.
+    """
+
 # Tile edge in pixels. 2048 keeps a uint16 tile at 8 MB, comfortably above the
 # scanner's native 512 px tiles (so we don't fight the pyramid) and far below any
 # level that would matter for memory.
@@ -243,6 +253,7 @@ def extract_scene_channel(
     tile: int = DEFAULT_TILE,
     level: int = 0,
     progress=None,
+    should_cancel=None,
 ) -> bool:
     """Write one channel of one scene to a TIFF, tile by tile.
 
@@ -251,7 +262,10 @@ def extract_scene_channel(
     handed to imwrite -- which for the tested slide would have meant a 2 GB
     allocation per channel.
 
-    `progress` is called as progress(done_tiles, total_tiles) if given.
+    `progress` is called as progress(done_tiles, total_tiles) if given, and
+    `should_cancel` is polled between tiles -- the tile loop is the only place a
+    multi-minute extraction can be interrupted, since a single read_block cannot
+    be broken into.
     Returns True only if a non-empty file was produced.
     """
     import tifffile as tiff
@@ -327,9 +341,25 @@ def extract_scene_channel(
                         done += 1
                         if progress is not None:
                             progress(done, n_tiles)
+                        if should_cancel is not None and should_cancel():
+                            raise SetupCancelled(
+                                "extraction cancelled by the user")
             mm.flush()
-        finally:
+        except SetupCancelled:
+            # A half-written channel would pass an existence check and be
+            # organized as if complete, so remove it.
             del mm
+            try:
+                if os.path.isfile(dest_path):
+                    os.remove(dest_path)
+            except OSError:
+                pass
+            raise
+        finally:
+            try:
+                del mm
+            except Exception:
+                pass
 
     ok = os.path.isfile(dest_path) and os.path.getsize(dest_path) > 0
     if not ok:
