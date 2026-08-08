@@ -567,8 +567,14 @@ class FluorescenceStrategy(ProcessingStrategy):
                 prune_spurs_le_um=params.get("prune_spurs_le_um", 0.0)
             )
 
+            # Record the region these measurements came from, so counts can be
+            # normalised: the full image extent, or an ROI's polygon volume.
+            metrics_df = self.stamp_analyzed_extent(metrics_df)
             if metrics_df is not None:
                 metrics_df.to_csv(metrics_csv_path, index=False)
+            # Written unconditionally: an image with zero detections still has a
+            # meaningful analysed volume, and that is a result worth keeping.
+            self.write_analysis_summary(metrics_df)
 
             # Persist full N×N pairwise distance matrix
             dist_df = detailed_outputs.get('distance_matrix')

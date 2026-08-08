@@ -519,3 +519,166 @@ def summarize_clear_plan(plan: Sequence[Dict[str, Any]]) -> str:
             + ", ".join(e["channel"] for e in none)
         )
     return "\n\n".join(lines) if lines else "Nothing to do."
+
+
+# --------------------------------------------------------------------------- #
+# How much area / volume was actually analysed
+# --------------------------------------------------------------------------- #
+def masked_pixel_count(
+    record: Dict[str, Any],
+    image_shape: Optional[Sequence[int]] = None,
+) -> Optional[int]:
+    """Number of pixels (2D) or voxels (3D) INSIDE an ROI's polygons.
+
+    This is deliberately not the crop's pixel count. ``_build_crop_memmap``
+    writes a bounding-box-shaped array and then zeroes everything outside the
+    polygon, so the array is larger than the region actually analysed. For a
+    diagonal or otherwise irregular polygon the bounding box can be nearly twice
+    the polygon's area, and using it would inflate every density derived from it.
+
+    Mirrors ``_build_crop_memmap``'s nearest-polygon-per-slice rule exactly, so
+    the count matches the pixels that were really kept: slices between two drawn
+    Z levels take the nearer polygon, and a lone polygon applies to every slice.
+
+    Returns None when the record can't be interpreted, or when `image_shape` is
+    given and disagrees with the crop the record describes (which means the
+    record belongs to a different image and must not be trusted).
+    """
+    from skimage.draw import polygon as _raster  # lazy: keeps this module light
+
+    bbox = record.get("bbox") or {}
+    try:
+        y0, x0 = int(bbox["y0"]), int(bbox["x0"])
+        y1, x1 = int(bbox["y1"]), int(bbox["x1"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    crop_h, crop_w = y1 - y0, x1 - x0
+    if crop_h <= 0 or crop_w <= 0:
+        return None
+
+    try:
+        if "z_polygons" in record:
+            z_polys = {int(e["z"]): np.asarray(e["polygon_yx"], dtype=float)
+                       for e in record["z_polygons"]}
+        else:
+            z_polys = {0: np.asarray(record["polygon_yx"], dtype=float)}
+    except Exception:
+        return None
+    if not z_polys:
+        return None
+
+    z0 = int(bbox.get("z0") or 0)
+    z1 = bbox.get("z1")
+    full_shape = record.get("full_image_shape") or []
+    is_3d = len(full_shape) == 3 or (image_shape is not None and len(image_shape) == 3)
+
+    if is_3d:
+        if z1 is None:
+            z1 = int(full_shape[0]) if len(full_shape) == 3 else None
+            if z1 is None and image_shape is not None:
+                z1 = z0 + int(image_shape[0])
+        if z1 is None:
+            return None
+        crop_depth = int(z1) - z0
+        if crop_depth <= 0:
+            return None
+        expected = (crop_depth, crop_h, crop_w)
+    else:
+        expected = (crop_h, crop_w)
+
+    if image_shape is not None and tuple(int(v) for v in image_shape) != expected:
+        return None
+
+    sorted_zs = sorted(z_polys)
+
+    def _count_for(nearest_z: int) -> int:
+        poly = z_polys[nearest_z] - np.array([y0, x0], dtype=float)
+        rr, cc = _raster(poly[:, 0], poly[:, 1], shape=(crop_h, crop_w))
+        mask = np.zeros((crop_h, crop_w), dtype=bool)
+        mask[rr, cc] = True
+        return int(mask.sum())
+
+    cache: Dict[int, int] = {}
+    if not is_3d:
+        nearest = min(sorted_zs, key=lambda z: abs(z - 0))
+        return _count_for(nearest)
+
+    total = 0
+    for local_z in range(expected[0]):
+        global_z = z0 + local_z
+        nearest = min(sorted_zs, key=lambda z: abs(z - global_z))
+        if nearest not in cache:
+            cache[nearest] = _count_for(nearest)
+        total += cache[nearest]
+    return total
+
+
+def analyzed_extent(
+    processed_dir: str,
+    image_shape: Sequence[int],
+    spacing: Sequence[float],
+    is_2d: bool,
+) -> Dict[str, Any]:
+    """Physical area (2D) or volume (3D) that a run actually analysed.
+
+    Answers "what was the denominator?" so counts from a full image and from a
+    sub-region can be turned into comparable densities.
+
+    An ROI session is detected by ``roi_polygon.json`` sitting in
+    ``processed_dir`` -- which is what the pipeline's processed_dir IS once
+    ``_switch_to_roi_mode`` has run. Deriving the region from that file rather
+    than from a value stamped at crop time means sessions created before this
+    existed are measured correctly too, and there is nothing to keep in sync.
+
+    `spacing` is per-pixel (z, y, x) as the strategies hold it; z is 1.0 in 2D.
+    Returns keys: ``region`` ('full_image' | 'roi'), ``pixels`` (count),
+    ``area_um2`` or ``volume_um3``, and for an ROI ``bbox_pixels`` plus
+    ``polygon_fraction_of_bbox`` so the shape's efficiency is visible.
+    """
+    shape = tuple(int(v) for v in image_shape)
+    try:
+        zs, ys, xs = (float(spacing[0]), float(spacing[1]), float(spacing[2]))
+    except (IndexError, TypeError, ValueError):
+        zs = ys = xs = 1.0
+
+    unit_key = "area_um2" if is_2d else "volume_um3"
+    per_pixel = (ys * xs) if is_2d else (zs * ys * xs)
+
+    bbox_pixels = 1
+    for dim in shape:
+        bbox_pixels *= int(dim)
+
+    out: Dict[str, Any] = {
+        "region": "full_image",
+        "pixels": bbox_pixels,
+        unit_key: bbox_pixels * per_pixel,
+    }
+
+    roi_json = os.path.join(processed_dir or "", ROI_JSON_NAME)
+    if not os.path.isfile(roi_json):
+        return out
+
+    try:
+        with open(roi_json, "r") as fh:
+            record = json.load(fh)
+    except Exception:
+        return out
+
+    count = masked_pixel_count(record, image_shape=shape)
+    if count is None or count <= 0:
+        # An ROI session whose polygon can't be measured must not silently report
+        # the bounding box as if it were the region: say the region is an ROI and
+        # flag the number as unverified rather than quietly overstating it.
+        out["region"] = "roi"
+        out["polygon_measured"] = False
+        return out
+
+    out.update({
+        "region": "roi",
+        "pixels": count,
+        unit_key: count * per_pixel,
+        "bbox_pixels": bbox_pixels,
+        "polygon_fraction_of_bbox": (count / bbox_pixels) if bbox_pixels else None,
+        "polygon_measured": True,
+    })
+    return out

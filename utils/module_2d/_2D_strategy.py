@@ -559,8 +559,14 @@ class Fluorescence2DStrategy(ProcessingStrategy):
             )
 
             # 4. TABULAR DATA PERSISTENCE
+            # Record the region these measurements came from, so counts can be
+            # normalised: the full image extent, or an ROI's polygon area.
+            metrics_df = self.stamp_analyzed_extent(metrics_df)
             if metrics_df is not None and not metrics_df.empty:
                 metrics_df.to_csv(metrics_csv_path, index=False)
+            # Written unconditionally: an image with zero detections still has a
+            # meaningful analysed area, and that is a result worth keeping.
+            self.write_analysis_summary(metrics_df)
 
             # 5. DETAILED DATA PERSISTENCE (Coordinate Persistence)
             if detailed_outputs:

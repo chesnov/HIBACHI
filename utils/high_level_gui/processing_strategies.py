@@ -122,6 +122,118 @@ class ProcessingStrategy(abc.ABC):
         # that needs to pass between steps but isn't strictly config.
         self.intermediate_state: Dict[str, Any] = {}
 
+    # ---- how much area / volume this run analysed ------------------------ #
+    def analyzed_extent(self) -> Dict[str, Any]:
+        """Physical area (2D) or volume (3D) this run actually analysed.
+
+        Reported so object counts can be turned into densities that are
+        comparable between a full image and a sub-region. For a full image this
+        is simply the image extent; for an ROI it is the POLYGON's area, not the
+        cropped array's -- the crop is bounding-box shaped with everything
+        outside the polygon zeroed, so the array overstates the analysed region
+        (by 2x for a triangle, more for a thin diagonal shape).
+
+        Whether this is an ROI run is determined from ``roi_polygon.json`` in
+        ``processed_dir``, which IS the ROI directory once the pipeline has
+        switched into ROI mode. Deriving it from that file rather than a value
+        recorded at crop time means ROI sessions created before this existed are
+        measured correctly too.
+        """
+        is_2d = len(self.image_shape) == 2
+        try:
+            from .roi_sharing import analyzed_extent as _extent
+            return _extent(self.processed_dir, self.image_shape, self.spacing, is_2d)
+        except Exception as exc:
+            # Never let reporting break a completed analysis: fall back to the
+            # image extent and say the ROI could not be measured.
+            print(f"  [Extent] could not resolve analysed region ({exc}); "
+                  "reporting full image extent.")
+            pixels = 1
+            for dim in self.image_shape:
+                pixels *= int(dim)
+            try:
+                zs, ys, xs = (float(self.spacing[0]), float(self.spacing[1]),
+                              float(self.spacing[2]))
+            except Exception:
+                zs = ys = xs = 1.0
+            per_px = (ys * xs) if is_2d else (zs * ys * xs)
+            key = "area_um2" if is_2d else "volume_um3"
+            return {"region": "full_image", "pixels": pixels, key: pixels * per_px}
+
+    def stamp_analyzed_extent(self, metrics_df):
+        """Add the analysed region as constant columns on a metrics table.
+
+        Kept to two columns so the table stays readable; the fuller breakdown
+        goes in the summary written by ``write_analysis_summary``. Putting the
+        denominator on every row means a density needs no other file.
+        """
+        if metrics_df is None or metrics_df.empty:
+            return metrics_df
+        extent = self.analyzed_extent()
+        key = "area_um2" if len(self.image_shape) == 2 else "volume_um3"
+        metrics_df["analyzed_region"] = extent.get("region", "full_image")
+        metrics_df[f"analyzed_{key}"] = extent.get(key)
+        return metrics_df
+
+    def write_analysis_summary(self, metrics_df=None) -> Optional[str]:
+        """Write a one-row summary of the run: region, extent, count, density.
+
+        Written separately from the metrics table because that table is only
+        saved when it has rows -- so an image where nothing was detected would
+        otherwise record no extent at all, when "zero objects in this much
+        tissue" is exactly the result worth keeping.
+        """
+        import csv
+
+        is_2d = len(self.image_shape) == 2
+        extent = self.analyzed_extent()
+        key = "area_um2" if is_2d else "volume_um3"
+        size = extent.get(key)
+
+        n = 0
+        if metrics_df is not None:
+            try:
+                n = int(len(metrics_df))
+            except Exception:
+                n = 0
+
+        row: Dict[str, Any] = {
+            "mode": self.mode_name,
+            "analyzed_region": extent.get("region"),
+            "image_shape": "x".join(str(int(v)) for v in self.image_shape),
+            "analyzed_pixels": extent.get("pixels"),
+            f"analyzed_{key}": size,
+            "object_count": n,
+        }
+        # Per-mm densities: um^2 -> mm^2 is 1e6, um^3 -> mm^3 is 1e9. These are
+        # the units this kind of count is normally reported in.
+        if size:
+            if is_2d:
+                row["density_per_mm2"] = n / (size / 1e6)
+            else:
+                row["density_per_mm3"] = n / (size / 1e9)
+        if extent.get("region") == "roi":
+            row["roi_bbox_pixels"] = extent.get("bbox_pixels")
+            row["roi_polygon_fraction_of_bbox"] = extent.get(
+                "polygon_fraction_of_bbox")
+            row["roi_polygon_measured"] = extent.get("polygon_measured", False)
+
+        path = os.path.join(
+            self.processed_dir, f"analysis_summary_{self.mode_name}.csv")
+        try:
+            with open(path, "w", newline="") as fh:
+                writer = csv.DictWriter(fh, fieldnames=list(row))
+                writer.writeheader()
+                writer.writerow(row)
+        except OSError as exc:
+            print(f"  [Extent] could not write analysis summary: {exc}")
+            return None
+
+        unit = "um^2" if is_2d else "um^3"
+        print(f"  [Extent] {extent.get('region')}: {size:.1f} {unit}, "
+              f"{n} object(s) -> {os.path.basename(path)}")
+        return path
+
         # Auto-detect number of steps from the definitions
         self.steps = self.get_step_definitions()
         self.num_steps = len(self.steps)
