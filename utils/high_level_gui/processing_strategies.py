@@ -122,7 +122,14 @@ class ProcessingStrategy(abc.ABC):
         # that needs to pass between steps but isn't strictly config.
         self.intermediate_state: Dict[str, Any] = {}
 
-    # ---- how much area / volume this run analysed ------------------------ #
+        # Auto-detect number of steps from the definitions
+        self.steps = self.get_step_definitions()
+        self.num_steps = len(self.steps)
+
+        if self.num_steps == 0:
+            print(f"Warning: Strategy '{self.__class__.__name__}' defines 0 steps.")
+
+    # ---- how much area / volume this run analysed --------------------- #
     def analyzed_extent(self) -> Dict[str, Any]:
         """Physical area (2D) or volume (3D) this run actually analysed.
 
@@ -233,13 +240,6 @@ class ProcessingStrategy(abc.ABC):
         print(f"  [Extent] {extent.get('region')}: {size:.1f} {unit}, "
               f"{n} object(s) -> {os.path.basename(path)}")
         return path
-
-        # Auto-detect number of steps from the definitions
-        self.steps = self.get_step_definitions()
-        self.num_steps = len(self.steps)
-
-        if self.num_steps == 0:
-            print(f"Warning: Strategy '{self.__class__.__name__}' defines 0 steps.")
 
     @abc.abstractmethod
     def _get_mode_name(self) -> str:
