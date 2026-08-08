@@ -486,16 +486,38 @@ def build_segmentation_control_panel(viewer, gui_manager):
     )
     btn_clear = _compact_button(
         "\u2717 Clear",
-        "Remove the ROI layer.\n"
-        "If an ROI session is active, offers to return to full-image mode.\n"
-        "Existing ROI outputs are kept on disk.",
+        "Remove the drawing layer and leave region mode.\n"
+        "The region and its results are KEPT on disk \u2014 use Delete\n"
+        "to remove one permanently.",
+    )
+    btn_open = _compact_button(
+        "\u2937 Open region",
+        "Step into one of this image's saved regions without\n"
+        "closing the viewer. Saved regions are outlined on the\n"
+        "full image.",
+    )
+    btn_delete = _compact_button(
+        "\U0001f5d1 Delete region",
+        "Delete a saved region and everything computed on it.\n"
+        "Full-image results are not affected. Cannot be undone.",
     )
     btn_draw.clicked.connect(gui_manager.draw_roi)
     btn_confirm.clicked.connect(gui_manager.confirm_roi)
     btn_clear.clicked.connect(gui_manager.clear_roi)
+    btn_open.clicked.connect(gui_manager.open_roi_session)
+    btn_delete.clicked.connect(gui_manager.delete_roi_session)
     for _b in (btn_draw, btn_confirm, btn_clear):
         roi_row.addWidget(_b)
     outer.addLayout(roi_row)
+
+    # Second row: acting on regions that already exist, kept apart from the
+    # draw/apply/clear flow above so Delete is not adjacent to Clear.
+    roi_row2 = QHBoxLayout()
+    roi_row2.setContentsMargins(0, 0, 0, 0)
+    roi_row2.setSpacing(4)
+    for _b in (btn_open, btn_delete):
+        roi_row2.addWidget(_b)
+    outer.addLayout(roi_row2)
 
     # ---- Channels --------------------------------------------------------- #
     # A hairline rather than a section header: the button labels itself.

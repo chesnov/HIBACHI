@@ -2,6 +2,7 @@
 
 
 import os
+import shutil
 import yaml  # type: ignore
 from PyQt5.QtGui import QCloseEvent, QIcon  # type: ignore
 from PyQt5.QtCore import Qt, QEvent  # type: ignore
@@ -136,6 +137,16 @@ class ProjectViewWindow(QMainWindow):
         self.optimize_btn.setEnabled(False)
         button_layout.addWidget(self.optimize_btn)
 
+        self.delete_regions_btn = QPushButton("\U0001f5d1 Delete Regions\u2026")
+        self.delete_regions_btn.setToolTip(
+            "Delete the checked regions and everything computed on them. "
+            "Full-image results are not affected. Enabled when at least one "
+            "region row is checked."
+        )
+        self.delete_regions_btn.clicked.connect(self._delete_checked_regions)
+        self.delete_regions_btn.setEnabled(False)
+        button_layout.addWidget(self.delete_regions_btn)
+
         self.config_library_btn = QPushButton("\U0001f4da Config Library\u2026")
         self.config_library_btn.setToolTip(
             "Browse, import, duplicate, rename and export the configs in your "
@@ -183,6 +194,10 @@ class ProjectViewWindow(QMainWindow):
         view = self._content_view
         checked = view.checked_folders() if view is not None else []
         self.process_selected_btn.setEnabled(bool(checked))
+        # Only meaningful for region rows; a full-image row has nothing to delete.
+        from .project_selection import is_roi_leaf
+        self.delete_regions_btn.setEnabled(
+            any(is_roi_leaf(k) for k in checked))
 
         # Set Config applies per-channel, so it is only valid when the checked
         # images belong to at most one channel (a single image, several images in
@@ -365,6 +380,89 @@ class ProjectViewWindow(QMainWindow):
         self.project_manager.project_path = self._cross_scan_dir
         self.cross_channel_btn.setEnabled(True)
         self._update_action_buttons()
+
+    def _delete_checked_regions(self) -> None:
+        """Delete every checked region row, with its results.
+
+        Batch counterpart to Delete in the viewer. Full-image rows in the checked
+        set are ignored rather than deleted -- there is no such thing as deleting a
+        channel's full image from here, and treating a checked channel row as a
+        delete target would be catastrophic.
+        """
+        if self._content_view is None:
+            return
+        from .project_selection import split_leaf_key
+
+        targets = []
+        for key in self._content_view.checked_folders():
+            folder, roi_name = split_leaf_key(key)
+            if not roi_name:
+                continue
+            try:
+                from .roi_sharing import roi_session_dir
+                roi_dir = roi_session_dir(folder, roi_name)
+            except Exception:
+                roi_dir = None
+            if roi_dir and os.path.isdir(roi_dir):
+                try:
+                    n_out = len([f for f in os.listdir(roi_dir)
+                                 if f != "roi_polygon.json"])
+                except OSError:
+                    n_out = 0
+                targets.append((folder, roi_name, roi_dir, n_out))
+
+        if not targets:
+            QMessageBox.information(
+                self, "No regions checked",
+                "Check one or more region rows to delete them.")
+            return
+
+        total_out = sum(t[3] for t in targets)
+        listing = "\n".join(
+            f"  \u2022 {os.path.basename(os.path.dirname(f))} \u2014 {n}"
+            + (f" ({o} result file(s))" if o else "")
+            for f, n, _d, o in targets[:12])
+        if len(targets) > 12:
+            listing += f"\n  \u2026 and {len(targets) - 12} more"
+
+        reply = QMessageBox.question(
+            self, "Delete regions",
+            f"Delete {len(targets)} region(s) and {total_out} result file(s)?\n\n"
+            f"{listing}\n\n"
+            "Full-image results are not affected. This cannot be undone.",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        deleted, errors = 0, []
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            for _folder, roi_name, roi_dir, _n in targets:
+                try:
+                    shutil.rmtree(roi_dir)
+                    deleted += 1
+                except Exception as exc:
+                    errors.append(f"{roi_name}: {exc}")
+        finally:
+            QApplication.restoreOverrideCursor()
+
+        # Rebuild the tree so the deleted rows disappear.
+        try:
+            self._content_view.refresh()
+        except Exception:
+            pass
+        self._update_action_buttons()
+
+        if errors:
+            QMessageBox.warning(
+                self, "Some regions were not deleted",
+                f"{deleted} deleted.\n\n" + "\n".join(errors[:8]))
+        else:
+            QMessageBox.information(
+                self, "Regions deleted",
+                f"{deleted} region(s) deleted. Channels with no regions left "
+                "will open on the full image.")
 
     def _open_sample_folder(self, leaf_key: str) -> None:
         """Open one image, or one of its regions, in the segmentation view.

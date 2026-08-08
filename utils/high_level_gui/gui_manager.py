@@ -3,6 +3,7 @@ import sys
 import gc
 import copy
 import json
+import shutil
 import time
 import traceback
 import yaml  # type: ignore
@@ -545,21 +546,187 @@ class DynamicGUIManager(QObject):
             traceback.print_exc()
             return False
 
-    def _pick_roi_session(self, sessions):
-        """Ask which saved ROI to open. Returns (name, dir) or None for full image.
+    SAVED_REGION_SUFFIX = " (region)"
 
-        Offered only when a channel holds more than one session. "Full image" is a
-        first-class choice rather than a Cancel, because working on the whole image
-        is a normal thing to want and should not require dismissing a dialog.
+    def _show_saved_region_layers(self) -> int:
+        """Outline every saved region on the full image.
+
+        Opening a channel on the full image used to give no sign that regions
+        existed, so they were invisible unless you happened to answer a prompt.
+        Each region gets its own read-only layer, named after it, so you can see
+        where they are and step into one with 'Open region'.
+        """
+        if self.roi_active:
+            return 0
+        from .roi_sharing import list_roi_sessions, load_roi_record, record_polygons
+
+        for layer in [l for l in list(self.viewer.layers)
+                      if str(l.name).endswith(self.SAVED_REGION_SUFFIX)]:
+            self.viewer.layers.remove(layer.name)
+
+        sample_dir = os.path.dirname(self.processed_dir)
+        sessions = [se for se in list_roi_sessions(sample_dir)
+                    if se["has_polygon"]]
+        if not sessions:
+            return 0
+
+        colours = ("cyan", "magenta", "yellow", "lime", "orange", "white")
+        is_3d = self.image_stack.ndim == 3
+        scale = self._layer_scale()
+
+        for index, session in enumerate(sessions):
+            record = load_roi_record(session["roi_dir"])
+            if not record:
+                continue
+            try:
+                z_polys = record_polygons(record)
+            except Exception:
+                continue
+            verts = []
+            for z, poly in sorted(z_polys.items()):
+                arr = np.asarray(poly, dtype=float)
+                if is_3d:
+                    verts.append(np.hstack(
+                        [np.full((arr.shape[0], 1), float(z)), arr]))
+                else:
+                    verts.append(arr)
+            if not verts:
+                continue
+            try:
+                layer = self.viewer.add_shapes(
+                    verts, name=f"{session['name']}{self.SAVED_REGION_SUFFIX}",
+                    shape_type="polygon", edge_color=colours[index % len(colours)],
+                    face_color=[0, 0, 0, 0.0], edge_width=2, scale=scale,
+                )
+                # Read-only: this shows what is committed to disk, and editing it
+                # would imply the change is saved, which it is not.
+                layer.mode = "pan_zoom"
+                layer.editable = False
+            except Exception as exc:
+                print(f"  [ROI] could not outline {session['name']}: {exc}")
+
+        print(f"  [ROI] outlined {len(sessions)} saved region(s) on the full image")
+        return len(sessions)
+
+    def open_roi_session(self) -> None:
+        """Switch from the full image into one of its saved regions, in place.
+
+        Avoids closing and reopening the viewer just to reach a region, which is
+        what you had to do before if you dismissed the prompt on open.
+        """
+        from .roi_sharing import list_roi_sessions
+
+        sample_dir = os.path.dirname(
+            self._full_processed_dir if self.roi_active else self.processed_dir)
+        sessions = [se for se in list_roi_sessions(sample_dir)
+                    if se["has_polygon"]]
+        if not sessions:
+            QMessageBox.information(
+                None, "No regions",
+                "This image has no saved regions. Draw one and click Apply.")
+            return
+
+        choice = self._pick_roi_session(sessions)
+        if choice is None:
+            return
+        roi_name, _roi_dir = choice
+        if self.roi_active and roi_name == self.active_roi_name:
+            return                                  # already there
+
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            if self.roi_active:
+                # Back to the full image first, so the saved full-image state is
+                # restored before a different crop replaces it.
+                self._switch_to_full_image_mode()
+            if not self._try_load_existing_roi_session(roi_name=roi_name):
+                QMessageBox.warning(
+                    None, "Could not open region",
+                    f"'{roi_name}' could not be loaded. It may be missing its "
+                    "polygon file.")
+        except Exception as exc:
+            print(f"[ROI] open_roi_session failed: {exc}")
+            traceback.print_exc()
+            QMessageBox.critical(None, "ROI Error", str(exc))
+        finally:
+            QApplication.restoreOverrideCursor()
+
+    def delete_roi_session(self) -> None:
+        """Delete a saved region from disk, with its results.
+
+        Distinct from Clear, which only leaves ROI mode and deliberately keeps the
+        region. There was previously no way to remove a region at all from here:
+        Clear looked like a delete but wasn't.
+        """
+        from .roi_sharing import list_roi_sessions, roi_session_dir
+
+        sample_dir = os.path.dirname(
+            self._full_processed_dir if self.roi_active else self.processed_dir)
+        sessions = [se for se in list_roi_sessions(sample_dir)]
+        if not sessions:
+            QMessageBox.information(None, "No regions",
+                                    "This image has no saved regions to delete.")
+            return
+
+        choice = self._pick_roi_session(sessions, prompt="Delete which region?",
+                                       include_full=False)
+        if choice is None:
+            return
+        roi_name, roi_dir = choice
+
+        try:
+            n_files = len([f for f in os.listdir(roi_dir)
+                           if f != "roi_polygon.json"])
+        except OSError:
+            n_files = 0
+        reply = QMessageBox.question(
+            None, "Delete region",
+            f"Delete '{roi_name}' and its {n_files} result file(s)?\n\n"
+            "The region outline and anything computed on it are removed from "
+            "disk. Full-image results are not affected.\n\nThis cannot be undone.",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        was_active = self.roi_active and self.active_roi_name == roi_name
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            if was_active:
+                # Leave the session before deleting it: the crop memmap is open
+                # and the processed_dir points inside the folder being removed.
+                self._switch_to_full_image_mode()
+            shutil.rmtree(roi_dir)
+            print(f"  [ROI] deleted session '{roi_name}'")
+            self._show_saved_region_layers()
+        except Exception as exc:
+            print(f"[ROI] delete_roi_session failed: {exc}")
+            traceback.print_exc()
+            QMessageBox.critical(None, "ROI Error",
+                                 f"Could not delete '{roi_name}':\n{exc}")
+        finally:
+            QApplication.restoreOverrideCursor()
+
+    def _pick_roi_session(self, sessions, prompt: str = "",
+                          include_full: bool = True):
+        """Ask which saved region to act on. Returns (name, dir), or None.
+
+        "Full image" is a first-class choice rather than a Cancel, because working
+        on the whole image is a normal thing to want and should not require
+        dismissing a dialog. It is omitted for destructive actions, where "full
+        image" would be a meaningless answer.
         """
         from PyQt5.QtWidgets import QInputDialog  # type: ignore
 
         full_label = "Full image (no ROI)"
-        labels = [full_label] + [se["name"] for se in sessions]
+        labels = ([full_label] if include_full else []) + [
+            se["name"] for se in sessions]
+        if not labels:
+            return None
         label, ok = QInputDialog.getItem(
             None, "Choose a region",
-            f"This image has {len(sessions)} saved regions.\n"
-            "Which would you like to open?",
+            prompt or (f"This image has {len(sessions)} saved regions.\n"
+                       "Which would you like to open?"),
             labels, 0, False,
         )
         if not ok or label == full_label:
@@ -621,7 +788,10 @@ class DynamicGUIManager(QObject):
         # The event fires each time the shapes data changes (polygon added/edited).
         # We record the current Z slice and the polygon count so we can detect
         # additions vs edits and avoid double-counting.
-        self._roi_z_polygon_map: Dict[int, np.ndarray] = {}
+        # A LIST of (z, polygon), not a dict keyed by z. Keying by z meant a
+        # second polygon drawn on the same slice replaced the first, so in 2D --
+        # where everything is z=0 -- only the last polygon drawn ever survived.
+        self._roi_drawn: List[Tuple[int, np.ndarray]] = []
         self._roi_last_polygon_count: int = 0
 
         def _on_shapes_data_changed(event=None):
@@ -640,32 +810,190 @@ class DynamicGUIManager(QObject):
             poly_raw = np.array(shapes_layer.data[-1], dtype=float)
             # Strip Z column if present (ndisplay=2 still gives (N,3) in 3D)
             poly_yx = poly_raw[:, 1:] if poly_raw.shape[1] > 2 else poly_raw
-            self._roi_z_polygon_map[z_slice] = poly_yx
+            self._roi_drawn.append((z_slice, poly_yx))
             print(f"  [ROI] Polygon recorded at Z={z_slice} "
-                  f"({len(self._roi_z_polygon_map)} total)")
+                  f"({len(self._roi_drawn)} total)")
 
         self.viewer.layers[layer_name].events.data.connect(_on_shapes_data_changed)
 
         if is_3d:
             msg = (
-                "Draw polygons on any Z slices to define the 3D sub-region.\n\n"
+                "Draw one or more regions. Each polygon is tagged to the Z\n"
+                "slice it was drawn on.\n\n"
                 "  1. Scroll to a Z slice\n"
                 "  2. Click to add vertices, press Escape to close the polygon\n"
-                "  3. Scroll to the next relevant slice and repeat\n\n"
-                "Each polygon is automatically tagged to the slice it was\n"
-                "drawn on.  Drawing on only ONE slice extrudes that shape\n"
-                "through the entire Z stack.\n\n"
-                "When finished, click  ✓ Confirm ROI."
+                "  3. Repeat for as many regions as you like\n\n"
+                "Several polygons on the SAME slice become separate regions.\n"
+                "Polygons on DIFFERENT slices are ambiguous, so you will be\n"
+                "asked whether they are one region spanning those slices or\n"
+                "separate regions. A single polygon extrudes through all Z.\n\n"
+                "When finished, click  \u2713 Apply."
             )
         else:
             msg = (
-                "Draw a polygon on the image to define the sub-region.\n\n"
-                "  • Click to add vertices\n"
-                "  • Press Escape to close the polygon\n\n"
-                "When finished, click  ✓ Confirm ROI."
+                "Draw one or more regions on the image.\n\n"
+                "  \u2022 Click to add vertices\n"
+                "  \u2022 Press Escape to close the polygon\n"
+                "  \u2022 Repeat for as many regions as you like\n\n"
+                "Every polygon becomes its own region, each with its own\n"
+                "config and results.\n\n"
+                "When finished, click  \u2713 Apply."
             )
 
         QMessageBox.information(None, "Draw ROI", msg)
+
+    def _roi_spec(self, z_polygons, is_3d: bool, img_h: int, img_w: int):
+        """Validate one region's polygons and return its geometry, or None.
+
+        Everything is validated for every region BEFORE any of them is written,
+        so a bad third polygon cannot leave two half-created sessions on disk.
+        """
+        all_yx = np.vstack(list(z_polygons.values()))
+        y0 = max(0, int(np.floor(all_yx[:, 0].min())))
+        x0 = max(0, int(np.floor(all_yx[:, 1].min())))
+        y1 = min(img_h, int(np.ceil(all_yx[:, 0].max())) + 1)
+        x1 = min(img_w, int(np.ceil(all_yx[:, 1].max())) + 1)
+        crop_h, crop_w = y1 - y0, x1 - x0
+
+        if crop_h < 10 or crop_w < 10:
+            QMessageBox.warning(
+                None, "ROI Too Small",
+                f"One region is too small ({crop_h} \u00d7 {crop_w} px; the "
+                "minimum is 10 px per side). Nothing was created.")
+            return None
+
+        # Coordinate-space sanity check. Vertices are expected in image PIXEL
+        # indices; an extent far outside the image means the Shapes layer and the
+        # image layer are in different spaces, and cropping on those numbers would
+        # silently sample the wrong part of the image.
+        if (float(all_yx[:, 0].max()) > img_h * 1.5
+                or float(all_yx[:, 1].max()) > img_w * 1.5):
+            QMessageBox.critical(
+                None, "ROI Coordinate Error",
+                "A drawn region lies outside the image "
+                f"({all_yx[:, 0].max():.0f}, {all_yx[:, 1].max():.0f} vs image "
+                f"{img_h} x {img_w}).\n\nThis indicates the ROI layer is not in "
+                "the image's coordinate space. Nothing was created. Please "
+                "report this.")
+            return None
+
+        if is_3d:
+            sorted_zs = sorted(z_polygons.keys())
+            if len(sorted_zs) == 1:
+                z0_crop, z1_crop = 0, self.image_stack.shape[0]
+                z_desc = "extruded through all Z"
+            else:
+                z0_crop = max(0, sorted_zs[0])
+                z1_crop = min(self.image_stack.shape[0], sorted_zs[-1] + 1)
+                z_desc = (f"Z {z0_crop}\u2013{z1_crop} "
+                          f"({len(sorted_zs)} defined levels)")
+        else:
+            z0_crop, z1_crop = 0, None
+            z_desc = "2D"
+
+        return {"z_polygons": z_polygons, "y0": y0, "x0": x0, "y1": y1, "x1": x1,
+                "crop_h": crop_h, "crop_w": crop_w,
+                "z0": z0_crop, "z1": z1_crop, "z_desc": z_desc}
+
+    def _write_roi_session(self, spec):
+        """Create one region on disk. Returns (name, dir, crop memmap, config)."""
+        from .roi_sharing import next_roi_name, roi_session_dir
+
+        sample_dir = os.path.dirname(self._full_processed_dir)
+        roi_name = next_roi_name(sample_dir)
+        roi_dir = roi_session_dir(sample_dir, roi_name)
+        if not roi_dir:
+            # describe_channel could not read the folder; fall back to the legacy
+            # path rather than refusing to create a region at all.
+            roi_dir = self._full_processed_dir + "_roi"
+            roi_name = "ROI 1"
+        os.makedirs(roi_dir, exist_ok=True)
+        print(f"  [ROI] creating session '{roi_name}' in "
+              f"{os.path.basename(roi_dir)}")
+
+        y0, x0, y1, x1 = spec["y0"], spec["x0"], spec["y1"], spec["x1"]
+        z0_crop, z1_crop = spec["z0"], spec["z1"]
+        z_polygons = spec["z_polygons"]
+
+        roi_data = {
+            "format": "v2",
+            "z_polygons": [
+                {"z": int(z), "polygon_yx": np.asarray(poly, dtype=float).tolist()}
+                for z, poly in sorted(z_polygons.items())
+            ],
+            "bbox": {"y0": y0, "x0": x0, "y1": y1, "x1": x1,
+                     "z0": z0_crop, "z1": z1_crop},
+            "full_image_shape": list(self._full_image_stack.shape),
+        }
+        with open(os.path.join(roi_dir, "roi_polygon.json"), 'w') as fh:
+            json.dump(roi_data, fh, indent=2)
+
+        crop_mm = self._build_crop_memmap(
+            self._full_image_stack, y0, x0, y1, x1, z_polygons,
+            os.path.join(roi_dir, "roi_image_crop.dat"),
+            z0_crop=z0_crop, z1_crop=z1_crop,
+        )
+        roi_config = self._build_roi_config(
+            y0, x0, y1, x1, self._full_config, z0=z0_crop, z1=z1_crop)
+        with open(os.path.join(
+                roi_dir, f"processing_config_{self.processing_mode}.yaml"), 'w') as fh:
+            yaml.safe_dump(roi_config, fh, default_flow_style=False,
+                           sort_keys=False)
+        return roi_name, roi_dir, crop_mm, roi_config
+
+    def _group_drawn_polygons(self, drawn, is_3d: bool):
+        """Split drawn polygons into one entry per region.
+
+        The rule is chosen to be predictable rather than clever:
+
+          * one polygon                 -> one region
+          * several, all on one Z slice -> one region EACH. This covers all of 2D
+            and is what "draw several regions in one go" means.
+          * several across >=2 Z slices -> ambiguous, so ask. The default stays
+            "one region spanning Z", because that is the documented 3D workflow
+            (draw the same structure on several slices) and silently changing it
+            would split existing users' regions apart.
+
+        Returns a list of {z: polygon} dicts, or [] if the user cancelled.
+        """
+        if len(drawn) <= 1:
+            return [{z: poly} for z, poly in drawn]
+
+        distinct_z = sorted({z for z, _ in drawn})
+        if len(distinct_z) <= 1:
+            return [{z: poly} for z, poly in drawn]
+
+        reply = QMessageBox.question(
+            None, "Several polygons drawn",
+            f"You drew {len(drawn)} polygons across {len(distinct_z)} Z slices.\n\n"
+            "Save them as ONE region spanning those slices, or as "
+            f"{len(drawn)} SEPARATE regions?\n\n"
+            "Yes  -  one region spanning Z\n"
+            f"No   -  {len(drawn)} separate regions",
+            QMessageBox.Yes | QMessageBox.No | QMessageBox.Cancel,
+            QMessageBox.Yes,
+        )
+        if reply == QMessageBox.Cancel:
+            return []
+        if reply == QMessageBox.Yes:
+            # One region. Where two polygons share a slice only one mask can be
+            # applied to it, so say so rather than dropping one silently.
+            merged = {}
+            collisions = 0
+            for z, poly in drawn:
+                if z in merged:
+                    collisions += 1
+                merged[z] = poly
+            if collisions:
+                QMessageBox.information(
+                    None, "Overlapping slices",
+                    f"{collisions} polygon(s) shared a Z slice with another. A "
+                    "single region uses one outline per slice, so the later "
+                    "polygon was kept for those slices.\n\n"
+                    "Choose 'separate regions' instead if you meant them to be "
+                    "distinct.")
+            return [merged]
+        return [{z: poly} for z, poly in drawn]
 
     def confirm_roi(self) -> None:
         """
@@ -699,102 +1027,62 @@ class DynamicGUIManager(QObject):
         # --- Use the event-tracked Z→polygon map built during draw_roi ---
         # Fall back to parsing from vertex coordinates only if the map is
         # empty (e.g. confirm clicked without using draw_roi first).
-        z_polygons: Dict[int, np.ndarray] = {}
-
-        tracked = getattr(self, '_roi_z_polygon_map', {})
-        if tracked:
-            z_polygons = dict(tracked)
-            print(f"  [ROI] Using tracked map: {len(z_polygons)} polygon(s) "
-                  f"at Z={sorted(z_polygons.keys())}")
+        drawn: List[Tuple[int, np.ndarray]] = list(getattr(self, '_roi_drawn', []))
+        if drawn:
+            print(f"  [ROI] {len(drawn)} polygon(s) drawn at "
+                  f"Z={sorted({z for z, _ in drawn})}")
         else:
-            # Fallback: parse Z from vertex arrays (works in 2D, unreliable
-            # in 3D perspective mode — warn the user).
+            # Fallback: parse Z from the vertex arrays. Works in 2D; in 3D
+            # perspective mode napari stamps every vertex with the camera focal
+            # plane, so per-slice tagging needs the Draw button.
             for raw in shapes_layer.data:
                 arr = np.array(raw, dtype=float)
                 if arr.shape[1] == 3:
-                    z_val = int(round(float(arr[:, 0].mean())))
-                    poly_yx = arr[:, 1:]
+                    drawn.append((int(round(float(arr[:, 0].mean()))), arr[:, 1:]))
                 else:
-                    z_val = 0
-                    poly_yx = arr
-                z_polygons[z_val] = poly_yx
-            if is_3d and len(z_polygons) < len(shapes_layer.data):
-                print("  [ROI] Warning: some polygons may share the same Z "
-                      "index. Use '✏ Draw ROI' button to ensure reliable "
-                      "per-slice tagging.")
+                    drawn.append((0, arr))
 
-        if not z_polygons:
+        if not drawn:
             QMessageBox.warning(None, "Empty ROI", "No valid polygons found.")
             return
 
-        # --- Union YX bounding box across all polygons ---
-        all_yx = np.vstack(list(z_polygons.values()))
-        y0 = max(0, int(np.floor(all_yx[:, 0].min())))
-        x0 = max(0, int(np.floor(all_yx[:, 1].min())))
-        y1 = min(img_h, int(np.ceil(all_yx[:, 0].max())) + 1)
-        x1 = min(img_w, int(np.ceil(all_yx[:, 1].max())) + 1)
-        crop_h, crop_w = y1 - y0, x1 - x0
+        groups = self._group_drawn_polygons(drawn, is_3d)
+        if not groups:
+            return  # user cancelled the grouping question
 
-        if crop_h < 10 or crop_w < 10:
-            QMessageBox.warning(None, "ROI Too Small",
-                                "The selected region is too small (< 10 px). "
-                                "Please draw a larger polygon.")
-            return
+        # --- Validate and describe every region before writing anything ---
+        specs = []
+        for z_polygons in groups:
+            spec = self._roi_spec(z_polygons, is_3d, img_h, img_w)
+            if spec is None:
+                return          # a problem was reported; nothing written
+            specs.append(spec)
 
-        # Sanity check on the coordinate space. Vertices are expected in image
-        # PIXEL indices; a polygon whose extent falls well outside the image means
-        # the Shapes layer and the image layer are in different spaces, and
-        # cropping on those numbers would silently sample the wrong region.
-        raw_max_y = float(all_yx[:, 0].max())
-        raw_max_x = float(all_yx[:, 1].max())
-        if raw_max_y > img_h * 1.5 or raw_max_x > img_w * 1.5:
-            QMessageBox.critical(
-                None, "ROI Coordinate Error",
-                "The drawn region lies outside the image "
-                f"({raw_max_y:.0f}, {raw_max_x:.0f} vs image {img_h} x {img_w}).\n\n"
-                "This indicates the ROI layer is not in the image's coordinate "
-                "space. No crop was made. Please report this."
-            )
-            return
-
-        # --- Z range ---
-        # Single polygon → extrude through full Z stack.
-        # Multiple polygons → crop to the Z range they span.
-        if is_3d:
-            sorted_zs = sorted(z_polygons.keys())
-            if len(sorted_zs) == 1:
-                z0_crop, z1_crop = 0, self.image_stack.shape[0]
-                z_desc = "extruded through all Z"
-            else:
-                z0_crop = max(0, sorted_zs[0])
-                z1_crop = min(self.image_stack.shape[0], sorted_zs[-1] + 1)
-                z_desc = f"Z {z0_crop}–{z1_crop}  ({len(sorted_zs)} defined levels)"
-        else:
-            z0_crop, z1_crop = 0, None
-            z_desc = "2D"
-
-        # --- Confirmation dialog ---
         full_shape = self.image_stack.shape
-        n_poly = len(z_polygons)
-        poly_note = (f"{n_poly} polygon(s) defined" if n_poly > 1
-                     else "1 polygon")
+        if len(specs) == 1:
+            sp = specs[0]
+            detail = (f"YX bounding box: rows {sp['y0']}\u2013{sp['y1']}, "
+                      f"cols {sp['x0']}\u2013{sp['x1']}\n"
+                      f"Crop YX size: {sp['crop_h']} \u00d7 {sp['crop_w']} px  "
+                      f"(full image: {full_shape[-2]} \u00d7 {full_shape[-1]})\n"
+                      f"Z range: {sp['z_desc']}\n")
+        else:
+            detail = f"{len(specs)} regions will be created:\n" + "\n".join(
+                f"  \u2022 {sp['crop_h']} \u00d7 {sp['crop_w']} px, {sp['z_desc']}"
+                for sp in specs) + "\n"
+
         reply = QMessageBox.question(
             None,
-            "Confirm ROI",
-            f"YX bounding box: rows {y0}–{y1}, cols {x0}–{x1}\n"
-            f"Crop YX size: {crop_h} × {crop_w} px  "
-            f"(full image: {full_shape[-2]} × {full_shape[-1]})\n"
-            f"Z range: {z_desc}\n"
-            f"Polygons: {poly_note}\n\n"
-            f"This will clear any existing ROI session outputs and\n"
-            f"restart from Step 1 on the cropped region.\n\n"
-            f"Continue?",
+            "Confirm regions" if len(specs) > 1 else "Confirm ROI",
+            detail + "\nEach region gets its own config and is processed "
+            "independently, starting from Step 1.\n\nContinue?",
             QMessageBox.Yes | QMessageBox.No,
         )
         if reply != QMessageBox.Yes:
             return
 
         QApplication.setOverrideCursor(Qt.WaitCursor)
+        created = []
         try:
             # Save full-image references (idempotent if called again)
             if not self.roi_active:
@@ -805,67 +1093,34 @@ class DynamicGUIManager(QObject):
                 # doesn't come up auto-contrasted against a mostly-zero crop.
                 self._full_contrast_limits = self._current_contrast_limits()
 
-            # Allocate a NEW session instead of overwriting. Previously every
-            # confirm reused a single "..._roi" directory, so drawing a second
-            # region silently destroyed the first one's polygon and results.
-            from .roi_sharing import next_roi_name, roi_session_dir
-            sample_dir = os.path.dirname(self._full_processed_dir)
-            roi_name = next_roi_name(sample_dir)
-            roi_dir = roi_session_dir(sample_dir, roi_name)
-            if not roi_dir:
-                # describe_channel could not read the folder; fall back to the
-                # legacy path rather than refusing to create an ROI at all.
-                roi_dir = self._full_processed_dir + "_roi"
-                roi_name = "ROI 1"
-            os.makedirs(roi_dir, exist_ok=True)
-            print(f"  [ROI] creating session '{roi_name}' in "
-                  f"{os.path.basename(roi_dir)}")
-
-            # --- Persist polygon metadata (v2 format) ---
-            roi_data = {
-                "format": "v2",
-                "z_polygons": [
-                    {"z": int(z), "polygon_yx": poly.tolist()}
-                    for z, poly in sorted(z_polygons.items())
-                ],
-                "bbox": {
-                    "y0": y0, "x0": x0, "y1": y1, "x1": x1,
-                    "z0": z0_crop, "z1": z1_crop,
-                },
-                "full_image_shape": list(full_shape),
-            }
-            with open(os.path.join(roi_dir, "roi_polygon.json"), 'w') as fh:
-                json.dump(roi_data, fh, indent=2)
-
-            # --- Build cropped + masked image memmap ---
-            crop_path = os.path.join(roi_dir, "roi_image_crop.dat")
-            crop_mm = self._build_crop_memmap(
-                self._full_image_stack,
-                y0, x0, y1, x1,
-                z_polygons, crop_path,
-                z0_crop=z0_crop, z1_crop=z1_crop,
-            )
-
-            # --- Build rescaled config ---
-            roi_config = self._build_roi_config(
-                y0, x0, y1, x1, self._full_config,
-                z0=z0_crop, z1=z1_crop,
-            )
-
-            roi_cfg_path = os.path.join(
-                roi_dir, f"processing_config_{self.processing_mode}.yaml"
-            )
-            with open(roi_cfg_path, 'w') as fh:
-                yaml.safe_dump(roi_config, fh, default_flow_style=False,
-                                sort_keys=False)
+            for spec in specs:
+                created.append(self._write_roi_session(spec))
 
             # --- Remove the draw layer before reinitializing ---
             if layer_name in self.viewer.layers:
                 self.viewer.layers.remove(layer_name)
+            self._roi_drawn = []
 
-            # --- Switch pipeline to ROI mode (always restart from Step 1) ---
-            self._switch_to_roi_mode(crop_mm, roi_dir, roi_config,
-                                     call_restore=False, roi_name=roi_name)
+            if len(created) == 1:
+                # One region: step into it, as before.
+                name, roi_dir, crop_mm, roi_config = created[0]
+                self._switch_to_roi_mode(crop_mm, roi_dir, roi_config,
+                                         call_restore=False, roi_name=name)
+            else:
+                # Several regions: stepping into an arbitrary one would be a
+                # guess, so stay on the full image and show them all. Use
+                # "Open region" to enter one.
+                for _n, _d, crop_mm, _c in created:
+                    del crop_mm
+                self._show_saved_region_layers()
+                QApplication.restoreOverrideCursor()
+                QMessageBox.information(
+                    None, "Regions created",
+                    f"{len(created)} regions were created:\n\n"
+                    + "\n".join(f"  \u2022 {n}" for n, _d, _m, _c in created)
+                    + "\n\nThey are outlined on the full image. Use "
+                      "'Open region' to work on one, or process them from the "
+                      "Project View.")
 
         except Exception as exc:
             print(f"[ROI] confirm_roi failed: {exc}")
@@ -892,8 +1147,8 @@ class DynamicGUIManager(QObject):
             None,
             "Return to Full Image",
             f"Return to full-image processing mode?\n\n"
-            f"'{which}' and its outputs are preserved on disk and can be\n"
-            "reloaded the next time you open this image.",
+            f"'{which}' and its outputs are KEPT on disk and can be reopened\n"
+            "later. Use 'Delete region' to remove it permanently.",
             QMessageBox.Yes | QMessageBox.No,
         )
         if reply != QMessageBox.Yes:
@@ -1163,6 +1418,15 @@ class DynamicGUIManager(QObject):
                 layer.contrast_limits = self._full_contrast_limits
             except Exception:
                 pass
+
+        # Outline any saved regions so they are visible from the full image, and
+        # reachable via 'Open region', instead of being invisible unless a prompt
+        # happened to be answered on open.
+        if not self.roi_active:
+            try:
+                self._show_saved_region_layers()
+            except Exception as exc:
+                print(f"  [ROI] could not outline saved regions: {exc}")
 
     def restore_from_checkpoint(self) -> None:
         """
