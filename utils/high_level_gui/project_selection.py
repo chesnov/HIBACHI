@@ -1035,9 +1035,13 @@ if _HAVE_QT:
                 sessions = []
 
             if sessions:
-                # Tristate so the channel row reflects its regions, while staying
-                # separately checkable for the full image.
-                leaf.setFlags(leaf.flags() | Qt.ItemIsAutoTristate)
+                # Deliberately NOT ItemIsAutoTristate. Qt's auto-tristate couples a
+                # parent's check state to its children in both directions, which is
+                # wrong here: "process the full image" and "process its regions"
+                # are different requests, not a whole and its parts. With the flag
+                # set, checking one region marked the channel too, and a channel
+                # showing Checked is collected by checked_folders() -- so asking for
+                # a region would also have queued the full image.
                 for session in sessions:
                     leaf.addChild(self._make_roi_row(
                         folder, session["name"], channel_key))
@@ -1216,6 +1220,12 @@ if _HAVE_QT:
 
         # ---- events --------------------------------------------------------- #
         def _on_item_changed(self, _item, _col) -> None:
+            # No manual propagation guard is needed. Qt only pushes a check state
+            # down to children from an item that itself carries
+            # ItemIsAutoTristate, and only recomputes a parent from its children
+            # under the same condition. Channel rows do not carry the flag, so
+            # checking a sample stops at its channels and checking a region never
+            # marks its channel.
             if not self._loading:
                 self.selection_changed.emit()
 

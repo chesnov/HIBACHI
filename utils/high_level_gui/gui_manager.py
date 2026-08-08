@@ -468,8 +468,8 @@ class DynamicGUIManager(QObject):
                 return False
         else:
             choice = self._pick_roi_session(sessions)
-            if choice is None:
-                return False
+            if choice is None or choice is self.FULL_IMAGE:
+                return False        # both mean "work on the full image"
             roi_name, roi_dir = choice
 
         roi_json = os.path.join(roi_dir, "roi_polygon.json")
@@ -495,10 +495,8 @@ class DynamicGUIManager(QObject):
             else:
                 z_polygons = {0: np.array(roi_data['polygon_yx'])}
 
-            # Save full-image references
-            self._full_image_stack = self.image_stack
-            self._full_processed_dir = self.processed_dir
-            self._full_config = copy.deepcopy(self.config)
+            # Save full-image references, including the display range.
+            self._remember_full_image_state()
 
             # Derive crop shape from saved bbox
             src = self._full_image_stack
@@ -628,6 +626,14 @@ class DynamicGUIManager(QObject):
 
         choice = self._pick_roi_session(sessions)
         if choice is None:
+            return                                  # cancelled
+        if choice is self.FULL_IMAGE:
+            if self.roi_active:
+                QApplication.setOverrideCursor(Qt.WaitCursor)
+                try:
+                    self._switch_to_full_image_mode()
+                finally:
+                    QApplication.restoreOverrideCursor()
             return
         roi_name, _roi_dir = choice
         if self.roi_active and roi_name == self.active_roi_name:
@@ -637,8 +643,10 @@ class DynamicGUIManager(QObject):
         try:
             if self.roi_active:
                 # Back to the full image first, so the saved full-image state is
-                # restored before a different crop replaces it.
-                self._switch_to_full_image_mode()
+                # restored before a different crop replaces it. call_restore=False
+                # because we are only passing through: the full image's restore
+                # prompt would be about an image the user is not opening.
+                self._switch_to_full_image_mode(call_restore=False)
             if not self._try_load_existing_roi_session(roi_name=roi_name):
                 QMessageBox.warning(
                     None, "Could not open region",
@@ -670,7 +678,9 @@ class DynamicGUIManager(QObject):
 
         choice = self._pick_roi_session(sessions, prompt="Delete which region?",
                                        include_full=False)
-        if choice is None:
+        # include_full=False means the sentinel cannot come back, but unpacking it
+        # as a pair would raise, so it is handled rather than assumed away.
+        if choice is None or choice is self.FULL_IMAGE:
             return
         roi_name, roi_dir = choice
 
@@ -707,6 +717,10 @@ class DynamicGUIManager(QObject):
         finally:
             QApplication.restoreOverrideCursor()
 
+    # Sentinel for "the user chose the full image", as opposed to None for
+    # "the user cancelled".
+    FULL_IMAGE = object()
+
     def _pick_roi_session(self, sessions, prompt: str = "",
                           include_full: bool = True):
         """Ask which saved region to act on. Returns (name, dir), or None.
@@ -729,8 +743,13 @@ class DynamicGUIManager(QObject):
                        "Which would you like to open?"),
             labels, 0, False,
         )
-        if not ok or label == full_label:
-            return None
+        if not ok:
+            return None                      # cancelled: do nothing
+        if label == full_label:
+            # Distinct from cancelling. Collapsing the two meant picking
+            # "Full image" from inside a region did nothing at all, because the
+            # caller could not tell the two apart.
+            return self.FULL_IMAGE
         for se in sessions:
             if se["name"] == label:
                 return se["name"], se["roi_dir"]
@@ -1085,13 +1104,7 @@ class DynamicGUIManager(QObject):
         created = []
         try:
             # Save full-image references (idempotent if called again)
-            if not self.roi_active:
-                self._full_image_stack = self.image_stack
-                self._full_processed_dir = self.processed_dir
-                self._full_config = copy.deepcopy(self.config)
-                # Remember how the full image was being displayed so the ROI
-                # doesn't come up auto-contrasted against a mostly-zero crop.
-                self._full_contrast_limits = self._current_contrast_limits()
+            self._remember_full_image_state()
 
             for spec in specs:
                 created.append(self._write_roi_session(spec))
@@ -1224,8 +1237,14 @@ class DynamicGUIManager(QObject):
         print(f"[ROI] Now in ROI mode — shape {self.image_stack.shape}, "
               f"dir: {os.path.basename(roi_processed_dir)}")
 
-    def _switch_to_full_image_mode(self) -> None:
-        """Tears down the ROI session and reinstates full-image processing."""
+    def _switch_to_full_image_mode(self, call_restore: bool = True) -> None:
+        """Tears down the ROI session and reinstates full-image processing.
+
+        `call_restore=False` is for passing THROUGH full-image mode on the way to
+        another region. The restore prompt ("all steps complete - view results or
+        restart?") describes the full image, so raising it when the user asked for
+        a different region was answering a question they had not been asked.
+        """
         if self._full_image_stack is None:
             return
 
@@ -1250,7 +1269,8 @@ class DynamicGUIManager(QObject):
 
         self.current_step["value"] = 0
         self.strategy.intermediate_state = {}
-        self.restore_from_checkpoint()
+        if call_restore:
+            self.restore_from_checkpoint()
 
         # Notify connected slots (refresh_nav in app_launch) so the Back /
         # Forward / Process buttons reflect the resumed step index.
@@ -1374,6 +1394,27 @@ class DynamicGUIManager(QObject):
         else:
             self.spacing = (1.0, 1.0, 1.0)
             self.z_scale_factor = 1.0
+
+    def _remember_full_image_state(self) -> None:
+        """Snapshot everything needed to return to the full image later.
+
+        ONE place, called by every path that enters a region. There used to be two
+        independent copies of this: confirm_roi captured the display range, and the
+        session loader did not. Entering a region by drawing it therefore kept the
+        full image's brightness while opening a SAVED region did not, so the crop
+        came up auto-contrasted against its own mostly-zero array and looked
+        thresholded. Adding the fourth line to only one copy is what caused that,
+        so there is no second copy to forget.
+
+        Idempotent: does nothing once a region is already active, so passing
+        through does not snapshot a crop as if it were the full image.
+        """
+        if self.roi_active:
+            return
+        self._full_image_stack = self.image_stack
+        self._full_processed_dir = self.processed_dir
+        self._full_config = copy.deepcopy(self.config)
+        self._full_contrast_limits = self._current_contrast_limits()
 
     def _current_contrast_limits(self):
         """Contrast limits of the image layer currently on screen, or None."""
