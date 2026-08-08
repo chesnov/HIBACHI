@@ -2,6 +2,7 @@
 
 
 import os
+from typing import Optional
 import traceback
 import yaml  # type: ignore
 import numpy as np
@@ -444,6 +445,13 @@ class CrossChannelAnalyzerWindow(QMainWindow):
             project_root, "RELATIONAL_ANALYSIS", analysis_name, leaf
         )
         os.makedirs(sample_out_dir, exist_ok=True)
+        # Self-describing results, matching the batch path.
+        try:
+            with open(os.path.join(project_root, "RELATIONAL_ANALYSIS",
+                                   analysis_name, "region.txt"), "w") as fh:
+                fh.write((roi_name or "Full image") + "\n")
+        except OSError:
+            pass
 
         viewer = napari.Viewer(title=f"Cross-Channel Preview: {sample_name}")
         try:
@@ -624,18 +632,87 @@ class CrossChannelAnalyzerWindow(QMainWindow):
 # project window as well as this analyzer).
 # ============================================================================
 
+# Separates an analysis name from a region name inside it, matching the
+# convention used for slide scenes and tree leaves.
+ANALYSIS_SEP = "::"
+
+
+def make_analysis_key(analysis: str, region_dir: Optional[str] = None) -> str:
+    """Identity for one overlay choice: an analysis, optionally scoped to a region."""
+    return f"{analysis}{ANALYSIS_SEP}{region_dir}" if region_dir else analysis
+
+
+def split_analysis_key(key: str):
+    """(analysis, region_dir or None) for an overlay key."""
+    text = str(key)
+    if ANALYSIS_SEP in text:
+        analysis, _, region = text.partition(ANALYSIS_SEP)
+        return analysis, (region or None)
+    return text, None
+
+
+def _has_result_files(directory: str) -> bool:
+    """True if a directory holds relational outputs directly inside it."""
+    try:
+        return any(f.endswith(".dat") or f.endswith(".csv")
+                   for f in os.listdir(directory))
+    except OSError:
+        return False
+
+
 def list_relational_analyses(project_root: str):
-    """Names of saved cross-channel analyses under <project_root>/RELATIONAL_ANALYSIS."""
+    """Saved cross-channel analyses under <project_root>/RELATIONAL_ANALYSIS.
+
+    Returns (display, key) pairs. An analysis run on a saved region writes to
+    ``<analysis>/<sample>/<region>/`` rather than ``<analysis>/<sample>/``, so one
+    analysis name can hold several variants -- the full image, and one per region.
+    Listing only the top-level name meant selecting it found nothing at the level
+    the overlay looks, or worse, silently showed the FULL-IMAGE result when a
+    region was intended. Each variant is therefore its own entry.
+
+    Detected from the directory layout rather than from a recorded label, so an
+    analysis name used for both a full image and a region reports both.
+    """
     rel_dir = os.path.join(project_root, "RELATIONAL_ANALYSIS")
     if not os.path.isdir(rel_dir):
         return []
     try:
-        return sorted(
-            d for d in os.listdir(rel_dir)
-            if os.path.isdir(os.path.join(rel_dir, d))
-        )
+        analyses = sorted(d for d in os.listdir(rel_dir)
+                          if os.path.isdir(os.path.join(rel_dir, d)))
     except OSError:
         return []
+
+    out = []
+    for analysis in analyses:
+        a_dir = os.path.join(rel_dir, analysis)
+        has_full = False
+        regions = set()
+        try:
+            samples = [s for s in os.listdir(a_dir)
+                       if os.path.isdir(os.path.join(a_dir, s))]
+        except OSError:
+            samples = []
+        for sample in samples:
+            s_dir = os.path.join(a_dir, sample)
+            if _has_result_files(s_dir):
+                has_full = True
+            try:
+                for sub in os.listdir(s_dir):
+                    sub_path = os.path.join(s_dir, sub)
+                    if os.path.isdir(sub_path) and _has_result_files(sub_path):
+                        regions.add(sub)
+            except OSError:
+                pass
+
+        # An analysis with no detectable outputs still gets a plain entry, so a
+        # run that failed part-way is visible rather than vanishing.
+        if has_full or not regions:
+            out.append((analysis, make_analysis_key(analysis)))
+        for region in sorted(regions):
+            # Folder names are slugified ("ROI_2"); show them as drawn ("ROI 2").
+            out.append((f"{analysis}  \u203a  {region.replace('_', ' ')}",
+                        make_analysis_key(analysis, region)))
+    return out
 
 
 def draw_proximity_bridges(viewer, df, shape, spacing):
@@ -696,19 +773,29 @@ def open_sample_overlay(project_manager, sample_name, analysis_name=None, parent
         return False
 
     sample_out_dir = None
+    analysis_label = analysis_name
+    region_dir = None
     if analysis_name:
+        # The picker hands over a key, which may name a region inside the analysis.
+        analysis_name, region_dir = split_analysis_key(analysis_name)
         project_root = os.path.dirname(pm.project_path)
         sample_out_dir = os.path.join(
             project_root, "RELATIONAL_ANALYSIS", analysis_name, sample_name
         )
+        if region_dir:
+            sample_out_dir = os.path.join(sample_out_dir, region_dir)
+        analysis_label = (f"{analysis_name} \u203a {region_dir.replace('_', ' ')}"
+                          if region_dir else analysis_name)
         if not os.path.isdir(sample_out_dir):
             QMessageBox.warning(
                 parent, "Not Found",
-                f"No data found for sample '{sample_name}' in analysis '{analysis_name}'."
+                f"No data found for sample '{sample_name}' in "
+                f"'{analysis_label}'."
+                + ("\n\nThis sample may not have that region." if region_dir else "")
             )
             return False
 
-    title = (f"Overlay: {analysis_name} | {sample_name}"
+    title = (f"Overlay: {analysis_label} | {sample_name}"
              if analysis_name else f"Sample: {sample_name}")
     viewer = napari.Viewer(title=title)
     try:

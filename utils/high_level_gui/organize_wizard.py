@@ -323,9 +323,17 @@ def detect_default_mode(raw_dir: str) -> Optional[str]:
 try:
     from PyQt5.QtCore import QEventLoop, Qt, QThread, pyqtSignal  # type: ignore
     from PyQt5.QtWidgets import (  # type: ignore
-        QApplication, QComboBox, QFormLayout, QLabel, QMessageBox, QProgressDialog,
+        QApplication, QComboBox, QFormLayout, QFrame, QHBoxLayout, QLabel,
+        QListWidget, QListWidgetItem, QMessageBox, QProgressDialog, QPushButton,
         QRadioButton, QVBoxLayout, QButtonGroup, QWizard, QWizardPage, QWidget,
     )
+
+    def _hline() -> "QFrame":
+        """A thin separator, so the image list reads as its own section."""
+        line = QFrame()
+        line.setFrameShape(QFrame.HLine)
+        line.setFrameShadow(QFrame.Sunken)
+        return line
     from .project_scaffolding import (
         SetupCancelled,
         organize_channel_project, organize_processing_dir, scan_available_presets,
@@ -370,8 +378,75 @@ if _HAVE_QT:
             lay.addWidget(self.rb_single)
             lay.addWidget(self.rb_multi)
 
+            # ---- which images to include -------------------------------------
+            # Everything is checked by default, so the default behaviour is
+            # unchanged. Unchecking lets a project be set up on one image to try
+            # something quickly; the rest stay in the folder and can be added later
+            # with "Add images...".
+            lay.addWidget(_hline())
+            self._file_hint = QLabel("")
+            self._file_hint.setWordWrap(True)
+            lay.addWidget(self._file_hint)
+
+            self.file_list = QListWidget()
+            self.file_list.setSelectionMode(QListWidget.NoSelection)
+            self.file_list.setMaximumHeight(190)
+            for name in info["files"]:  # type: ignore[index]
+                item = QListWidgetItem(str(name))
+                item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+                item.setCheckState(Qt.Checked)
+                self.file_list.addItem(item)
+            self.file_list.itemChanged.connect(self._refresh_file_hint)
+            lay.addWidget(self.file_list)
+
+            row = QHBoxLayout()
+            row.setContentsMargins(0, 0, 0, 0)
+            btn_all = QPushButton("All")
+            btn_none = QPushButton("None")
+            btn_all.clicked.connect(lambda: self._set_all_files(Qt.Checked))
+            btn_none.clicked.connect(lambda: self._set_all_files(Qt.Unchecked))
+            row.addWidget(btn_all)
+            row.addWidget(btn_none)
+            row.addStretch(1)
+            lay.addLayout(row)
+            self._refresh_file_hint()
+
             # expose as a wizard field so pages can branch
             self.registerField(_F_MULTI, self.rb_multi)
+
+        def _set_all_files(self, state) -> None:
+            for i in range(self.file_list.count()):
+                self.file_list.item(i).setCheckState(state)
+
+        def _refresh_file_hint(self, *_a) -> None:
+            chosen = len(self.selected_files())
+            total = self.file_list.count()
+            if chosen == total:
+                self._file_hint.setText(
+                    f"Include all {total} image{'s' if total != 1 else ''}.")
+            else:
+                self._file_hint.setText(
+                    f"Include {chosen} of {total} images. The other "
+                    f"{total - chosen} stay in the folder and can be added later "
+                    "with 'Add images\u2026' in the project view.")
+            try:
+                self.completeChanged.emit()
+            except Exception:
+                pass
+
+        def selected_files(self) -> List[str]:
+            """Image filenames the user checked, in the order they were listed."""
+            out: List[str] = []
+            for i in range(self.file_list.count()):
+                item = self.file_list.item(i)
+                if item.checkState() == Qt.Checked:
+                    out.append(item.text())
+            return out
+
+        def isComplete(self) -> bool:  # noqa: N802
+            # Setting up a project with no images would produce nothing, so the
+            # Next button stays disabled until at least one is chosen.
+            return bool(self.selected_files())
 
         def nextId(self) -> int:  # noqa: N802
             return self._wiz.page_presets_id
@@ -498,7 +573,9 @@ if _HAVE_QT:
                         break
                     if self.single:
                         self.progress.emit("Organizing project…", 0, 1)
-                        organize_processing_dir(self.raw_dir, preset)
+                        organize_processing_dir(
+                            self.raw_dir, preset,
+                            only_files=self.raw_files or None)
                         self.targets.append(target)
                     else:
                         self.progress.emit(
@@ -543,6 +620,9 @@ if _HAVE_QT:
             # means "show everything" (see detect_default_mode).
             self.mode_filter = detect_default_mode(raw_dir)
             self.selections: Dict[int, str] = {}   # channel_idx -> preset_key
+            # Images to include. Empty means "all", which is what the detect page
+            # starts with, so narrowing is opt-in.
+            self.selected_files: List[str] = []
             self.is_multichannel = False
 
             if mode == "add":
@@ -562,7 +642,8 @@ if _HAVE_QT:
                 self.setPage(0, self._presets_page)
                 self.page_presets_id = 0
             else:
-                self.setPage(0, _DetectPage(self))
+                self._detect_page = _DetectPage(self)
+                self.setPage(0, self._detect_page)
                 self.setPage(1, self._presets_page)
 
             self.button(QWizard.FinishButton).setText("Organize")
@@ -593,6 +674,12 @@ if _HAVE_QT:
             Finish is clicked on). This makes "No presets were chosen" impossible
             whenever the presets page was actually shown and populated.
             """
+            # Which images to include, from the detect page. Absent in "add"
+            # mode, which has no detect page, so it falls back to every image.
+            detect_page = getattr(self, "_detect_page", None)
+            if detect_page is not None:
+                self.selected_files = list(detect_page.selected_files())
+
             page = self._presets_page
             combos = getattr(page, "_combos", {})
             if self.mode == "add":
@@ -641,7 +728,9 @@ if _HAVE_QT:
             if not self.selections:
                 raise ValueError("No presets were chosen.")
 
-            raw_files = list(self.detect["files"])  # type: ignore[index]
+            # Only the images the user checked. Everything is checked by default,
+            # so this is the full list unless they narrowed it.
+            raw_files = list(self.selected_files or self.detect["files"])  # type: ignore[index]
             steps = sorted(self.selections.items())
             single = (self.mode != "add") and not self.is_multichannel
 

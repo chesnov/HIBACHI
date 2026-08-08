@@ -7,7 +7,7 @@ import gc
 import yaml  # type: ignore
 import pandas as pd
 import tifffile as tiff  # type: ignore
-from typing import Dict, Any, List, Optional, Callable
+from typing import Dict, Any, List, Optional, Callable, Sequence
 
 from .gui_text_utils import (
     clean_filename_for_matching, is_os_sidecar, natural_sort_key,
@@ -15,6 +15,25 @@ from .gui_text_utils import (
 from .slide_reader import SetupCancelled  # re-exported for callers
 from .metadata import MetadataExtractor
 
+
+
+# HIBACHI's own record of what it detected, written by organize_processing_dir.
+# It must never be read back as user input: after a partial setup it lists only
+# the images from that run, and those have since been moved into their folders --
+# so a later run would match nothing and organize nothing. Same class of mistake
+# as reading a channel's own metadata.csv as an input.
+AUTO_METADATA_CSV = "auto_generated_metadata.csv"
+
+
+def _is_generated_csv(name: str) -> bool:
+    """True for a CSV this module wrote into the folder being scanned.
+
+    Only auto_generated_metadata.csv qualifies. 'metadata.csv' is deliberately NOT
+    excluded: it is a perfectly ordinary name for a USER's dimension file, and the
+    per-channel metadata.csv this module writes goes into the Channel_* directory,
+    never into the folder that gets scanned for input.
+    """
+    return os.path.basename(str(name)).lower() == AUTO_METADATA_CSV.lower()
 
 
 def scan_available_presets() -> Dict[str, Dict[str, str]]:
@@ -325,7 +344,8 @@ def _find_dimension_csv(source_root: str) -> Optional[str]:
     csvs = [f for f in entries
             if f.lower().endswith('.csv')
             and os.path.isfile(os.path.join(source_root, f))
-            and not is_os_sidecar(f)]
+            and not is_os_sidecar(f)
+            and not _is_generated_csv(f)]
     if not csvs:
         return None
     if len(csvs) == 1:
@@ -662,10 +682,170 @@ def organize_channel_project(
 
     return summary
 
-def organize_processing_dir(drctry: str, preset_details: Dict[str, str]) -> None:
+def existing_image_folder_names(project_dir: str) -> set:
+    """Folder names already organized in a project, single- or multi-channel.
+
+    A multi-channel project keeps one subfolder per image inside each Channel_*
+    directory; a single-channel project keeps them directly in the project folder.
+    Both are checked so one caller works for either kind.
+    """
+    from .project_selection import _valid_image_subfolders, _channel_project_dirs
+
+    names = set()
+    try:
+        channels = _channel_project_dirs(project_dir)
+    except Exception:
+        channels = []
+    roots = channels or [project_dir]
+    for root in roots:
+        try:
+            for sub in _valid_image_subfolders(root):
+                names.add(os.path.basename(sub.rstrip("/\\")))
+        except Exception:
+            pass
+    return names
+
+
+def unorganized_sources(project_dir: str) -> List[str]:
+    """Raw source keys sitting in a project that have not been organized yet.
+
+    Setting a project up on a subset leaves the remaining images loose in the
+    folder -- organizing does not consume them (multi-channel reads them in place,
+    and single-channel only moves the ones it was given). This finds what is left,
+    so a project can be extended later rather than re-set up from scratch.
+
+    Returns source keys, so a slide file contributes one entry per scene.
+    """
+    from .organize_wizard import detect_raw
+    from .slide_reader import folder_name_for_source
+
+    try:
+        detected = list(detect_raw(project_dir).get("files") or [])
+    except Exception:
+        return []
+    done = existing_image_folder_names(project_dir)
+    return [key for key in detected
+            if folder_name_for_source(key) not in done]
+
+
+def preset_from_existing_channel(channel_dir: str) -> Optional[Dict[str, str]]:
+    """Reuse an already-organized image's config as a template for new images.
+
+    Adding images to a project must not ask for a preset again: the channel already
+    has one, and picking a different config for a late arrival would make it
+    incomparable with its siblings. The config of an existing image in the same
+    channel IS that channel's config, so it is copied -- dimensions are recomputed
+    per image by the organizers, so only the parameter blocks carry over.
+    """
+    from .project_selection import _valid_image_subfolders
+
+    try:
+        folders = _valid_image_subfolders(channel_dir)
+    except Exception:
+        folders = []
+    for folder in folders:
+        try:
+            contents = sorted(os.listdir(folder))
+        except OSError:
+            continue
+        yml = next((f for f in contents
+                    if f.lower().endswith((".yaml", ".yml"))), None)
+        if not yml:
+            continue
+        path = os.path.join(folder, yml)
+        try:
+            with open(path, "r") as fh:
+                cfg = yaml.safe_load(fh) or {}
+        except Exception:
+            continue
+        mode = cfg.get("mode")
+        if mode and mode not in ("unknown", "error"):
+            return {"path": path, "default_mode": mode}
+    return None
+
+
+def add_sources_to_project(
+    project_dir: str,
+    source_keys: Sequence[str],
+    progress=None,
+    should_cancel=None,
+) -> Dict[str, Any]:
+    """Organize additional images into an existing project.
+
+    Reuses each channel's existing config rather than asking again, so images added
+    later are processed on the same terms as the ones already there.
+
+    Returns ``{'added': [...], 'channels': n, 'errors': [...], 'summaries': [...]}``.
+    """
+    from .project_selection import _channel_project_dirs
+
+    keys = [k for k in source_keys if k]
+    result: Dict[str, Any] = {"added": [], "channels": 0, "errors": [],
+                              "summaries": []}
+    if not keys:
+        return result
+
+    channels = _channel_project_dirs(project_dir)
+    if channels:
+        for channel_dir in sorted(channels):
+            preset = preset_from_existing_channel(channel_dir)
+            if preset is None:
+                result["errors"].append(
+                    f"{os.path.basename(channel_dir)}: no existing config to "
+                    "copy; add an image to this channel from scratch instead.")
+                continue
+            idx = _channel_index_of(channel_dir)
+            if idx is None:
+                result["errors"].append(
+                    f"{os.path.basename(channel_dir)}: cannot tell which channel "
+                    "this folder holds.")
+                continue
+            try:
+                summary = organize_channel_project(
+                    list(keys), project_dir, channel_dir, idx, preset,
+                    progress=progress, should_cancel=should_cancel)
+                result["summaries"].append(summary)
+                result["channels"] += 1
+            except SetupCancelled:
+                raise
+            except Exception as exc:
+                result["errors"].append(f"{os.path.basename(channel_dir)}: {exc}")
+    else:
+        preset = preset_from_existing_channel(project_dir)
+        if preset is None:
+            result["errors"].append(
+                "No existing config to copy; set the project up from scratch.")
+            return result
+        try:
+            organize_processing_dir(project_dir, preset, only_files=[
+                k for k in keys])
+            result["channels"] = 1
+        except Exception as exc:
+            result["errors"].append(str(exc))
+
+    result["added"] = list(keys)
+    return result
+
+
+def _channel_index_of(channel_dir: str) -> Optional[int]:
+    """Channel index parsed from a 'Channel_<n>_<name>' folder."""
+    base = os.path.basename(str(channel_dir).rstrip("/\\"))
+    parts = base.split("_")
+    if len(parts) >= 2 and parts[0].lower() == "channel" and parts[1].isdigit():
+        return int(parts[1])
+    return None
+
+
+def organize_processing_dir(drctry: str, preset_details: Dict[str, str],
+                            only_files: Optional[Sequence[str]] = None) -> None:
     """
     Setup Logic for SINGLE-CHANNEL / LEGACY mode.
     Includes Robust Matching for CSV filenames vs Disk filenames.
+
+    `only_files` restricts the run to a subset of the folder's images, which is how
+    a project can be set up on one image now and extended later. Files left out
+    stay where they are, loose in the folder, and can be organized in a second pass
+    -- the per-image subfolders this creates do not disturb them.
     """
     config_template_path = preset_details['path']
     fallback_mode = preset_details['default_mode']
@@ -677,7 +857,16 @@ def organize_processing_dir(drctry: str, preset_details: Dict[str, str]) -> None
     # its own image-less folder and make a single CSV look like two.
     all_files = [f for f in sorted(os.listdir(drctry)) if not is_os_sidecar(f)]
     raw_images = [f for f in all_files if f.lower().endswith(('.tif', '.tiff'))]
-    csv_files = [f for f in all_files if f.lower().endswith('.csv')]
+    if only_files is not None:
+        wanted = {os.path.basename(f) for f in only_files}
+        skipped = [f for f in raw_images if f not in wanted]
+        raw_images = [f for f in raw_images if f in wanted]
+        if skipped:
+            print(f"  Organizing {len(raw_images)} of "
+                  f"{len(raw_images) + len(skipped)} image(s); the rest are left "
+                  "in place and can be added later.")
+    csv_files = [f for f in all_files
+                 if f.lower().endswith('.csv') and not _is_generated_csv(f)]
 
     if not raw_images:
         # Single-channel setup reads TIFFs directly; .czi is only handled by the
@@ -782,9 +971,8 @@ def organize_processing_dir(drctry: str, preset_details: Dict[str, str]) -> None
         if generated_rows:
             df = pd.DataFrame(generated_rows)
             try:
-                df.to_csv(os.path.join(drctry, "auto_generated_metadata.csv"),
-                          index=False)
-                print("  Saved 'auto_generated_metadata.csv'.")
+                df.to_csv(os.path.join(drctry, AUTO_METADATA_CSV), index=False)
+                print(f"  Saved '{AUTO_METADATA_CSV}'.")
             except OSError as exc:
                 # A read-only project folder must not abort setup: the rows are
                 # already in memory, which is all step 4 needs.

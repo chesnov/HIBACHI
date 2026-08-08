@@ -369,6 +369,7 @@ class ProjectViewWindow(QMainWindow):
         view.overlay_requested.connect(self._open_overlay)
         view.selection_changed.connect(self._update_action_buttons)
         view.add_channel_requested.connect(self._add_channel)
+        view.add_images_requested.connect(self._add_images)
         view.resetup_requested.connect(self._resetup_project)
         self._install_content_view(view)
 
@@ -660,6 +661,99 @@ class ProjectViewWindow(QMainWindow):
             self._content_view.refresh()
         self._update_action_buttons()
 
+    def _add_images(self, project_dir: str) -> None:
+        """Organize raw images still sitting unorganized in the project folder.
+
+        Exists so a project can be set up on one image to try something quickly and
+        extended afterwards, rather than committing to the whole folder up front or
+        re-setting the project up from scratch.
+        """
+        from .project_scaffolding import add_sources_to_project, unorganized_sources
+        from .slide_reader import folder_name_for_source
+
+        pending = unorganized_sources(project_dir)
+        if not pending:
+            QMessageBox.information(
+                self, "Nothing to add",
+                "Every image in this folder is already organized.")
+            return
+
+        chosen = self._pick_sources(pending)
+        if not chosen:
+            return
+
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            result = add_sources_to_project(project_dir, chosen)
+        except Exception as exc:
+            QApplication.restoreOverrideCursor()
+            QMessageBox.critical(self, "Could not add images", str(exc))
+            return
+        finally:
+            QApplication.restoreOverrideCursor()
+
+        # Rebuild so the new rows appear and the button's count updates.
+        self.open_path(project_dir)
+
+        if result["errors"]:
+            QMessageBox.warning(
+                self, "Some images were not added",
+                f"{len(chosen)} image(s) attempted across "
+                f"{result['channels']} channel(s).\n\n"
+                + "\n".join(result["errors"][:8]))
+        else:
+            QMessageBox.information(
+                self, "Images added",
+                f"{len(chosen)} image(s) added to {result['channels']} "
+                "channel(s), using each channel's existing config.")
+
+    def _pick_sources(self, pending: list) -> list:
+        """Checkbox list of unorganized images. Returns the chosen source keys."""
+        from PyQt5.QtWidgets import (  # type: ignore
+            QDialog, QDialogButtonBox, QListWidget, QListWidgetItem, QVBoxLayout,
+            QLabel, QHBoxLayout, QPushButton,
+        )
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Add images")
+        dlg.setMinimumWidth(420)
+        lay = QVBoxLayout(dlg)
+        head = QLabel(
+            f"{len(pending)} image(s) in this folder are not organized yet.\n"
+            "They will be added to every channel using that channel's existing "
+            "config.")
+        head.setWordWrap(True)
+        lay.addWidget(head)
+
+        listw = QListWidget()
+        for key in pending:
+            item = QListWidgetItem(str(key))
+            item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+            item.setCheckState(Qt.Checked)
+            listw.addItem(item)
+        lay.addWidget(listw)
+
+        row = QHBoxLayout()
+        b_all, b_none = QPushButton("All"), QPushButton("None")
+        b_all.clicked.connect(
+            lambda: [listw.item(i).setCheckState(Qt.Checked)
+                     for i in range(listw.count())])
+        b_none.clicked.connect(
+            lambda: [listw.item(i).setCheckState(Qt.Unchecked)
+                     for i in range(listw.count())])
+        row.addWidget(b_all); row.addWidget(b_none); row.addStretch(1)
+        lay.addLayout(row)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.button(QDialogButtonBox.Ok).setText("Add")
+        buttons.accepted.connect(dlg.accept)
+        buttons.rejected.connect(dlg.reject)
+        lay.addWidget(buttons)
+
+        if dlg.exec_() != QDialog.Accepted:
+            return []
+        return [listw.item(i).text() for i in range(listw.count())
+                if listw.item(i).checkState() == Qt.Checked]
+
     def _add_channel(self, project_dir: str) -> None:
         """Extract one more channel from the leftover raw images."""
         from .organize_wizard import run_organize_wizard
@@ -774,6 +868,9 @@ class ProjectViewWindow(QMainWindow):
         )
         view.open_requested.connect(self._open_sample_folder)
         view.selection_changed.connect(self._update_action_buttons)
+        # Single-channel projects can be extended too: the button only appears
+        # when unorganized images are actually present.
+        view.add_images_requested.connect(self._add_images)
         view.resetup_requested.connect(self._resetup_project)
         self._install_content_view(view)
 

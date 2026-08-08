@@ -831,6 +831,7 @@ if _HAVE_QT:
         overlay_requested = pyqtSignal(str)
         selection_changed = pyqtSignal()
         add_channel_requested = pyqtSignal(str)
+        add_images_requested = pyqtSignal(str)
         resetup_requested = pyqtSignal(str)
 
         # Roles used on tree items:
@@ -923,6 +924,19 @@ if _HAVE_QT:
                 )
                 top.addWidget(self.add_channel_btn)
 
+            # Offered for both project kinds, and only when something is actually
+            # left to add -- a button that always says "nothing to add" is noise.
+            self.add_images_btn = QPushButton("＋ Add images…")
+            self.add_images_btn.setToolTip(
+                "Organize raw images that are still sitting unorganized in the "
+                "project folder, reusing each channel's existing config."
+            )
+            self.add_images_btn.clicked.connect(
+                lambda: self.add_images_requested.emit(self._project_dir)
+            )
+            top.addWidget(self.add_images_btn)
+            self._refresh_add_images_visibility()
+
             # Re-set up is available for both single- and multi-channel projects.
             self.resetup_btn = QPushButton("Re-set up project…")
             self.resetup_btn.setToolTip(
@@ -977,10 +991,25 @@ if _HAVE_QT:
             self._loading = False
             self.selection_changed.emit()
 
+        def _refresh_add_images_visibility(self) -> None:
+            """Show 'Add images' only when unorganized images are present."""
+            btn = getattr(self, "add_images_btn", None)
+            if btn is None:
+                return
+            try:
+                from .project_scaffolding import unorganized_sources
+                pending = unorganized_sources(self._project_dir)
+            except Exception:
+                pending = []
+            btn.setVisible(bool(pending))
+            if pending:
+                btn.setText(f"＋ Add images ({len(pending)})…")
+
         def refresh(self) -> None:
             """Recompute the tree from the current registry, keeping checks."""
             checked = set(self.checked_folders())
             self.reload(self._registry)
+            self._refresh_add_images_visibility()
             if checked:
                 self._loading = True
                 it = QTreeWidgetItemIterator(self.tree)
@@ -1251,8 +1280,16 @@ if _HAVE_QT:
             combo.blockSignals(True)
             combo.clear()
             combo.addItem("— none —", None)          # neutral default: no overlay
-            for name in self._analyses:
-                combo.addItem(name, name)
+            for entry in self._analyses:
+                # Entries are (display, key): one analysis can offer several
+                # variants -- the full image and one per saved region -- so the
+                # label shown and the identity passed on are not the same string.
+                # Plain strings are still accepted for older callers.
+                if isinstance(entry, (tuple, list)) and len(entry) == 2:
+                    display, key = entry
+                else:
+                    display = key = entry
+                combo.addItem(str(display), key)
             if previous is not None:
                 idx = combo.findData(previous)
                 combo.setCurrentIndex(idx if idx >= 0 else 0)
@@ -1265,12 +1302,20 @@ if _HAVE_QT:
                 w.setVisible(visible)
 
         def set_analyses(self, analyses) -> None:
-            """Refresh the list of available cross-channel analyses in the picker."""
+            """Refresh the cross-channel analyses in the picker.
+
+            `analyses` is a sequence of (display, key) pairs, or plain names.
+            """
             self._analyses = list(analyses or [])
             self._populate_analysis_combo(keep_selection=True)
 
         def current_analysis(self) -> Optional[str]:
-            """The selected analysis name, or None when on the neutral entry."""
+            """The selected analysis KEY, or None on the neutral entry.
+
+            A key may name a region inside an analysis; open_sample_overlay splits
+            it. It is deliberately not the displayed label, which is formatted for
+            reading rather than for lookup.
+            """
             combo = self.analysis_combo
             return combo.currentData() if combo is not None else None
 
