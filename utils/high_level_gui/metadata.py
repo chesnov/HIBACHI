@@ -20,6 +20,16 @@ except ImportError:
 
 
 
+class ChannelExtractionError(RuntimeError):
+    """Raised when a channel could not be written, carrying the specific reason.
+
+    Extraction used to fail silently: every failure path returned None, identical
+    to success, so project setup created image-less folders and reported nothing.
+    The reason is the whole value of this exception -- "aicspylibczi is not
+    installed" and "not a TIFF file" call for completely different user actions.
+    """
+
+
 class MetadataExtractor:
     """Helper class to parse dimensions and physical scales from microscopy files."""
 
@@ -146,8 +156,16 @@ class MetadataExtractor:
         return scales
 
     @staticmethod
-    def extract_channel_to_tiff(src_path: str, dest_path: str, channel_idx: int) -> None:
-        """Extracts a channel and preserves the spatial resolution tags."""
+    def extract_channel_to_tiff(src_path: str, dest_path: str, channel_idx: int) -> bool:
+        """Extracts a channel and preserves the spatial resolution tags.
+
+        Returns True on success and raises ChannelExtractionError otherwise.
+        Previously this returned None in every case -- including the several early
+        ``return`` paths and the blanket ``except`` -- so a caller could not tell a
+        successful extraction from one that wrote nothing. Project setup
+        consequently created image folders containing only a config, which then
+        failed validation with no indication of why.
+        """
         try:
             ext = os.path.splitext(src_path)[1].lower()
             ch_data = None
@@ -166,8 +184,8 @@ class MetadataExtractor:
                     data, dims = czi.read_image(C=channel_idx)
                     ch_data = np.squeeze(data)
                 except Exception as czi_e:
-                    print(f"    CZI Read Error: {czi_e}")
-                    return
+                    raise ChannelExtractionError(
+                        f"CZI read error: {czi_e}") from czi_e
 
             # --- BRANCH 2: TIFF FILES ---
             elif ext in ['.tif', '.tiff']:
@@ -196,27 +214,90 @@ class MetadataExtractor:
                 else:
                     ch_data = vol
             
-            else:
-                print(f"    Unsupported file type for extraction: {ext}")
-                return
-
-            # --- COMMON: SAVE TO DISK ---
-            if ch_data is not None:
-                # Calculate resolution for ImageJ/Fiji (pixels per unit)
-                # If meta is 1.0 (default), res is 1.0
-                res_x = 1.0 / source_meta['x'] if source_meta['x'] > 0 else 1.0
-                res_y = 1.0 / source_meta['y'] if source_meta['y'] > 0 else 1.0
-
-                tiff.imwrite(
-                    dest_path, ch_data, 
-                    photometric='minisblack',
-                    resolution=(res_x, res_y),
-                    metadata={'unit': 'micron', 'spacing': source_meta['z']}
+            elif ext == '.czi' and not HAS_CZI:
+                # Called out separately from "unsupported": the format IS supported,
+                # the optional reader just isn't installed, and that distinction is
+                # what tells the user how to fix it.
+                raise ChannelExtractionError(
+                    "cannot read .czi because 'aicspylibczi' is not installed "
+                    "in this environment"
                 )
 
+            else:
+                raise ChannelExtractionError(
+                    f"unsupported file type for extraction: {ext}")
+
+            # --- COMMON: SAVE TO DISK ---
+            if ch_data is None:
+                raise ChannelExtractionError("no channel data could be selected")
+
+            res_x = MetadataExtractor._safe_resolution(source_meta.get('x'))
+            res_y = MetadataExtractor._safe_resolution(source_meta.get('y'))
+            spacing = MetadataExtractor._safe_spacing(source_meta.get('z'))
+
+            tiff.imwrite(
+                dest_path, ch_data,
+                photometric='minisblack',
+                resolution=(res_x, res_y),
+                metadata={'unit': 'micron', 'spacing': spacing}
+            )
+            # Confirm rather than assume: imwrite can leave a zero-length file if
+            # the volume runs out of space mid-write, and a 0-byte .tif would pass
+            # a bare existence check downstream.
+            if not os.path.isfile(dest_path) or os.path.getsize(dest_path) == 0:
+                raise ChannelExtractionError(
+                    "the write completed but produced no data on disk "
+                    "(is the volume full or read-only?)")
+            return True
+
+        except ChannelExtractionError:
+            raise  # already carries a precise reason
         except Exception as e:
+            # Wrap anything unexpected so the caller still gets a usable reason
+            # instead of the old silent None.
             print(f"Extraction failed for {os.path.basename(src_path)}: {e}")
             traceback.print_exc()
+            raise ChannelExtractionError(f"{type(e).__name__}: {e}") from e
+
+    # TIFF stores resolution as a RATIONAL (two uint32s). Converting a float
+    # outside roughly 1e-6..1e6 overflows that conversion and makes imwrite raise
+    # -- which used to abort extraction silently, per file, depending only on what
+    # scale tag the source happened to carry.
+    _MIN_TIFF_RESOLUTION = 1e-6
+    _MAX_TIFF_RESOLUTION = 1e6
+
+    @staticmethod
+    def _safe_resolution(spacing: Any) -> float:
+        """Pixels-per-micron for a micron-per-pixel spacing, clamped to writable.
+
+        Falls back to 1.0 for missing, non-finite, non-positive or physically
+        implausible spacings (below a picometre or above a metre per pixel), since
+        such a value can only come from a junk resolution tag.
+        """
+        try:
+            s = float(spacing)
+        except (TypeError, ValueError):
+            return 1.0
+        if not np.isfinite(s) or s <= 0:
+            return 1.0
+        res = 1.0 / s
+        if not (MetadataExtractor._MIN_TIFF_RESOLUTION
+                <= res <= MetadataExtractor._MAX_TIFF_RESOLUTION):
+            print(f"    Warning: implausible pixel size {s:g} um; writing "
+                  "resolution 1.0 instead.")
+            return 1.0
+        return res
+
+    @staticmethod
+    def _safe_spacing(z: Any) -> float:
+        """Z spacing for the ImageJ 'spacing' tag, sanitised the same way."""
+        try:
+            s = float(z)
+        except (TypeError, ValueError):
+            return 1.0
+        if not np.isfinite(s) or s <= 0:
+            return 1.0
+        return s
 
     @staticmethod
     def get_czi_metadata(path: str) -> Dict[str, Union[float, bool]]:

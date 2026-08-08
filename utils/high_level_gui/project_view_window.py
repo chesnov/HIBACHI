@@ -604,10 +604,12 @@ class ProjectViewWindow(QMainWindow):
                 return
 
             # Not organized yet -- are there raw images to set up into a project?
+            from .gui_text_utils import is_os_sidecar
             raw_files = [
                 f for f in os.listdir(selected_path)
-                if f.lower().endswith(('.tif', '.tiff', '.czi')) and
-                os.path.isfile(os.path.join(selected_path, f))
+                if f.lower().endswith(('.tif', '.tiff', '.czi'))
+                and os.path.isfile(os.path.join(selected_path, f))
+                and not is_os_sidecar(f)
             ]
             if raw_files:
                 # Re-entry guard. When setup succeeds, this folder is a project, so

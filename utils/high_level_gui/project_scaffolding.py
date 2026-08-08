@@ -9,7 +9,9 @@ import pandas as pd
 import tifffile as tiff  # type: ignore
 from typing import Dict, Any, List, Optional, Callable
 
-from .gui_text_utils import clean_filename_for_matching, natural_sort_key
+from .gui_text_utils import (
+    clean_filename_for_matching, is_os_sidecar, natural_sort_key,
+)
 from .metadata import MetadataExtractor
 
 
@@ -321,7 +323,8 @@ def _find_dimension_csv(source_root: str) -> Optional[str]:
         return None
     csvs = [f for f in entries
             if f.lower().endswith('.csv')
-            and os.path.isfile(os.path.join(source_root, f))]
+            and os.path.isfile(os.path.join(source_root, f))
+            and not is_os_sidecar(f)]
     if not csvs:
         return None
     if len(csvs) == 1:
@@ -473,14 +476,29 @@ def organize_channel_project(
     metadata_rows = []
     summary: Dict[str, Any] = {
         'organized': [], 'missing_channel': [], 'failed': [],
-        'unscaled': [], 'csv': os.path.basename(csv_path) if csv_path else None,
+        'skipped_sidecars': [], 'unscaled': [],
+        'csv': os.path.basename(csv_path) if csv_path else None,
+        'channel_idx': channel_idx, 'mode': mode,
+        'target': target_root_dir, 'source_root': source_root,
     }
 
     for src_file in source_files:
         src_path = os.path.join(source_root, src_file)
-        
+
+        # Defensive: detect_raw already filters these, but organize_channel_project
+        # is public API and a stale caller could still pass sidecars through.
+        if is_os_sidecar(src_file):
+            summary['skipped_sidecars'].append(src_file)
+            continue
+
         # Ensure file has the requested channel
-        if MetadataExtractor.get_channel_count(src_path) <= channel_idx:
+        try:
+            n_ch = MetadataExtractor.get_channel_count(src_path)
+        except Exception as exc:
+            summary['failed'].append({'file': src_file,
+                                      'reason': f'channel count unreadable: {exc}'})
+            continue
+        if n_ch <= channel_idx:
             summary['missing_channel'].append(src_file)
             continue
 
@@ -492,11 +510,38 @@ def organize_channel_project(
         target_tif_path = os.path.join(img_subdir, target_tif_name)
 
         print(f"    Processing {src_file}...")
+        extracted = False
+        reason = ''
         try:
-            MetadataExtractor.extract_channel_to_tiff(src_path, target_tif_path, channel_idx)
+            extracted = bool(MetadataExtractor.extract_channel_to_tiff(
+                src_path, target_tif_path, channel_idx
+            ))
         except Exception as e:
+            reason = str(e)
             print(f"    Error extracting channel {channel_idx} from {src_file}: {e}")
-            summary['failed'].append(src_file)
+
+        # Trust the filesystem over the return value: this catches every failure
+        # mode, including any the extractor doesn't recognise in itself.
+        if not os.path.isfile(target_tif_path) or os.path.getsize(target_tif_path) == 0:
+            extracted = False
+            reason = reason or 'extraction wrote no image data'
+
+        if not extracted:
+            # Leave nothing behind. Writing the config anyway produced folders
+            # holding a YAML and no image, which fail the "one tif + one yaml"
+            # check and made a whole project look empty for no visible reason.
+            try:
+                if os.path.isfile(target_tif_path):
+                    os.remove(target_tif_path)
+                if not os.listdir(img_subdir):
+                    os.rmdir(img_subdir)
+            except OSError:
+                pass
+            summary['failed'].append({
+                'file': src_file,
+                'reason': reason or 'unknown extraction failure',
+                'channels_detected': n_ch,
+            })
             continue
 
         # Extract metadata from original source (richer metadata than extracted single channel)
@@ -593,7 +638,10 @@ def organize_processing_dir(drctry: str, preset_details: Dict[str, str]) -> None
 
     print(f"Organizing Standard Project in: {drctry}")
 
-    all_files = sorted(os.listdir(drctry))
+    # Sidecars must go before anything counts images or CSVs: a macOS volume
+    # yields a '._' twin for every file, which would otherwise be organized into
+    # its own image-less folder and make a single CSV look like two.
+    all_files = [f for f in sorted(os.listdir(drctry)) if not is_os_sidecar(f)]
     raw_images = [f for f in all_files if f.lower().endswith(('.tif', '.tiff'))]
     csv_files = [f for f in all_files if f.lower().endswith('.csv')]
 

@@ -27,6 +27,8 @@ from datetime import datetime
 from dataclasses import dataclass, field
 from typing import Callable, List, Optional
 
+from .gui_text_utils import is_os_sidecar
+
 # Image extensions HIBACHI understands as raw input.
 _RAW_IMAGE_EXTS = (".tif", ".tiff", ".czi")
 
@@ -82,6 +84,7 @@ def _valid_image_subfolders(directory: str) -> List[str]:
             contents = os.listdir(sub)
         except OSError:
             continue
+        contents = [f for f in contents if not is_os_sidecar(f)]
         tifs = [f for f in contents if f.lower().endswith((".tif", ".tiff"))]
         yamls = [f for f in contents if f.lower().endswith((".yaml", ".yml"))]
         if len(tifs) == 1 and len(yamls) == 1:
@@ -98,6 +101,10 @@ def _loose_images(directory: str) -> List[str]:
         return out
     for f in entries:
         full = os.path.join(directory, f)
+        # A macOS sidecar carries the real file's extension, so without this an
+        # otherwise-empty folder classifies as RAW_IMAGES and offers to be set up.
+        if is_os_sidecar(f):
+            continue
         if os.path.isfile(full) and f.lower().endswith(_RAW_IMAGE_EXTS):
             out.append(full)
     return out

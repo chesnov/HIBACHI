@@ -22,13 +22,19 @@ wizard is defined only when PyQt5 is importable.
 
 from __future__ import annotations
 
+import datetime
 import os
 import re
 import shutil
 import yaml
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Sequence
 
 _RAW_EXTS = (".tif", ".tiff", ".czi")
+
+# Sidecar filtering lives in gui_text_utils so every path that enumerates raw
+# images agrees on what counts as an image (see is_os_sidecar for why this
+# matters on macOS external volumes).
+from .gui_text_utils import is_os_sidecar  # noqa: E402
 
 
 # --------------------------------------------------------------------------- #
@@ -44,13 +50,24 @@ def detect_raw(raw_dir: str) -> Dict[str, object]:
     from .metadata import MetadataExtractor  # lazy: heavy import, keeps helpers testable
 
     files: List[str] = []
+    skipped: List[str] = []
     try:
         for f in sorted(os.listdir(raw_dir)):
-            if (f.lower().endswith(_RAW_EXTS)
+            if not (f.lower().endswith(_RAW_EXTS)
                     and os.path.isfile(os.path.join(raw_dir, f))):
-                files.append(f)
+                continue
+            # macOS AppleDouble sidecars share the real file's extension and sort
+            # first, so they must be dropped before anything inspects "the first
+            # image" or hands this list to the scaffolder.
+            if is_os_sidecar(f):
+                skipped.append(f)
+                continue
+            files.append(f)
     except OSError:
         pass
+    if skipped:
+        print(f"  [detect] ignored {len(skipped)} operating-system sidecar "
+              f"file(s), e.g. {skipped[0]}")
 
     max_channels = 1
     for f in files:
@@ -64,6 +81,7 @@ def detect_raw(raw_dir: str) -> Dict[str, object]:
         "files": files,
         "max_channels": max_channels,
         "has_czi": any(f.lower().endswith(".czi") for f in files),
+        "skipped_sidecars": skipped,
     }
 
 
@@ -227,16 +245,25 @@ def detect_default_mode(raw_dir: str) -> Optional[str]:
     try:
         files = [f for f in sorted(os.listdir(raw_dir))
                  if f.lower().endswith((".tif", ".tiff"))
-                 and os.path.isfile(os.path.join(raw_dir, f))]
+                 and os.path.isfile(os.path.join(raw_dir, f))
+                 and not is_os_sidecar(f)]
     except OSError:
         return None
     if not files:
         return None  # e.g. only .czi present -> don't guess
 
-    try:
-        with tiff.TiffFile(os.path.join(raw_dir, files[0])) as tf:
-            shape = tf.series[0].shape
-    except Exception:
+    # Try each candidate rather than only files[0]. One unreadable file used to
+    # collapse the whole guess to None, which silently unfiltered the preset list
+    # and offered 3D configs for a 2D dataset.
+    shape = None
+    for name in files:
+        try:
+            with tiff.TiffFile(os.path.join(raw_dir, name)) as tf:
+                shape = tf.series[0].shape
+            break
+        except Exception as exc:
+            print(f"  [detect] could not read {name} for mode detection: {exc}")
+    if shape is None:
         return None
 
     ndim = len(shape)
@@ -525,7 +552,7 @@ if _HAVE_QT:
                 # wizard, so going out of scope doesn't destroy it).
                 progress.close()
 
-            self._verify_created(targets)
+            self._verify_created(targets, summaries)
             self._report_unscaled(summaries)
 
         def _report_unscaled(self, summaries: List[dict]) -> None:
@@ -567,7 +594,178 @@ if _HAVE_QT:
                 "project, or correct the dimensions per image in the project view."
             )
 
-        def _verify_created(self, targets: List[str]) -> None:
+        # ---- diagnostics ---------------------------------------------------- #
+        def _environment(self) -> List[str]:
+            """Environment facts worth having when setup behaves differently on one
+            machine than another -- which is exactly the report this exists for."""
+            import platform
+            lines = [
+                f"platform      : {platform.platform()}",
+                f"python        : {platform.python_version()}",
+            ]
+            for mod in ("tifffile", "numpy", "pandas"):
+                try:
+                    m = __import__(mod)
+                    lines.append(f"{mod:<14}: {getattr(m, '__version__', '?')}")
+                except Exception:
+                    lines.append(f"{mod:<14}: NOT IMPORTABLE")
+            try:
+                from .metadata import HAS_CZI
+                lines.append("czi support   : "
+                             + ("yes" if HAS_CZI else "no (aicspylibczi missing)"))
+            except Exception:
+                lines.append("czi support   : unknown")
+            return lines
+
+        def _inspect_file(self, name: str) -> str:
+            """Why one raw file can or cannot be used, in a single line.
+
+            This is the part that identifies a cause. Shape, channel count and
+            resolved scale together distinguish "not a TIFF at all" from "no
+            channel to extract" from "junk resolution tag", which the old message
+            lumped into one unexplained empty folder.
+            """
+            path = os.path.join(self.raw_dir, name)
+            try:
+                size = os.path.getsize(path)
+            except OSError as exc:
+                return f"unreadable ({exc})"
+            bits = [f"{size / 1e6:.2f} MB"]
+
+            if name.lower().endswith(".czi"):
+                try:
+                    from .metadata import HAS_CZI, MetadataExtractor
+                    if not HAS_CZI:
+                        return f"{bits[0]}, .czi but aicspylibczi is NOT installed"
+                    bits.append(f"channels={MetadataExtractor.get_channel_count(path)}")
+                except Exception as exc:
+                    return f"{bits[0]}, czi inspection failed: {exc}"
+                return ", ".join(bits)
+
+            try:
+                import tifffile as tiff
+                with tiff.TiffFile(path) as tf:
+                    bits.append(f"shape={tf.series[0].shape}")
+                    bits.append(f"dtype={tf.series[0].dtype}")
+                    bits.append("imagej=" + ("yes" if tf.imagej_metadata else "no"))
+                    bits.append("ome=" + ("yes" if tf.ome_metadata else "no"))
+                from .metadata import MetadataExtractor
+                bits.append(f"channels={MetadataExtractor.get_channel_count(path)}")
+                meta = MetadataExtractor.read_tiff_metadata(path)
+                bits.append(
+                    f"scale_found={meta.get('found')} x={float(meta.get('x', 1)):g} "
+                    f"y={float(meta.get('y', 1)):g} z={float(meta.get('z', 1)):g}"
+                )
+            except Exception as exc:
+                bits.append(f"NOT READABLE AS TIFF: {type(exc).__name__}: {exc}")
+            return ", ".join(bits)
+
+        def _diagnostics(self, targets: Sequence[str],
+                         summaries: Sequence[dict]) -> List[str]:
+            """Everything setup saw and did, for both the log and the dialog."""
+            from .project_selection import classify_path
+
+            lines: List[str] = ["=== HIBACHI project setup diagnostics ==="]
+            lines.append("when          : "
+                         + datetime.datetime.now().isoformat(timespec="seconds"))
+            lines.extend(self._environment())
+            lines.append("")
+            lines.append(f"raw dir       : {self.raw_dir}")
+            lines.append(f"project dir   : {self.project_dir}")
+            lines.append(f"wizard mode   : {self.mode}")
+            lines.append(f"multichannel  : {self.is_multichannel}")
+            lines.append(f"detected mode : {self.mode_filter or 'undetermined'}")
+            lines.append(f"max channels  : {self.detect.get('max_channels')}")
+            lines.append(f"presets chosen: {self.selections}")
+
+            files = list(self.detect.get("files") or [])
+            sidecars = list(self.detect.get("skipped_sidecars") or [])
+            lines.append("")
+            lines.append(f"raw images    : {len(files)}")
+            if sidecars:
+                lines.append(f"os sidecars ignored: {len(sidecars)} "
+                             f"(e.g. {sidecars[0]})")
+
+            lines.append("")
+            lines.append("--- per-file inspection ---")
+            for f in files[:20]:
+                lines.append(f"  {f}: {self._inspect_file(f)}")
+            if len(files) > 20:
+                lines.append(f"  ... and {len(files) - 20} more")
+
+            lines.append("")
+            lines.append("--- per-channel results ---")
+            for summary in summaries:
+                lines.append(
+                    f"  channel {summary.get('channel_idx')} -> "
+                    f"{os.path.basename(str(summary.get('target')))}"
+                    f"  mode={summary.get('mode')}"
+                )
+                lines.append(f"      organized      : "
+                             f"{len(summary.get('organized') or [])}")
+                lines.append(f"      missing channel: "
+                             f"{summary.get('missing_channel') or []}")
+                lines.append(f"      sidecars       : "
+                             f"{summary.get('skipped_sidecars') or []}")
+                lines.append(f"      csv used       : {summary.get('csv')}")
+                lines.append(f"      unscaled       : "
+                             f"{summary.get('unscaled') or []}")
+                for fail in (summary.get("failed") or []):
+                    if isinstance(fail, dict):
+                        lines.append(
+                            f"      FAILED {fail.get('file')}: "
+                            f"{fail.get('reason')} "
+                            f"(channels detected: {fail.get('channels_detected')})"
+                        )
+                    else:
+                        lines.append(f"      FAILED {fail}")
+
+            lines.append("")
+            lines.append("--- resulting folders ---")
+            for target in dict.fromkeys(targets):
+                lines.append(f"  {target}")
+                try:
+                    lines.append(f"      classified as: {classify_path(target).kind}")
+                except Exception as exc:
+                    lines.append(f"      classify error: {exc}")
+                try:
+                    for sub in sorted(os.listdir(target))[:10]:
+                        full = os.path.join(target, sub)
+                        if os.path.isdir(full):
+                            lines.append(
+                                f"      {sub}/ -> {sorted(os.listdir(full))[:6]}")
+                        else:
+                            lines.append(f"      {sub}")
+                except OSError as exc:
+                    lines.append(f"      (unreadable: {exc})")
+            return lines
+
+        def _write_log(self, lines: Sequence[str]) -> Optional[str]:
+            """Write the diagnostics to disk; returns the path, or None if nowhere.
+
+            The project folder is tried first so the log sits with the data it
+            describes, then the raw folder, then temp -- a read-only or full volume
+            is exactly the sort of condition that causes the failure being
+            diagnosed, so the last fallback must not be on the user's drive.
+            """
+            import tempfile
+            body = "\n".join(lines) + "\n"
+            name = ("hibachi_setup_log_"
+                    + datetime.datetime.now().strftime("%Y%m%d_%H%M%S") + ".txt")
+            for folder in (self.project_dir, self.raw_dir, tempfile.gettempdir()):
+                if not folder:
+                    continue
+                try:
+                    path = os.path.join(folder, name)
+                    with open(path, "w") as fh:
+                        fh.write(body)
+                    return path
+                except Exception:
+                    continue
+            return None
+
+        def _verify_created(self, targets: List[str],
+                            summaries: Sequence[dict] = ()) -> None:
             """Confirm setup actually produced something openable.
 
             Every organize step can decline work for individually benign reasons:
@@ -578,9 +776,10 @@ if _HAVE_QT:
             images, and re-opened this wizard. That was the endless
             project-creation loop, with no project and no error message.
 
-            Checking the on-disk result closes that hole for good: whatever the
-            underlying reason, "nothing was created" now surfaces as a message the
-            user can act on instead of a wizard that reappears forever.
+            When it does fail, the message has to carry the reason. The first
+            version named only the empty folders, which told a user nothing about
+            *why* they were empty, so the per-file findings and a written log go in
+            here too.
             """
             from .project_selection import (  # lazy: pure logic, no Qt at import
                 classify_path, MULTICHANNEL_PROJECT, PROJECT,
@@ -595,13 +794,54 @@ if _HAVE_QT:
                     failed.append(target)
 
             if not made:
-                where = "\n".join(f"\u2022 {t}" for t in (failed or targets))
+                lines = self._diagnostics(targets, summaries)
+                log_path = self._write_log(lines)
+                for line in lines:
+                    print(line)
+
+                # Lead with the actual per-file reasons: they are what identifies
+                # the cause. Fall back to the folder list only if there are none.
+                reasons: List[str] = []
+                for summary in summaries:
+                    for fail in (summary.get("failed") or []):
+                        if isinstance(fail, dict):
+                            reasons.append(
+                                f"\u2022 {fail.get('file')}: {fail.get('reason')}")
+                        else:
+                            reasons.append(f"\u2022 {fail}")
+                missing = sorted({
+                    f for summary in summaries
+                    for f in (summary.get("missing_channel") or [])
+                })
+
+                if reasons:
+                    uniq = list(dict.fromkeys(reasons))
+                    detail = ("None of the images could be extracted:\n"
+                              + "\n".join(uniq[:6]))
+                    if len(uniq) > 6:
+                        detail += f"\n\u2026 and {len(uniq) - 6} more"
+                elif missing:
+                    detail = (
+                        f"{len(missing)} image(s) did not contain the requested "
+                        "channel, e.g. " + ", ".join(missing[:3]) + ".\n"
+                        "If these images are single-channel, set the project up as "
+                        "single-channel instead."
+                    )
+                else:
+                    where = "\n".join(f"\u2022 {t}" for t in (failed or targets))
+                    detail = f"Nothing usable was written to:\n{where}"
+
+                log_note = (
+                    f"\n\nA diagnostic log was saved to:\n{log_path}\n"
+                    "Please send this file to the developer."
+                    if log_path else
+                    "\n\nDiagnostics were printed to the console."
+                )
+
                 raise ValueError(
                     "Setup finished without creating any image folders, so there "
-                    "is no project to open.\n\nNothing usable was written to:\n"
-                    f"{where}\n\nYour raw images were left untouched. Check that "
-                    "the images can be read, and that any metadata CSV in the "
-                    "folder lists filenames matching the files on disk."
+                    f"is no project to open.\n\n{detail}\n\nYour raw images were "
+                    f"left untouched.{log_note}"
                 )
 
             # Partial success (e.g. one channel of several came up empty) is worth

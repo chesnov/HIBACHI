@@ -50,3 +50,43 @@ def clean_filename_for_matching(name: str) -> str:
     # Remove scene suffixes like " #1", " #2"
     n = re.sub(r'\s+#\d+$', '', n)
     return n.strip()
+
+
+# --------------------------------------------------------------------------- #
+# Operating-system sidecar files
+# --------------------------------------------------------------------------- #
+_APPLEDOUBLE_PREFIX = "._"
+_JUNK_BASENAMES = {
+    ".ds_store", "thumbs.db", "desktop.ini", ".spotlight-v100",
+    ".trashes", ".fseventsd", ".apdisk", "__macosx",
+}
+
+
+def is_os_sidecar(name: str) -> bool:
+    """True if `name` is an operating-system sidecar file rather than real data.
+
+    macOS writes an AppleDouble resource fork named ``._<original>`` beside every
+    file on filesystems that can't store forks natively -- exFAT, NTFS, FAT32 and
+    SMB shares, which covers essentially every external drive and network volume
+    mounted under /Volumes. These sidecars carry the SAME extension as the file
+    they shadow, so ``._scan.tif`` passes any ``endswith('.tif')`` check while
+    being a ~4 KB AppleDouble blob that no TIFF reader can open.
+
+    Worse, ``._name`` sorts BEFORE ``name`` (0x2E precedes alphanumerics), so a
+    sidecar is the first entry in any sorted listing. Code that inspects only the
+    first image to guess a folder's properties therefore inspects the sidecar,
+    fails, and falls back to its "unknown" branch -- which is how a folder of 2D
+    images was detected as 3D on a Mac but correctly as 2D on Linux.
+
+    Filtering these out is safe on every platform: a leading ``._`` is not a
+    naming convention any microscope export uses.
+    """
+    base = os.path.basename(str(name))
+    if base.startswith(_APPLEDOUBLE_PREFIX):
+        return True
+    return base.lower() in _JUNK_BASENAMES
+
+
+def real_files(names) -> List[str]:
+    """`names` with operating-system sidecar files removed, order preserved."""
+    return [n for n in names if not is_os_sidecar(n)]
