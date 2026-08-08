@@ -247,6 +247,7 @@ class DynamicGUIManager(QObject):
         # These are set when the user confirms a polygon crop.
         # _full_* refs allow returning to the full-image session at any time.
         self.roi_active: bool = False
+        self._full_contrast_limits: Optional[list] = None
         self._full_image_stack: Optional[np.ndarray] = None
         self._full_processed_dir: Optional[str] = None
         self._full_config: Optional[Dict[str, Any]] = None
@@ -632,12 +633,20 @@ class DynamicGUIManager(QObject):
         if is_3d:
             self.viewer.dims.ndisplay = 2
 
+        # MUST share the image layer's scale. Without it the layer sits in world
+        # space, so for a 2D image (scaled by microns/pixel) napari returns
+        # vertices in microns; confirm_roi treats them as pixel indices, and the
+        # crop lands offset toward the origin and shrunk by 1/spacing. 3D was
+        # unaffected because its y/x scale is 1, which is why this only showed up
+        # on 2D data -- and only once real pixel dimensions were imported, since
+        # an uncalibrated image has spacing exactly 1.0.
         self.viewer.add_shapes(
             name=layer_name,
             shape_type='polygon',
             edge_color='yellow',
             face_color=[1, 1, 0, 0.08],
             edge_width=3,
+            scale=self._layer_scale(),
         )
         self.viewer.layers[layer_name].mode = 'add_polygon'
 
@@ -765,6 +774,22 @@ class DynamicGUIManager(QObject):
                                 "Please draw a larger polygon.")
             return
 
+        # Sanity check on the coordinate space. Vertices are expected in image
+        # PIXEL indices; a polygon whose extent falls well outside the image means
+        # the Shapes layer and the image layer are in different spaces, and
+        # cropping on those numbers would silently sample the wrong region.
+        raw_max_y = float(all_yx[:, 0].max())
+        raw_max_x = float(all_yx[:, 1].max())
+        if raw_max_y > img_h * 1.5 or raw_max_x > img_w * 1.5:
+            QMessageBox.critical(
+                None, "ROI Coordinate Error",
+                "The drawn region lies outside the image "
+                f"({raw_max_y:.0f}, {raw_max_x:.0f} vs image {img_h} x {img_w}).\n\n"
+                "This indicates the ROI layer is not in the image's coordinate "
+                "space. No crop was made. Please report this."
+            )
+            return
+
         # --- Z range ---
         # Single polygon → extrude through full Z stack.
         # Multiple polygons → crop to the Z range they span.
@@ -809,6 +834,9 @@ class DynamicGUIManager(QObject):
                 self._full_image_stack = self.image_stack
                 self._full_processed_dir = self.processed_dir
                 self._full_config = copy.deepcopy(self.config)
+                # Remember how the full image was being displayed so the ROI
+                # doesn't come up auto-contrasted against a mostly-zero crop.
+                self._full_contrast_limits = self._current_contrast_limits()
 
             roi_dir = self._full_processed_dir + "_roi"
             os.makedirs(roi_dir, exist_ok=True)
@@ -965,6 +993,8 @@ class DynamicGUIManager(QObject):
         self._stop_worker_safely()
 
         self.roi_active = False
+        # Full image gets its own auto-contrast again.
+        self._full_contrast_limits = None
         self.image_stack = self._full_image_stack
         self.processed_dir = self._full_processed_dir
         self.config = copy.deepcopy(self._full_config)
@@ -1105,20 +1135,49 @@ class DynamicGUIManager(QObject):
             self.spacing = (1.0, 1.0, 1.0)
             self.z_scale_factor = 1.0
 
+    def _current_contrast_limits(self):
+        """Contrast limits of the image layer currently on screen, or None."""
+        name = f"Original stack ({self.processing_mode} mode)"
+        try:
+            if name in self.viewer.layers:
+                return list(self.viewer.layers[name].contrast_limits)
+        except Exception:
+            pass
+        return None
+
+    def _layer_scale(self) -> tuple:
+        """Napari `scale` for layers over the current image.
+
+        Single source of truth so an overlaid layer cannot end up in a different
+        world space from the image. That mattered: the ROI Shapes layer used to be
+        added unscaled, and because the 2D branch below scales by MICRONS PER
+        PIXEL, napari then reported polygon vertices in microns while confirm_roi
+        read them as pixel indices -- cropping the wrong part of the image.
+        """
+        return (
+            (self.z_scale_factor, 1, 1) if self.image_stack.ndim == 3
+            else (self.spacing[1], self.spacing[2])
+        )
+
     def _initialize_layers(self) -> None:
         """Adds the original image to Napari."""
         self.viewer.layers.clear() 
         layer_name = f"Original stack ({self.processing_mode} mode)"
         if layer_name in self.viewer.layers:
             self.viewer.layers.remove(layer_name)
-            
-        scale = (
-            (self.z_scale_factor, 1, 1) if self.image_stack.ndim == 3
-            else (self.spacing[1], self.spacing[2])
+
+        layer = self.viewer.add_image(
+            self.image_stack, name=layer_name, scale=self._layer_scale()
         )
-        self.viewer.add_image(
-            self.image_stack, name=layer_name, scale=scale
-        )
+        # Carry the full image's display range into an ROI session. A crop is
+        # bounding-box shaped with everything outside the polygon zeroed, so
+        # napari's auto-contrast stretches to that mostly-empty array and the
+        # sub-region looks thresholded rather than like the image it came from.
+        if getattr(self, "_full_contrast_limits", None):
+            try:
+                layer.contrast_limits = self._full_contrast_limits
+            except Exception:
+                pass
 
     def restore_from_checkpoint(self) -> None:
         """
