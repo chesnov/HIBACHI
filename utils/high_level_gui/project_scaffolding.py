@@ -502,7 +502,13 @@ def organize_channel_project(
             summary['missing_channel'].append(src_file)
             continue
 
-        basename = os.path.splitext(src_file)[0]
+        # A slide source is "file::scene"; splitext would mangle it, and all six
+        # scenes of one slide would collide on the same folder name.
+        try:
+            from .slide_reader import folder_name_for_source
+            basename = folder_name_for_source(src_file)
+        except Exception:
+            basename = os.path.splitext(src_file)[0]
         img_subdir = os.path.join(target_root_dir, basename)
         os.makedirs(img_subdir, exist_ok=True)
 
@@ -545,7 +551,9 @@ def organize_channel_project(
             continue
 
         # Extract metadata from original source (richer metadata than extracted single channel)
-        if src_file.lower().endswith('.czi'):
+        if MetadataExtractor._slide_source(src_file)[0] is not None:
+            meta = MetadataExtractor.read_slide_metadata(src_path)
+        elif src_file.lower().endswith('.czi'):
             meta = MetadataExtractor.get_czi_metadata(src_path)
         else:
             meta = MetadataExtractor.read_tiff_metadata(src_path)

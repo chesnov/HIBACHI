@@ -31,6 +31,15 @@ from typing import Dict, List, Optional, Sequence
 
 _RAW_EXTS = (".tif", ".tiff", ".czi")
 
+# Whole-slide formats read through slideio. Declared separately because one such
+# file expands into several samples, one per scanned scene.
+try:
+    from .slide_formats import supported_extensions as _slide_exts
+    _SLIDE_EXTS = tuple(_slide_exts())
+except Exception:
+    _SLIDE_EXTS = ()
+_RAW_EXTS = _RAW_EXTS + _SLIDE_EXTS
+
 # Sidecar filtering lives in gui_text_utils so every path that enumerates raw
 # images agrees on what counts as an image (see is_os_sidecar for why this
 # matters on macOS external volumes).
@@ -62,6 +71,26 @@ def detect_raw(raw_dir: str) -> Dict[str, object]:
             if is_os_sidecar(f):
                 skipped.append(f)
                 continue
+
+            # A slide file is not one image: each scanned scene becomes its own
+            # source, keyed "file::scene". A single-scene slide yields a bare
+            # filename, so nothing else in the pipeline has to care.
+            if f.lower().endswith(_SLIDE_EXTS):
+                try:
+                    from .slide_reader import list_sources
+                    scene_keys = list_sources(os.path.join(raw_dir, f))
+                except Exception as exc:
+                    print(f"  [detect] could not read slide {f}: {exc}")
+                    scene_keys = []
+                if scene_keys:
+                    files.extend(scene_keys)
+                    if len(scene_keys) > 1:
+                        print(f"  [detect] {f} contains "
+                              f"{len(scene_keys)} scenes")
+                else:
+                    print(f"  [detect] {f} yielded no readable scenes; skipped")
+                continue
+
             files.append(f)
     except OSError:
         pass
@@ -244,7 +273,7 @@ def detect_default_mode(raw_dir: str) -> Optional[str]:
 
     try:
         files = [f for f in sorted(os.listdir(raw_dir))
-                 if f.lower().endswith((".tif", ".tiff"))
+                 if f.lower().endswith((".tif", ".tiff") + _SLIDE_EXTS)
                  and os.path.isfile(os.path.join(raw_dir, f))
                  and not is_os_sidecar(f)]
     except OSError:
@@ -258,6 +287,13 @@ def detect_default_mode(raw_dir: str) -> Optional[str]:
     shape = None
     for name in files:
         try:
+            if name.lower().endswith(_SLIDE_EXTS):
+                from .slide_reader import list_sources, scene_shape
+                keys = list_sources(os.path.join(raw_dir, name))
+                shape = scene_shape(keys[0], raw_dir) if keys else None
+                if shape is None:
+                    continue
+                break
             with tiff.TiffFile(os.path.join(raw_dir, name)) as tf:
                 shape = tf.series[0].shape
             break

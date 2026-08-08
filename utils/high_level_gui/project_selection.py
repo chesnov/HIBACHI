@@ -31,6 +31,11 @@ from .gui_text_utils import is_os_sidecar
 
 # Image extensions HIBACHI understands as raw input.
 _RAW_IMAGE_EXTS = (".tif", ".tiff", ".czi")
+try:  # whole-slide formats count as raw images for folder classification
+    from .slide_formats import supported_extensions as _slide_exts
+    _RAW_IMAGE_EXTS = _RAW_IMAGE_EXTS + tuple(_slide_exts())
+except Exception:
+    pass
 
 # --------------------------------------------------------------------------- #
 # Classification (pure logic)

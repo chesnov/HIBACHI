@@ -36,6 +36,10 @@ dependencies:
       - pyconify~=0.2.1
       - PyQt5~=5.15.11
       - scikit-learn~=1.6.1
+      # Whole-slide formats (Olympus .vsi, Aperio, Hamamatsu, Leica and others).
+      # pip rather than conda: wheels exist for macOS arm64 + x86_64, Linux and
+      # Windows, and unlike the Bio-Formats route it needs no JVM.
+      - slideio>=2.7.4
       - seaborn~=0.13.2
       - tifffile>=2023.1.1
       - zarr~=3.0.2

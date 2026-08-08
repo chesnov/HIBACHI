@@ -34,8 +34,29 @@ class MetadataExtractor:
     """Helper class to parse dimensions and physical scales from microscopy files."""
 
     @staticmethod
+    def _slide_source(path: str):
+        """(FormatSpec, source_key) if `path` is a slide source, else (None, None).
+
+        Accepts a plain path or a source key like ``/data/Image.vsi::20x_01``, so
+        callers already threading a filename through don't need to know that one
+        slide file can contain several scenes.
+        """
+        try:
+            from .slide_formats import spec_for_path
+            from .slide_reader import parse_source_key
+        except Exception:
+            return None, None
+        filename, _scene = parse_source_key(path)
+        return spec_for_path(filename), path
+
+    @staticmethod
     def get_channel_count(path: str) -> int:
-        """Determines the number of channels in a file (CZI or TIFF)."""
+        """Determines the number of channels in a file (slide, CZI or TIFF)."""
+        spec, key = MetadataExtractor._slide_source(path)
+        if spec is not None:
+            from .slide_reader import scene_channel_count
+            return scene_channel_count(key)
+
         ext = os.path.splitext(path)[1].lower()
         if ext == '.czi' and HAS_CZI:
             try:
@@ -61,6 +82,13 @@ class MetadataExtractor:
                         if len(shape) == 4: return min(shape[0], shape[1])
             except Exception: return 1
         return 1
+
+    @staticmethod
+    def read_slide_metadata(path: str) -> Dict[str, Union[float, bool]]:
+        """Physical scale of a slide source, in the read_tiff_metadata shape."""
+        from .slide_reader import scene_metadata
+        _spec, key = MetadataExtractor._slide_source(path)
+        return scene_metadata(key or path)
 
     @staticmethod
     def read_tiff_metadata(path: str) -> Dict[str, Union[float, bool]]:
@@ -166,6 +194,23 @@ class MetadataExtractor:
         consequently created image folders containing only a config, which then
         failed validation with no indication of why.
         """
+        spec, key = MetadataExtractor._slide_source(src_path)
+        if spec is not None:
+            # Slides extract tile-by-tile straight to disk instead of via ch_data
+            # below: one scene of the tested VSI is 997 megapixels, so assembling
+            # a channel in memory would mean a 2 GB allocation.
+            from .slide_reader import extract_scene_channel
+            try:
+                if extract_scene_channel(key, dest_path, channel_idx):
+                    return True
+                raise ChannelExtractionError(
+                    "slide extraction produced no image data")
+            except ChannelExtractionError:
+                raise
+            except Exception as exc:
+                raise ChannelExtractionError(
+                    f"{type(exc).__name__}: {exc}") from exc
+
         try:
             ext = os.path.splitext(src_path)[1].lower()
             ch_data = None
@@ -235,8 +280,14 @@ class MetadataExtractor:
             res_y = MetadataExtractor._safe_resolution(source_meta.get('y'))
             spacing = MetadataExtractor._safe_spacing(source_meta.get('z'))
 
+            # imagej=True is required for the 'micron' unit to survive a round
+            # trip. Without it tifffile records ResolutionUnit=INCH and reading the
+            # file back gives a pixel size ~25400x too large -- masked inside
+            # HIBACHI (dimensions come from the config) but wrong for anyone who
+            # opens the extracted TIFF in Fiji.
             tiff.imwrite(
                 dest_path, ch_data,
+                imagej=True,
                 photometric='minisblack',
                 resolution=(res_x, res_y),
                 metadata={'unit': 'micron', 'spacing': spacing}

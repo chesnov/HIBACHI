@@ -605,9 +605,10 @@ class ProjectViewWindow(QMainWindow):
 
             # Not organized yet -- are there raw images to set up into a project?
             from .gui_text_utils import is_os_sidecar
+            from .project_selection import _RAW_IMAGE_EXTS as _LOADABLE_RAW_EXTS
             raw_files = [
                 f for f in os.listdir(selected_path)
-                if f.lower().endswith(('.tif', '.tiff', '.czi'))
+                if f.lower().endswith(_LOADABLE_RAW_EXTS)
                 and os.path.isfile(os.path.join(selected_path, f))
                 and not is_os_sidecar(f)
             ]
