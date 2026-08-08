@@ -303,6 +303,70 @@ def apply_roi_propagation(
     return {"written": written, "skipped": skipped, "errors": errors}
 
 
+def load_existing_rois(sample_dirs: Sequence[str]) -> List[Dict[str, Any]]:
+    """Read back the ROI session of each channel that has one.
+
+    The overlay is where an ROI is defined, but the record is stored per channel,
+    so the overlay has no memory of its own: without this it opens blank even
+    though every channel is cropped. Reading the channels back is what makes the
+    ROI visible again after the overlay is closed and reopened.
+
+    Returns one entry per channel that has a loadable ``roi_polygon.json``:
+    ``{channel, sample_dir, roi_dir, record, z_polygons, bbox}`` where
+    ``z_polygons`` maps Z index -> (N,2) YX array in full-image pixel
+    coordinates. Both the v2 format and the legacy single-polygon v1 format are
+    accepted, matching what ``_try_load_existing_roi_session`` tolerates.
+    """
+    out: List[Dict[str, Any]] = []
+    for sample_dir in sample_dirs:
+        info = describe_channel(sample_dir)
+        if info is None:
+            continue
+        path = os.path.join(info["roi_dir"], ROI_JSON_NAME)
+        if not os.path.isfile(path):
+            continue
+        try:
+            with open(path, "r") as fh:
+                record = json.load(fh)
+        except Exception:
+            continue
+
+        try:
+            if "z_polygons" in record:
+                z_polys = {
+                    int(entry["z"]): np.asarray(entry["polygon_yx"], dtype=float)
+                    for entry in record["z_polygons"]
+                }
+            else:  # v1: one un-keyed polygon
+                z_polys = {0: np.asarray(record["polygon_yx"], dtype=float)}
+        except Exception:
+            continue
+        if not z_polys:
+            continue
+
+        info.update({
+            "record": record,
+            "z_polygons": z_polys,
+            "bbox": record.get("bbox") or {},
+        })
+        out.append(info)
+    return out
+
+
+def rois_are_identical(loaded: Sequence[Dict[str, Any]]) -> bool:
+    """True if every loaded channel carries the same polygon set.
+
+    Propagation writes byte-identical records, so this is normally true; a False
+    here means the channels were cropped separately (e.g. per-channel ROIs drawn
+    before this feature existed) and the overlay should say so rather than
+    silently showing one of them.
+    """
+    if len(loaded) <= 1:
+        return True
+    first = loaded[0]["record"].get("z_polygons")
+    return all(e["record"].get("z_polygons") == first for e in loaded[1:])
+
+
 def summarize_plan(plan: Sequence[Dict[str, Any]]) -> str:
     """One-paragraph, user-facing description of what `plan` will do."""
     by_status: Dict[str, List[Dict[str, Any]]] = {}

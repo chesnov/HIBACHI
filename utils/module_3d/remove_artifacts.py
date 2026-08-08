@@ -26,7 +26,7 @@ from tqdm import tqdm
 DASK_SCHEDULER = 'threads'
 
 
-def _get_safe_temp_dir(base_path: Optional[str] = None, suffix: str = "") -> str:
+def _get_safe_temp_dir(base_path: str, suffix: str = "") -> str:
     """Creates a temporary directory strictly inside the provided base_path."""
     # Temporary files MUST live in the project directory. No hidden/OS-temp
     # fallback: a missing base_path is a bug, so fail loudly.
@@ -629,7 +629,8 @@ def apply_hull_trimming(
     z_erosion_iterations: int = 0,
     post_smoothing_iter: int = 0,
     otsu_scale_factor: float = 0.8,
-    temp_root_path: Optional[str] = None
+    *,
+    temp_root_path: str,
 ) -> Tuple[Optional[str], Optional[str], Optional[np.ndarray]]:
     """
     Main Entry Point for Step 2.

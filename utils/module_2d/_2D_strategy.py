@@ -284,7 +284,12 @@ class Fluorescence2DStrategy(ProcessingStrategy):
                 brightness_cutoff_factor=float(params.get("brightness_cutoff_factor", 1.5)),
                 min_size_pixels=int(params.get("min_size_pixels", 20)),
                 hull_closing_radius=int(params.get("hull_closing_radius", 10)),
-                otsu_scale_factor=float(params.get("otsu_scale_factor", 0.8))
+                otsu_scale_factor=float(params.get("otsu_scale_factor", 0.8)),
+                # Required: hull trimming writes on-disk chunk arrays and refuses
+                # to fall back to the OS temp dir, so it needs the project temp
+                # root. Omitting it here is what made Step 2 fail for every 2D
+                # project while the 3D path (which does pass it) worked fine.
+                temp_root_path=self.temp_dir,
             )
 
             if not temp_dat_path or not os.path.exists(temp_dat_path):

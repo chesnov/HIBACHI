@@ -35,11 +35,14 @@ from PyQt5.QtWidgets import (  # type: ignore
 
 from .roi_sharing import (
     HAS_ROI, NEW, NO_ROI, ORPHAN, REPLACE, SHAPE_MISMATCH, UNUSABLE,
-    apply_roi_clear, apply_roi_propagation, plan_roi_clear,
-    plan_roi_propagation, roi_record_from_polygons,
+    apply_roi_clear, apply_roi_propagation, load_existing_rois, plan_roi_clear,
+    plan_roi_propagation, roi_record_from_polygons, rois_are_identical,
 )
 
 ROI_LAYER_NAME = "ROI Selection"
+# Kept separate from the drawing layer so showing a saved ROI never interferes
+# with, or gets mistaken for, a new drawing in progress.
+SAVED_LAYER_NAME = "ROI (saved)"
 
 
 # --------------------------------------------------------------------------- #
@@ -162,6 +165,113 @@ class OverlayROIPanel:
         self._z_polygons: Dict[int, np.ndarray] = {}
         self._last_count = 0
 
+    # ---- shared helpers ------------------------------------------------- #
+    def _reference_scale(self):
+        """Scale of the overlay's image layers, so ROI layers share their space.
+
+        open_sample_overlay applies (z_scale, 1, 1) to 3D samples. An ROI layer
+        left at unit scale would sit in a different world space, which shifts the
+        Z slider mapping and misplaces both drawn and displayed polygons.
+        """
+        for existing in self.viewer.layers:
+            if existing.name in (ROI_LAYER_NAME, SAVED_LAYER_NAME):
+                continue
+            try:
+                return tuple(float(v) for v in existing.scale)
+            except Exception:
+                return None
+        return None
+
+    def _as_vertices(self, z_polygons):
+        """Napari vertex arrays for a {z: (N,2) YX} map.
+
+        3D viewers need (N,3) with the Z index prepended; 2D wants the YX array
+        unchanged.
+        """
+        is_3d = self.full_shape is not None and len(self.full_shape) == 3
+        out = []
+        for z, poly in sorted(z_polygons.items()):
+            arr = np.asarray(poly, dtype=float)
+            if is_3d:
+                zcol = np.full((arr.shape[0], 1), float(z))
+                out.append(np.hstack([zcol, arr]))
+            else:
+                out.append(arr)
+        return out
+
+    # ---- showing what is already saved ---------------------------------- #
+    def show_saved_rois(self, quiet: bool = False) -> int:
+        """Display the ROI already stored on this sample's channels.
+
+        Called when the overlay opens, which is what gives the overlay a memory:
+        the record lives in the channel folders, so without reading it back the
+        overlay came up blank even though every channel was cropped.
+
+        Returns the number of channels found to have an ROI.
+        """
+        loaded = load_existing_rois(self.sample_dirs)
+
+        if SAVED_LAYER_NAME in self.viewer.layers:
+            self.viewer.layers.remove(SAVED_LAYER_NAME)
+
+        if not loaded:
+            if not quiet:
+                QMessageBox.information(
+                    None, "No saved ROI",
+                    f"No channel of '{self.sample_name}' has a saved ROI.\n\n"
+                    "Draw one and apply it to see it here.")
+            return 0
+
+        # Normally every channel holds the same record, so show it once. When they
+        # differ, show the union and say so rather than picking one silently.
+        identical = rois_are_identical(loaded)
+        if identical:
+            z_polygons = loaded[0]["z_polygons"]
+        else:
+            z_polygons = {}
+            for entry in loaded:
+                for z, poly in entry["z_polygons"].items():
+                    z_polygons.setdefault(z, poly)
+
+        verts = self._as_vertices(z_polygons)
+        if not verts:
+            return 0
+
+        layer = self.viewer.add_shapes(
+            verts,
+            name=SAVED_LAYER_NAME,
+            shape_type="polygon",
+            edge_color="cyan",
+            face_color=[0, 1, 1, 0.06],
+            edge_width=2,
+        )
+        scale = self._reference_scale()
+        if scale is not None and len(scale) == len(self.full_shape or ()):
+            try:
+                layer.scale = scale
+            except Exception:
+                pass
+        # Read-only by intent: this shows what is already committed to disk.
+        # Editing it would imply the change propagates, which it does not.
+        try:
+            layer.mode = "pan_zoom"
+            layer.editable = False
+        except Exception:
+            pass
+
+        names = ", ".join(e["channel"] for e in loaded)
+        print(f"  [ROI] loaded saved ROI from {len(loaded)} channel(s): {names}")
+        if not identical and not quiet:
+            QMessageBox.warning(
+                None, "Channels have different ROIs",
+                f"The channels of '{self.sample_name}' do not all share the same "
+                "region:\n\n" + "\n".join(
+                    f"\u2022 {e['channel']}: {len(e['z_polygons'])} polygon(s)"
+                    for e in loaded)
+                + "\n\nAll of them are shown together. Draw a new region and "
+                  "apply it to bring them back into agreement.")
+        return len(loaded)
+
     # ---- drawing -------------------------------------------------------- #
     def draw_roi(self) -> None:
         """Add a polygon layer in draw mode, tagging each polygon with its Z slice.
@@ -198,14 +308,7 @@ class OverlayROIPanel:
         # which changes the Z slider's step mapping -- so current_step[0] would no
         # longer be the data slice index and polygons would be recorded against
         # the wrong Z.
-        ref_scale = None
-        for existing in self.viewer.layers:
-            if existing.name != ROI_LAYER_NAME:
-                try:
-                    ref_scale = tuple(float(v) for v in existing.scale)
-                except Exception:
-                    ref_scale = None
-                break
+        ref_scale = self._reference_scale()
 
         layer = self.viewer.add_shapes(
             name=ROI_LAYER_NAME,
@@ -517,6 +620,11 @@ def add_overlay_roi_panel(viewer, sample_name: str, sample_dirs: Sequence[str],
         "Each channel crops its own image and rebuilds its own config,\n"
         "then segments the sub-region independently.",
     )
+    btn_show = _button(
+        "\U0001f441 Show saved ROI",
+        "Re-display the region already saved on this sample's channels.\n"
+        "Loaded automatically when the overlay opens.",
+    )
     btn_clear = _button(
         "\u21a9 Return to full image\u2026",
         "Remove the ROI session from any subset of this sample's channels\n"
@@ -526,6 +634,7 @@ def add_overlay_roi_panel(viewer, sample_name: str, sample_dirs: Sequence[str],
 
     btn_draw.clicked.connect(panel.draw_roi)
     btn_apply.clicked.connect(panel.apply_to_channels)
+    btn_show.clicked.connect(panel.show_saved_rois)
     btn_clear.clicked.connect(panel.return_to_full_image)
 
     row = QHBoxLayout()
@@ -534,6 +643,7 @@ def add_overlay_roi_panel(viewer, sample_name: str, sample_dirs: Sequence[str],
     row.addWidget(btn_draw)
     row.addWidget(btn_apply)
     outer.addLayout(row)
+    outer.addWidget(btn_show)
     outer.addWidget(btn_clear)
 
     dock = viewer.window.add_dock_widget(container, area="left", name="ROI")
@@ -550,6 +660,13 @@ def add_overlay_roi_panel(viewer, sample_name: str, sample_dirs: Sequence[str],
     # The container is owned by the dock, which is owned by the napari window, so
     # attaching the panel here ties its lifetime to the viewer's.
     container._hibachi_roi_panel = panel
+
+    # Show any ROI already saved on these channels. quiet=True because an overlay
+    # with no ROI is the normal case and must not pop a dialog on every open.
+    try:
+        panel.show_saved_rois(quiet=True)
+    except Exception as exc:
+        print(f"Could not load saved ROI: {exc}")
 
     if _lock_panel_height is not None:
         _lock_panel_height(container, dock)

@@ -18,21 +18,59 @@ class RelationalEngine:
     """
 
     @staticmethod
-    def _find_dat(folder_path):
-        """Helper to find the final_segmentation.dat in a project folder."""
-        if not folder_path or not os.path.isdir(folder_path): 
+    def _find_dat(folder_path, include_roi: bool = False):
+        """Helper to find the final_segmentation.dat in a project folder.
+
+        Skips ROI sub-region sessions by default. An ROI session lives in
+        ``<basename>_processed_<mode>_roi``, which also contains the substring
+        "_processed_", so the original scan matched it as readily as the
+        full-image directory -- and returned whichever ``os.listdir`` happened to
+        yield first. That made cross-channel analysis silently read the CROP's
+        segmentation for a channel that had an ROI: a different array with a
+        different shape from the full image the caller is memmapping it against.
+        Which one won depended on filesystem ordering, so it reproduced on some
+        machines and not others.
+
+        Full-image directories are preferred explicitly rather than by luck, and
+        results are sorted so the choice is deterministic when several exist.
+        """
+        if not folder_path or not os.path.isdir(folder_path):
             return None
-        
-        # Look for the standard processed folder suffix
-        for d in os.listdir(folder_path):
-            if "_processed_" in d:
-                proc_dir = os.path.join(folder_path, d)
-                if not os.path.isdir(proc_dir): 
-                    continue
-                for f in os.listdir(proc_dir):
-                    if f.startswith("final_segmentation") and f.endswith(".dat"):
-                        return os.path.join(proc_dir, f)
+
+        try:
+            entries = sorted(os.listdir(folder_path))
+        except OSError:
+            return None
+
+        full_image, roi = [], []
+        for d in entries:
+            if "_processed_" not in d:
+                continue
+            if not os.path.isdir(os.path.join(folder_path, d)):
+                continue
+            (roi if RelationalEngine._is_roi_dir(d) else full_image).append(d)
+
+        # Full-image dirs first; ROI sessions only when explicitly requested.
+        for d in full_image + (roi if include_roi else []):
+            proc_dir = os.path.join(folder_path, d)
+            try:
+                names = sorted(os.listdir(proc_dir))
+            except OSError:
+                continue
+            for f in names:
+                if f.startswith("final_segmentation") and f.endswith(".dat"):
+                    return os.path.join(proc_dir, f)
         return None
+
+    @staticmethod
+    def _is_roi_dir(name: str) -> bool:
+        """True for an ROI sub-region session directory.
+
+        Matches the bare ``_roi`` suffix and any ``_roi_<label>`` variant, so
+        named or numbered ROI sessions are excluded on the same rule.
+        """
+        base = os.path.basename(str(name).rstrip("/\\"))
+        return base.endswith("_roi") or "_roi_" in base
 
     @staticmethod
     def relabel_sequentially(mask):

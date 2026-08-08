@@ -24,10 +24,14 @@ import dask_image.ndmeasure
 from dask.diagnostics import ProgressBar
 import dask_image
 
-def _get_safe_temp_dir(base_path: Optional[str] = None, suffix: str = "") -> str:
-    """Creates a temporary directory strictly inside the provided base_path."""
-    # Temporary files MUST live in the project directory (see 3D path). No
-    # hidden/OS-temp fallback: a missing base_path is a bug, so fail loudly.
+def _get_safe_temp_dir(base_path: str, suffix: str = "") -> str:
+    """Creates a temporary directory strictly inside the provided base_path.
+
+    `base_path` is required and has no default. It previously defaulted to None,
+    so a caller that forgot to thread the project temp root through produced a
+    ValueError from deep inside a pipeline step rather than an immediate
+    TypeError -- which is how the 2D trim step shipped broken while 3D worked.
+    """
     if not base_path:
         raise ValueError(
             "_get_safe_temp_dir requires a project temp directory (temp_root_path); "
@@ -313,7 +317,8 @@ def apply_hull_trimming_2d(
     min_size_pixels: int,
     hull_closing_radius: int = 10,
     otsu_scale_factor: float = 0.8,
-    temp_root_path: Optional[str] = None
+    *,
+    temp_root_path: str,
 ) -> Tuple[Optional[str], Optional[str], Optional[np.ndarray]]:
     """
     Main Entry Point for Step 2 (2D).
