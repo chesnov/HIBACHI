@@ -325,6 +325,68 @@ def sample_status(sample_folder: str) -> str:
     return STATUS_IN_PROGRESS
 
 
+# --------------------------------------------------------------------------- #
+# Leaf identity
+# --------------------------------------------------------------------------- #
+# A tree leaf used to be a sample-folder path. Regions add a third level, so a
+# leaf is now either a plain folder (the full image) or "<folder>::<region>".
+# Same separator as slide source keys, so there is one convention for "a thing
+# inside a thing" rather than two.
+LEAF_SEP = "::"
+
+
+def make_leaf_key(sample_folder: str, roi_name: Optional[str] = None) -> str:
+    """Identity string for a tree leaf."""
+    return f"{sample_folder}{LEAF_SEP}{roi_name}" if roi_name else sample_folder
+
+
+def split_leaf_key(key: str) -> tuple:
+    """(sample_folder, roi_name or None) for a leaf key.
+
+    Every consumer of checked_folders() must route through this: a bare folder
+    means the full image, a key with a region name means that region. Passing a
+    key straight to something expecting a folder would look up a directory that
+    does not exist.
+    """
+    text = str(key)
+    if LEAF_SEP in text:
+        folder, _, roi = text.partition(LEAF_SEP)
+        return folder, (roi or None)
+    return text, None
+
+
+def is_roi_leaf(key: str) -> bool:
+    """True if this leaf identifies a region rather than a full image."""
+    return split_leaf_key(key)[1] is not None
+
+
+def roi_status(sample_folder: str, roi_name: str) -> str:
+    """Processing status of one region, mirroring sample_status for full images.
+
+    Reads the region's own session directory rather than the channel's
+    ``<basename>_processed_<mode>``: a region has its own checkpoints and its own
+    metrics, so a processed full image says nothing about whether its regions have
+    been processed.
+    """
+    try:
+        from .roi_sharing import roi_session_dir
+        roi_dir = roi_session_dir(sample_folder, roi_name)
+    except Exception:
+        return STATUS_UNKNOWN
+    if not roi_dir or not os.path.isdir(roi_dir):
+        return STATUS_UNKNOWN
+    try:
+        out_files = os.listdir(roi_dir)
+    except OSError:
+        return STATUS_UNKNOWN
+    if any(f.startswith("metrics_df_") and f.endswith(".csv") for f in out_files):
+        return STATUS_PROCESSED
+    # A polygon on its own is a defined-but-unprocessed region; anything more
+    # means the pipeline has started on it.
+    others = [f for f in out_files if f != "roi_polygon.json"]
+    return STATUS_IN_PROGRESS if others else STATUS_UNPROCESSED
+
+
 def prettify_step_name(method: str) -> str:
     """'execute_raw_segmentation' -> 'Raw Segmentation'; strips a mode suffix."""
     if not method:
@@ -931,22 +993,110 @@ if _HAVE_QT:
                 self._loading = False
             self.selection_changed.emit()
 
-        def highlight_folder(self, folder: str) -> None:
-            """Make `folder`'s row the current (highlighted) selection and scroll
-            it into view. Used when returning from an image so the one you were
-            just looking at stays marked, instead of the list losing its place."""
-            if not folder:
+        def highlight_folder(self, leaf_key: str) -> None:
+            """Make `leaf_key`'s row current and scroll it into view.
+
+            Used when returning from an image so the row you were just looking at
+            stays marked instead of the list losing its place. Takes a leaf key, so
+            returning from a region highlights that region's row rather than
+            jumping up to its channel.
+            """
+            if not leaf_key:
                 return
             it = QTreeWidgetItemIterator(self.tree)
             while it.value():
                 item = it.value()
-                if item.data(0, Qt.UserRole) == folder:
+                if item.data(0, Qt.UserRole) == leaf_key:
+                    # Region rows live under a collapsed-by-default parent in
+                    # single-channel projects, so make sure it is visible.
+                    parent = item.parent()
+                    if parent is not None:
+                        parent.setExpanded(True)
                     self.tree.setCurrentItem(item)
                     self.tree.scrollToItem(item)
                     break
                 it += 1
 
         def _make_leaf(self, name: str, folder: str, channel_key: str) -> "QTreeWidgetItem":
+            """One channel row, with a child row per saved region.
+
+            The channel row stays actionable in its own right -- it IS the full
+            image, and processing the whole image is still a normal thing to do.
+            Regions hang beneath it as siblings of nothing, each independently
+            checkable, so batch selection can mix full images and regions freely.
+            """
+            leaf = self._make_image_row(name, folder, channel_key)
+
+            try:
+                from .roi_sharing import list_roi_sessions
+                sessions = [se for se in list_roi_sessions(folder)
+                            if se["has_polygon"]]
+            except Exception:
+                sessions = []
+
+            if sessions:
+                # Tristate so the channel row reflects its regions, while staying
+                # separately checkable for the full image.
+                leaf.setFlags(leaf.flags() | Qt.ItemIsAutoTristate)
+                for session in sessions:
+                    leaf.addChild(self._make_roi_row(
+                        folder, session["name"], channel_key))
+            return leaf
+
+        def _make_roi_row(self, folder: str, roi_name: str,
+                          channel_key: str) -> "QTreeWidgetItem":
+            """One region row beneath its channel."""
+            status = roi_status(folder, roi_name)
+            status_txt = _STATUS_TEXT.get(status, status)
+            roi_dir = ""
+            try:
+                from .roi_sharing import roi_session_dir
+                roi_dir = roi_session_dir(folder, roi_name) or ""
+            except Exception:
+                pass
+            row = QTreeWidgetItem([
+                roi_name,
+                self._roi_config_name(roi_dir),
+                status_txt,
+                format_last_edited(folder_last_edited(roi_dir)) if roi_dir else "",
+            ])
+            # Identity is the compound key; the channel key is inherited so
+            # "checked images span at most one channel" logic keeps working.
+            row.setData(0, Qt.UserRole, make_leaf_key(folder, roi_name))
+            row.setData(1, Qt.UserRole, channel_key)
+            row.setFlags(row.flags() | Qt.ItemIsUserCheckable)
+            row.setCheckState(0, Qt.Unchecked)
+            color = _STATUS_COLOR.get(status)
+            if color:
+                from PyQt5.QtGui import QColor, QBrush  # type: ignore
+                row.setForeground(2, QBrush(QColor(color)))
+            return row
+
+        @staticmethod
+        def _roi_config_name(roi_dir: str) -> str:
+            """Name of a region's own config, which it owns independently."""
+            if not roi_dir:
+                return ""
+            try:
+                for f in sorted(os.listdir(roi_dir)):
+                    if f.lower().endswith((".yaml", ".yml")):
+                        try:
+                            import yaml  # type: ignore
+                            with open(os.path.join(roi_dir, f), "r",
+                                      encoding="utf-8") as fh:
+                                cfg = yaml.safe_load(fh) or {}
+                            named = cfg.get("config_name") or cfg.get("name")
+                            if named:
+                                return str(named)
+                        except Exception:
+                            pass
+                        return os.path.splitext(f)[0]
+            except OSError:
+                pass
+            return ""
+
+        def _make_image_row(self, name: str, folder: str,
+                            channel_key: str) -> "QTreeWidgetItem":
             status = sample_status(folder)
             mode = self._read_mode(folder)
             status_txt = _STATUS_TEXT.get(status, status)
@@ -965,7 +1115,7 @@ if _HAVE_QT:
                 status_txt,
                 format_last_edited(folder_last_edited(folder)),
             ])
-            leaf.setData(0, Qt.UserRole, folder)         # actionable path
+            leaf.setData(0, Qt.UserRole, make_leaf_key(folder))  # actionable path
             leaf.setData(1, Qt.UserRole, channel_key)    # channel identity
             leaf.setFlags(leaf.flags() | Qt.ItemIsUserCheckable)
             leaf.setCheckState(0, Qt.Unchecked)

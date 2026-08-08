@@ -182,8 +182,12 @@ def describe_channel(sample_dir: str) -> Optional[Dict[str, Any]]:
         "sample_dir": sample_dir,
         "channel": os.path.basename(os.path.dirname(sample_dir)),
         "tif": os.path.join(sample_dir, tif),
+        "basename": basename,
         "mode": mode,
         "processed_dir": processed_dir,
+        # Legacy single-ROI path. Kept because roi_session_dir(sample, None) and
+        # every pre-multi-ROI caller resolve through it; use list_roi_sessions()
+        # to enumerate all of a channel's regions.
         "roi_dir": processed_dir + ROI_DIR_SUFFIX,
     }
 
@@ -198,9 +202,30 @@ SHAPE_MISMATCH = "shape_mismatch"  # channel's image doesn't match the drawing
 UNUSABLE = "unusable"        # not a valid sample folder (missing tif/yaml/mode)
 
 
+def choose_shared_roi_name(sample_dirs: Sequence[str]) -> str:
+    """An ROI name free in EVERY channel of a sample.
+
+    Regions are propagated under one shared name so that "ROI 2" means the same
+    region in every channel. Cross-channel analysis within a region depends on
+    that correspondence, so the name has to be free everywhere rather than
+    allocated per channel.
+    """
+    used = set()
+    for sample_dir in sample_dirs:
+        for session in list_roi_sessions(sample_dir):
+            for token in str(session["name"]).split():
+                if token.isdigit():
+                    used.add(int(token))
+    n = 1
+    while n in used:
+        n += 1
+    return f"{ROI_AUTO_PREFIX} {n}"
+
+
 def plan_roi_propagation(
     sample_dirs: Sequence[str],
     full_shape: Sequence[int],
+    roi_name: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """Inspect each channel and report what propagating the ROI would do.
 
@@ -214,6 +239,8 @@ def plan_roi_propagation(
     and is worth surfacing instead of silently corrupting.
     """
     target = tuple(int(v) for v in full_shape)
+    # None means "add a new region"; a name means "replace that region".
+    shared_name = roi_name or choose_shared_roi_name(sample_dirs)
     plan: List[Dict[str, Any]] = []
 
     for sample_dir in sample_dirs:
@@ -237,7 +264,8 @@ def plan_roi_propagation(
             plan.append(info)
             continue
 
-        roi_dir = info["roi_dir"]
+        roi_dir = roi_session_dir(sample_dir, shared_name) or info["roi_dir"]
+        info["roi_name"] = shared_name
         existing = os.path.isfile(os.path.join(roi_dir, ROI_JSON_NAME))
         stale: List[str] = []
         if os.path.isdir(roi_dir):
@@ -249,6 +277,7 @@ def plan_roi_propagation(
                 stale = []
 
         info.update({
+            "roi_dir": roi_dir,
             "status": REPLACE if existing else NEW,
             "shape": shape,
             # Files that will be deleted so the new polygon actually takes
@@ -322,49 +351,67 @@ def load_existing_rois(sample_dirs: Sequence[str]) -> List[Dict[str, Any]]:
         info = describe_channel(sample_dir)
         if info is None:
             continue
-        path = os.path.join(info["roi_dir"], ROI_JSON_NAME)
-        if not os.path.isfile(path):
-            continue
-        try:
-            with open(path, "r") as fh:
-                record = json.load(fh)
-        except Exception:
-            continue
+        # Every session in the channel, so the overlay can show all regions
+        # rather than only the legacy one.
+        for session in list_roi_sessions(sample_dir):
+            if not session["has_polygon"]:
+                continue
+            path = os.path.join(session["roi_dir"], ROI_JSON_NAME)
+            try:
+                with open(path, "r") as fh:
+                    record = json.load(fh)
+            except Exception:
+                continue
 
-        try:
-            if "z_polygons" in record:
-                z_polys = {
-                    int(entry["z"]): np.asarray(entry["polygon_yx"], dtype=float)
-                    for entry in record["z_polygons"]
-                }
-            else:  # v1: one un-keyed polygon
-                z_polys = {0: np.asarray(record["polygon_yx"], dtype=float)}
-        except Exception:
-            continue
-        if not z_polys:
-            continue
+            try:
+                z_polys = record_polygons(record)
+            except Exception:
+                continue
+            if not z_polys:
+                continue
 
-        info.update({
-            "record": record,
-            "z_polygons": z_polys,
-            "bbox": record.get("bbox") or {},
-        })
-        out.append(info)
+            entry = dict(info)
+            entry.update({
+                "roi_dir": session["roi_dir"],
+                "roi_name": session["name"],
+                "record": record,
+                "z_polygons": z_polys,
+                "bbox": record.get("bbox") or {},
+            })
+            out.append(entry)
     return out
 
 
-def rois_are_identical(loaded: Sequence[Dict[str, Any]]) -> bool:
-    """True if every loaded channel carries the same polygon set.
+def group_rois_by_name(
+    loaded: Sequence[Dict[str, Any]]
+) -> Dict[str, List[Dict[str, Any]]]:
+    """Group loaded sessions by region name, preserving discovery order.
 
-    Propagation writes byte-identical records, so this is normally true; a False
-    here means the channels were cropped separately (e.g. per-channel ROIs drawn
-    before this feature existed) and the overlay should say so rather than
-    silently showing one of them.
+    A sample now has several regions, each present in several channels, so the
+    overlay works per REGION rather than per channel.
     """
-    if len(loaded) <= 1:
-        return True
-    first = loaded[0]["record"].get("z_polygons")
-    return all(e["record"].get("z_polygons") == first for e in loaded[1:])
+    grouped: Dict[str, List[Dict[str, Any]]] = {}
+    for entry in loaded:
+        grouped.setdefault(entry.get("roi_name") or "ROI 1", []).append(entry)
+    return grouped
+
+
+def rois_are_identical(loaded: Sequence[Dict[str, Any]]) -> bool:
+    """True if every channel agrees on the geometry of each named region.
+
+    Propagation writes byte-identical records under one shared name, so this is
+    normally true. False means some channel was cropped separately -- e.g.
+    per-channel regions drawn before regions were shared -- and the overlay should
+    say so rather than silently showing one of them. Compared WITHIN each name:
+    two differently-named regions are supposed to differ.
+    """
+    for entries in group_rois_by_name(loaded).values():
+        if len(entries) <= 1:
+            continue
+        first = entries[0]["record"].get("z_polygons")
+        if any(e["record"].get("z_polygons") != first for e in entries[1:]):
+            return False
+    return True
 
 
 def summarize_plan(plan: Sequence[Dict[str, Any]]) -> str:
@@ -409,7 +456,8 @@ ORPHAN = "orphan"        # ROI folder with no roi_polygon.json -> leftover files
 NO_ROI = "no_roi"        # nothing to do; already opens on the full image
 
 
-def plan_roi_clear(sample_dirs: Sequence[str]) -> List[Dict[str, Any]]:
+def plan_roi_clear(sample_dirs: Sequence[str],
+                   roi_name: Optional[str] = None) -> List[Dict[str, Any]]:
     """Inspect each channel and report what returning it to the full image means.
 
     Performs no writes. ``HAS_ROI`` means ``roi_polygon.json`` is present, so
@@ -437,31 +485,38 @@ def plan_roi_clear(sample_dirs: Sequence[str]) -> List[Dict[str, Any]]:
             })
             continue
 
-        roi_dir = info["roi_dir"]
-        has_json = os.path.isfile(os.path.join(roi_dir, ROI_JSON_NAME))
-        files: List[str] = []
-        if os.path.isdir(roi_dir):
+        # One entry per SESSION, not per channel: a channel can now hold several
+        # regions, and clearing is a per-region decision.
+        sessions = list_roi_sessions(sample_dir)
+        if roi_name is not None:
+            sessions = [se for se in sessions if se["name"] == roi_name]
+
+        if not sessions:
+            entry = dict(info)
+            entry.update({"status": NO_ROI, "discards": [], "outputs": [],
+                          "roi_name": roi_name})
+            plan.append(entry)
+            continue
+
+        for session in sessions:
+            roi_dir = session["roi_dir"]
             try:
                 files = sorted(os.listdir(roi_dir))
             except OSError:
                 files = []
-
-        if has_json:
-            status = HAS_ROI
-        elif files:
-            status = ORPHAN
-        else:
-            status = NO_ROI
-
-        info.update({
-            "status": status,
-            # Everything that will be deleted, polygon file included.
-            "discards": files,
-            # Result files only, which is what the user actually cares about
-            # losing (the polygon itself is cheap to redraw).
-            "outputs": [f for f in files if f != ROI_JSON_NAME],
-        })
-        plan.append(info)
+            entry = dict(info)
+            entry.update({
+                "roi_dir": roi_dir,
+                "roi_name": session["name"],
+                "status": HAS_ROI if session["has_polygon"] else (
+                    ORPHAN if files else NO_ROI),
+                # Everything that will be deleted, polygon file included.
+                "discards": files,
+                # Result files only, which is what the user actually cares about
+                # losing (the polygon itself is cheap to redraw).
+                "outputs": [f for f in files if f != ROI_JSON_NAME],
+            })
+            plan.append(entry)
 
     return plan
 
@@ -682,3 +737,567 @@ def analyzed_extent(
         "polygon_measured": True,
     })
     return out
+
+
+# --------------------------------------------------------------------------- #
+# ROI session engine
+# --------------------------------------------------------------------------- #
+# Phase 0 of multi-ROI support: this section holds the machinery that used to
+# live inside DynamicGUIManager. It is Qt-free and napari-free on purpose --
+# batch processing runs in a child process with no GUI, so while the crop builder
+# and the config deriver were methods on the GUI class, an ROI could not be
+# processed except interactively. Nothing here imports from gui_manager.
+
+ROI_CONFIG_PREFIX = "processing_config_"
+
+
+def processed_dir_name(tif_basename: str, mode: str) -> str:
+    """Directory name a strategy writes its results into.
+
+    ONE definition of this, on purpose. The pattern
+    ``<basename>_processed_<mode>`` was previously re-derived independently in
+    project_selection.sample_status, batch_processor (twice) and
+    project_scaffolding.apply_template_config_to_project. Parallel derivations of
+    the same rule are how the 2D pipeline ended up passing a temp directory the
+    3D pipeline passed and the 2D one didn't -- so multi-ROI support routes every
+    caller through here instead of adding a fifth copy.
+    """
+    return f"{tif_basename}_processed_{mode}"
+
+
+def roi_dir_name(tif_basename: str, mode: str, roi_name: Optional[str] = None) -> str:
+    """Directory name for one ROI session.
+
+    ``roi_name=None`` gives the legacy unnamed form ``..._roi``, which is adopted
+    in place rather than migrated: renaming a directory that may hold completed
+    results is a needless risk when reading the old name costs nothing.
+    """
+    base = processed_dir_name(tif_basename, mode) + ROI_DIR_SUFFIX
+    return base if not roi_name else f"{base}_{slugify_roi_name(roi_name)}"
+
+
+def slugify_roi_name(name: str) -> str:
+    """Filesystem-safe form of an ROI name."""
+    out = "".join(c if (c.isalnum() or c in "-_") else "_" for c in str(name))
+    return out.strip("_") or "roi"
+
+
+# Auto-assigned names look like "ROI 1". The number is what appears on disk, so
+# the slug of "ROI 1" is "ROI_1".
+ROI_AUTO_PREFIX = "ROI"
+
+
+def roi_display_name(dir_name: str) -> str:
+    """Human name for an ROI directory, inverse of roi_dir_name.
+
+    The legacy unnamed directory reads as "ROI 1" so it takes its place in a
+    numbered list without being renamed on disk.
+    """
+    base = os.path.basename(str(dir_name).rstrip("/\\"))
+    marker = ROI_DIR_SUFFIX + "_"
+    if marker in base:
+        return base.rsplit(marker, 1)[1].replace("_", " ")
+    return f"{ROI_AUTO_PREFIX} 1"
+
+
+def list_roi_sessions(sample_dir: str) -> List[Dict[str, Any]]:
+    """Every ROI session in a sample folder, ordered for display.
+
+    Returns dicts of ``{name, dir_name, roi_dir, has_polygon, legacy}``. The
+    legacy unnamed session sorts first so adopting it in place keeps it as
+    "ROI 1".
+    """
+    info = describe_channel(sample_dir)
+    if info is None:
+        return []
+    processed = os.path.basename(info["processed_dir"])
+    prefix = processed + ROI_DIR_SUFFIX
+    try:
+        entries = sorted(os.listdir(sample_dir))
+    except OSError:
+        return []
+
+    out: List[Dict[str, Any]] = []
+    for entry in entries:
+        full = os.path.join(sample_dir, entry)
+        if not os.path.isdir(full) or not entry.startswith(prefix):
+            continue
+        legacy = (entry == prefix)
+        out.append({
+            "name": roi_display_name(entry),
+            "dir_name": entry,
+            "roi_dir": full,
+            "has_polygon": os.path.isfile(os.path.join(full, ROI_JSON_NAME)),
+            "legacy": legacy,
+        })
+    out.sort(key=lambda e: (not e["legacy"], _name_sort_key(e["name"])))
+    return out
+
+
+def _name_sort_key(name: str):
+    """Sort 'ROI 2' before 'ROI 10' rather than lexically."""
+    import re
+    parts = re.split(r"(\d+)", str(name))
+    return [int(p) if p.isdigit() else p.lower() for p in parts]
+
+
+def next_roi_name(sample_dir: str) -> str:
+    """Next auto-assigned ROI name for a sample folder, e.g. 'ROI 3'.
+
+    Numbers are derived from the sessions currently on disk, so a number DOES
+    become available again once its session is deleted -- deleting "ROI 2" and
+    drawing a new region gives you "ROI 2" back. That is the behaviour most people
+    expect from an auto-numbered list, and avoiding it would mean persisting a
+    counter. The tradeoff worth knowing: results already exported from the old
+    "ROI 2" refer to a region the new "ROI 2" is not, so an exported CSV is only
+    unambiguous alongside the run it came from.
+    """
+    used = set()
+    for session in list_roi_sessions(sample_dir):
+        for token in str(session["name"]).split():
+            if token.isdigit():
+                used.add(int(token))
+    n = 1
+    while n in used:
+        n += 1
+    return f"{ROI_AUTO_PREFIX} {n}"
+
+
+def roi_session_dir(sample_dir: str, roi_name: Optional[str] = None) -> Optional[str]:
+    """Absolute path of one ROI session directory, or None if unresolvable.
+
+    With ``roi_name=None`` this returns the legacy unnamed path, preserving the
+    behaviour of every existing caller.
+    """
+    info = describe_channel(sample_dir)
+    if info is None:
+        return None
+    if roi_name is None:
+        return info["roi_dir"]
+    # An existing session wins over a freshly derived name so a legacy folder
+    # adopted as "ROI 1" resolves to its real directory.
+    for session in list_roi_sessions(sample_dir):
+        if session["name"] == roi_name:
+            return session["roi_dir"]
+    basename = os.path.splitext(os.path.basename(info["tif"]))[0]
+    return os.path.join(sample_dir,
+                        roi_dir_name(basename, info["mode"], roi_name))
+
+
+# --------------------------------------------------------------------------- #
+# Building a session's derived artifacts
+# --------------------------------------------------------------------------- #
+def build_crop_memmap(
+    src,
+    y0: int, x0: int, y1: int, x1: int,
+    z_polygons: Dict[int, Any],
+    out_path: str,
+    z0_crop: int = 0,
+    z1_crop: Optional[int] = None,
+    quiet: bool = False,
+):
+    """Write a cropped, polygon-masked copy of `src` and return an 'r+' memmap.
+
+    Moved verbatim from DynamicGUIManager._build_crop_memmap so that batch
+    processing -- which has no GUI object -- can build an ROI crop.
+
+    `z_polygons` maps global Z indices to YX polygon arrays in FULL-IMAGE
+    coordinates. Each crop slice uses the nearest defined polygon, which covers
+    three cases with one rule: a 2D image (one entry at z=0), a 3D region extruded
+    through Z (one entry, applied to every slice), and a true 3D region (one entry
+    per drawn level, nearest polygon in between). Slices outside the drawn range
+    take the first or last polygon rather than extrapolating to empty.
+    """
+    from skimage.draw import polygon as skimage_polygon
+
+    is_3d = src.ndim == 3
+    crop_h, crop_w = y1 - y0, x1 - x0
+
+    if is_3d:
+        if z1_crop is None:
+            z1_crop = src.shape[0]
+        crop_depth = z1_crop - z0_crop
+        crop_shape = (crop_depth, crop_h, crop_w)
+    else:
+        crop_shape = (crop_h, crop_w)
+
+    crop_mm = np.memmap(out_path, dtype=src.dtype, mode='w+', shape=crop_shape)
+    sorted_zs = sorted(z_polygons.keys())
+
+    def _mask_for_z(global_z: int):
+        nearest_z = min(sorted_zs, key=lambda z: abs(z - global_z))
+        poly = np.asarray(z_polygons[nearest_z], dtype=float) - np.array(
+            [y0, x0], dtype=float)
+        rr, cc = skimage_polygon(poly[:, 0], poly[:, 1], shape=(crop_h, crop_w))
+        m = np.zeros((crop_h, crop_w), dtype=bool)
+        m[rr, cc] = True
+        return m
+
+    if is_3d:
+        if not quiet:
+            print(f"  [ROI] Building 3D crop "
+                  f"({crop_depth} slices x {crop_h} x {crop_w})...")
+        mask_cache: Dict[int, Any] = {}
+        for local_z in range(crop_depth):
+            global_z = z0_crop + local_z
+            nearest_z = min(sorted_zs, key=lambda z: abs(z - global_z))
+            if nearest_z not in mask_cache:
+                mask_cache[nearest_z] = _mask_for_z(global_z)
+            mask2d = mask_cache[nearest_z]
+            slice_data = np.array(src[global_z, y0:y1, x0:x1])
+            slice_data[~mask2d] = 0
+            crop_mm[local_z] = slice_data
+    else:
+        mask2d = _mask_for_z(0)
+        crop_mm[:] = src[y0:y1, x0:x1]
+        crop_mm[~mask2d] = 0
+
+    crop_mm.flush()
+    return crop_mm
+
+
+def build_roi_config(
+    y0: int, x0: int, y1: int, x1: int,
+    base_config: Dict[str, Any],
+    full_shape: Sequence[int],
+    mode: str,
+    z0: int = 0,
+    z1: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Deep-copied config with physical dimensions rescaled to the crop extent.
+
+    Moved out of DynamicGUIManager and given `full_shape` and `mode` explicitly
+    instead of reading them off the GUI object, so batch processing can call it.
+
+    The YAMLs store TOTAL physical extent rather than per-voxel size, so crop
+    dimensions scale linearly with pixel count:
+        new_x_um = original_x_um * (crop_w / full_w)
+    which leaves per-voxel spacing unchanged while making the config
+    self-consistent for the smaller array.
+
+    IMPORTANT for multi-ROI: this is a one-time SEED for a new ROI's config, not
+    something to recompute on every open. Each ROI owns its config once created,
+    so re-deriving it would silently discard parameters the user tuned for that
+    region.
+    """
+    import copy as _copy
+
+    roi_config = _copy.deepcopy(base_config)
+    is_2d_mode = str(mode).endswith('_2d')
+    dim_key = 'pixel_dimensions' if is_2d_mode else 'voxel_dimensions'
+
+    orig_dims = base_config.get(dim_key, {'x': 1.0, 'y': 1.0, 'z': 1.0})
+    orig_x = float(orig_dims.get('x', 1.0))
+    orig_y = float(orig_dims.get('y', 1.0))
+
+    full_h = int(full_shape[-2])
+    full_w = int(full_shape[-1])
+
+    new_dims = dict(orig_dims)
+    new_dims['x'] = orig_x * ((x1 - x0) / full_w)
+    new_dims['y'] = orig_y * ((y1 - y0) / full_h)
+
+    if not is_2d_mode and 'z' in orig_dims and len(full_shape) == 3:
+        orig_z = float(orig_dims.get('z', 1.0))
+        full_z = int(full_shape[0])
+        effective_z1 = z1 if z1 is not None else full_z
+        new_dims['z'] = orig_z * ((effective_z1 - z0) / full_z)
+
+    roi_config[dim_key] = new_dims
+    return roi_config
+
+
+def load_roi_record(roi_dir: str) -> Optional[Dict[str, Any]]:
+    """The polygon record in an ROI directory, or None."""
+    path = os.path.join(roi_dir, ROI_JSON_NAME)
+    if not os.path.isfile(path):
+        return None
+    try:
+        with open(path, "r") as fh:
+            return json.load(fh)
+    except Exception:
+        return None
+
+
+def record_polygons(record: Dict[str, Any]) -> Dict[int, Any]:
+    """{z: (N,2) YX array} from a v2 or legacy v1 record."""
+    if "z_polygons" in record:
+        return {int(e["z"]): np.asarray(e["polygon_yx"], dtype=float)
+                for e in record["z_polygons"]}
+    return {0: np.asarray(record["polygon_yx"], dtype=float)}
+
+
+def ensure_roi_artifacts(
+    sample_dir: str,
+    roi_name: Optional[str] = None,
+    image_stack=None,
+    base_config: Optional[Dict[str, Any]] = None,
+) -> Optional[Dict[str, Any]]:
+    """Make an ROI session ready to process, rebuilding what is missing.
+
+    This is what lets an ROI be processed without a GUI. Given a sample folder and
+    an ROI name it guarantees the crop memmap and the ROI config exist, deriving
+    each from the channel's own image and config when absent -- the same lazy
+    rebuild the interactive path already performed, but callable from a batch
+    worker.
+
+    Returns ``{roi_dir, config, config_path, crop_path, crop_shape, mode,
+    record}`` or None if the session has no polygon to work from.
+
+    `image_stack` may be omitted when the crop already exists on disk; it is only
+    read when the crop has to be rebuilt.
+    """
+    import yaml as _yaml
+
+    info = describe_channel(sample_dir)
+    if info is None:
+        return None
+    roi_dir = roi_session_dir(sample_dir, roi_name)
+    if not roi_dir or not os.path.isdir(roi_dir):
+        return None
+
+    record = load_roi_record(roi_dir)
+    if record is None:
+        return None
+    bbox = record.get("bbox") or {}
+    try:
+        y0, x0 = int(bbox["y0"]), int(bbox["x0"])
+        y1, x1 = int(bbox["y1"]), int(bbox["x1"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    z0 = int(bbox.get("z0") or 0)
+    z1 = bbox.get("z1")
+
+    mode = info["mode"]
+    crop_path = os.path.join(roi_dir, ROI_CROP_NAME)
+
+    if not os.path.isfile(crop_path) or os.path.getsize(crop_path) == 0:
+        if image_stack is None:
+            import tifffile as _tiff
+            image_stack = _tiff.memmap(info["tif"], mode="r")
+        build_crop_memmap(image_stack, y0, x0, y1, x1,
+                          record_polygons(record), crop_path,
+                          z0_crop=z0, z1_crop=z1, quiet=True)
+
+    config_path = os.path.join(roi_dir, f"{ROI_CONFIG_PREFIX}{mode}.yaml")
+    if os.path.isfile(config_path):
+        # Persisted config wins: it may carry parameters tuned for this region,
+        # and re-deriving would throw them away.
+        try:
+            with open(config_path, "r") as fh:
+                config = _yaml.safe_load(fh) or {}
+        except Exception:
+            config = None
+    else:
+        config = None
+
+    if config is None:
+        if base_config is None:
+            try:
+                with open(os.path.join(sample_dir, os.path.basename(
+                        _channel_config_path(info))), "r") as fh:
+                    base_config = _yaml.safe_load(fh) or {}
+            except Exception:
+                base_config = {}
+        full_shape = _full_shape_of(info)
+        config = build_roi_config(y0, x0, y1, x1, base_config, full_shape,
+                                  mode, z0=z0, z1=z1)
+        try:
+            with open(config_path, "w") as fh:
+                _yaml.safe_dump(config, fh, sort_keys=False)
+        except OSError as exc:
+            print(f"  [ROI] could not persist ROI config: {exc}")
+
+    is_3d = len(_full_shape_of(info) or ()) == 3
+    crop_h, crop_w = y1 - y0, x1 - x0
+    if is_3d:
+        eff_z1 = z1 if z1 is not None else (_full_shape_of(info) or (0,))[0]
+        crop_shape = (int(eff_z1) - z0, crop_h, crop_w)
+    else:
+        crop_shape = (crop_h, crop_w)
+
+    # The crop is a raw memmap with no header, so its dtype has to come from the
+    # source image -- a caller reopening it needs both shape and dtype or it will
+    # read the bytes wrongly.
+    crop_dtype = None
+    try:
+        import tifffile as _tiff
+        with _tiff.TiffFile(info["tif"]) as tf:
+            crop_dtype = np.dtype(tf.series[0].dtype)
+    except Exception:
+        crop_dtype = np.dtype(np.uint16)
+
+    return {
+        "roi_dir": roi_dir, "config": config, "config_path": config_path,
+        "crop_path": crop_path, "crop_shape": crop_shape,
+        "crop_dtype": crop_dtype, "mode": mode,
+        "record": record, "sample_dir": sample_dir,
+        "roi_name": roi_name or roi_display_name(os.path.basename(roi_dir)),
+    }
+
+
+def apply_template_to_regions(
+    sample_dirs: Sequence[str],
+    template: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Push a template config into every saved region of the given channels.
+
+    A region's config is the template's parameter blocks with the DIMENSION block
+    re-derived for that region's own crop -- reusing the channel's dimensions would
+    describe an array of the wrong size, and copying the region's old parameters
+    would defeat the point of applying a template. Each region's existing bbox is
+    read from its polygon record so nothing has to be recomputed from pixels.
+
+    Returns ``{updated: [...], skipped: [...], errors: [...]}``.
+    """
+    import yaml as _yaml
+
+    updated: List[str] = []
+    skipped: List[Dict[str, Any]] = []
+    errors: List[Dict[str, str]] = []
+
+    for sample_dir in sample_dirs:
+        info = describe_channel(sample_dir)
+        if info is None:
+            continue
+        full_shape = _full_shape_of(info)
+        for session in list_roi_sessions(sample_dir):
+            if not session["has_polygon"]:
+                skipped.append({"roi_dir": session["roi_dir"],
+                                "reason": "no polygon"})
+                continue
+            record = load_roi_record(session["roi_dir"])
+            bbox = (record or {}).get("bbox") or {}
+            try:
+                y0, x0 = int(bbox["y0"]), int(bbox["x0"])
+                y1, x1 = int(bbox["y1"]), int(bbox["x1"])
+            except (KeyError, TypeError, ValueError):
+                skipped.append({"roi_dir": session["roi_dir"],
+                                "reason": "unreadable bbox"})
+                continue
+            try:
+                new_cfg = build_roi_config(
+                    y0, x0, y1, x1, template, full_shape or (1, 1),
+                    info["mode"], z0=int(bbox.get("z0") or 0),
+                    z1=bbox.get("z1"))
+                # mode follows the channel, never the template, so a template
+                # exported from a 3D project cannot silently convert a 2D region.
+                new_cfg["mode"] = info["mode"]
+                path = os.path.join(
+                    session["roi_dir"],
+                    f"{ROI_CONFIG_PREFIX}{info['mode']}.yaml")
+                with open(path, "w") as fh:
+                    _yaml.safe_dump(new_cfg, fh, default_flow_style=False,
+                                    sort_keys=False)
+                updated.append(path)
+            except Exception as exc:
+                errors.append({"roi_dir": session["roi_dir"], "error": str(exc)})
+
+    return {"updated": updated, "skipped": skipped, "errors": errors}
+
+
+def count_regions(sample_dirs: Sequence[str]) -> int:
+    """How many saved regions the given channels hold in total."""
+    return sum(1 for d in sample_dirs
+               for se in list_roi_sessions(d) if se["has_polygon"])
+
+
+def regions_common_to_channels(
+    channel_dirs: Sequence[str],
+    require_segmentation: bool = False,
+) -> List[str]:
+    """Region names present in EVERY given channel, in display order.
+
+    Cross-channel analysis compares one region's mask across channels, so a region
+    only qualifies if every channel has it. Because regions propagate under one
+    shared name with one shared polygon, a name present everywhere is guaranteed to
+    describe the same crop everywhere -- which is what makes the masks line up
+    voxel-for-voxel.
+
+    With `require_segmentation` a region also has to have been processed in every
+    channel, so the picker offers only what can actually be analysed rather than
+    failing partway through a recipe.
+    """
+    if not channel_dirs:
+        return []
+
+    per_channel: List[List[str]] = []
+    for sample_dir in channel_dirs:
+        names = []
+        for session in list_roi_sessions(sample_dir):
+            if not session["has_polygon"]:
+                continue
+            if require_segmentation and not _has_segmentation(session["roi_dir"]):
+                continue
+            names.append(session["name"])
+        per_channel.append(names)
+
+    common = set(per_channel[0])
+    for names in per_channel[1:]:
+        common &= set(names)
+    # Keep the first channel's order so the picker matches the tree.
+    return [n for n in per_channel[0] if n in common]
+
+
+def _has_segmentation(directory: str) -> bool:
+    """True if a results directory holds a final segmentation mask."""
+    try:
+        return any(f.startswith("final_segmentation") and f.endswith(".dat")
+                   for f in os.listdir(directory))
+    except OSError:
+        return False
+
+
+def region_geometry(sample_dir: str, roi_name: str) -> Optional[Dict[str, Any]]:
+    """Crop shape and per-voxel spacing of one region, for relational analysis.
+
+    Relational analysis memmaps each channel's mask against a shape and converts
+    distances with a spacing, and for a region both must describe the CROP. Taking
+    them from the channel's full-resolution TIFF -- as the full-image path does --
+    would read past the end of a region's mask.
+
+    Returns ``{shape, spacing, roi_dir, mode}`` or None.
+    """
+    art = ensure_roi_artifacts(sample_dir, roi_name)
+    if art is None:
+        return None
+    shape = tuple(int(v) for v in art["crop_shape"])
+    config = art["config"] or {}
+    is_2d = str(art["mode"]).endswith("_2d")
+    dim_key = "pixel_dimensions" if is_2d else "voxel_dimensions"
+    dims = config.get(dim_key) or {}
+
+    # The config stores TOTAL microns for the crop, so per-voxel spacing is that
+    # divided by the crop's pixel count -- matching how the full-image path derives
+    # spacing from its own dimensions.
+    def _per_px(total, count):
+        try:
+            total = float(total)
+        except (TypeError, ValueError):
+            return 1.0
+        return (total / count) if (count and total > 0) else 1.0
+
+    if len(shape) == 3:
+        spacing = (_per_px(dims.get("z", 1.0), shape[0]),
+                   _per_px(dims.get("y", 1.0), shape[1]),
+                   _per_px(dims.get("x", 1.0), shape[2]))
+    else:
+        spacing = (_per_px(dims.get("y", 1.0), shape[0]),
+                   _per_px(dims.get("x", 1.0), shape[1]))
+
+    return {"shape": shape, "spacing": spacing, "roi_dir": art["roi_dir"],
+            "mode": art["mode"]}
+
+
+def _channel_config_path(info: Dict[str, Any]) -> str:
+    """Path of a channel's own YAML config."""
+    sample_dir = info["sample_dir"]
+    for f in sorted(os.listdir(sample_dir)):
+        if f.lower().endswith((".yaml", ".yml")):
+            return os.path.join(sample_dir, f)
+    return ""
+
+
+def _full_shape_of(info: Dict[str, Any]) -> Optional[Tuple[int, ...]]:
+    """Full image shape of a channel, from the TIFF header."""
+    return _image_shape(info["tif"])

@@ -93,6 +93,64 @@ class BatchProcessor:
 
         return spacing_val, z_scale_factor_val
 
+    def _resolve_target(self, leaf_key: str, load_pixels: bool = False):
+        """Everything a strategy needs for one leaf, image or saved region.
+
+        ONE resolver for both entry points below. Both used to derive the image
+        path, the config path and ``<basename>_processed_<mode>`` independently,
+        and a region differs in all three: its image is the cropped memmap, its
+        config is its own (with dimensions rescaled to the crop), and its results
+        live in the region's session directory. Two parallel derivations of that
+        would drift, so there is one.
+
+        Returns None when the leaf cannot be resolved. `load_pixels` opens the
+        image; scanning leaves it False so status checks stay header-only.
+        """
+        from .project_selection import split_leaf_key
+
+        folder_path, roi_name = split_leaf_key(leaf_key)
+        details = self.project_manager.get_image_details(folder_path)
+        if (details.get('mode') == 'error' or not details.get('tif_file')
+                or not details.get('yaml_file')):
+            return None
+
+        mode = details.get('mode', 'unknown')
+        label = os.path.basename(folder_path)
+
+        if roi_name is None:
+            tif_path = os.path.join(folder_path, details['tif_file'])
+            with open(os.path.join(folder_path, details['yaml_file']), 'r') as fh:
+                config_params = yaml.safe_load(fh) or {}
+            basename = os.path.splitext(details['tif_file'])[0]
+            processed_dir = os.path.join(folder_path,
+                                        f"{basename}_processed_{mode}")
+            if load_pixels:
+                image = tiff.memmap(tif_path, mode='r')
+                image_shape = image.shape
+            else:
+                image = None
+                with tiff.TiffFile(tif_path) as tf:
+                    image_shape = tf.series[0].shape if tf.series else (1,)
+            return {'folder': folder_path, 'roi_name': None, 'mode': mode,
+                    'config': config_params, 'processed_dir': processed_dir,
+                    'image': image, 'image_shape': image_shape, 'label': label}
+
+        # --- a saved region ---
+        from .roi_sharing import ensure_roi_artifacts
+        art = ensure_roi_artifacts(folder_path, roi_name)
+        if art is None:
+            print(f"  [Error] region {roi_name!r} of {label} has no polygon; "
+                  "skipping.")
+            return None
+        image = None
+        if load_pixels:
+            image = np.memmap(art['crop_path'], dtype=art['crop_dtype'],
+                              mode='r+', shape=art['crop_shape'])
+        return {'folder': folder_path, 'roi_name': roi_name, 'mode': art['mode'],
+                'config': art['config'], 'processed_dir': art['roi_dir'],
+                'image': image, 'image_shape': art['crop_shape'],
+                'label': f"{label} [{roi_name}]"}
+
     def _scan_folder_status(self, folder_path: str) -> Dict[str, Any]:
         """
         Performs a lightweight status check on a single folder without loading pixel data.
@@ -118,13 +176,12 @@ class BatchProcessor:
         }
         strategy_instance = None
         try:
-            details = self.project_manager.get_image_details(folder_path)
-            if details['mode'] == 'error' or not details['tif_file'] or not details['yaml_file']:
+            # Resolves a full image or a saved region; no pixel data is loaded.
+            target = self._resolve_target(folder_path, load_pixels=False)
+            if target is None:
                 return result
 
-            tif_filename: str = details['tif_file']
-            yaml_filename: str = details['yaml_file']
-            mode: str = details.get('mode', 'unknown')
+            mode: str = target['mode']
             result['mode'] = mode
 
             StrategyClass = self.supported_strategies.get(mode)
@@ -132,24 +189,13 @@ class BatchProcessor:
                 result['status'] = 'unsupported'
                 return result
 
-            # Read TIFF header only — no pixel data loaded into RAM.
-            tif_path = os.path.join(folder_path, tif_filename)
-            with tiff.TiffFile(tif_path) as tf:
-                image_shape = tf.series[0].shape if tf.series else (1,)
-
-            config_path = os.path.join(folder_path, yaml_filename)
-            with open(config_path, 'r') as f:
-                config_params = yaml.safe_load(f)
-
-            basename = os.path.splitext(tif_filename)[0]
-            processed_dir = os.path.join(
-                folder_path, f"{basename}_processed_{mode}"
-            )
+            config_params = target['config']
+            image_shape = target['image_shape']
             spacing, z_scale = self._calculate_spacing_for_batch(config_params, image_shape)
 
             strategy_instance = StrategyClass(
-                config=config_params.copy(),
-                processed_dir=processed_dir,
+                config=dict(config_params),
+                processed_dir=target['processed_dir'],
                 image_shape=image_shape,
                 spacing=spacing,
                 scale_factor=z_scale,
@@ -169,7 +215,7 @@ class BatchProcessor:
                 result['status'] = 'partial'
 
         except Exception as e:
-            print(f"  [Scan Error] {os.path.basename(folder_path)}: {e}")
+            print(f"  [Scan Error] {folder_path}: {e}")
         finally:
             if strategy_instance is not None:
                 del strategy_instance
@@ -302,60 +348,49 @@ class BatchProcessor:
         Returns:
             bool: True if processing completed successfully (or was already done), False otherwise.
         """
-        folder_name = os.path.basename(folder_path)
-        print(f"\n--- Batch Processing: {folder_name} ---")
-        print(f"    Mode: {target_strategy_key} | Force Restart: {force_restart}")
-
         start_time_folder = time.time()
         image_stack = None
         strategy_instance = None
 
         try:
-            # 1. Validation
-            details = self.project_manager.get_image_details(folder_path)
-            if details['mode'] == 'error' or not details['tif_file'] or not details['yaml_file']:
+            # 1. Resolve the target: a full image, or one of its saved regions.
+            # A region's image is its cropped memmap and its results go to its own
+            # session directory, so nothing below needs to know which it got.
+            try:
+                target = self._resolve_target(folder_path, load_pixels=True)
+            except MemoryError:
+                print(f"  [CRITICAL] Out of Memory loading {folder_path}. Skipping.")
+                return False
+            except Exception as e:
+                print(f"  [Error] Loading image failed: {e}")
+                return False
+            if target is None:
                 print(f"  [Error] Invalid folder structure or missing files. Skipping.")
                 return False
 
-            tif_filename, yaml_filename = details['tif_file'], details['yaml_file']
-            StrategyClass = self.supported_strategies.get(target_strategy_key)
+            folder_name = target['label']
+            print(f"\n--- Batch Processing: {folder_name} ---")
+            print(f"    Mode: {target_strategy_key} | Force Restart: {force_restart}")
 
+            StrategyClass = self.supported_strategies.get(target_strategy_key)
             if not StrategyClass:
                 print(f"  [Error] Strategy '{target_strategy_key}' not supported.")
                 return False
 
-            # 2. Load Image
-            try:
-                image_file_path = os.path.join(folder_path, tif_filename)
-                # Use mmap_mode to prevent full RAM load
-                image_stack = tiff.memmap(image_file_path, mode='r')
-            except MemoryError:
-                print(f"  [CRITICAL] Out of Memory loading {tif_filename}. Skipping.")
-                return False
-            except Exception as e:
-                print(f"  [Error] Loading TIFF failed: {e}")
-                return False
-
-            if image_stack.size == 0:
+            image_stack = target['image']
+            if image_stack is None or image_stack.size == 0:
                 raise ValueError("Image stack is empty.")
 
-            # 3. Load Config
-            config_path = os.path.join(folder_path, yaml_filename)
-            with open(config_path, 'r') as f:
-                config_params = yaml.safe_load(f)
-
-            basename = os.path.splitext(tif_filename)[0]
-            processed_dir = os.path.join(
-                folder_path, f"{basename}_processed_{target_strategy_key}"
-            )
+            config_params = target['config']
+            processed_dir = target['processed_dir']
 
             spacing, z_scale = self._calculate_spacing_for_batch(
                 config_params, image_stack.shape
             )
 
-            # 4. Instantiate Strategy
+            # 2. Instantiate Strategy
             strategy_instance = StrategyClass(
-                config=config_params.copy(),
+                config=dict(config_params),
                 processed_dir=processed_dir,
                 image_shape=image_stack.shape,
                 spacing=spacing,

@@ -207,8 +207,11 @@ class ProjectViewWindow(QMainWindow):
     def _uniform_mode(self, folders: list):
         """Return the common processing mode of `folders`, or None if they are
         mixed / undetermined."""
+        from .project_selection import split_leaf_key
         modes = set()
-        for folder in folders:
+        for key in folders:
+            # A region shares its channel's mode, so resolve to the folder first.
+            folder, _roi = split_leaf_key(key)
             try:
                 mode = self.project_manager.get_image_details(folder).get('mode')
             except Exception:
@@ -363,8 +366,16 @@ class ProjectViewWindow(QMainWindow):
         self.cross_channel_btn.setEnabled(True)
         self._update_action_buttons()
 
-    def _open_sample_folder(self, folder: str) -> None:
-        """Open one image/channel folder in the interactive segmentation view."""
+    def _open_sample_folder(self, leaf_key: str) -> None:
+        """Open one image, or one of its regions, in the segmentation view.
+
+        `leaf_key` is what the tree hands over: a plain folder for the full image,
+        or "<folder>::<region>" for a region row.
+        """
+        if not leaf_key:
+            return
+        from .project_selection import split_leaf_key
+        folder, roi_name = split_leaf_key(leaf_key)
         if not folder:
             return
         # Re-entrancy guard. Launching the segmentation viewer runs its setup --
@@ -382,10 +393,13 @@ class ProjectViewWindow(QMainWindow):
             # Processing may change this folder's status/outputs; refresh the tree
             # when we come back so it doesn't show stale "in progress / N ago".
             self._pending_content_refresh = True
-            self._last_opened_folder = folder
+            # Remember the leaf, not just the folder, so returning re-highlights
+            # the region row rather than jumping to its channel.
+            self._last_opened_folder = leaf_key
             self.hide()
             from .app_launch import interactive_segmentation_with_config  # lazy: avoid cycle
-            interactive_segmentation_with_config(folder, project_manager=self.project_manager)
+            interactive_segmentation_with_config(
+                folder, project_manager=self.project_manager, roi_name=roi_name)
         finally:
             self._launching_viewer = False
 
@@ -482,6 +496,8 @@ class ProjectViewWindow(QMainWindow):
     def _process_selected(self) -> None:
         if self._content_view is None:
             return
+        # Regions and full images are both processable leaves now, so the whole
+        # checked set goes through; the batch processor resolves each one.
         self._batch_process_folders(self._content_view.checked_folders())
 
     def _batch_process_folders(self, folders: list) -> None:
@@ -675,7 +691,12 @@ class ProjectViewWindow(QMainWindow):
         """Apply a template YAML to the checked (single-channel) image folders."""
         if self._content_view is None:
             return
-        folders = self._content_view.checked_folders()
+        # Set Config applies to channels. A channel's saved regions each own their
+        # config, so propagating is a separate, explicit decision rather than an
+        # implicit side effect of retargeting the channel.
+        from .project_selection import split_leaf_key
+        keys = self._content_view.checked_folders()
+        folders = sorted({split_leaf_key(k)[0] for k in keys})
         if not folders:
             return
 
@@ -726,6 +747,30 @@ class ProjectViewWindow(QMainWindow):
         from .reconcile_dialog import make_reconcile_confirm
         from .config_library import ConfigLibraryError
 
+        # Ask about regions before doing anything, so the answer is part of one
+        # decision rather than a surprise afterwards.
+        propagate_to_regions = False
+        try:
+            from .roi_sharing import count_regions
+            n_regions = count_regions(folders)
+        except Exception:
+            n_regions = 0
+        if n_regions:
+            answer = QMessageBox.question(
+                self, "Apply to saved regions too?",
+                f"These channels hold {n_regions} saved region(s), each with its "
+                "own config.\n\n"
+                "Apply this config to those regions as well?\n\n"
+                "Yes  -  regions get the same parameters, with their dimensions "
+                "rescaled to each region's own crop.\n"
+                "No   -  regions keep their current configs.",
+                QMessageBox.Yes | QMessageBox.No | QMessageBox.Cancel,
+                QMessageBox.No,
+            )
+            if answer == QMessageBox.Cancel:
+                return
+            propagate_to_regions = (answer == QMessageBox.Yes)
+
         QApplication.setOverrideCursor(Qt.WaitCursor)
         saved = self.project_manager.image_folders
         self.project_manager.image_folders = list(folders)
@@ -755,6 +800,24 @@ class ProjectViewWindow(QMainWindow):
         if results.get('aborted'):
             return
 
+        # Only now propagate to regions: if the channel apply aborted, the regions
+        # must not be changed either, or the two would disagree.
+        region_note = ""
+        if propagate_to_regions:
+            try:
+                import yaml as _yaml
+                from .roi_sharing import apply_template_to_regions
+                with open(template_path, "r", encoding="utf-8") as fh:
+                    template = _yaml.safe_load(fh) or {}
+                r = apply_template_to_regions(folders, template)
+                region_note = (f"\nRegions updated : {len(r['updated'])}"
+                               + (f"  ({len(r['errors'])} failed)"
+                                  if r["errors"] else ""))
+            except Exception as exc:
+                region_note = f"\nRegions : failed ({exc})"
+        elif n_regions:
+            region_note = f"\nRegions : {n_regions} left unchanged"
+
         summary = (
             f"Config template applied.\n\n"
             f"Updated : {results['success']}\n"
@@ -762,6 +825,7 @@ class ProjectViewWindow(QMainWindow):
             f"Failed  : {results['failed']}\n"
             f"Results cleared : {results.get('cleared', 0)}  "
             f"(parameters changed — these images reopen unprocessed)\n"
+            + region_note
         )
         if results['updated_folders']:
             preview = results['updated_folders'][:8]
@@ -786,8 +850,10 @@ class ProjectViewWindow(QMainWindow):
         shared mode when they agree (ignoring 'unknown'/'error'), else None so the
         picker falls back to showing all configs.
         """
+        from .project_selection import split_leaf_key
         modes = set()
-        for folder in folders:
+        for key in folders:
+            folder, _roi = split_leaf_key(key)
             try:
                 m = self.project_manager.get_image_details(folder).get('mode')
             except Exception:
@@ -908,14 +974,29 @@ class ProjectViewWindow(QMainWindow):
             except Exception:
                 pass
 
-    def _run_config_path(self, folder: str):
-        """Absolute path to a folder's processed run config, or None if absent.
+    def _run_config_path(self, leaf_key: str):
+        """Absolute path to a leaf's processed run config, or None if absent.
 
-        Looks for ``<basename>_processed_<mode>/processing_config_<mode>.yaml``
-        next to the image, matching how the pipeline writes it.
+        For a full image this is
+        ``<basename>_processed_<mode>/processing_config_<mode>.yaml``; for a region
+        it is the same file inside that region's own session directory, since a
+        region owns its config independently of its channel.
         """
-        if not folder:
+        if not leaf_key:
             return None
+        from .project_selection import split_leaf_key
+        folder, roi_name = split_leaf_key(leaf_key)
+        if roi_name:
+            try:
+                from .roi_sharing import roi_session_dir
+                roi_dir = roi_session_dir(folder, roi_name)
+                if not roi_dir:
+                    return None
+                mode = self.project_manager.get_image_details(folder).get('mode')
+                cfg = os.path.join(roi_dir, f"processing_config_{mode}.yaml")
+                return cfg if os.path.isfile(cfg) else None
+            except Exception:
+                return None
         try:
             details = self.project_manager.get_image_details(folder)
         except Exception:

@@ -18,7 +18,7 @@ class RelationalEngine:
     """
 
     @staticmethod
-    def _find_dat(folder_path, include_roi: bool = False):
+    def _find_dat(folder_path, include_roi: bool = False, roi_name=None):
         """Helper to find the final_segmentation.dat in a project folder.
 
         Skips ROI sub-region sessions by default. An ROI session lives in
@@ -35,6 +35,27 @@ class RelationalEngine:
         results are sorted so the choice is deterministic when several exist.
         """
         if not folder_path or not os.path.isdir(folder_path):
+            return None
+
+        # A named region's results live directly in its session directory, which
+        # IS the processed dir -- so it is searched directly rather than scanned
+        # for a "_processed_" child. Every channel's copy of a region shares one
+        # polygon and bounding box, which is what makes the masks comparable
+        # across channels at all.
+        if roi_name:
+            try:
+                from .roi_sharing import roi_session_dir
+                roi_dir = roi_session_dir(folder_path, roi_name)
+            except Exception:
+                return None
+            if not roi_dir or not os.path.isdir(roi_dir):
+                return None
+            try:
+                for f in sorted(os.listdir(roi_dir)):
+                    if f.startswith("final_segmentation") and f.endswith(".dat"):
+                        return os.path.join(roi_dir, f)
+            except OSError:
+                pass
             return None
 
         try:
@@ -200,11 +221,19 @@ class RelationalEngine:
         print(f"  [Intersect Metrics] Saved {len(metrics_df)} objects → {csv_path}")
     
     @staticmethod
-    def run_recipe(sample_name, registry, recipe, out_dir, shape, spacing):
+    def run_recipe(sample_name, registry, recipe, out_dir, shape, spacing,
+                   roi_name=None):
         """
         Executes a sequence of relational steps.
         Saves metrics, coverage stats, and connection coordinates.
+
+        `roi_name` restricts the analysis to one saved region. Every channel holds
+        that region under the same name with the same polygon, so the per-channel
+        masks are the same crop and line up voxel-for-voxel -- the analysis itself
+        needs no changes, only a different set of .dat files. `shape` and `spacing`
+        must then describe the CROP, not the full image.
         """
+        _dat = lambda folder: RelationalEngine._find_dat(folder, roi_name=roi_name)
         sample_channels = registry.get(sample_name, {})
         
         # 1. Biological Name Mapping
@@ -230,7 +259,7 @@ class RelationalEngine:
 
             if step_type == "primary":
                 target_ch = step['target']
-                ch_path = RelationalEngine._find_dat(sample_channels.get(target_ch))
+                ch_path = _dat(sample_channels.get(target_ch))
                 ch_name = name_registry.get(target_ch, "Primary")
 
                 # Guard: when a 'primary' step immediately precedes an 'analyze' step that
@@ -254,14 +283,14 @@ class RelationalEngine:
 
             elif step_type == "intersect":
                 inputs = step['inputs']
-                path_a = RelationalEngine._find_dat(sample_channels.get(inputs[0]))
+                path_a = _dat(sample_channels.get(inputs[0]))
                 name_a = name_registry.get(inputs[0], "A")
 
                 if inputs[1] == "PREVIOUS_RESULT":
                     path_b = last_mask_path
                     name_b = last_mask_name
                 else:
-                    path_b = RelationalEngine._find_dat(sample_channels.get(inputs[1]))
+                    path_b = _dat(sample_channels.get(inputs[1]))
                     name_b = name_registry.get(inputs[1], "B")
 
                 if path_a and path_b:
@@ -332,7 +361,7 @@ class RelationalEngine:
                 parent_id_map = {}
                 if step.get('primary'):
                     primary_ch_key   = step['primary']
-                    active_mask_path = RelationalEngine._find_dat(sample_channels.get(primary_ch_key))
+                    active_mask_path = _dat(sample_channels.get(primary_ch_key))
                     active_mask_name = name_registry.get(primary_ch_key, primary_ch_key)
 
                     if step.get('target') == "PREVIOUS_RESULT":
@@ -342,14 +371,14 @@ class RelationalEngine:
                     else:
                         # Case 3: partner is a named channel — direct two-channel analysis
                         partner_ch_key   = step['target']
-                        partner_dat_path = RelationalEngine._find_dat(sample_channels.get(partner_ch_key))
+                        partner_dat_path = _dat(sample_channels.get(partner_ch_key))
                         partner_bio_name = name_registry.get(partner_ch_key, partner_ch_key)
                 else:
                     # Case 1: default — previous result is primary, target channel is partner
                     active_mask_path = last_mask_path
                     active_mask_name = last_mask_name
                     partner_bio_name = name_registry.get(step['target'], "Partner")
-                    partner_dat_path = RelationalEngine._find_dat(sample_channels.get(step['target']))
+                    partner_dat_path = _dat(sample_channels.get(step['target']))
                 if active_mask_path and partner_dat_path:
                     # Execute proximity and overlap logic
                     if is_2d:

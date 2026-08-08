@@ -579,8 +579,15 @@ def _handle_napari_close() -> None:
     lifecycle("napari.destroyed", note="qt window destroyed signal fired")
     QTimer.singleShot(100, _check_if_last_window)
 
-def interactive_segmentation_with_config(selected_folder: str = None, project_manager=None) -> None:
-    """Launches Napari with the DynamicGUIManager for a single sample."""
+def interactive_segmentation_with_config(selected_folder: str = None,
+                                         project_manager=None,
+                                         roi_name: str = None) -> None:
+    """Launches Napari with the DynamicGUIManager for a single sample.
+
+    `roi_name` opens a specific saved region instead of the full image. Without it
+    the manager behaves as before: full image, or a prompt when the channel has a
+    saved region.
+    """
     try:
         from .gui_manager import DynamicGUIManager
     except ImportError:
@@ -630,6 +637,7 @@ def interactive_segmentation_with_config(selected_folder: str = None, project_ma
             pass
 
         gui_manager = DynamicGUIManager(viewer, config, image_stack, file_loc, mode,
+                                        roi_name=roi_name,
                                         project_manager=project_manager)
         control_panel, refresh_nav = build_segmentation_control_panel(
             viewer, gui_manager

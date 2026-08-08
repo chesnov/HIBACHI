@@ -18,6 +18,16 @@ from .metadata import get_sample_metadata
 
 
 
+def _safe_name(name: str) -> str:
+    """Folder-safe form of a region name, e.g. 'ROI 2' -> 'ROI_2'.
+
+    Region results are written to a subfolder named after the region, so the same
+    recipe run on the full image and on a region cannot overwrite each other.
+    """
+    return "".join(c if (c.isalnum() or c in "-_") else "_"
+                   for c in str(name)).strip("_") or "region"
+
+
 class CrossChannelAnalyzerWindow(QMainWindow):
     def __init__(self, project_manager):
         super().__init__()
@@ -109,6 +119,18 @@ class CrossChannelAnalyzerWindow(QMainWindow):
         self.sample_selector.addItems(sorted(list(self.pm.sample_registry.keys())))
         selector_layout.addWidget(self.sample_selector)
         exec_layout.addLayout(selector_layout)
+
+        # Region selector. Only regions that exist in EVERY channel of the sample
+        # are offered: the analysis compares one region's mask across channels, so a
+        # region missing from one channel cannot be analysed. Rebuilt whenever the
+        # sample changes.
+        region_layout = QHBoxLayout()
+        region_layout.addWidget(QLabel("Region:"))
+        self.region_selector = QComboBox()
+        region_layout.addWidget(self.region_selector)
+        exec_layout.addLayout(region_layout)
+        self.sample_selector.currentTextChanged.connect(self._reload_regions)
+        self._reload_regions(self.sample_selector.currentText())
 
         self.btn_preview = QPushButton("👁️ Preview Recipe (Napari)")
         self.btn_preview.setFixedHeight(40)
@@ -337,6 +359,63 @@ class CrossChannelAnalyzerWindow(QMainWindow):
             self.recipe_steps.append(step)
             self.recipe_list.addItem(step["name"])
 
+    FULL_IMAGE_LABEL = "Full image"
+
+    def _reload_regions(self, sample_name: str = "") -> None:
+        """Repopulate the region picker for the selected sample."""
+        self.region_selector.clear()
+        self.region_selector.addItem(self.FULL_IMAGE_LABEL)
+        try:
+            channels = list(
+                (self.pm.sample_registry.get(sample_name) or {}).values())
+            from .roi_sharing import regions_common_to_channels
+            for name in regions_common_to_channels(channels,
+                                                   require_segmentation=True):
+                self.region_selector.addItem(name)
+        except Exception as exc:
+            print(f"  [Relational] could not list regions: {exc}")
+
+    def _selected_region(self):
+        """Region name chosen in the picker, or None for the full image."""
+        try:
+            label = self.region_selector.currentText()
+        except Exception:
+            return None
+        return None if (not label or label == self.FULL_IMAGE_LABEL) else label
+
+    def _geometry_for(self, sample_data: dict, roi_name):
+        """(shape, spacing) for a sample, honouring the selected region.
+
+        A region's masks are the CROP, so its shape and spacing must come from the
+        region rather than the channel's full-resolution TIFF -- memmapping a
+        region's mask against the full shape would read past the end of the file.
+        Returns (None, None) when it cannot be determined.
+        """
+        first_ch = list(sample_data.values())[0]
+        if roi_name:
+            from .roi_sharing import region_geometry
+            geo = region_geometry(first_ch, roi_name)
+            if geo is None:
+                return None, None
+            return geo["shape"], geo["spacing"]
+
+        tif_path = next((os.path.join(first_ch, f) for f in os.listdir(first_ch)
+                         if f.lower().endswith((".tif", ".tiff"))), None)
+        if not tif_path:
+            return None, None
+        with tiff.TiffFile(tif_path) as tif:
+            shape = tif.series[0].shape
+        meta, _ = get_sample_metadata(first_ch)
+        meta = meta or {}
+        if len(shape) == 3:
+            spacing = (meta.get('z', 1.0) / shape[0],
+                       meta.get('y', 1.0) / shape[1],
+                       meta.get('x', 1.0) / shape[2])
+        else:
+            spacing = (meta.get('y', 1.0) / shape[0],
+                       meta.get('x', 1.0) / shape[1])
+        return shape, spacing
+
     def preview_recipe(self):
         if not self.recipe_steps:
             QMessageBox.information(self, "Info", "Recipe is empty.")
@@ -352,12 +431,17 @@ class CrossChannelAnalyzerWindow(QMainWindow):
 
         sample_name = self.sample_selector.currentText()
         sample_data = self.pm.sample_registry[sample_name]
-        
+        roi_name = self._selected_region()
+
         # 2. Setup Viewer
-        # Setup permanent path for this sample's relational results
+        # Setup permanent path for this sample's relational results. A region's
+        # results go in their own subfolder so running the same recipe on the full
+        # image and on a region cannot overwrite one another.
         project_root = os.path.dirname(self.pm.project_path)
+        leaf = sample_name if not roi_name else os.path.join(
+            sample_name, _safe_name(roi_name))
         sample_out_dir = os.path.join(
-            project_root, "RELATIONAL_ANALYSIS", analysis_name, sample_name
+            project_root, "RELATIONAL_ANALYSIS", analysis_name, leaf
         )
         os.makedirs(sample_out_dir, exist_ok=True)
 
@@ -408,8 +492,8 @@ class CrossChannelAnalyzerWindow(QMainWindow):
         
         # Run calculation
         derived_masks, metrics_df = RelationalEngine.run_recipe(
-            sample_name, self.pm.sample_registry, self.recipe_steps, 
-            sample_out_dir, shape, spacing
+            sample_name, self.pm.sample_registry, self.recipe_steps,
+            sample_out_dir, shape, spacing, roi_name=roi_name
         )
 
         # Add the Red Proximity Lines
@@ -455,6 +539,7 @@ class CrossChannelAnalyzerWindow(QMainWindow):
             return
 
         # 1. Ask for an Analysis Name (to create a subfolder)
+        roi_name = self._selected_region()
         analysis_name, ok = QInputDialog.getText(self, "Batch Run", "Enter name for this analysis:")
         if not ok or not analysis_name:
             return
@@ -465,6 +550,13 @@ class CrossChannelAnalyzerWindow(QMainWindow):
         os.makedirs(batch_out_dir, exist_ok=True)
 
         # 3. Save the recipe itself for reproducibility
+        # Record which region the run covered, so a results folder is
+        # self-describing rather than depending on someone remembering.
+        try:
+            with open(os.path.join(batch_out_dir, "region.txt"), 'w') as f:
+                f.write((roi_name or "Full image") + "\n")
+        except OSError:
+            pass
         with open(os.path.join(batch_out_dir, "recipe.yaml"), 'w') as f:
             yaml.dump(self.recipe_steps, f)
 
@@ -480,28 +572,24 @@ class CrossChannelAnalyzerWindow(QMainWindow):
                 print(f"Processing {i+1}/{total}: {s_name}...")
                 sample_data = self.pm.sample_registry[s_name]
                 
-                # Fetch shape/spacing from the first channel of the sample
-                first_ch = list(sample_data.values())[0]
-                tif_path = next(os.path.join(first_ch, f) for f in os.listdir(first_ch) if f.lower().endswith(('.tif', '.tiff')))
-                
-                with tiff.TiffFile(tif_path) as tif:
-                    shape = tif.series[0].shape
-                
-                # Retrieve spacing from strategy (fallback to 1.0)
-                meta, _ = get_sample_metadata(first_ch)
-                # Simple spacing calc
-                if len(shape) == 3:
-                    spacing = (meta.get('z', 1.0)/shape[0], meta.get('y', 1.0)/shape[1], meta.get('x', 1.0)/shape[2])
-                else:
-                    spacing = (meta.get('y', 1.0)/shape[0], meta.get('x', 1.0)/shape[1])
+                # Shape/spacing for this sample, from the region when one is
+                # selected. Samples lacking that region are skipped with a note
+                # rather than analysed against the wrong geometry.
+                shape, spacing = self._geometry_for(sample_data, roi_name)
+                if shape is None:
+                    print(f"  [Skip] {s_name}: "
+                          + (f"region {roi_name!r} not available in every channel"
+                             if roi_name else "no readable image"))
+                    continue
 
-                # Sample-specific output folder
-                sample_out = os.path.join(batch_out_dir, s_name)
-                
+                # Sample-specific output folder, kept separate per region.
+                sample_out = os.path.join(batch_out_dir, s_name) if not roi_name \
+                    else os.path.join(batch_out_dir, s_name, _safe_name(roi_name))
+
                 # EXECUTE ENGINE
                 RelationalEngine.run_recipe(
                     s_name, self.pm.sample_registry, self.recipe_steps,
-                    sample_out, shape, spacing
+                    sample_out, shape, spacing, roi_name=roi_name
                 )
 
             QApplication.restoreOverrideCursor()
@@ -517,7 +605,9 @@ class CrossChannelAnalyzerWindow(QMainWindow):
         # 5. Create Master Summary Table
         all_csvs = []
         for s_name in samples:
-            csv_p = os.path.join(batch_out_dir, s_name, f"{s_name}_relational_results.csv")
+            leaf_dir = os.path.join(batch_out_dir, s_name) if not roi_name \
+                else os.path.join(batch_out_dir, s_name, _safe_name(roi_name))
+            csv_p = os.path.join(leaf_dir, f"{s_name}_relational_results.csv")
             if os.path.exists(csv_p):
                 df = pd.read_csv(csv_p)
                 df['sample_name'] = s_name

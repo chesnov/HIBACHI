@@ -35,14 +35,18 @@ from PyQt5.QtWidgets import (  # type: ignore
 
 from .roi_sharing import (
     HAS_ROI, NEW, NO_ROI, ORPHAN, REPLACE, SHAPE_MISMATCH, UNUSABLE,
-    apply_roi_clear, apply_roi_propagation, load_existing_rois, plan_roi_clear,
+    apply_roi_clear, apply_roi_propagation, choose_shared_roi_name,
+    group_rois_by_name, load_existing_rois, plan_roi_clear,
     plan_roi_propagation, roi_record_from_polygons, rois_are_identical,
 )
 
 ROI_LAYER_NAME = "ROI Selection"
-# Kept separate from the drawing layer so showing a saved ROI never interferes
-# with, or gets mistaken for, a new drawing in progress.
-SAVED_LAYER_NAME = "ROI (saved)"
+# Saved regions get one layer each, named "<region> (saved)". Kept distinct from
+# the drawing layer so displaying saved regions never interferes with, or gets
+# mistaken for, a new drawing in progress.
+SAVED_LAYER_SUFFIX = " (saved)"
+# Distinguishable outline colours, cycled per region.
+_REGION_COLOURS = ("cyan", "magenta", "yellow", "lime", "orange", "white")
 
 
 # --------------------------------------------------------------------------- #
@@ -174,7 +178,9 @@ class OverlayROIPanel:
         Z slider mapping and misplaces both drawn and displayed polygons.
         """
         for existing in self.viewer.layers:
-            if existing.name in (ROI_LAYER_NAME, SAVED_LAYER_NAME):
+            # Skip our own layers: the drawing layer and every "<name> (saved)".
+            if (existing.name == ROI_LAYER_NAME
+                    or str(existing.name).endswith(SAVED_LAYER_SUFFIX)):
                 continue
             try:
                 return tuple(float(v) for v in existing.scale)
@@ -201,76 +207,82 @@ class OverlayROIPanel:
 
     # ---- showing what is already saved ---------------------------------- #
     def show_saved_rois(self, quiet: bool = False) -> int:
-        """Display the ROI already stored on this sample's channels.
+        """Display every region already saved on this sample's channels.
 
         Called when the overlay opens, which is what gives the overlay a memory:
-        the record lives in the channel folders, so without reading it back the
-        overlay came up blank even though every channel was cropped.
+        records live in the channel folders, so without reading them back the
+        overlay came up blank even though channels were cropped.
 
-        Returns the number of channels found to have an ROI.
+        Each named region gets its OWN layer ("ROI 2 (saved)") so regions can be
+        toggled independently -- with several regions in one layer there is no way
+        to tell which polygon belongs to which.
+
+        Returns the number of distinct regions found.
         """
         loaded = load_existing_rois(self.sample_dirs)
 
-        if SAVED_LAYER_NAME in self.viewer.layers:
-            self.viewer.layers.remove(SAVED_LAYER_NAME)
+        for layer in [l for l in list(self.viewer.layers)
+                      if str(l.name).endswith(SAVED_LAYER_SUFFIX)]:
+            self.viewer.layers.remove(layer.name)
 
         if not loaded:
             if not quiet:
                 QMessageBox.information(
                     None, "No saved ROI",
-                    f"No channel of '{self.sample_name}' has a saved ROI.\n\n"
+                    f"No channel of '{self.sample_name}' has a saved region.\n\n"
                     "Draw one and apply it to see it here.")
             return 0
 
-        # Normally every channel holds the same record, so show it once. When they
-        # differ, show the union and say so rather than picking one silently.
+        grouped = group_rois_by_name(loaded)
         identical = rois_are_identical(loaded)
-        if identical:
-            z_polygons = loaded[0]["z_polygons"]
-        else:
-            z_polygons = {}
-            for entry in loaded:
+        scale = self._reference_scale()
+
+        for index, (name, entries) in enumerate(grouped.items()):
+            # Normally every channel holds the same record for a region, so show
+            # it once. Where they differ, show the union so the discrepancy is
+            # visible rather than hidden behind whichever channel came first.
+            z_polygons: Dict[int, np.ndarray] = {}
+            for entry in entries:
                 for z, poly in entry["z_polygons"].items():
                     z_polygons.setdefault(z, poly)
+            verts = self._as_vertices(z_polygons)
+            if not verts:
+                continue
 
-        verts = self._as_vertices(z_polygons)
-        if not verts:
-            return 0
-
-        layer = self.viewer.add_shapes(
-            verts,
-            name=SAVED_LAYER_NAME,
-            shape_type="polygon",
-            edge_color="cyan",
-            face_color=[0, 1, 1, 0.06],
-            edge_width=2,
-        )
-        scale = self._reference_scale()
-        if scale is not None and len(scale) == len(self.full_shape or ()):
+            colour = _REGION_COLOURS[index % len(_REGION_COLOURS)]
+            layer = self.viewer.add_shapes(
+                verts,
+                name=f"{name}{SAVED_LAYER_SUFFIX}",
+                shape_type="polygon",
+                edge_color=colour,
+                face_color=[0, 0, 0, 0.0],
+                edge_width=2,
+            )
+            if scale is not None and len(scale) == len(self.full_shape or ()):
+                try:
+                    layer.scale = scale
+                except Exception:
+                    pass
+            # Read-only by intent: this shows what is committed to disk, and
+            # editing it would imply the change propagates, which it does not.
             try:
-                layer.scale = scale
+                layer.mode = "pan_zoom"
+                layer.editable = False
             except Exception:
                 pass
-        # Read-only by intent: this shows what is already committed to disk.
-        # Editing it would imply the change propagates, which it does not.
-        try:
-            layer.mode = "pan_zoom"
-            layer.editable = False
-        except Exception:
-            pass
 
-        names = ", ".join(e["channel"] for e in loaded)
-        print(f"  [ROI] loaded saved ROI from {len(loaded)} channel(s): {names}")
+        print(f"  [ROI] loaded {len(grouped)} saved region(s): "
+              f"{', '.join(grouped)}")
         if not identical and not quiet:
             QMessageBox.warning(
-                None, "Channels have different ROIs",
-                f"The channels of '{self.sample_name}' do not all share the same "
-                "region:\n\n" + "\n".join(
-                    f"\u2022 {e['channel']}: {len(e['z_polygons'])} polygon(s)"
-                    for e in loaded)
-                + "\n\nAll of them are shown together. Draw a new region and "
-                  "apply it to bring them back into agreement.")
-        return len(loaded)
+                None, "Channels disagree on a region",
+                f"In '{self.sample_name}', some channels hold a different shape "
+                "for the same named region:\n\n"
+                + "\n".join(f"\u2022 {n}: {len(v)} channel(s)"
+                             for n, v in grouped.items())
+                + "\n\nThe union is shown. Draw the region again and apply it to "
+                  "bring the channels back into agreement.")
+        return len(grouped)
 
     # ---- drawing -------------------------------------------------------- #
     def draw_roi(self) -> None:
@@ -420,7 +432,11 @@ class OverlayROIPanel:
             QMessageBox.warning(None, "ROI not usable", str(exc))
             return
 
-        plan = plan_roi_propagation(self.sample_dirs, self.full_shape)
+        # One shared name across channels, so "ROI 2" is the same region
+        # everywhere -- which is what cross-channel analysis within a region needs.
+        new_name = choose_shared_roi_name(self.sample_dirs)
+        plan = plan_roi_propagation(self.sample_dirs, self.full_shape,
+                                    roi_name=new_name)
         rows = []
         for entry in plan:
             status = entry.get("status")
@@ -456,16 +472,16 @@ class OverlayROIPanel:
                       if bbox["z1"] - bbox["z0"] != self.full_shape[0]
                       else ", all Z")
         intro = (
-            f"Apply this region to the channels of '{self.sample_name}'.\n\n"
+            f"Add '{new_name}' to the channels of '{self.sample_name}'.\n\n"
             f"Region: {bbox['y1'] - bbox['y0']} \u00d7 {bbox['x1'] - bbox['x0']} px"
             f"{z_note}, from {len(record['z_polygons'])} polygon(s).\n\n"
-            "Each channel crops its own image to this region and rebuilds its own "
-            "config on next open. Processing starts again from step 1 for the "
-            "channels you select."
+            "Existing regions are left alone. Each channel crops its own image to "
+            "this region and gets its own config, so processing starts from step 1 "
+            "for the channels you select."
         )
 
         dlg = ChannelSelectDialog(
-            "Apply ROI to channels", intro, rows, "Apply ROI"
+            f"Add {new_name} to channels", intro, rows, f"Add {new_name}"
         )
         if dlg.exec_() != QDialog.Accepted:
             return
@@ -474,12 +490,14 @@ class OverlayROIPanel:
             return
 
         result = apply_roi_propagation(chosen, record)
+        self.show_saved_rois(quiet=True)   # reflect the new region immediately
         self._report(
-            "ROI applied",
-            f"{len(result['written'])} channel(s) now use this region.",
+            f"{new_name} added",
+            f"{new_name} was added to {len(result['written'])} channel(s).",
             result["errors"],
-            tail=("Open each channel from the project view to segment the "
-                  "sub-region. Choose 'Yes' when it asks to load the ROI session."),
+            tail=("Open a channel from the project view to segment it. When a "
+                  "channel holds several regions you will be asked which one to "
+                  "open."),
         )
 
     # ---- clear ---------------------------------------------------------- #
@@ -491,9 +509,10 @@ class OverlayROIPanel:
             channel = entry.get("channel", "?")
             if status == HAS_ROI:
                 n = len(entry.get("outputs") or [])
+                region = entry.get("roi_name") or "region"
                 rows.append({
-                    "entry": entry, "enabled": True, "default": True,
-                    "label": (f"{channel}  \u2014  ROI session active"
+                    "entry": entry, "enabled": True, "default": False,
+                    "label": (f"{channel} \u2014 {region}"
                               + (f" ({n} result file(s) deleted)" if n else "")),
                     "tooltip": entry.get("roi_dir", ""),
                 })
@@ -526,14 +545,14 @@ class OverlayROIPanel:
             return
 
         intro = (
-            f"Return channels of '{self.sample_name}' to the full image.\n\n"
-            "This deletes each selected channel's ROI session, including any "
-            "results computed on the sub-region. Full-image results are NOT "
-            "affected \u2014 they live in a separate folder. The channel then opens "
-            "uncropped, without asking about an ROI."
+            f"Delete saved regions from '{self.sample_name}'.\n\n"
+            "Each row is one region in one channel. Deleting a region removes any "
+            "results computed on it. Full-image results are NOT affected \u2014 they "
+            "live in a separate folder.\n\n"
+            "Nothing is checked by default, since this destroys results."
         )
         dlg = ChannelSelectDialog(
-            "Return to full image", intro, rows, "Return to full image"
+            "Delete saved regions", intro, rows, "Delete selected"
         )
         if dlg.exec_() != QDialog.Accepted:
             return
@@ -542,9 +561,11 @@ class OverlayROIPanel:
             return
 
         result = apply_roi_clear(chosen)
+        self.show_saved_rois(quiet=True)   # drop the deleted regions from view
         self._report(
-            "Returned to full image",
-            f"{len(result['cleared'])} channel(s) will now open on the full image.",
+            "Regions deleted",
+            f"{len(result['cleared'])} region(s) removed. Channels with no "
+            "regions left will open on the full image.",
             result["errors"],
         )
 
@@ -626,10 +647,10 @@ def add_overlay_roi_panel(viewer, sample_name: str, sample_dirs: Sequence[str],
         "Loaded automatically when the overlay opens.",
     )
     btn_clear = _button(
-        "\u21a9 Return to full image\u2026",
-        "Remove the ROI session from any subset of this sample's channels\n"
-        "so they open uncropped. Deletes results computed on the\n"
-        "sub-region; full-image results are kept.",
+        "\U0001f5d1 Manage saved regions\u2026",
+        "Delete saved regions from any subset of this sample's channels.\n"
+        "Removes results computed on those regions; full-image results\n"
+        "are kept. A channel with no regions left opens uncropped.",
     )
 
     btn_draw.clicked.connect(panel.draw_roi)

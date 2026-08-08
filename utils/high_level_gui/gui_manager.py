@@ -218,6 +218,7 @@ class DynamicGUIManager(QObject):
         image_stack: np.ndarray,
         file_loc: str,
         processing_mode: str,
+        roi_name: Optional[str] = None,
         project_manager: Any = None,
     ):
         super().__init__()
@@ -247,6 +248,9 @@ class DynamicGUIManager(QObject):
         # These are set when the user confirms a polygon crop.
         # _full_* refs allow returning to the full-image session at any time.
         self.roi_active: bool = False
+        # Which named ROI session is loaded. None means the full image. Auto-named
+        # ("ROI 1", "ROI 2", ...) so several regions can coexist per channel.
+        self.active_roi_name: Optional[str] = None
         self._full_contrast_limits: Optional[list] = None
         self._full_image_stack: Optional[np.ndarray] = None
         self._full_processed_dir: Optional[str] = None
@@ -312,7 +316,7 @@ class DynamicGUIManager(QObject):
         # Check for a previously confirmed ROI session first.  If found and
         # the user accepts, _try_load_existing_roi_session() handles the
         # checkpoint restore itself; otherwise we fall through to the normal path.
-        if not self._try_load_existing_roi_session():
+        if not self._try_load_existing_roi_session(roi_name=roi_name):
             self.restore_from_checkpoint()
 
     def _init_persistent_log(self) -> None:
@@ -382,82 +386,16 @@ class DynamicGUIManager(QObject):
         z0_crop: int = 0,
         z1_crop: Optional[int] = None,
     ) -> np.memmap:
+        """Thin wrapper over roi_sharing.build_crop_memmap.
+
+        The implementation moved out of this class so batch processing -- which
+        runs in a child process with no GUI object -- can build an ROI crop. This
+        wrapper stays so existing call sites and any saved user scripts keep
+        working, and so there is exactly one implementation.
         """
-        Writes a cropped, polygon-masked copy of *src* to *out_path* and
-        returns an 'r+' memmap handle to it.
-
-        *z_polygons* maps global Z indices to YX polygon arrays (full-image
-        coordinates).  For each Z slice in the crop the nearest defined polygon
-        is used — nearest-neighbour interpolation between defined levels.  This
-        supports three cases uniformly:
-
-          • 2D image          — single entry {0: polygon_yx}.
-          • 3D full-Z extrude — single entry {any_z: polygon_yx}; the same
-                                 mask is applied to every slice.
-          • 3D multi-polygon  — one entry per drawn Z level; slices between
-                                 defined levels get the nearest polygon.
-
-        Slices before the first defined Z use the first polygon; slices after
-        the last defined Z use the last polygon (no extrapolation to zeros).
-
-        Args:
-            src:           Full-resolution image (2-D or 3-D array/memmap).
-            y0,x0,y1,x1:  YX bounding box in full-image pixel coordinates.
-            z_polygons:    Dict {global_z: polygon_yx (N×2, full-image coords)}.
-            out_path:      Destination path for the output .dat memmap.
-            z0_crop:       First Z slice index to include (3D only).
-            z1_crop:       One-past-last Z slice index (3D only; None = end).
-
-        Returns:
-            np.memmap opened in 'r+' mode at *out_path*.
-        """
-        is_3d = src.ndim == 3
-        crop_h, crop_w = y1 - y0, x1 - x0
-
-        if is_3d:
-            if z1_crop is None:
-                z1_crop = src.shape[0]
-            crop_depth = z1_crop - z0_crop
-            crop_shape = (crop_depth, crop_h, crop_w)
-        else:
-            crop_shape = (crop_h, crop_w)
-
-        crop_mm = np.memmap(out_path, dtype=src.dtype, mode='w+', shape=crop_shape)
-
-        sorted_zs = sorted(z_polygons.keys())
-
-        def _mask_for_z(global_z: int) -> np.ndarray:
-            """Returns a boolean crop-local mask for the nearest polygon."""
-            nearest_z = min(sorted_zs, key=lambda z: abs(z - global_z))
-            poly = z_polygons[nearest_z] - np.array([y0, x0], dtype=float)
-            rr, cc = skimage_polygon(poly[:, 0], poly[:, 1],
-                                     shape=(crop_h, crop_w))
-            m = np.zeros((crop_h, crop_w), dtype=bool)
-            m[rr, cc] = True
-            return m
-
-        if is_3d:
-            print(f"  [ROI] Building 3D crop "
-                  f"({crop_depth} slices × {crop_h} × {crop_w})…")
-            # Cache masks: if there is only one polygon defined all slices share
-            # the same mask — avoid rebuilding it 192 times.
-            mask_cache: Dict[int, np.ndarray] = {}
-            for local_z in range(crop_depth):
-                global_z = z0_crop + local_z
-                nearest_z = min(sorted_zs, key=lambda z: abs(z - global_z))
-                if nearest_z not in mask_cache:
-                    mask_cache[nearest_z] = _mask_for_z(global_z)
-                mask2d = mask_cache[nearest_z]
-                slice_data = np.array(src[global_z, y0:y1, x0:x1])
-                slice_data[~mask2d] = 0
-                crop_mm[local_z] = slice_data
-        else:
-            mask2d = _mask_for_z(0)
-            crop_mm[:] = src[y0:y1, x0:x1]
-            crop_mm[~mask2d] = 0
-
-        crop_mm.flush()
-        return crop_mm
+        from .roi_sharing import build_crop_memmap
+        return build_crop_memmap(src, y0, x0, y1, x1, z_polygons, out_path,
+                                 z0_crop=z0_crop, z1_crop=z1_crop)
 
     def _build_roi_config(
         self,
@@ -466,70 +404,75 @@ class DynamicGUIManager(QObject):
         z0: int = 0,
         z1: Optional[int] = None,
     ) -> Dict[str, Any]:
+        """Thin wrapper over roi_sharing.build_roi_config.
+
+        The implementation moved out of this class for the same reason as the crop
+        builder. It previously read the full image shape and the mode off `self`;
+        those are now passed explicitly so a batch worker can derive an ROI config
+        with no GUI object in existence.
         """
-        Produces a deep-copied config with the physical dimensions rescaled to
-        the crop extent.  All execute_* parameter blocks are taken verbatim.
-
-        The YAMLs store *total* physical extent (not per-voxel size), so the
-        crop dimensions scale linearly with pixel count:
-            new_x_um = original_x_um × (crop_w / full_w)
-        This leaves per-voxel spacing identical while making the config
-        self-consistent for the smaller array.
-
-        Args:
-            y0,x0,y1,x1: YX bounding box in full-image pixel coordinates.
-            base_config:  Original full-image config to copy from.
-            z0, z1:       Z crop range (3D only).  z1=None means full Z range.
-        """
-        roi_config = copy.deepcopy(base_config)
-        is_2d_mode = self.processing_mode.endswith('_2d')
-        dim_key = 'pixel_dimensions' if is_2d_mode else 'voxel_dimensions'
-
-        orig_dims = base_config.get(dim_key, {'x': 1.0, 'y': 1.0, 'z': 1.0})
-        orig_x = float(orig_dims.get('x', 1.0))
-        orig_y = float(orig_dims.get('y', 1.0))
-
-        full_h = self._full_image_stack.shape[-2]
-        full_w = self._full_image_stack.shape[-1]
-
-        new_dims = dict(orig_dims)
-        new_dims['x'] = orig_x * ((x1 - x0) / full_w)
-        new_dims['y'] = orig_y * ((y1 - y0) / full_h)
-
-        if not is_2d_mode and 'z' in orig_dims:
-            orig_z = float(orig_dims.get('z', 1.0))
-            full_z = self._full_image_stack.shape[0]
-            effective_z1 = z1 if z1 is not None else full_z
-            new_dims['z'] = orig_z * ((effective_z1 - z0) / full_z)
-
-        roi_config[dim_key] = new_dims
-        return roi_config
+        from .roi_sharing import build_roi_config
+        return build_roi_config(
+            y0, x0, y1, x1, base_config,
+            full_shape=self._full_image_stack.shape,
+            mode=self.processing_mode,
+            z0=z0, z1=z1,
+        )
 
     # --- Startup: detect an existing ROI session ---
 
-    def _try_load_existing_roi_session(self) -> bool:
+    def _try_load_existing_roi_session(self, roi_name: Optional[str] = None) -> bool:
         """
-        Checks whether a completed ROI session already exists for this image.
-        Handles both the v1 JSON format (single polygon) and the current v2
-        format (dict of Z→polygon entries).
+        Loads a saved ROI (sub-region) session for this image.
 
-        Returns True if the ROI session was loaded (caller must NOT call
+        `roi_name` selects one explicitly -- which is how the project view opens a
+        particular ROI row, and how a batch worker targets one. When it is None the
+        behaviour depends on how many sessions exist: none means fall through to
+        the full image, one means ask as before, and several means offer a picker,
+        because a channel can now hold "ROI 1", "ROI 2", ... and silently loading
+        the first would be a coin toss.
+
+        Handles both the v1 JSON format (single polygon) and the current v2 format
+        (dict of Z->polygon entries).
+
+        Returns True if a session was loaded (caller must NOT call
         restore_from_checkpoint again), False otherwise.
         """
-        roi_dir = self.processed_dir + "_roi"
+        from .roi_sharing import list_roi_sessions, roi_session_dir
+
+        sample_dir = os.path.dirname(self.processed_dir)
+        sessions = [se for se in list_roi_sessions(sample_dir)
+                    if se["has_polygon"]]
+
+        if roi_name is not None:
+            roi_dir = roi_session_dir(sample_dir, roi_name)
+            if not roi_dir or not os.path.isfile(
+                    os.path.join(roi_dir, "roi_polygon.json")):
+                print(f"[ROI] no session named {roi_name!r} for this image")
+                return False
+        elif not sessions:
+            return False
+        elif len(sessions) == 1:
+            roi_name = sessions[0]["name"]
+            roi_dir = sessions[0]["roi_dir"]
+            reply = QMessageBox.question(
+                None,
+                "ROI Session Found",
+                "A previous ROI (sub-region) session was found for this image.\n\n"
+                "Load the ROI session?\n"
+                "(Choose 'No' to work on the full image instead.)",
+                QMessageBox.Yes | QMessageBox.No,
+            )
+            if reply != QMessageBox.Yes:
+                return False
+        else:
+            choice = self._pick_roi_session(sessions)
+            if choice is None:
+                return False
+            roi_name, roi_dir = choice
+
         roi_json = os.path.join(roi_dir, "roi_polygon.json")
         if not os.path.exists(roi_json):
-            return False
-
-        reply = QMessageBox.question(
-            None,
-            "ROI Session Found",
-            "A previous ROI (sub-region) session was found for this image.\n\n"
-            "Load the ROI session?\n"
-            "(Choose 'No' to work on the full image instead.)",
-            QMessageBox.Yes | QMessageBox.No,
-        )
-        if reply != QMessageBox.Yes:
             return False
 
         try:
@@ -594,13 +537,37 @@ class DynamicGUIManager(QObject):
                 )
 
             self._switch_to_roi_mode(crop_mm, roi_dir, roi_config,
-                                     call_restore=True)
+                                     call_restore=True, roi_name=roi_name)
             return True
 
         except Exception as exc:
             print(f"[ROI] Failed to load existing session: {exc}")
             traceback.print_exc()
             return False
+
+    def _pick_roi_session(self, sessions):
+        """Ask which saved ROI to open. Returns (name, dir) or None for full image.
+
+        Offered only when a channel holds more than one session. "Full image" is a
+        first-class choice rather than a Cancel, because working on the whole image
+        is a normal thing to want and should not require dismissing a dialog.
+        """
+        from PyQt5.QtWidgets import QInputDialog  # type: ignore
+
+        full_label = "Full image (no ROI)"
+        labels = [full_label] + [se["name"] for se in sessions]
+        label, ok = QInputDialog.getItem(
+            None, "Choose a region",
+            f"This image has {len(sessions)} saved regions.\n"
+            "Which would you like to open?",
+            labels, 0, False,
+        )
+        if not ok or label == full_label:
+            return None
+        for se in sessions:
+            if se["name"] == label:
+                return se["name"], se["roi_dir"]
+        return None
 
     # --- Three user-facing buttons ---
 
@@ -838,8 +805,21 @@ class DynamicGUIManager(QObject):
                 # doesn't come up auto-contrasted against a mostly-zero crop.
                 self._full_contrast_limits = self._current_contrast_limits()
 
-            roi_dir = self._full_processed_dir + "_roi"
+            # Allocate a NEW session instead of overwriting. Previously every
+            # confirm reused a single "..._roi" directory, so drawing a second
+            # region silently destroyed the first one's polygon and results.
+            from .roi_sharing import next_roi_name, roi_session_dir
+            sample_dir = os.path.dirname(self._full_processed_dir)
+            roi_name = next_roi_name(sample_dir)
+            roi_dir = roi_session_dir(sample_dir, roi_name)
+            if not roi_dir:
+                # describe_channel could not read the folder; fall back to the
+                # legacy path rather than refusing to create an ROI at all.
+                roi_dir = self._full_processed_dir + "_roi"
+                roi_name = "ROI 1"
             os.makedirs(roi_dir, exist_ok=True)
+            print(f"  [ROI] creating session '{roi_name}' in "
+                  f"{os.path.basename(roi_dir)}")
 
             # --- Persist polygon metadata (v2 format) ---
             roi_data = {
@@ -885,7 +865,7 @@ class DynamicGUIManager(QObject):
 
             # --- Switch pipeline to ROI mode (always restart from Step 1) ---
             self._switch_to_roi_mode(crop_mm, roi_dir, roi_config,
-                                     call_restore=False)
+                                     call_restore=False, roi_name=roi_name)
 
         except Exception as exc:
             print(f"[ROI] confirm_roi failed: {exc}")
@@ -906,11 +886,13 @@ class DynamicGUIManager(QObject):
         if not self.roi_active:
             return
 
+        # Name the session being left, now that a channel can hold several.
+        which = self.active_roi_name or "this region"
         reply = QMessageBox.question(
             None,
             "Return to Full Image",
-            "Return to full-image processing mode?\n\n"
-            "ROI session outputs are preserved on disk and can be\n"
+            f"Return to full-image processing mode?\n\n"
+            f"'{which}' and its outputs are preserved on disk and can be\n"
             "reloaded the next time you open this image.",
             QMessageBox.Yes | QMessageBox.No,
         )
@@ -936,6 +918,7 @@ class DynamicGUIManager(QObject):
         roi_processed_dir: str,
         roi_config: Dict[str, Any],
         call_restore: bool = False,
+        roi_name: Optional[str] = None,
     ) -> None:
         """
         Reinitialises the pipeline to operate on *cropped_image*.
@@ -951,6 +934,7 @@ class DynamicGUIManager(QObject):
         self._stop_worker_safely()
 
         self.roi_active = True
+        self.active_roi_name = roi_name
         self.image_stack = cropped_image
         self.processed_dir = roi_processed_dir
         self.config = roi_config
@@ -993,6 +977,7 @@ class DynamicGUIManager(QObject):
         self._stop_worker_safely()
 
         self.roi_active = False
+        self.active_roi_name = None
         # Full image gets its own auto-contrast again.
         self._full_contrast_limits = None
         self.image_stack = self._full_image_stack
