@@ -26,6 +26,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
+from scipy import ndimage
 
 from .engine import (
     Domain, build_domain, derive_f_grid, f_grid_probe, monte_carlo_null,
@@ -158,6 +159,11 @@ class SampleJob:
     primary_dir: Optional[str] = None
     mode: Optional[str] = None
     roi_crop: Optional[Dict[str, Any]] = None
+    # Segmentations of the channels that can serve as a parent-object domain.
+    # Needed because "inside channel A" is a different null from "inside the
+    # tissue", and the domain has to be built from A's actual masks.
+    domain_a_path: Optional[str] = None
+    domain_b_path: Optional[str] = None
 
     def load(self, path: str) -> np.ndarray:
         return np.array(np.memmap(path, dtype=np.int32, mode="r",
@@ -168,6 +174,48 @@ class SampleJob:
 # Run
 # =============================================================================
 
+def _parent_domain(job: "SampleJob", choice: str):
+    """(mask, parent_labels, reason) for a parent-object domain.
+
+    Returns (None, None, reason) when the required channel's segmentation is
+    missing, so the caller can skip the sample rather than quietly substituting
+    a different domain -- and therefore a different hypothesis.
+    """
+    def _load(path):
+        if not path:
+            return None
+        try:
+            return np.array(np.memmap(path, dtype=np.int32, mode="r",
+                                      shape=job.shape))
+        except (ValueError, OSError):
+            return None
+
+    a = _load(job.domain_a_path)
+    b = _load(job.domain_b_path)
+
+    if choice == "parent_a":
+        if a is None:
+            return None, None, "domain channel A has no segmentation"
+        return a > 0, a, ""
+    if choice == "parent_b":
+        if b is None:
+            return None, None, "domain channel B has no segmentation"
+        return b > 0, b, ""
+    if choice == "parent_both":
+        if a is None or b is None:
+            return None, None, "both domain channels are needed for A and B"
+        mask = (a > 0) & (b > 0)
+        if not mask.any():
+            return None, None, "channels A and B do not overlap"
+        # Label the overlap itself, so per-parent containment means "inside one
+        # connected overlap region" rather than "inside one A object".
+        labelled, _ = ndimage.label(mask,
+                                    structure=ndimage.generate_binary_structure(
+                                        mask.ndim, mask.ndim))
+        return mask, labelled.astype(np.int32), ""
+    return None, None, f"unknown domain choice {choice!r}"
+
+
 @dataclass
 class RunParameters:
     """Everything that defines the null. Recorded verbatim in the manifest."""
@@ -177,6 +225,11 @@ class RunParameters:
     hardcore: bool = True
     min_separation_um: float = 0.0
     use_hull: bool = True
+    # 'hull' | 'field' | 'parent_a' | 'parent_b' | 'parent_both'. Kept explicit
+    # rather than inferred from use_hull, because the parent options need the
+    # domain built from another channel's masks.
+    domain_choice: str = "hull"
+    per_parent_containment: bool = False
     erode_um: float = 0.0
     compute_f: bool = True
     compute_g: bool = True
@@ -225,11 +278,27 @@ def run_project(jobs: Sequence[SampleJob],
             continue
 
         explicit = (explicit_domains or {}).get(job.sample)
+        parent_labels = None
+        choice = str(params.domain_choice or "hull")
+
+        if explicit is None and choice.startswith("parent"):
+            explicit, parent_labels, why = _parent_domain(job, choice)
+            if explicit is None:
+                # Falling back silently would answer a different question from
+                # the one the user asked, so the sample is skipped instead.
+                log(f"  [{job.sample}] {why}; skipped.")
+                continue
+
         domain = build_domain(
             shape=job.shape, spacing=job.spacing,
             channel_sample_dir=job.primary_dir, mode=job.mode,
-            use_hull=params.use_hull, roi_crop=job.roi_crop,
+            use_hull=(choice == "hull"), roi_crop=job.roi_crop,
             explicit_mask=explicit, erode_um=params.erode_um)
+        if parent_labels is not None:
+            domain.parent_labels = parent_labels
+            domain.source = choice
+            domain.diagnostics["parent_objects"] = int(
+                np.unique(parent_labels[parent_labels > 0]).size)
 
         if domain.voxels == 0:
             log(f"  [{job.sample}] empty domain; skipped.")
@@ -283,7 +352,9 @@ def run_project(jobs: Sequence[SampleJob],
                 compute_f=params.compute_f, compute_g=params.compute_g,
                 cross_statistic=params.cross_statistic,
                 keep_first_draw=params.keep_first_draw,
-                max_attempts=params.max_attempts, progress=progress)
+                max_attempts=params.max_attempts,
+                per_parent_containment=params.per_parent_containment,
+                progress=progress)
         except Exception as exc:                       # one bad image, not the run
             log(f"  [{job.sample}] FAILED: {exc}")
             traceback.print_exc()
@@ -366,6 +437,8 @@ def run_project(jobs: Sequence[SampleJob],
 def jobs_from_registry(sample_registry: Dict[str, Dict[str, str]],
                        primary_channel: str,
                        partner_channel: Optional[str] = None,
+                       domain_a_channel: Optional[str] = None,
+                       domain_b_channel: Optional[str] = None,
                        roi_name: Optional[str] = None,
                        geometry_for: Optional[Callable[[Dict[str, str], Optional[str]],
                                                        Tuple[Any, Any]]] = None,
@@ -412,11 +485,17 @@ def jobs_from_registry(sample_registry: Dict[str, Dict[str, str]],
                     log(f"  [{sample}] region {roi_name!r} geometry unavailable; "
                         f"the hull cannot be cropped, so the field will be used.")
 
+        def _seg(ch):
+            return (find_final_segmentation(channels[ch], roi_name)
+                    if ch and ch in channels else None)
+
         jobs.append(SampleJob(
             sample=sample, shape=tuple(int(s) for s in shape),
             spacing=tuple(float(s) for s in spacing),
             primary_path=primary_path, partner_path=partner_path,
-            primary_dir=primary_dir, mode=_mode_of(primary_dir), roi_crop=crop))
+            primary_dir=primary_dir, mode=_mode_of(primary_dir), roi_crop=crop,
+            domain_a_path=_seg(domain_a_channel),
+            domain_b_path=_seg(domain_b_channel)))
     return jobs
 
 

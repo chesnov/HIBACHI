@@ -136,15 +136,21 @@ class SpatialNullDialog(QDialog):
         dv = QVBoxLayout(dom)
         self.cb_domain = QComboBox()
         allowed = DOMAIN_CHOICES if self.intersect_inputs else DOMAIN_CHOICES[:2]
+        names = [c.split("_", 2)[-1] for c in self.intersect_inputs]
         for key, label, _ in allowed:
+            # Substitute the real channel names so the choice is unambiguous.
+            if key == "parent_a" and len(names) > 0:
+                label = f"Inside {names[0]}"
+            elif key == "parent_b" and len(names) > 1:
+                label = f"Inside {names[1]}"
+            elif key == "parent_both" and len(names) > 1:
+                label = f"Inside {names[0]} and {names[1]} (their overlap)"
             self.cb_domain.addItem(label, key)
         dv.addWidget(self.cb_domain)
         self.lbl_domain = QLabel()
         self.lbl_domain.setWordWrap(True)
         self.lbl_domain.setStyleSheet("color: grey;")
         dv.addWidget(self.lbl_domain)
-        self.cb_domain.currentIndexChanged.connect(self._domain_help)
-        self._domain_help()
 
         self.chk_per_parent = QCheckBox(
             "Require each object to fit inside a SINGLE parent object")
@@ -167,6 +173,12 @@ class SpatialNullDialog(QDialog):
         row.addStretch()
         dv.addLayout(row)
         layout.addWidget(dom)
+
+        # Connected and primed only now that every widget the handler touches
+        # exists. Doing it earlier raised AttributeError on chk_per_parent,
+        # because adding items to the combo fires currentIndexChanged.
+        self.cb_domain.currentIndexChanged.connect(self._domain_help)
+        self._domain_help()
 
         nul = QGroupBox("Null model")
         nf = QFormLayout(nul)
@@ -260,12 +272,21 @@ class SpatialNullDialog(QDialog):
         layout.addWidget(buttons)
 
     def _domain_help(self):
+        """Show what the selected domain holds fixed, and gate the parent option.
+
+        Written to tolerate being called mid-construction: Qt fires
+        currentIndexChanged while a combo is being populated, so a handler that
+        assumes every widget already exists is a latent crash.
+        """
         key = self.cb_domain.currentData()
         for k, _, help_text in DOMAIN_CHOICES:
             if k == key:
-                self.lbl_domain.setText(help_text)
+                if getattr(self, "lbl_domain", None) is not None:
+                    self.lbl_domain.setText(help_text)
                 break
-        self.chk_per_parent.setEnabled(str(key).startswith("parent"))
+        chk = getattr(self, "chk_per_parent", None)
+        if chk is not None:
+            chk.setEnabled(str(key).startswith("parent"))
 
     # -- parameters -----------------------------------------------------------
 
@@ -290,6 +311,10 @@ class SpatialNullDialog(QDialog):
             "also_csv": self.chk_csv.isChecked(),
             "roi_name": self.roi_name,
             "intersection_inputs": self.intersect_inputs,
+            "domain_a_channel": (self.intersect_inputs[0]
+                                 if len(self.intersect_inputs) > 0 else None),
+            "domain_b_channel": (self.intersect_inputs[1]
+                                 if len(self.intersect_inputs) > 1 else None),
         }
 
     # -- run ------------------------------------------------------------------
@@ -313,11 +338,16 @@ class SpatialNullDialog(QDialog):
         if p["roi_name"]:
             out_dir = os.path.join(out_dir, p["roi_name"])
 
+        # Both of these used to stop at the manifest and never reach the
+        # engine, so a parent-object domain silently became the whole field and
+        # per-parent containment did nothing.
         params = RunParameters(
             n_reference=p["n_reference"], n_test=p["n_test"],
             rotate=p["rotate"], hardcore=p["hardcore"],
             min_separation_um=p["min_separation_um"],
             use_hull=(p["domain_choice"] == "hull"),
+            domain_choice=p["domain_choice"],
+            per_parent_containment=p["per_parent_containment"],
             erode_um=p["erode_um"], compute_f=p["compute_f"],
             compute_g=p["compute_g"], cross_statistic=p["cross_statistic"],
             seed=p["seed"], roi_name=p["roi_name"],
@@ -325,9 +355,12 @@ class SpatialNullDialog(QDialog):
 
         QApplication.setOverrideCursor(Qt.WaitCursor)
         try:
+            dom_a, dom_b = p["domain_a_channel"], p["domain_b_channel"]
             jobs = jobs_from_registry(
                 self.pm.sample_registry, p["primary_channel"],
-                p["partner_channel"], roi_name=p["roi_name"])
+                p["partner_channel"],
+                domain_a_channel=dom_a, domain_b_channel=dom_b,
+                roi_name=p["roi_name"])
             if not jobs:
                 QApplication.restoreOverrideCursor()
                 QMessageBox.warning(
