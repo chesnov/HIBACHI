@@ -1,0 +1,492 @@
+"""
+null_runner.py -- HIBACHI-facing driver for the mask-preserving spatial null.
+
+Sits between the analyzer UI and `synthetic_null`'s engine. Responsibilities:
+
+  * resolve each sample's masks, geometry, domain and ROI crop
+  * derive the run's SHARED F grid in a cheap first pass, before any
+    Monte-Carlo, so every image and draw shares one coordinate frame
+  * run the per-sample null and collect tidy per-object frames
+  * write the export artifacts and manifest
+  * optionally hand back the first draw's labels for visual verification
+
+The application deliberately produces no inference. A HIBACHI project is
+typically one biological replicate whose images are technical replicates, so the
+only defensible tests live downstream across projects (see `hibachi_null_io`).
+What is produced here is raw material plus the diagnostics needed to judge
+whether an image is interpretable at all.
+"""
+
+from __future__ import annotations
+
+import os
+import traceback
+from dataclasses import dataclass
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+
+import numpy as np
+import pandas as pd
+
+from .engine import (
+    Domain, build_domain, derive_f_grid, f_grid_probe, monte_carlo_null,
+    describe_within_project, extract_templates,
+)
+from .export import (
+    build_manifest, concat_null_frames, concat_observed_frames,
+    stack_f_curves, write_project_export,
+)
+
+DEFAULT_N_REFERENCE = 199
+DEFAULT_N_TEST = 199
+
+
+# =============================================================================
+# Sample resolution
+# =============================================================================
+
+def _is_roi_dir(name: str) -> bool:
+    base = os.path.basename(str(name).rstrip("/\\"))
+    return base.endswith("_roi") or "_roi_" in base
+
+
+def find_final_segmentation(sample_dir: str,
+                            roi_name: Optional[str] = None) -> Optional[str]:
+    """`final_segmentation*.dat` for a sample, honouring a region.
+
+    Full-image sessions are preferred explicitly. An ROI session directory also
+    contains "_processed_", so a naive scan can return the CROP's segmentation
+    for a channel that happens to have a region -- a different array with a
+    different shape from the one the caller is memmapping against.
+    """
+    if not sample_dir or not os.path.isdir(sample_dir):
+        return None
+
+    if roi_name:
+        try:
+            from ..high_level_gui.roi_sharing import roi_session_dir
+        except ImportError:
+            return None
+        rdir = roi_session_dir(sample_dir, roi_name)
+        if not rdir or not os.path.isdir(rdir):
+            return None
+        for f in sorted(os.listdir(rdir)):
+            if f.startswith("final_segmentation") and f.endswith(".dat"):
+                return os.path.join(rdir, f)
+        return None
+
+    try:
+        entries = sorted(os.listdir(sample_dir))
+    except OSError:
+        return None
+    for d in entries:
+        full = os.path.join(sample_dir, d)
+        if "_processed_" not in d or not os.path.isdir(full) or _is_roi_dir(d):
+            continue
+        for f in sorted(os.listdir(full)):
+            if f.startswith("final_segmentation") and f.endswith(".dat"):
+                return os.path.join(full, f)
+    return None
+
+
+def roi_crop_spec(sample_dir: str, roi_name: str,
+                  full_shape: Tuple[int, ...]) -> Optional[Dict[str, Any]]:
+    """Everything needed to crop a FULL-IMAGE array the way the masks were cropped.
+
+    A region is a bounding box AND a per-slice polygon. Cropping by the box
+    alone would admit the corners between box and polygon, where the masks were
+    forcibly zeroed -- no real object can exist there, so including them would
+    inflate the domain and bias F toward apparent clustering.
+
+    Uses `roi_sharing`'s own record and polygon accessors, and reproduces
+    `build_crop_memmap`'s nearest-defined-polygon rule, so the domain and the
+    masks provably share one definition instead of drifting apart.
+    """
+    try:
+        from ..high_level_gui.roi_sharing import (roi_session_dir,
+                                                  load_roi_record,
+                                                  record_polygons)
+    except ImportError:
+        return None
+
+    rdir = roi_session_dir(sample_dir, roi_name)
+    if not rdir:
+        return None
+    record = load_roi_record(rdir)
+    if not record:
+        return None
+    bbox = record.get("bbox") or {}
+    polys = record_polygons(record)
+    if not bbox or not polys:
+        return None
+
+    is_3d = len(full_shape) == 3
+    y0 = int(bbox.get("y0") or 0)
+    x0 = int(bbox.get("x0") or 0)
+    y1 = int(bbox.get("y1") or (full_shape[1] if is_3d else full_shape[0]))
+    x1 = int(bbox.get("x1") or (full_shape[2] if is_3d else full_shape[1]))
+    crop_h, crop_w = y1 - y0, x1 - x0
+
+    try:
+        from skimage.draw import polygon as skpoly
+    except ImportError:
+        return None
+
+    slice_masks: Dict[int, np.ndarray] = {}
+    for z, poly in polys.items():
+        p = np.asarray(poly, dtype=float) - np.array([y0, x0], dtype=float)
+        rr, cc = skpoly(p[:, 0], p[:, 1], shape=(crop_h, crop_w))
+        m = np.zeros((crop_h, crop_w), dtype=bool)
+        m[rr, cc] = True
+        slice_masks[int(z)] = m
+
+    return {"bbox": {"z0": int(bbox.get("z0") or 0),
+                     "z1": (int(bbox["z1"]) if bbox.get("z1") is not None
+                            else (full_shape[0] if is_3d else None)),
+                     "y0": y0, "y1": y1, "x0": x0, "x1": x1},
+            "slice_masks": slice_masks,
+            "full_shape": tuple(int(v) for v in full_shape)}
+
+
+@dataclass
+class SampleJob:
+    """One image's resolved inputs."""
+    sample: str
+    shape: Tuple[int, ...]
+    spacing: Tuple[float, ...]
+    primary_path: str
+    partner_path: Optional[str] = None
+    primary_dir: Optional[str] = None
+    mode: Optional[str] = None
+    roi_crop: Optional[Dict[str, Any]] = None
+
+    def load(self, path: str) -> np.ndarray:
+        return np.array(np.memmap(path, dtype=np.int32, mode="r",
+                                  shape=self.shape))
+
+
+# =============================================================================
+# Run
+# =============================================================================
+
+@dataclass
+class RunParameters:
+    """Everything that defines the null. Recorded verbatim in the manifest."""
+    n_reference: int = DEFAULT_N_REFERENCE
+    n_test: int = DEFAULT_N_TEST
+    rotate: bool = True
+    hardcore: bool = True
+    min_separation_um: float = 0.0
+    use_hull: bool = True
+    erode_um: float = 0.0
+    compute_f: bool = True
+    compute_g: bool = True
+    cross_statistic: str = "median"
+    max_attempts: int = 2000
+    seed: Optional[int] = 0
+    grid_points: int = 512
+    roi_name: Optional[str] = None
+    keep_first_draw: bool = True
+    also_csv: bool = False
+
+    def as_dict(self) -> Dict[str, Any]:
+        return dict(self.__dict__)
+
+
+def run_project(jobs: Sequence[SampleJob],
+                params: Optional[RunParameters] = None,
+                out_dir: Optional[str] = None,
+                project_name: str = "project",
+                channels: Optional[Dict[str, Any]] = None,
+                explicit_domains: Optional[Dict[str, np.ndarray]] = None,
+                log: Callable[[str], None] = print,
+                progress: Optional[Any] = None) -> Dict[str, Any]:
+    """Run the null across a project's samples and write the export.
+
+    Two passes on purpose. The first only probes each image for one scalar so
+    the run's shared F grid can be derived before any Monte-Carlo starts; a grid
+    derived per image would give every image a different x-axis and the curves
+    could never be pooled, which is the whole point of exporting them.
+    """
+    params = params or RunParameters()
+    channels = channels or {}
+    rng = np.random.default_rng(params.seed)
+
+    # ---- pass 1: geometry, domains, F-grid probes ---------------------------
+    prepared: List[Dict[str, Any]] = []
+    probes: List[float] = []
+    for job in jobs:
+        try:
+            primary = job.load(job.primary_path)
+        except (ValueError, OSError) as exc:
+            log(f"  [{job.sample}] cannot read segmentation ({exc}); skipped.")
+            continue
+        if not (primary > 0).any():
+            log(f"  [{job.sample}] no objects; skipped.")
+            continue
+
+        explicit = (explicit_domains or {}).get(job.sample)
+        domain = build_domain(
+            shape=job.shape, spacing=job.spacing,
+            channel_sample_dir=job.primary_dir, mode=job.mode,
+            use_hull=params.use_hull, roi_crop=job.roi_crop,
+            explicit_mask=explicit, erode_um=params.erode_um)
+
+        if domain.voxels == 0:
+            log(f"  [{job.sample}] empty domain; skipped.")
+            continue
+        # Objects outside the domain cannot be reproduced by any draw, so the
+        # observed and null populations would differ. Report rather than hide.
+        outside = int(np.count_nonzero((primary > 0) & ~domain.mask))
+        if outside:
+            log(f"  [{job.sample}] {outside} object voxels lie OUTSIDE the "
+                f"domain ({domain.source}); the null cannot reproduce them.")
+
+        partner = None
+        if job.partner_path:
+            try:
+                partner = job.load(job.partner_path)
+            except (ValueError, OSError) as exc:
+                log(f"  [{job.sample}] cannot read partner ({exc}).")
+
+        probe = f_grid_probe(primary, domain) if params.compute_f else 0.0
+        probes.append(probe)
+        prepared.append({"job": job, "primary": primary, "partner": partner,
+                         "domain": domain, "outside_voxels": outside})
+
+    if not prepared:
+        log("No scorable samples.")
+        return {"n_samples": 0}
+
+    f_grid, grid_info = derive_f_grid(probes, params.grid_points)
+    if params.compute_f:
+        log(f"Shared F grid: 0-{grid_info['f_grid_max_um']:g} um "
+            f"({grid_info['f_grid_points']} points), from a raw maximum of "
+            f"{grid_info['f_grid_raw_max_um']:.3g} um across {len(probes)} images.")
+
+    # ---- pass 2: Monte-Carlo ----------------------------------------------
+    results, meta_rows = [], []
+    obs_frames, null_frames, curve_sets, image_ids = [], [], [], []
+    first_draws: Dict[str, np.ndarray] = {}
+
+    for item in prepared:
+        job: SampleJob = item["job"]
+        log(f"  [{job.sample}] {int(np.unique(item['primary'][item['primary']>0]).size)} "
+            f"objects, domain={item['domain'].source}, "
+            f"{params.n_reference}+{params.n_test} draws...")
+        try:
+            res = monte_carlo_null(
+                item["primary"], item["domain"], f_grid=f_grid,
+                sample=job.sample, partner_labels=item["partner"],
+                n_reference=params.n_reference, n_test=params.n_test, rng=rng,
+                rotate=params.rotate, hardcore=params.hardcore,
+                min_separation_um=params.min_separation_um,
+                compute_f=params.compute_f, compute_g=params.compute_g,
+                cross_statistic=params.cross_statistic,
+                keep_first_draw=params.keep_first_draw,
+                max_attempts=params.max_attempts, progress=progress)
+        except Exception as exc:                       # one bad image, not the run
+            log(f"  [{job.sample}] FAILED: {exc}")
+            traceback.print_exc()
+            continue
+
+        row = res.metadata_row()
+        row["shape"] = "x".join(str(s) for s in job.shape)
+        row["spacing_um"] = ",".join(f"{s:g}" for s in job.spacing)
+        row["roi_name"] = params.roi_name or ""
+        row["object_voxels_outside_domain"] = item["outside_voxels"]
+        meta_rows.append(row)
+
+        results.append(res)
+        image_ids.append(job.sample)
+        obs_frames.append(res.observed_objects)
+        null_frames.append(res.null_objects)
+        curve_sets.append(res.f_curves)
+        if res.first_draw_labels is not None:
+            first_draws[job.sample] = res.first_draw_labels
+
+        warn = []
+        if res.diagnostics.get("packing_warning"):
+            warn.append(f"occupancy {res.diagnostics['occupancy_fraction']:.1%}")
+        if res.diagnostics.get("placement_warning"):
+            warn.append(f"{res.diagnostics['draws_incomplete']} draws incomplete")
+        acc = res.diagnostics.get("orientation_acceptance_rate")
+        if acc is not None and np.isfinite(acc) and acc < 0.5:
+            warn.append(f"orientation acceptance {acc:.0%}")
+        if warn:
+            log(f"      concerns: {'; '.join(warn)}")
+
+    metadata = pd.DataFrame(meta_rows)
+    observed = concat_observed_frames(obs_frames, image_ids)
+    nulls = concat_null_frames(null_frames, image_ids)
+    curves = (stack_f_curves(curve_sets, image_ids, f_grid)
+              if params.compute_f else {})
+
+    out: Dict[str, Any] = {
+        "n_samples": len(results), "metadata": metadata,
+        "observed_objects": observed, "null_objects": nulls,
+        "f_curves": curves, "f_grid": f_grid, "grid_info": grid_info,
+        "first_draw_labels": first_draws, "results": results,
+        "description": describe_within_project(metadata)
+        if not metadata.empty else pd.DataFrame(),
+    }
+
+    if out_dir:
+        ndim = len(jobs[0].shape) if jobs else 2
+        # The realised domain, not the requested one: `use_hull=True` falls
+        # back to the field when no hull is persisted, and pooling a hull run
+        # with a field run is exactly the mistake the key exists to catch.
+        realised = sorted(set(metadata["domain_source"].dropna().astype(str))) \
+            if "domain_source" in metadata.columns else []
+        manifest = build_manifest(
+            project_name=project_name, ndim=ndim,
+            parameters=params.as_dict(), grid_info=grid_info,
+            channels=channels, n_images=len(results),
+            extra={"domain_source": "+".join(realised) or None})
+        written = write_project_export(
+            out_dir, manifest, metadata, observed, nulls, curves,
+            also_csv=params.also_csv)
+        if not out["description"].empty:
+            out["description"].to_csv(
+                os.path.join(out_dir, "within_project_description.csv"),
+                index=False)
+        out["written"] = written
+        log(f"\nExported {len(results)} images -> {out_dir}")
+        log("  " + "\n  ".join(f"{k}: {os.path.basename(v)}"
+                               for k, v in written.items()))
+        log("\nThis export contains no inference. A project is one biological "
+            "replicate, so pool several with hibachi_null_io and test there.")
+
+    return out
+
+
+# =============================================================================
+# Registry driver
+# =============================================================================
+
+def jobs_from_registry(sample_registry: Dict[str, Dict[str, str]],
+                       primary_channel: str,
+                       partner_channel: Optional[str] = None,
+                       roi_name: Optional[str] = None,
+                       geometry_for: Optional[Callable[[Dict[str, str], Optional[str]],
+                                                       Tuple[Any, Any]]] = None,
+                       log: Callable[[str], None] = print) -> List[SampleJob]:
+    """Build jobs from HIBACHI's `sample_registry`.
+
+    `geometry_for(sample_channels, roi_name) -> (shape, spacing)` should be the
+    analyzer's own resolver, so this agrees with the rest of the app about what
+    an ROI's shape and spacing are.
+    """
+    jobs: List[SampleJob] = []
+    for sample, channels in sample_registry.items():
+        if primary_channel not in channels:
+            continue
+        primary_dir = channels[primary_channel]
+
+        if geometry_for is not None:
+            shape, spacing = geometry_for(channels, roi_name)
+        else:
+            shape, spacing = _geometry_fallback(primary_dir, roi_name)
+        if shape is None or spacing is None:
+            log(f"  [{sample}] no geometry"
+                + (f" for region {roi_name!r}" if roi_name else "") + "; skipped.")
+            continue
+
+        primary_path = find_final_segmentation(primary_dir, roi_name)
+        if not primary_path:
+            log(f"  [{sample}] no final segmentation for {primary_channel}; skipped.")
+            continue
+
+        partner_path = None
+        if partner_channel and partner_channel in channels:
+            partner_path = find_final_segmentation(channels[partner_channel], roi_name)
+            if not partner_path:
+                log(f"  [{sample}] no final segmentation for the partner "
+                    f"{partner_channel}; cross-distances will be omitted.")
+
+        crop = None
+        if roi_name:
+            full_shape = _full_shape(primary_dir)
+            if full_shape:
+                crop = roi_crop_spec(primary_dir, roi_name, full_shape)
+                if crop is None:
+                    log(f"  [{sample}] region {roi_name!r} geometry unavailable; "
+                        f"the hull cannot be cropped, so the field will be used.")
+
+        jobs.append(SampleJob(
+            sample=sample, shape=tuple(int(s) for s in shape),
+            spacing=tuple(float(s) for s in spacing),
+            primary_path=primary_path, partner_path=partner_path,
+            primary_dir=primary_dir, mode=_mode_of(primary_dir), roi_crop=crop))
+    return jobs
+
+
+def _read_config(sample_dir: str) -> Dict[str, Any]:
+    import yaml
+    try:
+        names = sorted(f for f in os.listdir(sample_dir)
+                       if f.lower().endswith((".yaml", ".yml")))
+    except OSError:
+        return {}
+    for n in names:
+        try:
+            with open(os.path.join(sample_dir, n)) as fh:
+                cfg = yaml.safe_load(fh) or {}
+            if isinstance(cfg, dict):
+                return cfg
+        except Exception:
+            continue
+    return {}
+
+
+def _mode_of(sample_dir: str) -> Optional[str]:
+    m = _read_config(sample_dir).get("mode")
+    return m if isinstance(m, str) else None
+
+
+def _full_shape(sample_dir: str) -> Optional[Tuple[int, ...]]:
+    """Spatial shape of the full image, disambiguated by the config mode."""
+    import tifffile
+    cfg = _read_config(sample_dir)
+    is_2d = str(cfg.get("mode", "")).endswith("_2d")
+    want = 2 if is_2d else 3
+    try:
+        tif = next(os.path.join(sample_dir, f) for f in sorted(os.listdir(sample_dir))
+                   if f.lower().endswith((".tif", ".tiff")))
+    except (StopIteration, OSError):
+        return None
+    with tifffile.TiffFile(tif) as t:
+        shape = tuple(int(s) for s in t.series[0].shape)
+    shape = tuple(s for s in shape if s > 1) or shape
+    # Trailing axes are the spatial ones; leading axes are channels or time.
+    return shape[-want:] if len(shape) >= want else None
+
+
+def _geometry_fallback(sample_dir: str,
+                       roi_name: Optional[str]) -> Tuple[Any, Any]:
+    """(shape, spacing) when the analyzer's resolver is unavailable.
+
+    Config dimensions are TOTAL microns, so per-voxel spacing is that divided by
+    the voxel count -- the same derivation the analyzer uses.
+    """
+    if roi_name:
+        try:
+            from ..high_level_gui.roi_sharing import region_geometry
+            geo = region_geometry(sample_dir, roi_name)
+            return (geo["shape"], geo["spacing"]) if geo else (None, None)
+        except Exception:
+            return None, None
+
+    shape = _full_shape(sample_dir)
+    if shape is None:
+        return None, None
+    cfg = _read_config(sample_dir)
+    dims = cfg.get("voxel_dimensions") or cfg.get("pixel_dimensions") or {}
+    keys = ("z", "y", "x") if len(shape) == 3 else ("y", "x")
+    spacing = []
+    for k, n in zip(keys, shape):
+        try:
+            total = float(dims.get(k, 0) or 0)
+        except (TypeError, ValueError):
+            total = 0.0
+        spacing.append(total / n if total > 0 and n else 1.0)
+    return shape, tuple(spacing)
