@@ -92,7 +92,9 @@ class CrossChannelAnalyzerWindow(QMainWindow):
         # --- 3. ADD STEP BUTTONS ---
         add_step_layout = QHBoxLayout()
         
-        self.btn_synth = QPushButton("🧬 Generate Synthetic Channel")
+        # No longer generates an intensity image: it randomises the segmented
+        # masks themselves and exports raw distances for downstream statistics.
+        self.btn_synth = QPushButton("🎲 Spatial Null (randomise masks)")
         self.btn_synth.setStyleSheet("background-color: #8A2BE2; color: white;") # Purple
         
         self.btn_intersect = QPushButton("+ Intersection")
@@ -191,13 +193,33 @@ class CrossChannelAnalyzerWindow(QMainWindow):
     def get_checked_channels(self):
         return [self.channel_list.item(i).text() for i in range(self.channel_list.count()) 
                 if self.channel_list.item(i).checkState() == Qt.Checked]
+
     def open_synthetic_dialog(self):
+        """Launch the spatial-null dialog, informed by the current recipe.
+
+        The recipe matters: an intersection step means the OVERLAP objects are
+        what get randomised, and it makes the parent-object domains meaningful,
+        so the dialog needs the steps and the selected region -- not just the
+        project.
+
+        Catches Exception rather than only ImportError: the previous handler let
+        any failure inside the dialog's constructor escape unhandled, which took
+        the window down instead of reporting.
+        """
         try:
-            from .synthetic_engine import SyntheticDataDialog
-            dialog = SyntheticDataDialog(self.pm, self)
+            from ..spatial_null import SpatialNullDialog
+            dialog = SpatialNullDialog(
+                self.pm,
+                checked_channels=self.get_checked_channels(),
+                recipe=self.recipe_steps,
+                roi_name=self._selected_region(),
+                parent=self,
+            )
             dialog.exec_()
-        except ImportError as e:
-            QMessageBox.critical(self, "Error", f"Failed to load synthetic engine:\n{e}")
+        except Exception as e:
+            traceback.print_exc()
+            QMessageBox.critical(self, "Error",
+                                 f"Failed to open the spatial null dialog:\n{e}")
 
     def add_intersect_step(self):
         checked = self.get_checked_channels()
@@ -405,9 +427,17 @@ class CrossChannelAnalyzerWindow(QMainWindow):
         if not tif_path:
             return None, None
         with tiff.TiffFile(tif_path) as tif:
-            shape = tif.series[0].shape
-        meta, _ = get_sample_metadata(first_ch)
+            shape = tuple(int(s) for s in tif.series[0].shape)
+        meta, mode = get_sample_metadata(first_ch)
         meta = meta or {}
+        # A (C, Z, Y, X) or (C, Y, X) file would otherwise hand back a shape the
+        # .dat memmaps do not have. The config's mode says how many trailing
+        # axes are spatial, which is the only reliable discriminator: a 3-axis
+        # array may be (Z, Y, X) or (C, Y, X).
+        want = 2 if str(mode or "").endswith("_2d") else 3
+        shape = tuple(s for s in shape if s > 1) or shape
+        if len(shape) > want:
+            shape = shape[-want:]
         if len(shape) == 3:
             spacing = (meta.get('z', 1.0) / shape[0],
                        meta.get('y', 1.0) / shape[1],
@@ -609,13 +639,19 @@ class CrossChannelAnalyzerWindow(QMainWindow):
             print(f"FATAL ERROR IN BATCH: {e}")
             traceback.print_exc()
             QMessageBox.critical(self, "Batch Error", str(e))
+            # Without this the summary block below still runs and can report
+            # "Successfully generated" for a batch that died.
+            return
 
         # 5. Create Master Summary Table
         all_csvs = []
         for s_name in samples:
             leaf_dir = os.path.join(batch_out_dir, s_name) if not roi_name \
                 else os.path.join(batch_out_dir, s_name, _safe_name(roi_name))
-            csv_p = os.path.join(leaf_dir, f"{s_name}_relational_results.csv")
+            # run_recipe writes "_relational_metrics.csv"; nothing has ever
+            # written "_relational_results.csv", so this list was always empty
+            # and MASTER_RELATIONAL_RESULTS.csv was never produced.
+            csv_p = os.path.join(leaf_dir, f"{s_name}_relational_metrics.csv")
             if os.path.exists(csv_p):
                 df = pd.read_csv(csv_p)
                 df['sample_name'] = s_name

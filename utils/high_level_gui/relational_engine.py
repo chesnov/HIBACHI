@@ -216,7 +216,14 @@ class RelationalEngine:
         metrics_df['label'] = metrics_df['label'].astype(int)
         metrics_df = pd.merge(map_df, metrics_df, on='label', how='right')
 
-        csv_path = os.path.join(out_dir, f"{sample_name}_relational_metrics.csv")
+        # Step-scoped filename. This used to write the SAME path as run_recipe's
+        # final table below, so in an intersect -> analyze recipe the analyze
+        # result silently overwrote the intersection metrics, and with two
+        # intersect steps the second overwrote the first. The overlap objects are
+        # what the spatial null randomises, so losing them broke that path.
+        safe = "".join(ch if ch.isalnum() or ch in "-_" else "_"
+                       for ch in str(mask_name))
+        csv_path = os.path.join(out_dir, f"{sample_name}_{safe}_metrics.csv")
         metrics_df.to_csv(csv_path, index=False)
         print(f"  [Intersect Metrics] Saved {len(metrics_df)} objects → {csv_path}")
     
