@@ -199,7 +199,12 @@ def reconstruct_hull_from_shell(shell: np.ndarray,
     # components over filled components is the signature. Comparing shell
     # components against enclosed background regions would not work: a cavity
     # adds one of each, leaving the counts equal.
-    struct = _conn_structure(shell.ndim)
+    # FULL connectivity (8 in 2D, 26 in 3D), not face connectivity. The 2D hull
+    # generator erodes with a 4-connected element, so a shell running diagonally
+    # is only 8-connected; labelling it with face connectivity shatters a smooth
+    # ellipse into ~190 fragments and reports a cavity for every one of them.
+    # Measured on a plain ellipse: 188 components under 4-connectivity, 1 under 8.
+    struct = ndimage.generate_binary_structure(shell.ndim, shell.ndim)
     _, n_shell_components = ndimage.label(shell, structure=struct)
     _, n_filled_components = ndimage.label(filled, structure=struct)
     diag["shell_components"] = int(n_shell_components)
