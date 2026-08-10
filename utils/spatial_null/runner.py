@@ -168,6 +168,23 @@ class SampleJob:
     # tissue", and the domain has to be built from A's actual masks.
     domain_a_path: Optional[str] = None
     domain_b_path: Optional[str] = None
+    # When the objects to randomise are an OVERLAP rather than a channel. The
+    # intersection is recomputed here from the two segmentations, so the spatial
+    # null does not depend on a relational batch having been run first.
+    primary_kind: str = "channel"            # 'channel' | 'intersection'
+    intersect_a_path: Optional[str] = None
+    intersect_b_path: Optional[str] = None
+    intersect_label_mode: str = "connected"
+    intersect_preserve_ids: bool = False
+
+    def load_primary(self) -> np.ndarray:
+        """The objects to randomise, whether a channel or a computed overlap."""
+        if self.primary_kind != "intersection":
+            return self.load(self.primary_path)
+        a = self.load(self.intersect_a_path)
+        b = self.load(self.intersect_b_path)
+        return intersection_labels(a, b, self.intersect_label_mode,
+                                   self.intersect_preserve_ids)
 
     def load(self, path: str) -> np.ndarray:
         return np.array(np.memmap(path, dtype=np.int32, mode="r",
@@ -177,6 +194,59 @@ class SampleJob:
 # =============================================================================
 # Run
 # =============================================================================
+
+def _count_disconnected(labels: np.ndarray) -> int:
+    """How many labels consist of more than one connected piece."""
+    values = np.unique(labels[labels > 0])
+    if values.size == 0:
+        return 0
+    struct = ndimage.generate_binary_structure(labels.ndim, labels.ndim)
+    slices = ndimage.find_objects(labels)
+    n = 0
+    for lbl in values:
+        i = int(lbl) - 1
+        if i < 0 or i >= len(slices) or slices[i] is None:
+            continue
+        _, count = ndimage.label(labels[slices[i]] == lbl, structure=struct)
+        if count > 1:
+            n += 1
+    return n
+
+
+def intersection_labels(a: np.ndarray, b: np.ndarray,
+                        label_mode: str = "connected",
+                        preserve_ids: bool = False) -> np.ndarray:
+    """Overlap of two label images, labelled as the recipe's mode specifies.
+
+    Mirrors `RelationalEngine.intersect_masks`. One deliberate difference:
+    'binary' is promoted to connected components. That mode writes a single
+    label over every overlap region, which as a randomisation template would be
+    one enormous disconnected "object" moved rigidly as a unit -- almost
+    certainly not what is wanted, and it would make the null meaningless.
+    """
+    overlap = (a > 0) & (b > 0)
+    out = np.zeros(a.shape, dtype=np.int32)
+    if not overlap.any():
+        return out
+
+    if label_mode == "parent_a":
+        out[:] = np.where(overlap, a, 0)
+    elif label_mode == "parent_b":
+        out[:] = np.where(overlap, b, 0)
+    else:                                   # 'connected', or 'binary' promoted
+        labelled, _ = ndimage.label(
+            overlap, structure=ndimage.generate_binary_structure(a.ndim, a.ndim))
+        return labelled.astype(np.int32)
+
+    if not preserve_ids:
+        # Relabel 1..N: inherited ids can be non-contiguous, and a parent
+        # contributing two separate overlap fragments would otherwise be one
+        # object that cannot be moved rigidly.
+        labelled, _ = ndimage.label(
+            out > 0, structure=ndimage.generate_binary_structure(a.ndim, a.ndim))
+        return labelled.astype(np.int32)
+    return out
+
 
 def _parent_domain(job: "SampleJob", choice: str):
     """(mask, parent_labels, reason) for a parent-object domain.
@@ -297,13 +367,30 @@ def run_project(jobs: Sequence[SampleJob],
         _report(phase="prepare", sample=job.sample,
                 sample_index=idx, n_samples=len(jobs))
         try:
-            primary = job.load(job.primary_path)
-        except (ValueError, OSError) as exc:
+            primary = job.load_primary()
+        except (ValueError, OSError, TypeError) as exc:
             log(f"  [{job.sample}] cannot read segmentation ({exc}); skipped.")
             continue
         if not (primary > 0).any():
-            log(f"  [{job.sample}] no objects; skipped.")
+            log(f"  [{job.sample}] "
+                + ("the two channels do not overlap" if job.primary_kind ==
+                   "intersection" else "no objects") + "; skipped.")
             continue
+        if job.primary_kind == "intersection":
+            log(f"  [{job.sample}] overlap gives "
+                f"{int(np.unique(primary[primary > 0]).size)} object(s) "
+                f"({job.intersect_label_mode}).")
+
+        # A label spanning disconnected pieces is moved as ONE rigid template,
+        # keeping the fragments' relative arrangement fixed. That is a coherent
+        # null but a surprising one, and it arises silently from
+        # parent_a/parent_b with IDs preserved, so it is reported.
+        n_split = _count_disconnected(primary)
+        if n_split:
+            log(f"  [{job.sample}] {n_split} label(s) span disconnected "
+                f"fragments and will be moved as single rigid units. If that is "
+                f"not intended, use the 'connected' label mode or do not "
+                f"preserve IDs.")
 
         explicit = (explicit_domains or {}).get(job.sample)
         parent_labels = None
@@ -348,7 +435,8 @@ def run_project(jobs: Sequence[SampleJob],
         probe = f_grid_probe(primary, domain) if params.compute_f else 0.0
         probes.append(probe)
         prepared.append({"job": job, "primary": primary, "partner": partner,
-                         "domain": domain, "outside_voxels": outside})
+                         "domain": domain, "outside_voxels": outside,
+                         "disconnected_labels": n_split})
 
     if not prepared:
         log("No scorable samples.")
@@ -430,6 +518,8 @@ def run_project(jobs: Sequence[SampleJob],
         row["primary_channel"] = channels.get("primary") or ""
         row["partner_channel"] = channels.get("partner") or ""
         row["object_voxels_outside_domain"] = item["outside_voxels"]
+        row["disconnected_labels"] = item.get("disconnected_labels", 0)
+        row["primary_kind"] = job.primary_kind
         meta_rows.append(row)
 
         results.append(res)
@@ -628,6 +718,7 @@ def jobs_from_registry(sample_registry: Dict[str, Dict[str, str]],
                        partner_channel: Optional[str] = None,
                        domain_a_channel: Optional[str] = None,
                        domain_b_channel: Optional[str] = None,
+                       primary_intersection: Optional[Dict[str, Any]] = None,
                        roi_name: Optional[str] = None,
                        geometry_for: Optional[Callable[[Dict[str, str], Optional[str]],
                                                        Tuple[Any, Any]]] = None,
@@ -639,10 +730,20 @@ def jobs_from_registry(sample_registry: Dict[str, Dict[str, str]],
     an ROI's shape and spacing are.
     """
     jobs: List[SampleJob] = []
+    spec = primary_intersection or {}
+    a_ch, b_ch = spec.get("a_channel"), spec.get("b_channel")
+
     for sample, channels in sample_registry.items():
-        if primary_channel not in channels:
-            continue
-        primary_dir = channels[primary_channel]
+        if spec:
+            if a_ch not in channels or b_ch not in channels:
+                log(f"  [{sample}] missing one of the intersection channels "
+                    f"({a_ch}, {b_ch}); skipped.")
+                continue
+            primary_dir = channels[a_ch]
+        else:
+            if primary_channel not in channels:
+                continue
+            primary_dir = channels[primary_channel]
 
         if geometry_for is not None:
             shape, spacing = geometry_for(channels, roi_name)
@@ -653,10 +754,24 @@ def jobs_from_registry(sample_registry: Dict[str, Dict[str, str]],
                 + (f" for region {roi_name!r}" if roi_name else "") + "; skipped.")
             continue
 
-        primary_path = find_final_segmentation(primary_dir, roi_name)
-        if not primary_path:
-            log(f"  [{sample}] no final segmentation for {primary_channel}; skipped.")
-            continue
+        def _seg_for(ch, folder):
+            return find_final_segmentation(folder, roi_name)
+
+        if spec:
+            a_path = _seg_for(a_ch, channels[a_ch])
+            b_path = _seg_for(b_ch, channels[b_ch])
+            if not a_path or not b_path:
+                log(f"  [{sample}] the intersection needs segmentations for both "
+                    f"{a_ch} and {b_ch}; skipped.")
+                continue
+            primary_path = a_path
+        else:
+            a_path = b_path = None
+            primary_path = find_final_segmentation(primary_dir, roi_name)
+            if not primary_path:
+                log(f"  [{sample}] no final segmentation for "
+                    f"{primary_channel}; skipped.")
+                continue
 
         partner_path = None
         if partner_channel and partner_channel in channels:
@@ -684,7 +799,11 @@ def jobs_from_registry(sample_registry: Dict[str, Dict[str, str]],
             primary_path=primary_path, partner_path=partner_path,
             primary_dir=primary_dir, mode=_mode_of(primary_dir), roi_crop=crop,
             domain_a_path=_seg(domain_a_channel),
-            domain_b_path=_seg(domain_b_channel)))
+            domain_b_path=_seg(domain_b_channel),
+            primary_kind=("intersection" if spec else "channel"),
+            intersect_a_path=a_path, intersect_b_path=b_path,
+            intersect_label_mode=str(spec.get("label_mode") or "connected"),
+            intersect_preserve_ids=bool(spec.get("preserve_ids"))))
     return jobs
 
 

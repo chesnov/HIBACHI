@@ -204,6 +204,7 @@ class SpatialNullDialog(QDialog):
         self.all_channels = sorted(
             {c for chans in self.pm.sample_registry.values() for c in chans})
         self.checked = [c for c in (checked_channels or []) if c in self.all_channels]
+        self.intersect_step = self._recipe_intersect_step()
         self.intersect_inputs = self._recipe_intersection()
 
         self.setWindowTitle("Spatial Null (mask-preserving randomisation)")
@@ -214,11 +215,31 @@ class SpatialNullDialog(QDialog):
 
     def _recipe_intersection(self) -> List[str]:
         """Channels of the last intersection step, if the recipe has one."""
+        step = self._recipe_intersect_step()
+        if not step:
+            return []
+        return [c for c in (step.get("inputs") or []) if c != "PREVIOUS_RESULT"]
+
+    def _recipe_intersect_step(self) -> Optional[Dict[str, Any]]:
+        """The last intersect step, kept whole for its label_mode/preserve_ids.
+
+        Those matter: the overlap is recomputed here from the two segmentations
+        using the same settings, so the null does not require a relational batch
+        to have been run first.
+        """
         for step in reversed(self.recipe):
             if step.get("type") == "intersect":
-                return [c for c in (step.get("inputs") or [])
-                        if c != "PREVIOUS_RESULT"]
-        return []
+                inputs = [c for c in (step.get("inputs") or [])
+                          if c != "PREVIOUS_RESULT"]
+                if len(inputs) >= 2:
+                    return step
+        return None
+
+    @property
+    def overlap_label(self) -> str:
+        names = [c.split("_", 2)[-1] for c in self.intersect_inputs]
+        return (f"Overlap: {names[0]} ∩ {names[1]}  (from recipe)"
+                if len(names) > 1 else "Overlap (from recipe)")
 
     # -- UI -------------------------------------------------------------------
 
@@ -238,11 +259,18 @@ class SpatialNullDialog(QDialog):
         form = QFormLayout(src)
 
         self.cb_primary = QComboBox()
-        self.cb_primary.addItems(self.all_channels)
         if self.intersect_inputs:
-            self.cb_primary.setEnabled(False)
+            # Selectable, not forced: with an intersection in the recipe you may
+            # want to randomise the overlap OR either whole channel.
+            self.cb_primary.addItem(self.overlap_label, "__OVERLAP__")
+        for ch in self.all_channels:
+            self.cb_primary.addItem(ch, ch)
+        if self.intersect_inputs:
+            self.cb_primary.setCurrentIndex(0)
             self.cb_primary.setToolTip(
-                "Taken from the recipe's intersection result.")
+                "The overlap is recomputed from the two channels' "
+                "segmentations using the recipe's label mode, so no relational "
+                "batch has to be run first.")
         elif self.checked:
             self.cb_primary.setCurrentText(self.checked[0])
         form.addRow("Objects to randomise:", self.cb_primary)
@@ -253,11 +281,22 @@ class SpatialNullDialog(QDialog):
         self.cb_partner.setToolTip(
             "Held fixed and never moved. Its distance field is computed once, "
             "so cross-distances cost almost nothing per draw.")
-        if len(self.checked) > 1:
+        # With an overlap selected the interesting partner is a THIRD channel,
+        # not one of the two that formed it -- distance to a constituent is
+        # degenerate, since the overlap lies inside it by construction.
+        third = [c for c in self.all_channels if c not in self.intersect_inputs]
+        if self.intersect_inputs and third:
+            self.cb_partner.setCurrentText(third[0])
+        elif len(self.checked) > 1:
             self.cb_partner.setCurrentText(self.checked[1])
         elif len(self.intersect_inputs) > 1:
             self.cb_partner.setCurrentText(self.intersect_inputs[1])
         form.addRow("Fixed partner channel:", self.cb_partner)
+
+        self.lbl_partner_warn = QLabel("")
+        self.lbl_partner_warn.setWordWrap(True)
+        self.lbl_partner_warn.setStyleSheet("color: #b45309;")
+        form.addRow("", self.lbl_partner_warn)
         layout.addWidget(src)
 
         dom = QGroupBox("Domain — this IS the null hypothesis")
@@ -453,9 +492,37 @@ class SpatialNullDialog(QDialog):
         self.btn_run.clicked.connect(self.run)
         layout.addWidget(buttons)
 
+    @property
+    def primary_is_overlap(self) -> bool:
+        return self.cb_primary.currentData() == "__OVERLAP__"
+
+    def _primary_display(self) -> str:
+        """Biological name of whatever is being randomised."""
+        if self.primary_is_overlap:
+            names = [c.split("_", 2)[-1] for c in self.intersect_inputs]
+            return "_and_".join(names[:2]) if len(names) > 1 else "overlap"
+        return str(self.cb_primary.currentData() or "").split("_", 2)[-1]
+
+    def _check_partner(self, *_):
+        """Warn when the partner cannot yield a meaningful distance."""
+        partner = self.cb_partner.currentText()
+        if partner.startswith("None"):
+            self.lbl_partner_warn.setText("")
+            return
+        msg = ""
+        if self.primary_is_overlap and partner in self.intersect_inputs:
+            msg = (f"The overlap lies inside {partner.split('_', 2)[-1]} by "
+                   f"construction, so its distance to it is always 0 — pick a "
+                   f"third channel.")
+        elif partner == self.cb_primary.currentData():
+            msg = "The partner is the same channel as the objects being randomised."
+        self.lbl_partner_warn.setText(msg)
+
     def _wire_signals(self):
         """Connect signals and prime derived labels. Call once, last."""
         self.cb_domain.currentIndexChanged.connect(self._domain_help)
+        self.cb_primary.currentIndexChanged.connect(self._check_partner)
+        self.cb_partner.currentIndexChanged.connect(self._check_partner)
         for widget in (self.cb_primary, self.cb_partner, self.cb_domain):
             widget.currentIndexChanged.connect(self._refresh_name)
         self.le_name.textChanged.connect(self._refresh_path_label)
@@ -465,6 +532,7 @@ class SpatialNullDialog(QDialog):
         self.sp_qc.valueChanged.connect(self._qc_estimate)
 
         self._domain_help()
+        self._check_partner()
         self._refresh_name()
         self._show_existing_runs()
         self._qc_estimate()
@@ -486,7 +554,9 @@ class SpatialNullDialog(QDialog):
             partner = self.cb_partner.currentText()
             name = suggest_run_name(
                 self.null_root,
-                primary=self.cb_primary.currentText(),
+                primary=("Channel_x_" + self._primary_display()
+                         if self.primary_is_overlap
+                         else self.cb_primary.currentText()),
                 partner=None if partner.startswith("None") else partner,
                 domain_choice=str(self.cb_domain.currentData() or "hull"),
                 roi_name=self.roi_name)
@@ -550,7 +620,18 @@ class SpatialNullDialog(QDialog):
     def parameters(self) -> Dict[str, Any]:
         partner = self.cb_partner.currentText()
         return {
-            "primary_channel": self.cb_primary.currentText(),
+            "primary_channel": (None if self.primary_is_overlap
+                                else self.cb_primary.currentData()),
+            "primary_is_overlap": self.primary_is_overlap,
+            "primary_display": self._primary_display(),
+            "intersection_spec": ({
+                "a_channel": self.intersect_inputs[0],
+                "b_channel": self.intersect_inputs[1],
+                "label_mode": (self.intersect_step or {}).get("label_mode")
+                              or "connected",
+                "preserve_ids": bool((self.intersect_step or {}).get("preserve_ids")),
+            } if self.primary_is_overlap and len(self.intersect_inputs) > 1
+              else None),
             "partner_channel": None if partner.startswith("None") else partner,
             "domain_choice": self.cb_domain.currentData(),
             "per_parent_containment": self.chk_per_parent.isChecked(),
@@ -582,10 +663,19 @@ class SpatialNullDialog(QDialog):
         from .runner import RunParameters, jobs_from_registry, run_project
 
         p = self.parameters()
-        if not p["primary_channel"]:
+        if not p["primary_channel"] and not p["intersection_spec"]:
             QMessageBox.warning(self, "Nothing selected",
-                                "Choose a channel whose objects to randomise.")
+                                "Choose a channel, or the recipe's overlap, to "
+                                "randomise.")
             return
+        if p["intersection_spec"] and p["partner_channel"] in self.intersect_inputs:
+            if QMessageBox.question(
+                    self, "Degenerate partner",
+                    "The overlap lies inside that channel by construction, so "
+                    "every cross-distance will be 0.\n\nRun anyway?",
+                    QMessageBox.Yes | QMessageBox.Cancel,
+                    QMessageBox.Cancel) != QMessageBox.Yes:
+                return
         if p["domain_choice"] in ("parent_a", "parent_b", "parent_both") \
                 and not p["intersection_inputs"]:
             QMessageBox.warning(
@@ -639,6 +729,7 @@ class SpatialNullDialog(QDialog):
                 self.pm.sample_registry, p["primary_channel"],
                 p["partner_channel"],
                 domain_a_channel=dom_a, domain_b_channel=dom_b,
+                primary_intersection=p["intersection_spec"],
                 roi_name=p["roi_name"])
         except Exception as exc:
             QMessageBox.critical(self, "Run failed", str(exc))
@@ -657,7 +748,9 @@ class SpatialNullDialog(QDialog):
                                    parent=self)
         worker = _NullWorker(
             jobs, params, out_dir, os.path.basename(self.project_root),
-            {"primary": p["primary_channel"], "partner": p["partner_channel"],
+            {"primary": (p["primary_channel"]
+                         or f"Channel_x_{p['primary_display']}"),
+             "partner": p["partner_channel"],
              "domain_choice": p["domain_choice"]})
 
         state: Dict[str, Any] = {"result": None, "error": None}

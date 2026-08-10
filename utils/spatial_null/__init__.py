@@ -91,6 +91,7 @@ from .runner import (
     RunParameters,
     SampleJob,
     find_final_segmentation,
+    intersection_labels,
     jobs_from_registry,
     list_runs,
     roi_crop_spec,
@@ -115,7 +116,8 @@ __all__ = [
     "build_manifest", "write_project_export",
     # runner
     "RunParameters", "SampleJob", "find_final_segmentation",
-    "jobs_from_registry", "list_runs", "roi_crop_spec", "run_project",
+    "intersection_labels", "jobs_from_registry", "list_runs",
+    "roi_crop_spec", "run_project",
     "suggest_run_name",
 ]
 
