@@ -34,6 +34,7 @@ from .engine import (
 )
 from .qc_render import (
     estimate_qc_output, qc_paths, render_draw, render_observed,
+    self_test as qc_self_test,
 )
 from .export import (
     build_manifest, concat_null_frames, concat_observed_frames,
@@ -358,15 +359,27 @@ def run_project(jobs: Sequence[SampleJob],
             f"{grid_info['f_grid_raw_max_um']:.3g} um across {len(probes)} images.")
 
     # ---- pass 2: Monte-Carlo ----------------------------------------------
+    qc_failure_reason = None
+    qc_error_total = 0
     results, meta_rows = [], []
     obs_frames, null_frames, curve_sets, image_ids = [], [], [], []
     first_draws: Dict[str, np.ndarray] = {}
 
     n_qc = max(0, int(params.n_qc_images))
     if n_qc and out_dir:
-        count, mb = estimate_qc_output(len(prepared), min(n_qc, total_draws))
-        log(f"QC images: up to {count} JPGs (~{mb:.0f} MB) under "
-            f"{os.path.join(out_dir, 'qc_images')}.")
+        # Prove the renderer works BEFORE spending the run on it. Discovering a
+        # rendering problem afterwards, as an empty directory, wastes the whole
+        # computation and gives no clue why.
+        ok, why = qc_self_test(out_dir)
+        if not ok:
+            log("QC images DISABLED: the renderer failed its self-test.")
+            log(f"  {why.strip()}")
+            qc_failure_reason = why.strip().splitlines()[0] if why.strip() else "unknown"
+            n_qc = 0
+        else:
+            count, mb = estimate_qc_output(len(prepared), min(n_qc, total_draws))
+            log(f"QC images: up to {count} JPGs (~{mb:.0f} MB) under "
+                f"{os.path.join(out_dir, 'qc_images')}.")
 
     for idx, item in enumerate(prepared):
         job: SampleJob = item["job"]
@@ -426,6 +439,11 @@ def run_project(jobs: Sequence[SampleJob],
             warn.append(f"occupancy {res.diagnostics['occupancy_fraction']:.1%}")
         if res.diagnostics.get("placement_warning"):
             warn.append(f"{res.diagnostics['draws_incomplete']} draws incomplete")
+        if res.diagnostics.get("qc_errors"):
+            qc_error_total += int(res.diagnostics["qc_errors"])
+            # Reported per sample, not buried in a CSV column.
+            log(f"      QC: {res.diagnostics['qc_errors']} image(s) failed to "
+                f"render -- {res.diagnostics.get('qc_last_error', 'unknown')}")
         acc = res.diagnostics.get("orientation_acceptance_rate")
         if acc is not None and np.isfinite(acc) and acc < 0.5:
             warn.append(f"orientation acceptance {acc:.0%}")
@@ -445,6 +463,9 @@ def run_project(jobs: Sequence[SampleJob],
         "first_draw_labels": first_draws, "results": results,
         "qc_dir": (os.path.join(out_dir, "qc_images")
                    if (out_dir and n_qc) else None),
+        "qc_requested": int(params.n_qc_images),
+        "qc_disabled_reason": qc_failure_reason,
+        "qc_errors": int(qc_error_total),
         "description": describe_within_project(metadata)
         if not metadata.empty else pd.DataFrame(),
     }
@@ -505,7 +526,10 @@ def _make_qc_hook(job: "SampleJob", item: Dict[str, Any], out_dir: str,
                         item["primary"], partner, obs_pairs, spacing,
                         domain_mask=domain.mask, sample=job.sample)
     except Exception as exc:
-        log(f"      QC: could not render the observed image ({exc}).")
+        import traceback
+        log(f"      QC: could not render the observed image -- "
+            f"{type(exc).__name__}: {exc}")
+        log("      " + traceback.format_exc().replace("\n", "\n      ").strip())
 
     def hook(draw_index: int, set_index: int, labels, pairs):
         name = f"draw_{draw_index + 1:03d}_{'ref' if set_index == 0 else 'test'}.jpg"

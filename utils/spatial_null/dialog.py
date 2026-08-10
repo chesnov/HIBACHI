@@ -610,6 +610,14 @@ class SpatialNullDialog(QDialog):
                 f"Exported to:\n{out_dir}\n\n"
                 "The export holds raw per-object distances for every draw. "
                 "Pool several projects with hibachi_null_io to do statistics.")
+        if result.get("qc_disabled_reason"):
+            concerns.append(
+                "QC images were requested but the renderer failed its "
+                f"self-test, so none were written: {result['qc_disabled_reason']}")
+        elif result.get("qc_errors"):
+            concerns.append(
+                f"{result['qc_errors']} QC image(s) failed to render; see the "
+                f"console for the reason.")
         if result.get("qc_dir"):
             text += (f"\n\nQC images:\n{result['qc_dir']}\n"
                      "Each sample folder holds 000_observed.jpg plus one image "
