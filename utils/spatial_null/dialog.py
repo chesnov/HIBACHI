@@ -39,8 +39,9 @@ from typing import Any, Dict, List, Optional
 from PyQt5.QtCore import Qt, QThread, QTimer, pyqtSignal
 from PyQt5.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
-    QDoubleSpinBox, QFormLayout, QGroupBox, QHBoxLayout, QLabel, QMessageBox,
-    QPlainTextEdit, QProgressBar, QPushButton, QSpinBox, QVBoxLayout, QWidget,
+    QDoubleSpinBox, QFormLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit,
+    QMessageBox, QPlainTextEdit, QProgressBar, QPushButton, QSpinBox,
+    QVBoxLayout, QWidget,
 )
 
 DOMAIN_CHOICES = [
@@ -304,8 +305,7 @@ class SpatialNullDialog(QDialog):
         # Connected and primed only now that every widget the handler touches
         # exists. Doing it earlier raised AttributeError on chk_per_parent,
         # because adding items to the combo fires currentIndexChanged.
-        self.cb_domain.currentIndexChanged.connect(self._domain_help)
-        self._domain_help()
+
 
         nul = QGroupBox("Null model")
         nf = QFormLayout(nul)
@@ -367,6 +367,30 @@ class SpatialNullDialog(QDialog):
         outg = QGroupBox("Output")
         of = QFormLayout(outg)
 
+        # A project holds one named run per pairing, so results never overwrite
+        # one another: randomise A against C, then B against C, then A inside B.
+        self.le_name = QLineEdit()
+        self.le_name.setToolTip(
+            "Names this run's folder under SPATIAL_NULL/. Each pairing gets its "
+            "own, so several can coexist in one project. The default is the "
+            "next free ordinal with the pairing appended; it stops updating once "
+            "you type your own.")
+        self._name_edited = False
+        # textEdited fires only on user input, not on setText, so the default can
+        # keep tracking the selection until the user actually types.
+        self.le_name.textEdited.connect(self._on_name_edited)
+        of.addRow("Run name:", self.le_name)
+
+        self.lbl_path = QLabel("")
+        self.lbl_path.setStyleSheet("color: grey;")
+        self.lbl_path.setWordWrap(True)
+        of.addRow("", self.lbl_path)
+
+        self.lbl_existing = QLabel("")
+        self.lbl_existing.setStyleSheet("color: grey;")
+        self.lbl_existing.setWordWrap(True)
+        of.addRow("", self.lbl_existing)
+
         self.chk_qc = QCheckBox("Write QC images (JPG) of the randomisations")
         self.chk_qc.setChecked(False)
         self.chk_qc.setToolTip(
@@ -399,15 +423,9 @@ class SpatialNullDialog(QDialog):
         self.chk_qc_annotate.setEnabled(False)
         of.addRow(self.chk_qc_annotate)
 
-        self.chk_qc.toggled.connect(self.sp_qc.setEnabled)
-        self.chk_qc.toggled.connect(self.chk_qc_annotate.setEnabled)
-        self.chk_qc.toggled.connect(self._qc_estimate)
-        self.sp_qc.valueChanged.connect(self._qc_estimate)
-
         self.chk_csv = QCheckBox("Also write the null table as gzipped CSV")
         of.addRow(self.chk_csv)
         layout.addWidget(outg)
-        self._qc_estimate()
 
         note = QPlainTextEdit()
         note.setReadOnly(True)
@@ -420,6 +438,12 @@ class SpatialNullDialog(QDialog):
             "and do the inference there.")
         layout.addWidget(note)
 
+        # Every signal is connected here, after ALL widgets exist. Connecting
+        # mid-build is a latent crash: Qt fires currentIndexChanged while a combo
+        # is being populated, so a handler can run before the widgets it touches
+        # have been created.
+        self._wire_signals()
+
         buttons = QDialogButtonBox(QDialogButtonBox.Cancel)
         self.btn_run = QPushButton("Run and export")
         self.btn_run.setStyleSheet(
@@ -428,6 +452,69 @@ class SpatialNullDialog(QDialog):
         buttons.rejected.connect(self.reject)
         self.btn_run.clicked.connect(self.run)
         layout.addWidget(buttons)
+
+    def _wire_signals(self):
+        """Connect signals and prime derived labels. Call once, last."""
+        self.cb_domain.currentIndexChanged.connect(self._domain_help)
+        for widget in (self.cb_primary, self.cb_partner, self.cb_domain):
+            widget.currentIndexChanged.connect(self._refresh_name)
+        self.le_name.textChanged.connect(self._refresh_path_label)
+        self.chk_qc.toggled.connect(self.sp_qc.setEnabled)
+        self.chk_qc.toggled.connect(self.chk_qc_annotate.setEnabled)
+        self.chk_qc.toggled.connect(self._qc_estimate)
+        self.sp_qc.valueChanged.connect(self._qc_estimate)
+
+        self._domain_help()
+        self._refresh_name()
+        self._show_existing_runs()
+        self._qc_estimate()
+
+    @property
+    def null_root(self) -> str:
+        return os.path.join(self.project_root, "SPATIAL_NULL")
+
+    def _on_name_edited(self, _text):
+        self._name_edited = True
+
+    def _refresh_name(self, *_):
+        """Re-derive the default name, unless the user has typed their own."""
+        if self._name_edited:
+            self._refresh_path_label()
+            return
+        try:
+            from .runner import suggest_run_name
+            partner = self.cb_partner.currentText()
+            name = suggest_run_name(
+                self.null_root,
+                primary=self.cb_primary.currentText(),
+                partner=None if partner.startswith("None") else partner,
+                domain_choice=str(self.cb_domain.currentData() or "hull"),
+                roi_name=self.roi_name)
+        except Exception:
+            name = "01"
+        self.le_name.setText(name)
+        self._refresh_path_label()
+
+    def _refresh_path_label(self, *_):
+        name = self.le_name.text().strip() or "<name required>"
+        self.lbl_path.setText(os.path.join(self.null_root, name))
+
+    def _show_existing_runs(self):
+        """List what is already there, so a clash is visible before running."""
+        try:
+            from .runner import list_runs
+            runs = list_runs(self.null_root)
+        except Exception:
+            runs = []
+        if not runs:
+            self.lbl_existing.setText("No previous runs in this project.")
+            return
+        shown = "; ".join(
+            f"{r['run_name']} ({r.get('primary') or '?'}"
+            + (f" vs {r['partner']}" if r.get("partner") else "")
+            + f", n={r.get('n_images')})" for r in runs[:4])
+        more = f" … and {len(runs) - 4} more" if len(runs) > 4 else ""
+        self.lbl_existing.setText(f"Existing runs: {shown}{more}")
 
     def _qc_estimate(self, *_):
         """Show the file count and size before anything is written."""
@@ -480,6 +567,7 @@ class SpatialNullDialog(QDialog):
             "n_qc_images": (self.sp_qc.value() if self.chk_qc.isChecked() else 0),
             "qc_annotate_distances": self.chk_qc_annotate.isChecked(),
             "also_csv": self.chk_csv.isChecked(),
+            "run_name": self.le_name.text().strip(),
             "roi_name": self.roi_name,
             "intersection_inputs": self.intersect_inputs,
             "domain_a_channel": (self.intersect_inputs[0]
@@ -505,9 +593,28 @@ class SpatialNullDialog(QDialog):
                 "A parent-object domain needs an intersection in the recipe.")
             return
 
-        out_dir = os.path.join(self.project_root, "SPATIAL_NULL")
-        if p["roi_name"]:
-            out_dir = os.path.join(out_dir, p["roi_name"])
+        run_name = p["run_name"]
+        if not run_name:
+            QMessageBox.warning(self, "Name required",
+                                "Give this run a name so it does not overwrite "
+                                "another pairing.")
+            return
+        safe = "".join(c if c.isalnum() or c in "-_." else "_" for c in run_name)
+        if safe != run_name:
+            self.le_name.setText(safe)
+            run_name = safe
+
+        # The region goes in the name rather than the path, so every run sits at
+        # one predictable depth and the notebook loader needs no special case.
+        out_dir = os.path.join(self.null_root, run_name)
+        if os.path.isdir(out_dir) and os.listdir(out_dir):
+            choice = QMessageBox.question(
+                self, "Run already exists",
+                f"'{run_name}' already exists and holds results.\n\n"
+                "Overwrite it, or pick a different name?",
+                QMessageBox.Yes | QMessageBox.Cancel, QMessageBox.Cancel)
+            if choice != QMessageBox.Yes:
+                return
 
         # Both of these used to stop at the manifest and never reach the
         # engine, so a parent-object domain silently became the whole field and
@@ -521,7 +628,7 @@ class SpatialNullDialog(QDialog):
             per_parent_containment=p["per_parent_containment"],
             erode_um=p["erode_um"], compute_f=p["compute_f"],
             compute_g=p["compute_g"], cross_statistic=p["cross_statistic"],
-            seed=p["seed"], roi_name=p["roi_name"],
+            seed=p["seed"], roi_name=p["roi_name"], run_name=run_name,
             keep_first_draw=False, also_csv=p["also_csv"],
             n_qc_images=p["n_qc_images"],
             qc_annotate_distances=p["qc_annotate_distances"])
@@ -626,4 +733,8 @@ class SpatialNullDialog(QDialog):
         if concerns:
             text += "\n\nWorth checking:\n- " + "\n- ".join(concerns)
         QMessageBox.information(self, "Spatial null complete", text)
-        self.accept()
+        # Leave the dialog open so another pairing can be run straight away --
+        # that is the point of named runs.
+        self._name_edited = False
+        self._refresh_name()
+        self._show_existing_runs()

@@ -39,8 +39,14 @@ USAGE
     from ..spatial_null import RunParameters, jobs_from_registry, run_project
     jobs = jobs_from_registry(pm.sample_registry, "Channel_0_Aggregates",
                               "Channel_1_Microglia")
-    run_project(jobs, RunParameters(n_reference=199, n_test=199),
-                out_dir=".../SPATIAL_NULL")
+    run_project(jobs, RunParameters(n_reference=199, n_test=199,
+                                    run_name="01_Aggregates_vs_Microglia"),
+                out_dir=".../SPATIAL_NULL/01_Aggregates_vs_Microglia")
+
+    # A project holds one named run per pairing, so several coexist:
+    #   SPATIAL_NULL/01_Aggregates_in_tissue_vs_Microglia/
+    #   SPATIAL_NULL/02_Microglia_in_tissue_vs_Aggregates/
+    #   SPATIAL_NULL/03_Aggregates_in_Neurons_vs_Microglia/
 """
 
 from .engine import (
@@ -77,6 +83,7 @@ from .qc_render import (
 from .export import (
     COMPARABILITY_KEY,
     SCHEMA_VERSION,
+    biological_name,
     build_manifest,
     write_project_export,
 )
@@ -85,8 +92,10 @@ from .runner import (
     SampleJob,
     find_final_segmentation,
     jobs_from_registry,
+    list_runs,
     roi_crop_spec,
     run_project,
+    suggest_run_name,
 )
 
 __all__ = [
@@ -102,11 +111,12 @@ __all__ = [
     # qc images
     "estimate_qc_output", "qc_paths", "render_draw", "render_observed",
     # export
-    "COMPARABILITY_KEY", "SCHEMA_VERSION", "build_manifest",
-    "write_project_export",
+    "COMPARABILITY_KEY", "SCHEMA_VERSION", "biological_name",
+    "build_manifest", "write_project_export",
     # runner
     "RunParameters", "SampleJob", "find_final_segmentation",
-    "jobs_from_registry", "roi_crop_spec", "run_project",
+    "jobs_from_registry", "list_runs", "roi_crop_spec", "run_project",
+    "suggest_run_name",
 ]
 
 

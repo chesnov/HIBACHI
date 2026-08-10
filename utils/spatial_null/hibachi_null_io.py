@@ -21,8 +21,11 @@ WHAT IT GUARDS
 TYPICAL USE
     import hibachi_null_io as hio
 
-    ds = hio.load_projects(["/data/rep1/NULL_EXPORT", "/data/rep2/NULL_EXPORT"],
-                           group_from_name=r"(WT|KO)")
+    runs = hio.discover_runs(["/data/rep1", "/data/rep2", "/data/rep3"])
+    print(runs[["project", "run_name", "primary", "partner", "domain"]])
+
+    paths = hio.matching_runs(runs, primary="Aggregates", partner="Microglia")
+    ds = hio.load_projects(paths, group_from_name=r"(WT|KO)")
 
     eff = hio.per_image_effects(ds, statistic="median", index="cross")
     res = hio.replicate_test(eff, effect_col="effect_z")
@@ -83,6 +86,66 @@ class NullDataset:
         return sorted(self.manifests)
 
 
+def discover_runs(project_roots: Sequence[str]) -> "pd.DataFrame":
+    """Every named run under each project, with its pairing.
+
+    A project holds one run per pairing -- randomise A against C, B against C,
+    A inside B -- so the first job in a notebook is usually to see what exists
+    and pick the same pairing from each replicate.
+
+    Accepts either a project root (its SPATIAL_NULL is found) or a SPATIAL_NULL
+    directory itself.
+    """
+    rows: List[Dict[str, Any]] = []
+    for root in project_roots:
+        base = root
+        if not os.path.basename(os.path.normpath(base)) == "SPATIAL_NULL":
+            candidate = os.path.join(root, "SPATIAL_NULL")
+            if os.path.isdir(candidate):
+                base = candidate
+        if not os.path.isdir(base):
+            continue
+        for name in sorted(os.listdir(base)):
+            d = os.path.join(base, name)
+            man_path = os.path.join(d, "manifest.json")
+            if not os.path.isfile(man_path):
+                continue
+            try:
+                with open(man_path) as fh:
+                    m = json.load(fh)
+            except Exception:
+                continue
+            rows.append({
+                "project": m.get("project") or os.path.basename(
+                    os.path.dirname(os.path.normpath(base))),
+                "run_name": m.get("run_name") or name,
+                "path": d,
+                "primary": m.get("primary_name"),
+                "partner": m.get("partner_name"),
+                "domain": m.get("domain_choice"),
+                "domain_source": (m.get("comparability_key") or {}).get(
+                    "domain_source"),
+                "roi": m.get("roi_name") or "",
+                "n_images": m.get("n_images"),
+                "n_reference": m.get("n_reference"),
+                "n_test": m.get("n_test"),
+                "created": m.get("created"),
+            })
+    return pd.DataFrame(rows)
+
+
+def matching_runs(runs: "pd.DataFrame", primary: str,
+                  partner: Optional[str] = None,
+                  domain: Optional[str] = None) -> List[str]:
+    """Paths of the runs describing one pairing, ready for `load_projects`."""
+    sel = runs[runs["primary"] == primary]
+    if partner is not None:
+        sel = sel[sel["partner"] == partner]
+    if domain is not None:
+        sel = sel[sel["domain"] == domain]
+    return list(sel["path"])
+
+
 def _load_one(path: str) -> Dict[str, Any]:
     """Read one export directory into raw parts."""
     man_path = os.path.join(path, "manifest.json")
@@ -134,10 +197,18 @@ def _check_comparability(manifests: Dict[str, Dict[str, Any]]) -> List[str]:
             msg = f"{k}: {ref_name}={a!r} vs {name}={b!r}"
             (notes if k in SOFT_KEYS else problems).append(msg)
     if problems:
+        pairing = [m for m in problems if m.split(":")[0] in
+                   ("primary_name", "partner_name", "domain_choice")]
+        hint = ""
+        if pairing:
+            hint = ("\n\nThese are different PAIRINGS, not different replicates "
+                    "of one pairing. Use discover_runs() to see what each "
+                    "project contains, then matching_runs() to select the same "
+                    "pairing from each.")
         raise ValueError(
             "Refusing to pool exports whose nulls were defined differently -- "
             "the result would not mean anything. Mismatched keys:\n  "
-            + "\n  ".join(problems))
+            + "\n  ".join(problems) + hint)
     return notes
 
 
@@ -195,6 +266,8 @@ def load_projects(paths: Sequence[str],
                 continue
             f = frame.copy()
             f.insert(0, "project", raw["project"])
+            if "run_name" not in f.columns:
+                f.insert(1, "run_name", raw["manifest"].get("run_name") or "")
             sink.append(f)
 
     images_df = pd.concat(images, ignore_index=True) if images else pd.DataFrame()

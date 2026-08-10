@@ -249,6 +249,9 @@ class RunParameters:
     # 20 images is ~8,000 files. The caller is warned with an estimate.
     n_qc_images: int = 0
     qc_annotate_distances: bool = True
+    # Names this pairing on disk, so a project can hold many: randomise A
+    # against C, randomise B against C, randomise A inside B, and so on.
+    run_name: str = ""
 
     def as_dict(self) -> Dict[str, Any]:
         return dict(self.__dict__)
@@ -423,6 +426,9 @@ def run_project(jobs: Sequence[SampleJob],
         row["shape"] = "x".join(str(s) for s in job.shape)
         row["spacing_um"] = ",".join(f"{s:g}" for s in job.spacing)
         row["roi_name"] = params.roi_name or ""
+        row["run_name"] = params.run_name or ""
+        row["primary_channel"] = channels.get("primary") or ""
+        row["partner_channel"] = channels.get("partner") or ""
         row["object_voxels_outside_domain"] = item["outside_voxels"]
         meta_rows.append(row)
 
@@ -481,6 +487,7 @@ def run_project(jobs: Sequence[SampleJob],
             project_name=project_name, ndim=ndim,
             parameters=params.as_dict(), grid_info=grid_info,
             channels=channels, n_images=len(results),
+            run_name=params.run_name,
             extra={"domain_source": "+".join(realised) or None})
         written = write_project_export(
             out_dir, manifest, metadata, observed, nulls, curves,
@@ -545,6 +552,71 @@ def _make_qc_hook(job: "SampleJob", item: Dict[str, Any], out_dir: str,
             annotate_distances=params.qc_annotate_distances)
 
     return hook
+
+
+def suggest_run_name(root: str,
+                     primary: Optional[str] = None,
+                     partner: Optional[str] = None,
+                     domain_choice: str = "hull",
+                     roi_name: Optional[str] = None) -> str:
+    """Next free ordinal, with the pairing appended for legibility.
+
+    A bare ordinal is unambiguous but useless when browsing a folder months
+    later, so the pairing is folded in; the ordinal still guarantees uniqueness.
+    """
+    from .export import biological_name
+
+    existing = set()
+    if os.path.isdir(root):
+        for name in os.listdir(root):
+            if os.path.isdir(os.path.join(root, name)):
+                existing.add(name)
+    n = 1
+    while any(x.startswith(f"{n:02d}_") or x == f"{n:02d}" for x in existing):
+        n += 1
+
+    bits = [f"{n:02d}"]
+    p = biological_name(primary)
+    if p:
+        bits.append(p)
+    if domain_choice.startswith("parent"):
+        bits.append("in")
+        which = {"parent_a": primary, "parent_b": partner}.get(domain_choice)
+        bits.append(biological_name(which) or "parent")
+    elif domain_choice == "hull":
+        bits.append("in_tissue")
+    q = biological_name(partner)
+    if q:
+        bits += ["vs", q]
+    if roi_name:
+        bits.append(str(roi_name))
+    safe = "_".join(str(b) for b in bits if b)
+    return "".join(c if c.isalnum() or c in "-_" else "_" for c in safe)
+
+
+def list_runs(root: str) -> List[Dict[str, Any]]:
+    """Existing named runs under a SPATIAL_NULL directory, newest first."""
+    import json
+    out: List[Dict[str, Any]] = []
+    if not os.path.isdir(root):
+        return out
+    for name in sorted(os.listdir(root)):
+        d = os.path.join(root, name)
+        man = os.path.join(d, "manifest.json")
+        if not os.path.isfile(man):
+            continue
+        try:
+            with open(man) as fh:
+                m = json.load(fh)
+        except Exception:
+            m = {}
+        out.append({"run_name": name, "path": d,
+                    "primary": m.get("primary_name"),
+                    "partner": m.get("partner_name"),
+                    "domain_choice": m.get("domain_choice"),
+                    "n_images": m.get("n_images"),
+                    "created": m.get("created")})
+    return sorted(out, key=lambda r: str(r.get("created") or ""), reverse=True)
 
 
 # =============================================================================

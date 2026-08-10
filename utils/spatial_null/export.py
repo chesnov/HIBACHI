@@ -66,6 +66,14 @@ COMPARABILITY_KEY = (
     "min_separation_um",
     "distance_semantics",
     "cross_statistic",
+    # The PAIRING. Pooling "randomise A against C" from one replicate with
+    # "randomise B against C" from another is meaningless, and nothing else in
+    # the key would catch it. Biological names rather than channel keys, because
+    # the same channel is often Channel_0_X in one project and Channel_2_X in
+    # another -- the numbering is an accident of acquisition order.
+    "primary_name",
+    "partner_name",
+    "domain_choice",
     "f_grid_max_um",
     "f_grid_points",
 )
@@ -80,17 +88,39 @@ SOFT_KEYS = ("f_grid_max_um", "f_grid_points")
 _NULL_COLUMNS_MIN = ("image_id", "draw", "set", "template_label", "voxels")
 
 
+def biological_name(channel_key: Optional[str]) -> Optional[str]:
+    """'Channel_2_Aggregates' -> 'Aggregates'; passes anything else through.
+
+    Comparability is judged on this rather than the channel key, so a pairing
+    still matches when the same stain sits at a different channel index in
+    another project.
+    """
+    if not channel_key:
+        return None
+    parts = str(channel_key).split("_", 2)
+    return parts[-1] if len(parts) > 2 else str(channel_key)
+
+
 def build_manifest(project_name: str,
                    ndim: int,
                    parameters: Dict[str, Any],
                    grid_info: Dict[str, Any],
                    channels: Dict[str, Any],
                    n_images: int,
+                   run_name: Optional[str] = None,
                    extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Manifest describing one export, including its comparability key."""
     man: Dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
         "project": project_name,
+        # A project holds many named runs -- one per pairing -- so the run name
+        # is what distinguishes them on disk and in a pooled analysis.
+        "run_name": run_name or "",
+        "primary_channel": channels.get("primary"),
+        "partner_channel": channels.get("partner"),
+        "primary_name": biological_name(channels.get("primary")),
+        "partner_name": biological_name(channels.get("partner")),
+        "domain_choice": channels.get("domain_choice"),
         "ndim": int(ndim),
         "n_images": int(n_images),
         "channels": channels,
