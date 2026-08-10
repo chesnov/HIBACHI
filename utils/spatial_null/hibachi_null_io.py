@@ -131,6 +131,11 @@ def discover_runs(project_roots: Sequence[str]) -> "pd.DataFrame":
                 "domain_source": (m.get("comparability_key") or {}).get(
                     "domain_source"),
                 "roi": m.get("roi_name") or "",
+                # The recipe program that produced the randomised objects. Two
+                # runs sharing a pairing but differing in a size threshold are
+                # only distinguishable by this, so it is surfaced for selection.
+                "program": m.get("primary_program") or "",
+                "primary_kind": m.get("primary_kind") or "",
                 "n_images": m.get("n_images"),
                 "n_reference": m.get("n_reference"),
                 "n_test": m.get("n_test"),
@@ -141,13 +146,23 @@ def discover_runs(project_roots: Sequence[str]) -> "pd.DataFrame":
 
 def matching_runs(runs: "pd.DataFrame", primary: str,
                   partner: Optional[str] = None,
-                  domain: Optional[str] = None) -> List[str]:
-    """Paths of the runs describing one pairing, ready for `load_projects`."""
+                  domain: Optional[str] = None,
+                  program_contains: Optional[str] = None) -> List[str]:
+    """Paths of the runs describing one pairing, ready for `load_projects`.
+
+    `program_contains` narrows by the recorded recipe program, which is the only
+    thing separating two runs that share a pairing but differ in a size
+    threshold — the case that arises when one run randomises all objects and
+    another only the large ones.
+    """
     sel = runs[runs["primary"] == primary]
     if partner is not None:
         sel = sel[sel["partner"] == partner]
     if domain is not None:
         sel = sel[sel["domain"] == domain]
+    if program_contains is not None and "program" in sel.columns:
+        sel = sel[sel["program"].fillna("").str.contains(
+            program_contains, case=False, regex=False)]
     return list(sel["path"])
 
 

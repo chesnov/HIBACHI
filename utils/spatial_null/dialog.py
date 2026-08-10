@@ -62,6 +62,20 @@ DOMAIN_CHOICES = [
 ]
 
 
+def _describe_program_step(step) -> str:
+    """One recipe step in words, for the dialog and the manifest."""
+    kind = step.get("type")
+    if kind == "channel":
+        return str(step.get("channel", "")).split("_", 2)[-1]
+    if kind == "intersect":
+        a = str(step.get("channel") or "previous").split("_", 2)[-1]
+        b = str(step.get("channel_b", "")).split("_", 2)[-1]
+        return f"{a} ∩ {b}"
+    if kind == "filter":
+        return f"keep > {float(step.get('min_size') or 0):g} um²/um³"
+    return str(kind)
+
+
 class _NullWorker(QThread):
     """Runs the null off the GUI thread.
 
@@ -235,6 +249,73 @@ class SpatialNullDialog(QDialog):
                     return step
         return None
 
+    def _recipe_source_channel(self):
+        """Channel a filter-first recipe operates on: the checked one."""
+        for ch in self.checked:
+            if ch in self.all_channels:
+                return ch
+        # Fall back to the first real channel offered, so a recipe is still
+        # usable when nothing was checked.
+        for i in range(self.cb_primary.count()):
+            data = self.cb_primary.itemData(i)
+            if isinstance(data, str) and not data.startswith("__"):
+                return data
+        return None
+
+    def _recipe_program(self):
+        """The recipe's mask-producing steps, as a program for the runner.
+
+        Only 'intersect' and 'filter' change the mask; analysis steps do not.
+        The chain is linear (each step consumes the previous result), which is how
+        the cross-channel recipe already works, so a size filter after an
+        intersection is expressible without a special case.
+        """
+        program, names = [], []
+        for step in self.recipe:
+            kind = step.get("type")
+            if kind == "intersect":
+                inputs = [c for c in (step.get("inputs") or [])
+                          if c != "PREVIOUS_RESULT"]
+                if not program:
+                    if len(inputs) < 2:
+                        return [], ""
+                    program.append({
+                        "type": "intersect", "channel": inputs[0],
+                        "channel_b": inputs[1],
+                        "label_mode": step.get("label_mode") or "connected",
+                        "preserve_ids": bool(step.get("preserve_ids"))})
+                    names = [c.split("_", 2)[-1] for c in inputs[:2]]
+                else:
+                    if not inputs:
+                        return [], ""
+                    program.append({
+                        "type": "intersect", "channel_b": inputs[0],
+                        "label_mode": step.get("label_mode") or "connected",
+                        "preserve_ids": bool(step.get("preserve_ids"))})
+                    names.append(inputs[0].split("_", 2)[-1])
+            elif kind == "filter":
+                if not program:
+                    # A filter with nothing before it needs a source channel. It
+                    # cannot come from the primary selector, which is sitting on
+                    # "Recipe result" -- that would be circular. The channel the
+                    # user checked in the analyzer is what the recipe operates on,
+                    # so that is the source.
+                    src = self._recipe_source_channel()
+                    if not src:
+                        return [], ""
+                    program.append({"type": "channel", "channel": src})
+                    names = [src.split("_", 2)[-1]]
+                program.append({"type": "filter",
+                                "min_size": float(step.get("min_vol") or 0.0)})
+        if not program:
+            return [], ""
+
+        label = " & ".join(names) if names else "recipe"
+        sizes = [st["min_size"] for st in program if st["type"] == "filter"]
+        if sizes:
+            label += f" >{max(sizes):g}"
+        return program, label
+
     @property
     def overlap_label(self) -> str:
         names = [c.split("_", 2)[-1] for c in self.intersect_inputs]
@@ -259,13 +340,21 @@ class SpatialNullDialog(QDialog):
         form = QFormLayout(src)
 
         self.cb_primary = QComboBox()
+        self._has_filter = any(st.get("type") == "filter" for st in self.recipe)
+        if self._has_filter:
+            # A size/volume filter in the recipe is the supported route to
+            # randomising a size-restricted population: the threshold then lives
+            # in the recipe and is recorded in the run's manifest, instead of
+            # being a choice made after the null was already built (which cannot
+            # work, because the engine reduces to a nearest distance per draw).
+            self.cb_primary.addItem("Recipe result (see below)", "__RECIPE__")
         if self.intersect_inputs:
             # Selectable, not forced: with an intersection in the recipe you may
             # want to randomise the overlap OR either whole channel.
             self.cb_primary.addItem(self.overlap_label, "__OVERLAP__")
         for ch in self.all_channels:
             self.cb_primary.addItem(ch, ch)
-        if self.intersect_inputs:
+        if self._has_filter or self.intersect_inputs:
             self.cb_primary.setCurrentIndex(0)
             self.cb_primary.setToolTip(
                 "The overlap is recomputed from the two channels' "
@@ -274,6 +363,11 @@ class SpatialNullDialog(QDialog):
         elif self.checked:
             self.cb_primary.setCurrentText(self.checked[0])
         form.addRow("Objects to randomise:", self.cb_primary)
+
+        self.lbl_program = QLabel("")
+        self.lbl_program.setWordWrap(True)
+        self.lbl_program.setStyleSheet("color: grey;")
+        form.addRow("", self.lbl_program)
 
         self.cb_partner = QComboBox()
         self.cb_partner.addItem("None (no cross-distances)")
@@ -522,8 +616,53 @@ class SpatialNullDialog(QDialog):
     def primary_is_overlap(self) -> bool:
         return self.cb_primary.currentData() == "__OVERLAP__"
 
+    @property
+    def primary_is_recipe(self) -> bool:
+        return self.cb_primary.currentData() == "__RECIPE__"
+
+    def _refresh_program(self, *_):
+        """Show the resolved chain, so what gets randomised is never a guess."""
+        if not self.primary_is_recipe:
+            self.lbl_program.setText("")
+            return
+        program, label = self._recipe_program()
+        if not program:
+            self.lbl_program.setText(
+                "The recipe's filter has no channel or intersection before it — "
+                "add one, or pick a channel above.")
+            return
+        self.lbl_program.setText(
+            " → ".join(_describe_program_step(st) for st in program)
+            + f"      (recorded as '{label}')")
+
+    def _primary_base_name(self) -> str:
+        """Channel name(s) only, with any size restriction stripped.
+
+        This is what goes in the manifest as `primary_name`, so a size-restricted
+        run still MATCHES the pairing of its unrestricted sibling and the two are
+        separated by the recorded program instead. Folding the threshold into the
+        pairing name would make the restricted run invisible to a pairing lookup.
+        """
+        if self.primary_is_recipe:
+            program, _ = self._recipe_program()
+            names = []
+            for st in program:
+                for key in ("channel", "channel_b"):
+                    ch = st.get(key)
+                    if ch:
+                        names.append(str(ch).split("_", 2)[-1])
+            return "_and_".join(dict.fromkeys(names)) or "recipe"
+        if self.primary_is_overlap:
+            names = [c.split("_", 2)[-1] for c in self.intersect_inputs]
+            return "_and_".join(names[:2]) if len(names) > 1 else "overlap"
+        return str(self.cb_primary.currentData() or "").split("_", 2)[-1]
+
     def _primary_display(self) -> str:
-        """Biological name of whatever is being randomised."""
+        """Name for the run FOLDER, which does include the size restriction."""
+        if self.primary_is_recipe:
+            label = self._recipe_program()[1] or "recipe"
+            label = label.replace(" & ", "_and_").replace(" >", "_gt").replace(">", "gt")
+            return "".join(c if c.isalnum() or c in "-_." else "_" for c in label)
         if self.primary_is_overlap:
             names = [c.split("_", 2)[-1] for c in self.intersect_inputs]
             return "_and_".join(names[:2]) if len(names) > 1 else "overlap"
@@ -549,6 +688,8 @@ class SpatialNullDialog(QDialog):
         self.cb_domain.currentIndexChanged.connect(self._domain_help)
         self.cb_direction.currentIndexChanged.connect(self._refresh_name)
         self.cb_primary.currentIndexChanged.connect(self._check_partner)
+        self.cb_primary.currentIndexChanged.connect(self._refresh_program)
+        self.cb_primary.currentIndexChanged.connect(self._refresh_name)
         self.cb_partner.currentIndexChanged.connect(self._check_partner)
         for widget in (self.cb_primary, self.cb_partner, self.cb_domain):
             widget.currentIndexChanged.connect(self._refresh_name)
@@ -560,6 +701,7 @@ class SpatialNullDialog(QDialog):
 
         self._domain_help()
         self._check_partner()
+        self._refresh_program()
         self._refresh_name()
         self._show_existing_runs()
         self._qc_estimate()
@@ -586,7 +728,7 @@ class SpatialNullDialog(QDialog):
             name = suggest_run_name(
                 self.null_root,
                 primary=("Channel_x_" + self._primary_display()
-                         if self.primary_is_overlap
+                         if (self.primary_is_overlap or self.primary_is_recipe)
                          else self.cb_primary.currentText()),
                 partner=None if partner.startswith("None") else partner,
                 domain_choice=str(self.cb_domain.currentData() or "hull"),
@@ -652,10 +794,19 @@ class SpatialNullDialog(QDialog):
     def parameters(self) -> Dict[str, Any]:
         partner = self.cb_partner.currentText()
         return {
-            "primary_channel": (None if self.primary_is_overlap
+            "primary_channel": (None if (self.primary_is_overlap
+                                        or self.primary_is_recipe)
                                 else self.cb_primary.currentData()),
             "primary_is_overlap": self.primary_is_overlap,
+            "primary_is_recipe": self.primary_is_recipe,
+            "primary_recipe": (self._recipe_program()[0]
+                               if self.primary_is_recipe else None),
+            "primary_program_label": (
+                " -> ".join(_describe_program_step(st)
+                            for st in self._recipe_program()[0])
+                if self.primary_is_recipe else ""),
             "primary_display": self._primary_display(),
+            "primary_base_name": self._primary_base_name(),
             "intersection_spec": ({
                 "a_channel": self.intersect_inputs[0],
                 "b_channel": self.intersect_inputs[1],
@@ -698,7 +849,15 @@ class SpatialNullDialog(QDialog):
         from .runner import RunParameters, jobs_from_registry, run_project
 
         p = self.parameters()
-        if not p["primary_channel"] and not p["intersection_spec"]:
+        if p["primary_is_recipe"] and not p["primary_recipe"]:
+            QMessageBox.warning(
+                self, "Recipe not usable",
+                "The recipe's filter step has no channel or intersection before "
+                "it, so there is nothing to filter. Add one, or randomise a "
+                "channel directly.")
+            return
+        if (not p["primary_channel"] and not p["intersection_spec"]
+                and not p["primary_recipe"]):
             QMessageBox.warning(self, "Nothing selected",
                                 "Choose a channel, or the recipe's overlap, to "
                                 "randomise.")
@@ -756,6 +915,7 @@ class SpatialNullDialog(QDialog):
             measure_from=p["measure_from"],
             statistic_direction=p["statistic_direction"],
             seed=p["seed"], roi_name=p["roi_name"], run_name=run_name,
+            primary_program=p["primary_program_label"],
             keep_first_draw=False, also_csv=p["also_csv"],
             n_qc_images=p["n_qc_images"],
             qc_annotate_distances=p["qc_annotate_distances"])
@@ -767,6 +927,7 @@ class SpatialNullDialog(QDialog):
                 p["partner_channel"],
                 domain_a_channel=dom_a, domain_b_channel=dom_b,
                 primary_intersection=p["intersection_spec"],
+                primary_recipe=p["primary_recipe"],
                 roi_name=p["roi_name"])
         except Exception as exc:
             QMessageBox.critical(self, "Run failed", str(exc))
@@ -785,8 +946,10 @@ class SpatialNullDialog(QDialog):
                                    parent=self)
         worker = _NullWorker(
             jobs, params, out_dir, os.path.basename(self.project_root),
+            # The pairing uses the base channel name; the program string carries
+            # the size restriction (see _primary_base_name).
             {"primary": (p["primary_channel"]
-                         or f"Channel_x_{p['primary_display']}"),
+                         or f"Channel_x_{p['primary_base_name']}"),
              "partner": p["partner_channel"],
              "domain_choice": p["domain_choice"]})
 

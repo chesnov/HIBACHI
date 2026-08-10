@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import os
 import traceback
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -171,14 +171,20 @@ class SampleJob:
     # When the objects to randomise are an OVERLAP rather than a channel. The
     # intersection is recomputed here from the two segmentations, so the spatial
     # null does not depend on a relational batch having been run first.
-    primary_kind: str = "channel"            # 'channel' | 'intersection'
+    primary_kind: str = "channel"     # 'channel' | 'intersection' | 'recipe'
     intersect_a_path: Optional[str] = None
     intersect_b_path: Optional[str] = None
     intersect_label_mode: str = "connected"
     intersect_preserve_ids: bool = False
+    # A resolved chain of mask-producing recipe steps. When present it takes
+    # precedence, so "intersect then size-filter" is expressible without the
+    # runner needing a special case per combination.
+    primary_steps: List[Dict[str, Any]] = field(default_factory=list)
 
     def load_primary(self) -> np.ndarray:
-        """The objects to randomise, whether a channel or a computed overlap."""
+        """The objects to randomise: a channel, an overlap, or a recipe result."""
+        if self.primary_steps:
+            return evaluate_primary_steps(self)
         if self.primary_kind != "intersection":
             return self.load(self.primary_path)
         a = self.load(self.intersect_a_path)
@@ -246,6 +252,94 @@ def intersection_labels(a: np.ndarray, b: np.ndarray,
             out > 0, structure=ndimage.generate_binary_structure(a.ndim, a.ndim))
         return labelled.astype(np.int32)
     return out
+
+
+def _describe_step(step: Dict[str, Any]) -> str:
+    """Short human description of one resolved primary step, for the log."""
+    kind = step.get("type")
+    if kind == "channel":
+        return "channel"
+    if kind == "intersect":
+        return f"intersect({step.get('label_mode') or 'connected'})"
+    if kind == "filter":
+        lo = step.get("min_size") or 0
+        hi = step.get("max_size")
+        return f"filter(>={lo:g}" + (f", <={hi:g})" if hi else ")")
+    return str(kind)
+
+
+def filter_labels_by_size(labels: np.ndarray,
+                          spacing: Sequence[float],
+                          min_size: float = 0.0,
+                          max_size: Optional[float] = None) -> np.ndarray:
+    """Keep objects within a physical size range, relabelled 1..N.
+
+    Mirrors `RelationalEngine.filter_by_volume`, including its one surprising
+    behaviour: the incoming labels are DISCARDED and connected components
+    re-derived from the binary mask, so objects that touch are merged before the
+    size test. Reproducing that matters -- if this filtered differently from the
+    recipe step, the randomised population would not be the population the
+    recipe's own analysis reports on.
+
+    `min_size`/`max_size` are um^2 in 2D and um^3 in 3D, matching the recipe's
+    "Min Volume" prompt.
+    """
+    struct = ndimage.generate_binary_structure(labels.ndim, labels.ndim)
+    comps, _ = ndimage.label(labels > 0, structure=struct)
+    if comps.max() == 0:
+        return np.zeros_like(labels, dtype=np.int32)
+
+    unit = float(np.prod(spacing))
+    counts = np.bincount(comps.reshape(-1))
+    sizes = counts * unit
+
+    keep = np.zeros(counts.size, dtype=bool)
+    keep[1:] = sizes[1:] >= float(min_size)
+    if max_size is not None:
+        keep[1:] &= sizes[1:] <= float(max_size)
+
+    # Sequential relabelling, as the recipe does after a volume filter.
+    lut = np.zeros(counts.size, dtype=np.int32)
+    lut[np.flatnonzero(keep)] = np.arange(1, int(keep.sum()) + 1, dtype=np.int32)
+    return lut[comps]
+
+
+def evaluate_primary_steps(job: "SampleJob") -> np.ndarray:
+    """Build the objects to randomise by walking a resolved recipe program.
+
+    Each step consumes the previous result, exactly as the cross-channel recipe
+    does, so a chain such as "intersect pS129 with MAP2, then keep objects above
+    2 um^2" produces the same population the recipe would.
+
+    Steps (paths already resolved when the job was built):
+        {'type': 'channel',   'path': ...}
+        {'type': 'intersect', 'path_a':, 'path_b':, 'label_mode':, 'preserve_ids':}
+        {'type': 'filter',    'min_size':, 'max_size': (optional)}
+    """
+    current = None
+    for step in job.primary_steps:
+        kind = step.get("type")
+        if kind == "channel":
+            current = job.load(step["path"])
+        elif kind == "intersect":
+            a = job.load(step["path_a"]) if step.get("path_a") else current
+            b = job.load(step["path_b"])
+            if a is None:
+                raise ValueError("intersect step has no first input")
+            current = intersection_labels(a, b,
+                                          step.get("label_mode") or "connected",
+                                          bool(step.get("preserve_ids")))
+        elif kind == "filter":
+            if current is None:
+                raise ValueError("filter step has nothing to filter")
+            current = filter_labels_by_size(current, job.spacing,
+                                            float(step.get("min_size") or 0.0),
+                                            step.get("max_size"))
+        else:
+            raise ValueError(f"unsupported primary step {kind!r}")
+    if current is None:
+        raise ValueError("empty primary program")
+    return current
 
 
 def _parent_domain(job: "SampleJob", choice: str):
@@ -328,6 +422,9 @@ class RunParameters:
     # Names this pairing on disk, so a project can hold many: randomise A
     # against C, randomise B against C, randomise A inside B, and so on.
     run_name: str = ""
+    # Human-readable summary of the recipe program that produced the randomised
+    # objects, e.g. "pS129 -> filter(>=2 um^2)". Stored in the manifest.
+    primary_program: str = ""
 
     def as_dict(self) -> Dict[str, Any]:
         return dict(self.__dict__)
@@ -382,6 +479,10 @@ def run_project(jobs: Sequence[SampleJob],
                 + ("the two channels do not overlap" if job.primary_kind ==
                    "intersection" else "no objects") + "; skipped.")
             continue
+        if job.primary_kind == "recipe":
+            log(f"  [{job.sample}] recipe program gives "
+                f"{int(np.unique(primary[primary > 0]).size)} object(s): "
+                + " -> ".join(_describe_step(st) for st in job.primary_steps))
         if job.primary_kind == "intersection":
             log(f"  [{job.sample}] overlap gives "
                 f"{int(np.unique(primary[primary > 0]).size)} object(s) "
@@ -594,7 +695,12 @@ def run_project(jobs: Sequence[SampleJob],
             parameters=params.as_dict(), grid_info=grid_info,
             channels=channels, n_images=len(results),
             run_name=params.run_name,
-            extra={"domain_source": "+".join(realised) or None})
+            extra={"domain_source": "+".join(realised) or None,
+                   # Recording the program makes a size threshold part of the
+                   # null's definition rather than an undocumented choice, and
+                   # lets the loader tell two otherwise-identical runs apart.
+                   "primary_program": params.primary_program or None,
+                   "primary_kind": (jobs[0].primary_kind if jobs else None)})
         written = write_project_export(
             out_dir, manifest, metadata, observed, nulls, curves,
             also_csv=params.also_csv,
@@ -739,6 +845,7 @@ def jobs_from_registry(sample_registry: Dict[str, Dict[str, str]],
                        domain_a_channel: Optional[str] = None,
                        domain_b_channel: Optional[str] = None,
                        primary_intersection: Optional[Dict[str, Any]] = None,
+                       primary_recipe: Optional[Sequence[Dict[str, Any]]] = None,
                        roi_name: Optional[str] = None,
                        geometry_for: Optional[Callable[[Dict[str, str], Optional[str]],
                                                        Tuple[Any, Any]]] = None,
@@ -752,9 +859,22 @@ def jobs_from_registry(sample_registry: Dict[str, Dict[str, str]],
     jobs: List[SampleJob] = []
     spec = primary_intersection or {}
     a_ch, b_ch = spec.get("a_channel"), spec.get("b_channel")
+    recipe = list(primary_recipe or [])
+    # Channels the program needs, so a sample missing any of them is skipped
+    # rather than failing mid-run.
+    recipe_channels = [c for st in recipe
+                       for c in (st.get("channel"), st.get("channel_b"))
+                       if c]
 
     for sample, channels in sample_registry.items():
-        if spec:
+        if recipe:
+            missing = [c for c in recipe_channels if c not in channels]
+            if missing:
+                log(f"  [{sample}] recipe needs channel(s) "
+                    f"{', '.join(missing)}; skipped.")
+                continue
+            primary_dir = channels[recipe_channels[0]]
+        elif spec:
             if a_ch not in channels or b_ch not in channels:
                 log(f"  [{sample}] missing one of the intersection channels "
                     f"({a_ch}, {b_ch}); skipped.")
@@ -777,7 +897,37 @@ def jobs_from_registry(sample_registry: Dict[str, Dict[str, str]],
         def _seg_for(ch, folder):
             return find_final_segmentation(folder, roi_name)
 
-        if spec:
+        if recipe:
+            a_path = b_path = None
+            resolved, ok = [], True
+            for st in recipe:
+                out = dict(st)
+                for key, ch_key in (("path", "channel"), ("path_a", "channel"),
+                                    ("path_b", "channel_b")):
+                    ch = st.get(ch_key)
+                    if not ch:
+                        continue
+                    seg = _seg_for(ch, channels[ch])
+                    if not seg:
+                        log(f"  [{sample}] no final segmentation for {ch}; skipped.")
+                        ok = False
+                        break
+                    if st.get("type") == "channel" and key == "path":
+                        out["path"] = seg
+                    elif st.get("type") == "intersect" and key in ("path_a", "path_b"):
+                        out[key] = seg
+                if not ok:
+                    break
+                out.pop("channel", None)
+                out.pop("channel_b", None)
+                resolved.append(out)
+            if not ok:
+                continue
+            primary_path = next((r.get("path") or r.get("path_a")
+                                 for r in resolved if r.get("path") or r.get("path_a")),
+                                None)
+        elif spec:
+            resolved = []
             a_path = _seg_for(a_ch, channels[a_ch])
             b_path = _seg_for(b_ch, channels[b_ch])
             if not a_path or not b_path:
@@ -786,6 +936,7 @@ def jobs_from_registry(sample_registry: Dict[str, Dict[str, str]],
                 continue
             primary_path = a_path
         else:
+            resolved = []
             a_path = b_path = None
             primary_path = find_final_segmentation(primary_dir, roi_name)
             if not primary_path:
@@ -820,7 +971,9 @@ def jobs_from_registry(sample_registry: Dict[str, Dict[str, str]],
             primary_dir=primary_dir, mode=_mode_of(primary_dir), roi_crop=crop,
             domain_a_path=_seg(domain_a_channel),
             domain_b_path=_seg(domain_b_channel),
-            primary_kind=("intersection" if spec else "channel"),
+            primary_kind=("recipe" if recipe else
+                          "intersection" if spec else "channel"),
+            primary_steps=resolved,
             intersect_a_path=a_path, intersect_b_path=b_path,
             intersect_label_mode=str(spec.get("label_mode") or "connected"),
             intersect_preserve_ids=bool(spec.get("preserve_ids"))))
