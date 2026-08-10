@@ -83,6 +83,7 @@ __all__ = [
     "cross_distance_field", "nearest_cross_distances",
     "f_function", "g_function", "sup_norm_signed",
     "monte_carlo_null", "derive_f_grid", "f_grid_probe", "nearest_cross_pairs",
+    "MEASURE_FROM_CHOICES",
     "describe_within_project", "SDI_INTERPRETATION",
 ]
 
@@ -958,6 +959,11 @@ class NullResult:
     diagnostics: Dict[str, Any] = field(default_factory=dict)
     observed_objects: Optional[pd.DataFrame] = None
     null_objects: Optional[pd.DataFrame] = None
+    # The reverse direction: one row per FIXED partner object, holding its
+    # distance to the nearest randomised object. The partner set never moves, so
+    # `partner_label` is stable across draws and directly joinable.
+    observed_partners: Optional[pd.DataFrame] = None
+    null_partners: Optional[pd.DataFrame] = None
     f_curves: Dict[str, np.ndarray] = field(default_factory=dict)
     first_draw_labels: Optional[np.ndarray] = None
 
@@ -978,7 +984,19 @@ SDI_INTERPRETATION = {
     "F": "low = regular/evenly spread, high = clustered",
     "G": "low = clustered, high = regular/evenly spread",
     "cross": "low = closer to the partner than chance, high = farther",
+    "cross_primary": ("per randomised object -> nearest fixed partner; "
+                      "low = closer than chance"),
+    "cross_partner": ("per fixed partner -> nearest randomised object; "
+                      "low = closer than chance"),
 }
+
+# Which objects the cross-distance is measured FROM. These are different
+# quantities, not two views of one: "median over aggregates of the distance to
+# the nearest microglia" is not "median over microglia of the distance to the
+# nearest aggregate" -- they weight by different populations and differ whenever
+# the two counts differ. Both are computed by default so one run serves either
+# framing, and the choice of which drives the reported index is explicit.
+MEASURE_FROM_CHOICES = ("primary", "partner", "both")
 
 
 def _object_centroids_um(labels: np.ndarray,
@@ -1012,6 +1030,8 @@ def monte_carlo_null(labels: np.ndarray,
                      compute_f: bool = True,
                      compute_g: bool = True,
                      cross_statistic: str = "median",
+                     measure_from: str = "both",
+                     statistic_direction: str = "primary",
                      keep_first_draw: bool = True,
                      max_attempts: int = 2000,
                      record_centroids: bool = True,
@@ -1070,17 +1090,26 @@ def monte_carlo_null(labels: np.ndarray,
     d["per_parent_containment"] = bool(per_parent_containment)
 
     # ---- observed ----------------------------------------------------------
+    if measure_from not in MEASURE_FROM_CHOICES:
+        raise ValueError(f"measure_from must be one of {MEASURE_FROM_CHOICES}")
+    want_primary = measure_from in ("primary", "both")
+    want_partner = measure_from in ("partner", "both")
+    d["measure_from"] = measure_from
+    d["statistic_direction"] = statistic_direction
+
     # Indices are only needed when QC images will be drawn, and they roughly
     # double the transform's memory, so they are requested conditionally.
+    want_qc = bool(n_qc_draws > 0 and qc_hook is not None)
     cross_indices = None
-    if partner_labels is not None:
-        if n_qc_draws > 0 and qc_hook is not None:
+    cross_field = None
+    if partner_labels is not None and want_primary:
+        # Distance to the nearest PARTNER surface. Fixed across draws, so this is
+        # computed once for the whole sample.
+        if want_qc and statistic_direction == "primary":
             cross_field, cross_indices = cross_distance_field(
                 partner_labels, spacing, return_indices=True)
         else:
             cross_field = cross_distance_field(partner_labels, spacing)
-    else:
-        cross_field = None
 
     obs_values = np.unique(labels[labels > 0])
     obs_sizes = _object_sizes(labels)
@@ -1096,8 +1125,8 @@ def monte_carlo_null(labels: np.ndarray,
 
     obs: Dict[str, np.ndarray] = {}
     if cross_field is not None:
-        obs["cross"] = nearest_cross_distances(labels, cross_field)
-        obs_frame["cross_um"] = obs["cross"].astype(np.float32)
+        obs["cross_primary"] = nearest_cross_distances(labels, cross_field)
+        obs_frame["cross_um"] = obs["cross_primary"].astype(np.float32)
     if compute_g:
         obs["G"] = g_function(labels, spacing)
     if compute_f:
@@ -1108,6 +1137,30 @@ def monte_carlo_null(labels: np.ndarray,
                 [obs_cent.get(int(v), (np.nan,) * labels.ndim)[ax]
                  for v in obs_values], dtype=np.float32)
     result.observed_objects = pd.DataFrame(obs_frame)
+
+    partner_values = (np.unique(partner_labels[partner_labels > 0])
+                      if partner_labels is not None else np.empty(0, dtype=int))
+    if partner_labels is not None and want_partner and partner_values.size:
+        # The primary MOVES, so this field must be rebuilt every draw. Computed
+        # here for the observed arrangement.
+        obs_primary_field = cross_distance_field(labels, spacing)
+        obs["cross_partner"] = nearest_cross_distances(partner_labels,
+                                                       obs_primary_field)
+        p_sizes = _object_sizes(partner_labels)
+        p_frame: Dict[str, Any] = {
+            "partner_label": partner_values.astype(np.int32),
+            "voxels": np.array([p_sizes.get(int(v), 0) for v in partner_values],
+                               dtype=np.int32),
+            "to_primary_um": obs["cross_partner"].astype(np.float32),
+        }
+        p_frame["physical_size"] = p_frame["voxels"] * unit
+        if record_centroids:
+            p_cent = _object_centroids_um(partner_labels, spacing)
+            for ax, name in enumerate(_axis_names(labels.ndim)):
+                p_frame[f"centroid_{name}_um"] = np.array(
+                    [p_cent.get(int(v), (np.nan,) * labels.ndim)[ax]
+                     for v in partner_values], dtype=np.float32)
+        result.observed_partners = pd.DataFrame(p_frame)
 
     # G is per object but its length can differ from the object count when an
     # object has no Voronoi neighbour; join on the labels it was computed for.
@@ -1122,6 +1175,9 @@ def monte_carlo_null(labels: np.ndarray,
     test_F: List[np.ndarray] = []
     ref_scalar: List[float] = []
     test_scalar: List[float] = []
+    ref_scalar_p: List[float] = []
+    test_scalar_p: List[float] = []
+    partner_chunks: List[pd.DataFrame] = []
     ref_G: List[np.ndarray] = []
     test_G: List[np.ndarray] = []
     null_chunks: List[pd.DataFrame] = []
@@ -1155,20 +1211,10 @@ def monte_carlo_null(labels: np.ndarray,
         if i == 0 and keep_first_draw:
             result.first_draw_labels = pr.labels
 
-        # Render QC straight away rather than accumulating label arrays: holding
-        # 199 copies of a 3D volume would be gigabytes.
-        if qc_hook is not None and i < n_qc_draws:
-            pairs = (nearest_cross_pairs(pr.labels, cross_field, cross_indices,
-                                         spacing)
-                     if cross_field is not None else [])
-            try:
-                qc_hook(draw_index=i,
-                        set_index=0 if i < n_reference else 1,
-                        labels=pr.labels, pairs=pairs)
-            except Exception as exc:                  # QC must never kill a run
-                d.setdefault("qc_errors", 0)
-                d["qc_errors"] = int(d["qc_errors"]) + 1
-                d["qc_last_error"] = str(exc)
+        # Initialised unconditionally: the QC block below reads them, and they
+        # stay None whenever the reverse direction is not being computed.
+        draw_primary_field = None
+        draw_primary_indices = None
 
         vals = np.unique(pr.labels[pr.labels > 0])
         chunk: Dict[str, Any] = {
@@ -1185,6 +1231,25 @@ def monte_carlo_null(labels: np.ndarray,
             cd = nearest_cross_distances(pr.labels, cross_field)
             chunk["cross_um"] = cd.astype(np.float32)
             (ref_scalar if i < n_reference else test_scalar).append(_scalar(cd))
+
+        # Reverse direction. One extra distance transform per draw, because the
+        # primary has moved and the field must be rebuilt.
+        if partner_labels is not None and want_partner and partner_values.size:
+            if want_qc and i < n_qc_draws and statistic_direction == "partner":
+                draw_primary_field, draw_primary_indices = cross_distance_field(
+                    pr.labels, spacing, return_indices=True)
+            else:
+                draw_primary_field = cross_distance_field(pr.labels, spacing)
+            pd_dist = nearest_cross_distances(partner_labels, draw_primary_field)
+            (ref_scalar_p if i < n_reference else test_scalar_p).append(
+                _scalar(pd_dist))
+            partner_chunks.append(pd.DataFrame({
+                "draw": np.full(partner_values.size, i, dtype=np.int16),
+                "set": np.full(partner_values.size,
+                               0 if i < n_reference else 1, dtype=np.int8),
+                "partner_label": partner_values.astype(np.int32),
+                "to_primary_um": pd_dist.astype(np.float32),
+            }))
         if compute_g:
             gd = g_function(pr.labels, spacing)
             (ref_G if i < n_reference else test_G).append(gd)
@@ -1199,10 +1264,38 @@ def monte_carlo_null(labels: np.ndarray,
                     [pr.centroids.get(int(v), (np.nan,) * labels.ndim)[ax]
                      for v in vals], dtype=np.float32)
 
+        # QC is rendered here, once BOTH directions exist: it draws the segments
+        # for whichever direction is being reported, and the reverse field is
+        # only built above. Rendering immediately rather than accumulating label
+        # arrays matters too -- holding 199 copies of a 3D volume would be
+        # gigabytes.
+        if qc_hook is not None and i < n_qc_draws:
+            if statistic_direction == "partner" and draw_primary_field is not None:
+                # Segments drawn FROM the fixed partners, matching the reported
+                # statistic. Drawing the other direction would show measurements
+                # the numbers are not based on.
+                pairs = nearest_cross_pairs(partner_labels, draw_primary_field,
+                                            draw_primary_indices, spacing)
+            elif cross_field is not None:
+                pairs = nearest_cross_pairs(pr.labels, cross_field,
+                                            cross_indices, spacing)
+            else:
+                pairs = []
+            try:
+                qc_hook(draw_index=i,
+                        set_index=0 if i < n_reference else 1,
+                        labels=pr.labels, pairs=pairs)
+            except Exception as exc:                  # QC must never kill a run
+                d.setdefault("qc_errors", 0)
+                d["qc_errors"] = int(d["qc_errors"]) + 1
+                d["qc_last_error"] = str(exc)
+
         null_chunks.append(pd.DataFrame(chunk))
 
     result.null_objects = (pd.concat(null_chunks, ignore_index=True)
                            if null_chunks else pd.DataFrame())
+    result.null_partners = (pd.concat(partner_chunks, ignore_index=True)
+                            if partner_chunks else pd.DataFrame())
 
     d["orientation_acceptance_rate"] = float(o_acc / o_att) if o_att else float("nan")
     d["mean_unplaced_per_draw"] = float(failed_total / max(1, total))
@@ -1215,24 +1308,42 @@ def monte_carlo_null(labels: np.ndarray,
     d["placement_warning"] = bool(incomplete)
 
     # ---- indices -----------------------------------------------------------
-    if cross_field is not None:
-        obs_s = _scalar(obs["cross"])
-        ref_arr = np.asarray(ref_scalar, dtype=float)
-        result.statistics[f"cross_{cross_statistic}_observed"] = obs_s
-        result.statistics[f"cross_{cross_statistic}_null"] = (
+    def _record_direction(key: str, observed_values: np.ndarray,
+                          ref_list: List[float], test_list: List[float]):
+        obs_s = _scalar(observed_values)
+        ref_arr = np.asarray(ref_list, dtype=float)
+        result.statistics[f"{key}_{cross_statistic}_observed"] = obs_s
+        result.statistics[f"{key}_{cross_statistic}_null"] = (
             float(np.nanmedian(ref_arr)) if ref_arr.size else float("nan"))
-        result.statistics["cross_effect_um"] = (
+        result.statistics[f"{key}_effect_um"] = (
             float(np.nanmedian(ref_arr)) - obs_s if ref_arr.size else float("nan"))
         sd = float(np.nanstd(ref_arr, ddof=1)) if ref_arr.size > 1 else np.nan
         # Standardised alongside the microns: the same shift against a tight
         # null is far stronger evidence than against a wide one, and pooling
         # raw microns across images weights them as if it were not.
-        result.statistics["cross_effect_z"] = (
+        result.statistics[f"{key}_effect_z"] = (
             (float(np.nanmean(ref_arr)) - obs_s) / sd
             if np.isfinite(sd) and sd > 0 else np.nan)
-        result.statistics["cross_null_sd_um"] = sd
-        result.sdi["cross"] = 1.0 - _mid_p_rank(
-            obs_s, np.asarray(test_scalar, dtype=float))
+        result.statistics[f"{key}_null_sd_um"] = sd
+        result.sdi[key] = 1.0 - _mid_p_rank(
+            obs_s, np.asarray(test_list, dtype=float))
+
+    if cross_field is not None and "cross_primary" in obs:
+        _record_direction("cross_primary", obs["cross_primary"],
+                          ref_scalar, test_scalar)
+    if "cross_partner" in obs:
+        _record_direction("cross_partner", obs["cross_partner"],
+                          ref_scalar_p, test_scalar_p)
+
+    # `cross` is an alias for the direction chosen at computation time, so the
+    # headline column keeps a stable name whichever direction is in use.
+    alias = f"cross_{statistic_direction}"
+    if alias in result.sdi:
+        result.sdi["cross"] = result.sdi[alias]
+        for suffix in ("effect_um", "effect_z", "null_sd_um"):
+            if f"{alias}_{suffix}" in result.statistics:
+                result.statistics[f"cross_{suffix}"] = \
+                    result.statistics[f"{alias}_{suffix}"]
 
     if compute_g and ref_G:
         grid_g = _quantile_grid(

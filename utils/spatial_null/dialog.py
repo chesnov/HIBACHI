@@ -384,6 +384,32 @@ class SpatialNullDialog(QDialog):
             "significance.")
         nf.addRow("Test draws:", self.sp_test)
 
+        # Direction is a computation-time choice because the two are different
+        # quantities, not two views of one.
+        self.cb_direction = QComboBox()
+        self.cb_direction.addItem(
+            "From the randomised objects → nearest partner", "primary")
+        self.cb_direction.addItem(
+            "From the fixed partner → nearest randomised object", "partner")
+        self.cb_direction.setToolTip(
+            "Which population the distances are summarised over.\n\n"
+            "'From the randomised objects' answers e.g. 'how far is each "
+            "aggregate from the nearest microglia'.\n"
+            "'From the fixed partner' answers 'how far is each microglia from "
+            "the nearest aggregate'.\n\n"
+            "These differ whenever the two counts differ. Both are computed and "
+            "exported either way; this picks the one reported here and drawn in "
+            "the QC images.")
+        nf.addRow("Measure distances:", self.cb_direction)
+
+        self.chk_both = QCheckBox("Also export the opposite direction")
+        self.chk_both.setChecked(True)
+        self.chk_both.setToolTip(
+            "Costs one extra distance transform per draw, and means the "
+            "direction can be changed later without recomputing. Untick only if "
+            "runtime matters and you are certain of the direction.")
+        nf.addRow(self.chk_both)
+
         self.cb_stat = QComboBox()
         self.cb_stat.addItems(["median", "mean", "min"])
         self.cb_stat.setToolTip(
@@ -521,6 +547,7 @@ class SpatialNullDialog(QDialog):
     def _wire_signals(self):
         """Connect signals and prime derived labels. Call once, last."""
         self.cb_domain.currentIndexChanged.connect(self._domain_help)
+        self.cb_direction.currentIndexChanged.connect(self._refresh_name)
         self.cb_primary.currentIndexChanged.connect(self._check_partner)
         self.cb_partner.currentIndexChanged.connect(self._check_partner)
         for widget in (self.cb_primary, self.cb_partner, self.cb_domain):
@@ -544,6 +571,10 @@ class SpatialNullDialog(QDialog):
     def _on_name_edited(self, _text):
         self._name_edited = True
 
+    def _direction_tag(self) -> str:
+        return ("to" if str(self.cb_direction.currentData() or "primary")
+                == "primary" else "from")
+
     def _refresh_name(self, *_):
         """Re-derive the default name, unless the user has typed their own."""
         if self._name_edited:
@@ -559,7 +590,8 @@ class SpatialNullDialog(QDialog):
                          else self.cb_primary.currentText()),
                 partner=None if partner.startswith("None") else partner,
                 domain_choice=str(self.cb_domain.currentData() or "hull"),
-                roi_name=self.roi_name)
+                roi_name=self.roi_name,
+                direction=str(self.cb_direction.currentData() or "primary"))
         except Exception:
             name = "01"
         self.le_name.setText(name)
@@ -642,6 +674,9 @@ class SpatialNullDialog(QDialog):
             "n_reference": int(self.sp_ref.value()),
             "n_test": int(self.sp_test.value()),
             "cross_statistic": self.cb_stat.currentText(),
+            "statistic_direction": str(self.cb_direction.currentData() or "primary"),
+            "measure_from": ("both" if self.chk_both.isChecked()
+                             else str(self.cb_direction.currentData() or "primary")),
             "compute_f": self.chk_f.isChecked(),
             "compute_g": self.chk_g.isChecked(),
             "seed": int(self.sp_seed.value()),
@@ -718,6 +753,8 @@ class SpatialNullDialog(QDialog):
             per_parent_containment=p["per_parent_containment"],
             erode_um=p["erode_um"], compute_f=p["compute_f"],
             compute_g=p["compute_g"], cross_statistic=p["cross_statistic"],
+            measure_from=p["measure_from"],
+            statistic_direction=p["statistic_direction"],
             seed=p["seed"], roi_name=p["roi_name"], run_name=run_name,
             keep_first_draw=False, also_csv=p["also_csv"],
             n_qc_images=p["n_qc_images"],

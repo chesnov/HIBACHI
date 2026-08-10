@@ -22,11 +22,21 @@ WHAT MAKES THAT POSSIBLE
     observed data alone would give a statistic with no null to compare against.
 
 ARTIFACTS (per project, ~30-40 MB for 20 images x 200 objects x 398 draws)
-    manifest.json         schema version, parameters, comparability key
-    image_metadata.csv    one row per image: geometry, diagnostics, indices
-    observed_objects.csv  one row per real object
-    null_objects.npz      one row per (image, draw, object) -- the bulk
-    f_curves.npz          F CDFs on the run's shared grid
+    manifest.json          schema version, parameters, comparability key
+    image_metadata.csv     one row per image: geometry, diagnostics, indices
+    observed_objects.csv   one row per real randomised-channel object
+    null_objects.npz       one row per (image, draw, object) -- the bulk
+    observed_partners.csv  one row per fixed partner object (reverse direction)
+    null_partners.npz      one row per (image, draw, partner) -- reverse bulk
+    f_curves.npz           F CDFs on the run's shared grid
+
+DIRECTION
+    Cross-distances are exported BOTH ways, because they are different
+    quantities rather than two views of one: the median over aggregates of the
+    distance to the nearest microglia is not the median over microglia of the
+    distance to the nearest aggregate -- they weight by different populations
+    and diverge whenever the two counts differ. Exporting both means one run
+    serves either framing and the choice can be revisited without recomputing.
 
 FORMAT
     `.npz` for the bulk arrays and `.csv` for the small tables. Deliberately no
@@ -66,6 +76,10 @@ COMPARABILITY_KEY = (
     "min_separation_um",
     "distance_semantics",
     "cross_statistic",
+    # Which directions the run actually contains. A soft key: when one run has
+    # both directions and another only one, pooling the direction they share is
+    # perfectly valid, so the loader warns and lets the caller proceed.
+    "measure_from",
     # The PAIRING. Pooling "randomise A against C" from one replicate with
     # "randomise B against C" from another is meaningless, and nothing else in
     # the key would catch it. Biological names rather than channel keys, because
@@ -83,7 +97,7 @@ COMPARABILITY_KEY = (
 # monotone, bounded on [0,1] and sampled densely, so linear interpolation onto
 # a common grid is lossless well below any meaningful difference. Treated as a
 # warning by the loader, not a refusal.
-SOFT_KEYS = ("f_grid_max_um", "f_grid_points")
+SOFT_KEYS = ("f_grid_max_um", "f_grid_points", "measure_from")
 
 _NULL_COLUMNS_MIN = ("image_id", "draw", "set", "template_label", "voxels")
 
@@ -132,6 +146,7 @@ def build_manifest(project_name: str,
     man.update({k: parameters.get(k) for k in (
         "rotate", "hardcore", "min_separation_um", "cross_statistic",
         "n_reference", "n_test", "seed", "use_hull",
+        "measure_from", "statistic_direction",
         "roi_name", "erode_um", "compute_f", "compute_g", "max_attempts")})
     man.update({k: grid_info.get(k) for k in
                 ("f_grid_max_um", "f_grid_raw_max_um", "f_grid_points")})
@@ -147,7 +162,10 @@ def write_project_export(out_dir: str,
                          observed_objects: pd.DataFrame,
                          null_objects: pd.DataFrame,
                          f_curves: Optional[Dict[str, Any]] = None,
-                         also_csv: bool = False) -> Dict[str, str]:
+                         also_csv: bool = False,
+                         observed_partners: Optional[pd.DataFrame] = None,
+                         null_partners: Optional[pd.DataFrame] = None
+                         ) -> Dict[str, str]:
     """Write the five artifacts. Returns {artifact: path}."""
     os.makedirs(out_dir, exist_ok=True)
     written: Dict[str, str] = {}
@@ -183,6 +201,26 @@ def write_project_export(out_dir: str,
         q = os.path.join(out_dir, "null_objects.csv.gz")
         null_objects.to_csv(q, index=False, compression="gzip")
         written["null_objects_csv"] = q
+
+    if observed_partners is not None and not observed_partners.empty:
+        p = os.path.join(out_dir, "observed_partners.csv")
+        observed_partners.to_csv(p, index=False)
+        written["observed_partners"] = p
+
+    if null_partners is not None and not null_partners.empty:
+        p = os.path.join(out_dir, "null_partners.npz")
+        payload = {}
+        for c in null_partners.columns:
+            col = null_partners[c].to_numpy()
+            if col.dtype == object:
+                col = col.astype(str)
+            payload[c] = col
+        np.savez_compressed(p, **payload)
+        written["null_partners"] = p
+        if also_csv:
+            q = os.path.join(out_dir, "null_partners.csv.gz")
+            null_partners.to_csv(q, index=False, compression="gzip")
+            written["null_partners_csv"] = q
 
     if f_curves:
         p = os.path.join(out_dir, "f_curves.npz")
@@ -232,6 +270,22 @@ def concat_null_frames(frames: Iterable[pd.DataFrame],
         out.append(f)
     if not out:
         return pd.DataFrame(columns=list(_NULL_COLUMNS_MIN))
+    return pd.concat(out, ignore_index=True)
+
+
+def concat_frames(frames: Iterable[pd.DataFrame],
+                  image_ids: Iterable[Any],
+                  fallback_columns: Sequence[str] = ("image_id",)) -> pd.DataFrame:
+    """Tag each frame with its image id and concatenate; empty-safe."""
+    out: List[pd.DataFrame] = []
+    for img_id, frame in zip(image_ids, frames):
+        if frame is None or getattr(frame, "empty", True):
+            continue
+        f = frame.copy()
+        f.insert(0, "image_id", str(img_id))
+        out.append(f)
+    if not out:
+        return pd.DataFrame(columns=list(fallback_columns))
     return pd.concat(out, ignore_index=True)
 
 

@@ -27,7 +27,8 @@ TYPICAL USE
     paths = hio.matching_runs(runs, primary="Aggregates", partner="Microglia")
     ds = hio.load_projects(paths, group_from_name=r"(WT|KO)")
 
-    eff = hio.per_image_effects(ds, statistic="median", index="cross")
+    # direction="primary": per randomised object. "partner": per fixed partner.
+    eff = hio.per_image_effects(ds, statistic="median", direction="partner")
     res = hio.replicate_test(eff, effect_col="effect_z")
 
 INFERENTIAL UNIT
@@ -71,6 +72,10 @@ class NullDataset:
     images: pd.DataFrame                  # one row per image
     observed: pd.DataFrame                # one row per real object
     null: pd.DataFrame                    # one row per (image, draw, object)
+    # Reverse direction: per FIXED partner object. Different quantity, not a
+    # different view -- see per_image_effects(direction=...).
+    observed_partners: pd.DataFrame = field(default_factory=pd.DataFrame)
+    null_partners: pd.DataFrame = field(default_factory=pd.DataFrame)
     manifests: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     f_grid: Optional[np.ndarray] = None
     f_curves: Dict[str, Any] = field(default_factory=dict)
@@ -167,6 +172,21 @@ def _load_one(path: str) -> Dict[str, Any]:
         gz = os.path.join(path, "null_objects.csv.gz")
         null = pd.read_csv(gz) if os.path.isfile(gz) else pd.DataFrame()
 
+    obs_partners = pd.DataFrame()
+    q = os.path.join(path, "observed_partners.csv")
+    if os.path.isfile(q):
+        obs_partners = pd.read_csv(q)
+
+    null_partners = pd.DataFrame()
+    q = os.path.join(path, "null_partners.npz")
+    if os.path.isfile(q):
+        with np.load(q, allow_pickle=False) as z:
+            null_partners = pd.DataFrame({k: z[k] for k in z.files})
+    else:
+        q = os.path.join(path, "null_partners.csv.gz")
+        if os.path.isfile(q):
+            null_partners = pd.read_csv(q)
+
     curves: Dict[str, Any] = {}
     f_path = os.path.join(path, "f_curves.npz")
     if os.path.isfile(f_path):
@@ -176,7 +196,8 @@ def _load_one(path: str) -> Dict[str, Any]:
         curves["image_ids"] = curves["image_ids"].astype(str)
 
     return {"manifest": manifest, "images": images, "observed": observed,
-            "null": null, "curves": curves}
+            "null": null, "curves": curves,
+            "observed_partners": obs_partners, "null_partners": null_partners}
 
 
 def _check_comparability(manifests: Dict[str, Dict[str, Any]]) -> List[str]:
@@ -258,10 +279,13 @@ def load_projects(paths: Sequence[str],
                       RuntimeWarning, stacklevel=2)
 
     images, observed, nulls = [], [], []
+    obs_p, null_p = [], []
     for raw in parts:
         for frame, sink in ((raw["images"], images),
                             (raw["observed"], observed),
-                            (raw["null"], nulls)):
+                            (raw["null"], nulls),
+                            (raw["observed_partners"], obs_p),
+                            (raw["null_partners"], null_p)):
             if frame is None or frame.empty:
                 continue
             f = frame.copy()
@@ -273,6 +297,8 @@ def load_projects(paths: Sequence[str],
     images_df = pd.concat(images, ignore_index=True) if images else pd.DataFrame()
     observed_df = pd.concat(observed, ignore_index=True) if observed else pd.DataFrame()
     null_df = pd.concat(nulls, ignore_index=True) if nulls else pd.DataFrame()
+    obs_p_df = pd.concat(obs_p, ignore_index=True) if obs_p else pd.DataFrame()
+    null_p_df = pd.concat(null_p, ignore_index=True) if null_p else pd.DataFrame()
 
     # Group label. Derived from the image name so one project can hold several
     # conditions, and defaulting to the project when no image name is present.
@@ -285,7 +311,7 @@ def load_projects(paths: Sequence[str],
         toks = str(name).split(group_delimiter)
         return toks[group_field] if 0 <= group_field < len(toks) else "ungrouped"
 
-    for frame in (images_df, observed_df, null_df):
+    for frame in (images_df, observed_df, null_df, obs_p_df, null_p_df):
         if frame.empty:
             continue
         basis = frame["sample"] if "sample" in frame.columns else frame["project"]
@@ -303,6 +329,7 @@ def load_projects(paths: Sequence[str],
                             else _resample_curves(c, widest))
 
     return NullDataset(images=images_df, observed=observed_df, null=null_df,
+                       observed_partners=obs_p_df, null_partners=null_p_df,
                        manifests=manifests, f_grid=f_grid, f_curves=merged,
                        warnings=notes)
 
@@ -317,6 +344,7 @@ _AGG = {"median": np.median, "mean": np.mean, "min": np.min, "max": np.max}
 def per_image_effects(ds: NullDataset,
                       index: str = "cross",
                       statistic: str = "median",
+                      direction: str = "primary",
                       value_col: Optional[str] = None,
                       size_min: Optional[float] = None,
                       size_max: Optional[float] = None,
@@ -326,35 +354,63 @@ def per_image_effects(ds: NullDataset,
     """Recompute per-image effects and indices from the raw tables.
 
     None of this needs the Monte-Carlo re-run, which is the point of exporting
-    per-object rows. The summary statistic, the size cutoff and the tail
-    convention are all decided here rather than upstream.
+    per-object rows. The summary statistic, the size cutoff, the direction and
+    the tail convention are all decided here rather than upstream.
 
-    A size filter is applied to observed and null alike, matched on
-    `template_label`, so both sides describe the same objects. Filtering only
-    the observed side would compare different populations.
+    `direction` selects which population the distances are summarised over:
+
+      'primary'  one value per randomised object -- "how far is each aggregate
+                 from the nearest microglia"
+      'partner'  one value per fixed partner object -- "how far is each
+                 microglia from the nearest aggregate"
+
+    These are different quantities and diverge whenever the two counts differ,
+    so the choice is explicit rather than defaulted silently.
+
+    A size filter is applied to observed and null alike, matched on the object
+    id, so both sides describe the same objects. Filtering only the observed
+    side would compare different populations. Note that with
+    `direction='partner'` the filter applies to the PARTNER objects, and it
+    cannot subset the randomised population -- doing that needs a separate run
+    restricted at computation time, so that the threshold is recorded in the
+    manifest rather than chosen after the fact.
     """
-    if value_col is None:
-        value_col = {"cross": "cross_um", "G": "g_um"}.get(index, index)
-    if value_col not in ds.null.columns or value_col not in ds.observed.columns:
-        raise KeyError(f"{value_col!r} is not in both tables; "
-                       f"observed has {list(ds.observed.columns)}")
-    agg = _AGG[statistic]
+    if direction not in ("primary", "partner"):
+        raise ValueError("direction must be 'primary' or 'partner'")
 
-    obs = ds.observed
-    null = ds.null
+    if direction == "partner":
+        obs, null = ds.observed_partners, ds.null_partners
+        id_col = "partner_label"
+        default_value = "to_primary_um"
+        if obs is None or obs.empty or null is None or null.empty:
+            raise KeyError(
+                "This export has no reverse-direction tables. Re-run with "
+                "measure_from='both' (or 'partner'), or use "
+                "direction='primary'.")
+    else:
+        obs, null = ds.observed, ds.null
+        id_col = "template_label"
+        default_value = {"cross": "cross_um", "G": "g_um"}.get(index, index)
+
+    if value_col is None:
+        value_col = default_value
+    if value_col not in null.columns or value_col not in obs.columns:
+        raise KeyError(f"{value_col!r} is not in both {direction} tables; "
+                       f"observed has {list(obs.columns)}")
+    agg = _AGG[statistic]
     if size_min is not None or size_max is not None:
         if size_col not in obs.columns:
-            raise KeyError(f"{size_col!r} not in observed_objects")
-        keep = obs[["project", "image_id", "template_label", size_col]].copy()
+            raise KeyError(f"{size_col!r} not in the observed {direction} table")
+        keep = obs[["project", "image_id", id_col, size_col]].copy()
         if size_min is not None:
             keep = keep[keep[size_col] >= size_min]
         if size_max is not None:
             keep = keep[keep[size_col] <= size_max]
-        pairs = set(map(tuple, keep[["project", "image_id", "template_label"]].values))
+        pairs = set(map(tuple, keep[["project", "image_id", id_col]].values))
         obs = obs[[tuple(r) in pairs for r in
-                   obs[["project", "image_id", "template_label"]].values]]
+                   obs[["project", "image_id", id_col]].values]]
         null = null[[tuple(r) in pairs for r in
-                     null[["project", "image_id", "template_label"]].values]]
+                     null[["project", "image_id", id_col]].values]]
 
     def _stat(v: pd.Series) -> float:
         a = pd.to_numeric(v, errors="coerce").to_numpy(dtype=float)
@@ -413,6 +469,7 @@ def per_image_effects(ds: NullDataset,
             on=["project", "image_id"], how="left", suffixes=("", "_meta"))
     out.attrs["index"] = index
     out.attrs["statistic"] = statistic
+    out.attrs["direction"] = direction
     return out
 
 

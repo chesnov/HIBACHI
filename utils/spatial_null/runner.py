@@ -37,7 +37,7 @@ from .qc_render import (
     self_test as qc_self_test,
 )
 from .export import (
-    build_manifest, concat_null_frames, concat_observed_frames,
+    build_manifest, concat_frames, concat_null_frames, concat_observed_frames,
     stack_f_curves, write_project_export,
 )
 
@@ -308,6 +308,12 @@ class RunParameters:
     compute_f: bool = True
     compute_g: bool = True
     cross_statistic: str = "median"
+    # 'primary'  distances FROM each randomised object to the nearest partner
+    # 'partner'  distances FROM each fixed partner to the nearest randomised
+    # 'both'     compute both (default; one extra transform per draw)
+    measure_from: str = "both"
+    # Which direction drives the reported index and the QC segments.
+    statistic_direction: str = "primary"
     max_attempts: int = 2000
     seed: Optional[int] = 0
     grid_points: int = 512
@@ -454,6 +460,7 @@ def run_project(jobs: Sequence[SampleJob],
     qc_error_total = 0
     results, meta_rows = [], []
     obs_frames, null_frames, curve_sets, image_ids = [], [], [], []
+    obs_partner_frames, null_partner_frames = [], []
     first_draws: Dict[str, np.ndarray] = {}
 
     n_qc = max(0, int(params.n_qc_images))
@@ -496,6 +503,8 @@ def run_project(jobs: Sequence[SampleJob],
                 min_separation_um=params.min_separation_um,
                 compute_f=params.compute_f, compute_g=params.compute_g,
                 cross_statistic=params.cross_statistic,
+                measure_from=params.measure_from,
+                statistic_direction=params.statistic_direction,
                 keep_first_draw=params.keep_first_draw,
                 max_attempts=params.max_attempts,
                 per_parent_containment=params.per_parent_containment,
@@ -526,6 +535,8 @@ def run_project(jobs: Sequence[SampleJob],
         image_ids.append(job.sample)
         obs_frames.append(res.observed_objects)
         null_frames.append(res.null_objects)
+        obs_partner_frames.append(res.observed_partners)
+        null_partner_frames.append(res.null_partners)
         curve_sets.append(res.f_curves)
         if res.first_draw_labels is not None:
             first_draws[job.sample] = res.first_draw_labels
@@ -549,12 +560,17 @@ def run_project(jobs: Sequence[SampleJob],
     metadata = pd.DataFrame(meta_rows)
     observed = concat_observed_frames(obs_frames, image_ids)
     nulls = concat_null_frames(null_frames, image_ids)
+    obs_partners = concat_frames(obs_partner_frames, image_ids,
+                                 ("image_id", "partner_label"))
+    null_partners = concat_frames(null_partner_frames, image_ids,
+                                  ("image_id", "draw", "set", "partner_label"))
     curves = (stack_f_curves(curve_sets, image_ids, f_grid)
               if params.compute_f else {})
 
     out: Dict[str, Any] = {
         "n_samples": len(results), "metadata": metadata,
         "observed_objects": observed, "null_objects": nulls,
+        "observed_partners": obs_partners, "null_partners": null_partners,
         "f_curves": curves, "f_grid": f_grid, "grid_info": grid_info,
         "first_draw_labels": first_draws, "results": results,
         "qc_dir": (os.path.join(out_dir, "qc_images")
@@ -581,7 +597,8 @@ def run_project(jobs: Sequence[SampleJob],
             extra={"domain_source": "+".join(realised) or None})
         written = write_project_export(
             out_dir, manifest, metadata, observed, nulls, curves,
-            also_csv=params.also_csv)
+            also_csv=params.also_csv,
+            observed_partners=obs_partners, null_partners=null_partners)
         if not out["description"].empty:
             out["description"].to_csv(
                 os.path.join(out_dir, "within_project_description.csv"),
@@ -648,7 +665,8 @@ def suggest_run_name(root: str,
                      primary: Optional[str] = None,
                      partner: Optional[str] = None,
                      domain_choice: str = "hull",
-                     roi_name: Optional[str] = None) -> str:
+                     roi_name: Optional[str] = None,
+                     direction: str = "primary") -> str:
     """Next free ordinal, with the pairing appended for legibility.
 
     A bare ordinal is unambiguous but useless when browsing a folder months
@@ -677,7 +695,9 @@ def suggest_run_name(root: str,
         bits.append("in_tissue")
     q = biological_name(partner)
     if q:
-        bits += ["vs", q]
+        # The preposition encodes the direction, so two runs differing only in
+        # direction do not collide on one folder name.
+        bits += ["to" if direction == "primary" else "from", q]
     if roi_name:
         bits.append(str(roi_name))
     safe = "_".join(str(b) for b in bits if b)

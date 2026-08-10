@@ -10,7 +10,11 @@ LAYOUT
     engine.py    domain construction, rigid motion, placement, distance
                  functions, the Monte-Carlo driver. No I/O beyond reading the
                  persisted hull shell.
-    export.py    the on-disk schema and its comparability key.
+    export.py    the on-disk schema and its comparability key. Cross-distances
+                 are exported in BOTH directions -- per randomised object and
+                 per fixed partner -- because those are different quantities,
+                 not two views of one, and diverge whenever the two object
+                 counts differ.
     runner.py    HIBACHI-facing: resolves samples from the registry, handles
                  ROI cropping, runs, writes the export.
     dialog.py    the analyzer's Qt entry point, with a threaded progress dialog.
@@ -51,6 +55,7 @@ USAGE
 
 from .engine import (
     Domain,
+    MEASURE_FROM_CHOICES,
     NullResult,
     ObjectTemplate,
     PlacementResult,
@@ -102,7 +107,7 @@ from .runner import (
 __all__ = [
     # engine
     "Domain", "NullResult", "ObjectTemplate", "PlacementResult",
-    "SDI_INTERPRETATION", "boundary_mask", "build_domain",
+    "SDI_INTERPRETATION", "MEASURE_FROM_CHOICES", "boundary_mask", "build_domain",
     "cross_distance_field", "derive_f_grid", "describe_within_project",
     "extract_templates", "f_function", "f_grid_probe", "g_function",
     "monte_carlo_null", "nearest_cross_distances", "nearest_cross_pairs",
