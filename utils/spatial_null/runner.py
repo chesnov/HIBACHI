@@ -32,6 +32,9 @@ from .engine import (
     Domain, build_domain, derive_f_grid, f_grid_probe, monte_carlo_null,
     describe_within_project, extract_templates,
 )
+from .qc_render import (
+    estimate_qc_output, qc_paths, render_draw, render_observed,
+)
 from .export import (
     build_manifest, concat_null_frames, concat_observed_frames,
     stack_f_curves, write_project_export,
@@ -240,6 +243,11 @@ class RunParameters:
     roi_name: Optional[str] = None
     keep_first_draw: bool = True
     also_csv: bool = False
+    # QC images: one JPG per draw, plus one of the observed data per sample.
+    # Defaults to 0 because the count multiplies by samples -- 398 draws across
+    # 20 images is ~8,000 files. The caller is warned with an estimate.
+    n_qc_images: int = 0
+    qc_annotate_distances: bool = True
 
     def as_dict(self) -> Dict[str, Any]:
         return dict(self.__dict__)
@@ -252,7 +260,10 @@ def run_project(jobs: Sequence[SampleJob],
                 channels: Optional[Dict[str, Any]] = None,
                 explicit_domains: Optional[Dict[str, np.ndarray]] = None,
                 log: Callable[[str], None] = print,
-                progress: Optional[Any] = None) -> Dict[str, Any]:
+                progress: Optional[Any] = None,
+                progress_cb: Optional[Callable[..., None]] = None,
+                cancel_check: Optional[Callable[[], bool]] = None
+                ) -> Dict[str, Any]:
     """Run the null across a project's samples and write the export.
 
     Two passes on purpose. The first only probes each image for one scalar so
@@ -267,7 +278,20 @@ def run_project(jobs: Sequence[SampleJob],
     # ---- pass 1: geometry, domains, F-grid probes ---------------------------
     prepared: List[Dict[str, Any]] = []
     probes: List[float] = []
-    for job in jobs:
+
+    def _report(**kw):
+        if progress_cb is not None:
+            try:
+                progress_cb(**kw)
+            except Exception:
+                pass                       # never let the UI break the run
+
+    for idx, job in enumerate(jobs):
+        if cancel_check is not None and cancel_check():
+            log("Cancelled during setup.")
+            return {"n_samples": 0, "cancelled": True}
+        _report(phase="prepare", sample=job.sample,
+                sample_index=idx, n_samples=len(jobs))
         try:
             primary = job.load(job.primary_path)
         except (ValueError, OSError) as exc:
@@ -326,6 +350,7 @@ def run_project(jobs: Sequence[SampleJob],
         log("No scorable samples.")
         return {"n_samples": 0}
 
+    total_draws = int(params.n_reference) + int(params.n_test)
     f_grid, grid_info = derive_f_grid(probes, params.grid_points)
     if params.compute_f:
         log(f"Shared F grid: 0-{grid_info['f_grid_max_um']:g} um "
@@ -337,11 +362,27 @@ def run_project(jobs: Sequence[SampleJob],
     obs_frames, null_frames, curve_sets, image_ids = [], [], [], []
     first_draws: Dict[str, np.ndarray] = {}
 
-    for item in prepared:
+    n_qc = max(0, int(params.n_qc_images))
+    if n_qc and out_dir:
+        count, mb = estimate_qc_output(len(prepared), min(n_qc, total_draws))
+        log(f"QC images: up to {count} JPGs (~{mb:.0f} MB) under "
+            f"{os.path.join(out_dir, 'qc_images')}.")
+
+    for idx, item in enumerate(prepared):
         job: SampleJob = item["job"]
+        if cancel_check is not None and cancel_check():
+            log("Cancelled.")
+            break
         log(f"  [{job.sample}] {int(np.unique(item['primary'][item['primary']>0]).size)} "
             f"objects, domain={item['domain'].source}, "
             f"{params.n_reference}+{params.n_test} draws...")
+        _report(phase="run", sample=job.sample, sample_index=idx,
+                n_samples=len(prepared), draw=0, n_draws=total_draws)
+
+        qc_hook = None
+        if n_qc and out_dir:
+            qc_hook = _make_qc_hook(job, item, out_dir, params, n_qc, log)
+
         try:
             res = monte_carlo_null(
                 item["primary"], item["domain"], f_grid=f_grid,
@@ -354,6 +395,11 @@ def run_project(jobs: Sequence[SampleJob],
                 keep_first_draw=params.keep_first_draw,
                 max_attempts=params.max_attempts,
                 per_parent_containment=params.per_parent_containment,
+                qc_hook=qc_hook, n_qc_draws=(n_qc if qc_hook else 0),
+                cancel_check=cancel_check,
+                draw_callback=lambda i, n, _s=job.sample, _x=idx: _report(
+                    phase="run", sample=_s, sample_index=_x,
+                    n_samples=len(prepared), draw=i, n_draws=n),
                 progress=progress)
         except Exception as exc:                       # one bad image, not the run
             log(f"  [{job.sample}] FAILED: {exc}")
@@ -397,6 +443,8 @@ def run_project(jobs: Sequence[SampleJob],
         "observed_objects": observed, "null_objects": nulls,
         "f_curves": curves, "f_grid": f_grid, "grid_info": grid_info,
         "first_draw_labels": first_draws, "results": results,
+        "qc_dir": (os.path.join(out_dir, "qc_images")
+                   if (out_dir and n_qc) else None),
         "description": describe_within_project(metadata)
         if not metadata.empty else pd.DataFrame(),
     }
@@ -428,6 +476,51 @@ def run_project(jobs: Sequence[SampleJob],
             "replicate, so pool several with hibachi_null_io and test there.")
 
     return out
+
+
+def _make_qc_hook(job: "SampleJob", item: Dict[str, Any], out_dir: str,
+                  params: "RunParameters", n_qc: int,
+                  log: Callable[[str], None]):
+    """Build the per-draw QC renderer, and write the observed reference first.
+
+    The observed image is written once per sample because without it the draws
+    have nothing to be compared against.
+    """
+    from .engine import cross_distance_field, nearest_cross_pairs
+
+    directory = qc_paths(out_dir, job.sample)
+    domain = item["domain"]
+    partner = item["partner"]
+    spacing = job.spacing
+
+    try:
+        if partner is not None:
+            field, indices = cross_distance_field(partner, spacing,
+                                                  return_indices=True)
+            obs_pairs = nearest_cross_pairs(item["primary"], field, indices,
+                                            spacing)
+        else:
+            obs_pairs = []
+        render_observed(os.path.join(directory, "000_observed.jpg"),
+                        item["primary"], partner, obs_pairs, spacing,
+                        domain_mask=domain.mask, sample=job.sample)
+    except Exception as exc:
+        log(f"      QC: could not render the observed image ({exc}).")
+
+    def hook(draw_index: int, set_index: int, labels, pairs):
+        name = f"draw_{draw_index + 1:03d}_{'ref' if set_index == 0 else 'test'}.jpg"
+        dists = [p["distance_um"] for p in pairs
+                 if np.isfinite(p.get("distance_um", np.inf))]
+        summary = (f"n={len(dists)} objects · median nearest "
+                   f"{np.median(dists):.2f} µm" if dists else "no distances")
+        render_draw(
+            os.path.join(directory, name), labels, partner, pairs, spacing,
+            domain_mask=domain.mask,
+            title=f"{job.sample} — randomisation {draw_index + 1}",
+            subtitle=summary,
+            annotate_distances=params.qc_annotate_distances)
+
+    return hook
 
 
 # =============================================================================

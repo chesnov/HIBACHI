@@ -13,7 +13,10 @@ LAYOUT
     export.py    the on-disk schema and its comparability key.
     runner.py    HIBACHI-facing: resolves samples from the registry, handles
                  ROI cropping, runs, writes the export.
-    dialog.py    the analyzer's Qt entry point.
+    dialog.py    the analyzer's Qt entry point, with a threaded progress dialog.
+    qc_render.py JPG verification images: one per randomisation, showing the
+                 stationary partner, the randomised objects and the exact
+                 segment each measured distance came from.
     notebook/    hibachi_null_io.py -- standalone cross-project loader and the
                  statistics. Deliberately NOT imported from this package: it
                  must stay free of HIBACHI dependencies so it runs next to a
@@ -57,12 +60,19 @@ from .engine import (
     g_function,
     monte_carlo_null,
     nearest_cross_distances,
+    nearest_cross_pairs,
     per_object_boundary,
     place_templates,
     random_rotation,
     reconstruct_hull_from_shell,
     sup_norm_signed,
     transform_mask,
+)
+from .qc_render import (
+    estimate_qc_output,
+    qc_paths,
+    render_draw,
+    render_observed,
 )
 from .export import (
     COMPARABILITY_KEY,
@@ -85,9 +95,12 @@ __all__ = [
     "SDI_INTERPRETATION", "boundary_mask", "build_domain",
     "cross_distance_field", "derive_f_grid", "describe_within_project",
     "extract_templates", "f_function", "f_grid_probe", "g_function",
-    "monte_carlo_null", "nearest_cross_distances", "per_object_boundary",
+    "monte_carlo_null", "nearest_cross_distances", "nearest_cross_pairs",
+    "per_object_boundary",
     "place_templates", "random_rotation", "reconstruct_hull_from_shell",
     "sup_norm_signed", "transform_mask",
+    # qc images
+    "estimate_qc_output", "qc_paths", "render_draw", "render_observed",
     # export
     "COMPARABILITY_KEY", "SCHEMA_VERSION", "build_manifest",
     "write_project_export",

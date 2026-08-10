@@ -82,7 +82,7 @@ __all__ = [
     "place_templates", "boundary_mask", "per_object_boundary",
     "cross_distance_field", "nearest_cross_distances",
     "f_function", "g_function", "sup_norm_signed",
-    "monte_carlo_null", "derive_f_grid", "f_grid_probe",
+    "monte_carlo_null", "derive_f_grid", "f_grid_probe", "nearest_cross_pairs",
     "describe_within_project", "SDI_INTERPRETATION",
 ]
 
@@ -678,7 +678,8 @@ def _expand_physical(mask: np.ndarray, spacing: Sequence[float],
 # =============================================================================
 
 def cross_distance_field(partner_labels: np.ndarray,
-                         spacing: Sequence[float]) -> np.ndarray:
+                         spacing: Sequence[float],
+                         return_indices: bool = False):
     """Microns from every voxel to the nearest partner SURFACE voxel.
 
     Computed once, because the partner never moves across draws. Taking the
@@ -686,11 +687,61 @@ def cross_distance_field(partner_labels: np.ndarray,
     contour/cKDTree distance exactly -- boundary-to-boundary semantics, so an
     object sitting inside a partner reports its depth rather than collapsing to
     zero the way a solid-union transform would.
+
+    With `return_indices`, also returns the coordinates of that nearest partner
+    surface voxel per position. That is what lets a QC image draw the exact
+    segment the statistic measured, rather than an approximation of it.
     """
     surf = per_object_boundary(partner_labels)
     if not surf.any():
-        return np.full(partner_labels.shape, np.inf, dtype=np.float32)
+        empty = np.full(partner_labels.shape, np.inf, dtype=np.float32)
+        return (empty, None) if return_indices else empty
+    if return_indices:
+        dist, idx = distance_transform_edt(~surf, sampling=spacing,
+                                           return_indices=True)
+        return dist.astype(np.float32), idx
     return distance_transform_edt(~surf, sampling=spacing).astype(np.float32)
+
+
+def nearest_cross_pairs(labels: np.ndarray,
+                        field: np.ndarray,
+                        indices: Optional[np.ndarray],
+                        spacing: Sequence[float]) -> List[Dict[str, Any]]:
+    """Per object: the distance and the two voxels realising it.
+
+    The endpoints come from the same distance transform the statistic uses, so a
+    drawn segment is the measured one and not a redrawn guess -- which is the
+    only way a QC image can actually verify the algorithm.
+    """
+    values = np.unique(labels[labels > 0])
+    out: List[Dict[str, Any]] = []
+    if values.size == 0:
+        return out
+    struct = _conn_structure(labels.ndim)
+    slices = ndimage.find_objects(labels)
+    for lbl in values:
+        i = int(lbl) - 1
+        if i < 0 or i >= len(slices) or slices[i] is None:
+            continue
+        sl = slices[i]
+        sub = labels[sl] == lbl
+        surf = sub & ~ndimage.binary_erosion(sub, structure=struct)
+        if not surf.any():
+            surf = sub
+        local = field[sl]
+        vals = np.where(surf, local, np.inf)
+        if not np.isfinite(vals).any():
+            continue
+        flat = int(np.argmin(vals))
+        pos = np.unravel_index(flat, vals.shape)
+        p0 = tuple(int(pos[d] + sl[d].start) for d in range(labels.ndim))
+        entry: Dict[str, Any] = {"label": int(lbl),
+                                 "distance_um": float(local[pos]),
+                                 "p0": p0, "p1": None}
+        if indices is not None:
+            entry["p1"] = tuple(int(indices[d][p0]) for d in range(labels.ndim))
+        out.append(entry)
+    return out
 
 
 def nearest_cross_distances(labels: np.ndarray,
@@ -965,6 +1016,10 @@ def monte_carlo_null(labels: np.ndarray,
                      max_attempts: int = 2000,
                      record_centroids: bool = True,
                      per_parent_containment: bool = False,
+                     qc_hook: Optional[Any] = None,
+                     n_qc_draws: int = 0,
+                     cancel_check: Optional[Any] = None,
+                     draw_callback: Optional[Any] = None,
                      progress: Optional[Any] = None) -> NullResult:
     """Per-sample Monte-Carlo null for one object set in one domain.
 
@@ -1015,8 +1070,17 @@ def monte_carlo_null(labels: np.ndarray,
     d["per_parent_containment"] = bool(per_parent_containment)
 
     # ---- observed ----------------------------------------------------------
-    cross_field = (cross_distance_field(partner_labels, spacing)
-                   if partner_labels is not None else None)
+    # Indices are only needed when QC images will be drawn, and they roughly
+    # double the transform's memory, so they are requested conditionally.
+    cross_indices = None
+    if partner_labels is not None:
+        if n_qc_draws > 0 and qc_hook is not None:
+            cross_field, cross_indices = cross_distance_field(
+                partner_labels, spacing, return_indices=True)
+        else:
+            cross_field = cross_distance_field(partner_labels, spacing)
+    else:
+        cross_field = None
 
     obs_values = np.unique(labels[labels > 0])
     obs_sizes = _object_sizes(labels)
@@ -1071,6 +1135,13 @@ def monte_carlo_null(labels: np.ndarray,
         return float(agg(v)) if v.size else float("nan")
 
     for i in iterator:
+        # Checked between draws, which is the only safe interruption point: a
+        # running distance transform cannot be pre-empted.
+        if cancel_check is not None and cancel_check():
+            d["cancelled_after_draws"] = int(i)
+            break
+        if draw_callback is not None:
+            draw_callback(i, total)
         pr = place_templates(templates, domain, rng, rotate=rotate,
                              hardcore=hardcore,
                              min_separation_um=min_separation_um,
@@ -1083,6 +1154,21 @@ def monte_carlo_null(labels: np.ndarray,
             incomplete += 1
         if i == 0 and keep_first_draw:
             result.first_draw_labels = pr.labels
+
+        # Render QC straight away rather than accumulating label arrays: holding
+        # 199 copies of a 3D volume would be gigabytes.
+        if qc_hook is not None and i < n_qc_draws:
+            pairs = (nearest_cross_pairs(pr.labels, cross_field, cross_indices,
+                                         spacing)
+                     if cross_field is not None else [])
+            try:
+                qc_hook(draw_index=i,
+                        set_index=0 if i < n_reference else 1,
+                        labels=pr.labels, pairs=pairs)
+            except Exception as exc:                  # QC must never kill a run
+                d.setdefault("qc_errors", 0)
+                d["qc_errors"] = int(d["qc_errors"]) + 1
+                d["qc_last_error"] = str(exc)
 
         vals = np.unique(pr.labels[pr.labels > 0])
         chunk: Dict[str, Any] = {
@@ -1121,8 +1207,9 @@ def monte_carlo_null(labels: np.ndarray,
     d["orientation_acceptance_rate"] = float(o_acc / o_att) if o_att else float("nan")
     d["mean_unplaced_per_draw"] = float(failed_total / max(1, total))
     d["draws_incomplete"] = int(incomplete)
-    d["n_reference"] = int(n_reference)
-    d["n_test"] = int(n_test)
+    d["n_reference"] = int(len(ref_F) or len(ref_scalar) or len(ref_G) or n_reference)
+    d["n_test"] = int(len(test_F) or len(test_scalar) or len(test_G) or n_test)
+    d["cancelled"] = "cancelled_after_draws" in d
     # Crowded samples are exactly the ones where the null matters. Flag them;
     # never drop them, because dropping biases which samples reach the export.
     d["placement_warning"] = bool(incomplete)

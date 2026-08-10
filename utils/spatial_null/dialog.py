@@ -36,11 +36,11 @@ from __future__ import annotations
 import os
 from typing import Any, Dict, List, Optional
 
-from PyQt5.QtCore import Qt
+from PyQt5.QtCore import Qt, QThread, QTimer, pyqtSignal
 from PyQt5.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
     QDoubleSpinBox, QFormLayout, QGroupBox, QHBoxLayout, QLabel, QMessageBox,
-    QPlainTextEdit, QPushButton, QSpinBox, QVBoxLayout, QWidget,
+    QPlainTextEdit, QProgressBar, QPushButton, QSpinBox, QVBoxLayout, QWidget,
 )
 
 DOMAIN_CHOICES = [
@@ -59,6 +59,133 @@ DOMAIN_CHOICES = [
      "Holds both memberships fixed and tests arrangement alone. Most "
      "conservative."),
 ]
+
+
+class _NullWorker(QThread):
+    """Runs the null off the GUI thread.
+
+    A thread rather than a process: the engine is pure numpy/scipy with no Qt
+    and no native segmentation code, and numpy releases the GIL for the heavy
+    transforms, so the UI stays responsive. Cancellation is cooperative and
+    checked between draws, because a running distance transform cannot be
+    interrupted part-way.
+    """
+
+    progress = pyqtSignal(dict)
+    logline = pyqtSignal(str)
+    finished_ok = pyqtSignal(dict)
+    failed = pyqtSignal(str)
+
+    def __init__(self, jobs, params, out_dir, project_name, channels):
+        super().__init__()
+        self._jobs = jobs
+        self._params = params
+        self._out_dir = out_dir
+        self._project = project_name
+        self._channels = channels
+        self._cancel = False
+
+    def cancel(self):
+        self._cancel = True
+
+    def run(self):
+        try:
+            from .runner import run_project
+            result = run_project(
+                self._jobs, self._params, out_dir=self._out_dir,
+                project_name=self._project, channels=self._channels,
+                log=lambda m: self.logline.emit(str(m)),
+                progress_cb=lambda **kw: self.progress.emit(dict(kw)),
+                cancel_check=lambda: self._cancel)
+            self.finished_ok.emit(result)
+        except Exception as exc:
+            import traceback
+            self.failed.emit(f"{exc}\n\n{traceback.format_exc()}")
+
+
+class _NullProgressDialog(QDialog):
+    """Two bars plus a console, matching batch_progress_dialog's shape.
+
+    The spinner runs on its own timer so the window is visibly alive even while
+    a single long draw produces no events -- otherwise a slow sample looks
+    indistinguishable from a hang, which is what prompted this.
+    """
+
+    _SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+
+    def __init__(self, n_samples: int, n_draws: int, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Spatial null — running")
+        self.setMinimumWidth(560)
+        self.setWindowFlags(self.windowFlags() & ~Qt.WindowCloseButtonHint)
+        self._frame = 0
+        self._cancelled = False
+
+        v = QVBoxLayout(self)
+        self.lbl_head = QLabel("Preparing…")
+        self.lbl_head.setStyleSheet("font-weight: bold;")
+        v.addWidget(self.lbl_head)
+
+        self.bar_sample = QProgressBar()
+        self.bar_sample.setRange(0, max(1, n_samples))
+        self.bar_sample.setFormat("image %v of %m")
+        v.addWidget(self.bar_sample)
+
+        self.bar_draw = QProgressBar()
+        self.bar_draw.setRange(0, max(1, n_draws))
+        self.bar_draw.setFormat("randomisation %v of %m")
+        v.addWidget(self.bar_draw)
+
+        self.console = QPlainTextEdit()
+        self.console.setReadOnly(True)
+        self.console.setMaximumHeight(150)
+        v.addWidget(self.console)
+
+        row = QHBoxLayout()
+        row.addStretch()
+        self.btn_cancel = QPushButton("Cancel")
+        self.btn_cancel.clicked.connect(self._on_cancel)
+        row.addWidget(self.btn_cancel)
+        v.addLayout(row)
+
+        self._timer = QTimer(self)
+        self._timer.timeout.connect(self._spin)
+        self._timer.start(120)
+
+    def _spin(self):
+        self._frame = (self._frame + 1) % len(self._SPINNER)
+        base = self.lbl_head.text().lstrip(self._SPINNER + " ")
+        self.lbl_head.setText(f"{self._SPINNER[self._frame]} {base}")
+
+    def _on_cancel(self):
+        self._cancelled = True
+        self.btn_cancel.setEnabled(False)
+        self.btn_cancel.setText("Cancelling…")
+        self.append("Cancel requested; stopping after the current randomisation.")
+
+    @property
+    def cancelled(self) -> bool:
+        return self._cancelled
+
+    def append(self, text: str):
+        self.console.appendPlainText(text.rstrip())
+
+    def update_progress(self, info: dict):
+        phase = info.get("phase")
+        sample = info.get("sample", "")
+        if phase == "prepare":
+            self.lbl_head.setText(f"Reading masks and domains — {sample}")
+            self.bar_sample.setValue(int(info.get("sample_index", 0)))
+            self.bar_sample.setMaximum(max(1, int(info.get("n_samples", 1))))
+        elif phase == "run":
+            self.lbl_head.setText(f"Randomising — {sample}")
+            self.bar_sample.setMaximum(max(1, int(info.get("n_samples", 1))))
+            self.bar_sample.setValue(int(info.get("sample_index", 0)) + 1)
+            self.bar_draw.setMaximum(max(1, int(info.get("n_draws", 1))))
+            self.bar_draw.setValue(int(info.get("draw", 0)) + 1)
+
+    def close_when_done(self):
+        self._timer.stop()
 
 
 class SpatialNullDialog(QDialog):
@@ -239,17 +366,48 @@ class SpatialNullDialog(QDialog):
 
         outg = QGroupBox("Output")
         of = QFormLayout(outg)
-        self.chk_overlay = QCheckBox(
-            "Show the first draw as napari layers, with connection lines")
-        self.chk_overlay.setChecked(False)
-        self.chk_overlay.setToolTip(
-            "Off by default because it is per-sample and heavy. Worth turning on "
-            "once to confirm the randomisation looks right rather than trusting "
-            "it blindly.")
-        of.addRow(self.chk_overlay)
+
+        self.chk_qc = QCheckBox("Write QC images (JPG) of the randomisations")
+        self.chk_qc.setChecked(False)
+        self.chk_qc.setToolTip(
+            "One JPG per randomisation, plus one of the real data to compare "
+            "against. Each shows the stationary partner, the randomised objects, "
+            "and a red segment per object marking the shortest distance the "
+            "algorithm measured — the endpoints come from the same distance "
+            "transform as the statistic, so the picture verifies the maths.")
+        of.addRow(self.chk_qc)
+
+        self.sp_qc = QSpinBox()
+        self.sp_qc.setRange(1, 2000)
+        self.sp_qc.setValue(10)
+        self.sp_qc.setEnabled(False)
+        self.sp_qc.setToolTip(
+            "Images PER SAMPLE. This multiplies: 398 draws across 20 samples is "
+            "~8,000 files and well over a gigabyte. Set it to the full draw "
+            "count only if you really want every one.")
+        self.lbl_qc = QLabel("")
+        self.lbl_qc.setStyleSheet("color: grey;")
+        row_qc = QHBoxLayout()
+        row_qc.addWidget(QLabel("Images per sample:"))
+        row_qc.addWidget(self.sp_qc)
+        row_qc.addWidget(self.lbl_qc)
+        row_qc.addStretch()
+        of.addRow(row_qc)
+
+        self.chk_qc_annotate = QCheckBox("Print the distance beside each line")
+        self.chk_qc_annotate.setChecked(True)
+        self.chk_qc_annotate.setEnabled(False)
+        of.addRow(self.chk_qc_annotate)
+
+        self.chk_qc.toggled.connect(self.sp_qc.setEnabled)
+        self.chk_qc.toggled.connect(self.chk_qc_annotate.setEnabled)
+        self.chk_qc.toggled.connect(self._qc_estimate)
+        self.sp_qc.valueChanged.connect(self._qc_estimate)
+
         self.chk_csv = QCheckBox("Also write the null table as gzipped CSV")
         of.addRow(self.chk_csv)
         layout.addWidget(outg)
+        self._qc_estimate()
 
         note = QPlainTextEdit()
         note.setReadOnly(True)
@@ -270,6 +428,18 @@ class SpatialNullDialog(QDialog):
         buttons.rejected.connect(self.reject)
         self.btn_run.clicked.connect(self.run)
         layout.addWidget(buttons)
+
+    def _qc_estimate(self, *_):
+        """Show the file count and size before anything is written."""
+        if not getattr(self, "chk_qc", None) or not self.chk_qc.isChecked():
+            if getattr(self, "lbl_qc", None):
+                self.lbl_qc.setText("")
+            return
+        from .qc_render import estimate_qc_output
+        n_samples = max(1, len(self.pm.sample_registry))
+        count, mb = estimate_qc_output(n_samples, self.sp_qc.value())
+        self.lbl_qc.setText(f"≈ {count} files, {mb:.0f} MB across "
+                            f"{n_samples} sample(s)")
 
     def _domain_help(self):
         """Show what the selected domain holds fixed, and gate the parent option.
@@ -307,7 +477,8 @@ class SpatialNullDialog(QDialog):
             "compute_f": self.chk_f.isChecked(),
             "compute_g": self.chk_g.isChecked(),
             "seed": int(self.sp_seed.value()),
-            "show_overlay": self.chk_overlay.isChecked(),
+            "n_qc_images": (self.sp_qc.value() if self.chk_qc.isChecked() else 0),
+            "qc_annotate_distances": self.chk_qc_annotate.isChecked(),
             "also_csv": self.chk_csv.isChecked(),
             "roi_name": self.roi_name,
             "intersection_inputs": self.intersect_inputs,
@@ -351,9 +522,10 @@ class SpatialNullDialog(QDialog):
             erode_um=p["erode_um"], compute_f=p["compute_f"],
             compute_g=p["compute_g"], cross_statistic=p["cross_statistic"],
             seed=p["seed"], roi_name=p["roi_name"],
-            keep_first_draw=p["show_overlay"], also_csv=p["also_csv"])
+            keep_first_draw=False, also_csv=p["also_csv"],
+            n_qc_images=p["n_qc_images"],
+            qc_annotate_distances=p["qc_annotate_distances"])
 
-        QApplication.setOverrideCursor(Qt.WaitCursor)
         try:
             dom_a, dom_b = p["domain_a_channel"], p["domain_b_channel"]
             jobs = jobs_from_registry(
@@ -361,24 +533,52 @@ class SpatialNullDialog(QDialog):
                 p["partner_channel"],
                 domain_a_channel=dom_a, domain_b_channel=dom_b,
                 roi_name=p["roi_name"])
-            if not jobs:
-                QApplication.restoreOverrideCursor()
-                QMessageBox.warning(
-                    self, "No samples",
-                    "No sample had a final segmentation for that channel"
-                    + (f" in region {p['roi_name']!r}." if p["roi_name"] else "."))
-                return
-
-            result = run_project(
-                jobs, params, out_dir=out_dir,
-                project_name=os.path.basename(self.project_root),
-                channels={"primary": p["primary_channel"],
-                          "partner": p["partner_channel"],
-                          "domain_choice": p["domain_choice"]})
-            QApplication.restoreOverrideCursor()
         except Exception as exc:
-            QApplication.restoreOverrideCursor()
             QMessageBox.critical(self, "Run failed", str(exc))
+            return
+
+        if not jobs:
+            QMessageBox.warning(
+                self, "No samples",
+                "No sample had a final segmentation for that channel"
+                + (f" in region {p['roi_name']!r}." if p["roi_name"] else "."))
+            return
+
+        # Run off the GUI thread so the window stays responsive and cancellable
+        # instead of the OS offering to kill it.
+        prog = _NullProgressDialog(len(jobs), params.n_reference + params.n_test,
+                                   parent=self)
+        worker = _NullWorker(
+            jobs, params, out_dir, os.path.basename(self.project_root),
+            {"primary": p["primary_channel"], "partner": p["partner_channel"],
+             "domain_choice": p["domain_choice"]})
+
+        state: Dict[str, Any] = {"result": None, "error": None}
+        worker.progress.connect(prog.update_progress)
+        worker.logline.connect(prog.append)
+        worker.finished_ok.connect(lambda r: (state.__setitem__("result", r),
+                                             prog.accept()))
+        worker.failed.connect(lambda m: (state.__setitem__("error", m),
+                                         prog.reject()))
+        poll = QTimer(prog)
+        poll.timeout.connect(lambda: worker.cancel() if prog.cancelled else None)
+        poll.start(200)
+
+        worker.start()
+        prog.exec_()
+        prog.close_when_done()
+        poll.stop()
+        if worker.isRunning():
+            worker.cancel()
+            worker.wait(30000)
+
+        if state["error"]:
+            QMessageBox.critical(self, "Run failed", state["error"])
+            return
+        result = state["result"] or {}
+        if prog.cancelled and not result.get("n_samples"):
+            QMessageBox.information(self, "Cancelled",
+                                    "The run was cancelled; nothing was written.")
             return
 
         if not result.get("n_samples"):
@@ -410,31 +610,12 @@ class SpatialNullDialog(QDialog):
                 f"Exported to:\n{out_dir}\n\n"
                 "The export holds raw per-object distances for every draw. "
                 "Pool several projects with hibachi_null_io to do statistics.")
+        if result.get("qc_dir"):
+            text += (f"\n\nQC images:\n{result['qc_dir']}\n"
+                     "Each sample folder holds 000_observed.jpg plus one image "
+                     "per randomisation. Compare the draws against the observed "
+                     "one.")
         if concerns:
             text += "\n\nWorth checking:\n- " + "\n- ".join(concerns)
         QMessageBox.information(self, "Spatial null complete", text)
-
-        if p["show_overlay"] and result.get("first_draw_labels"):
-            self._offer_overlay(result)
         self.accept()
-
-    def _offer_overlay(self, result: Dict[str, Any]):
-        """Show one sample's observed and first-draw masks side by side."""
-        first = result.get("first_draw_labels") or {}
-        if not first:
-            return
-        try:
-            import napari
-        except ImportError:
-            QMessageBox.information(
-                self, "napari unavailable",
-                "Install napari to view the overlay; the export is unaffected.")
-            return
-        sample, labels = next(iter(first.items()))
-        viewer = napari.Viewer(title=f"Spatial null — {sample}")
-        viewer.add_labels(labels, name=f"{sample} randomised (draw 1)")
-        QMessageBox.information(
-            self, "Overlay",
-            f"Showing the first draw for {sample}. Compare it against the real "
-            f"segmentation to confirm sizes and shapes are preserved and that "
-            f"nothing sits outside the domain.")
