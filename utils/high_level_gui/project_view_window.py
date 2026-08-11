@@ -489,8 +489,9 @@ class ProjectViewWindow(QMainWindow):
                 f"{len(region_targets)} region(s)?\n\n{summary}\n\n"
                 "Only these regions change. Their channels' full-image configs are "
                 "untouched, and each region keeps its own dimensions.\n\n"
-                "Processing parameters will be replaced, so they reprocess from "
-                "Step 1.",
+                "ANY EXISTING RESULTS FOR THESE REGIONS WILL BE DELETED, so a "
+                "region can never show data its displayed parameters did not "
+                "produce. They will reprocess from Step 1.",
                 QMessageBox.Yes | QMessageBox.No, QMessageBox.No) != QMessageBox.Yes:
             return
 
@@ -499,7 +500,8 @@ class ProjectViewWindow(QMainWindow):
             with open(template_path, "r", encoding="utf-8") as fh:
                 template = _yaml.safe_load(fh) or {}
             result = apply_template_to_regions(
-                [], template, targets=list(region_targets))
+                [], template, targets=list(region_targets),
+                config_name=os.path.splitext(os.path.basename(template_path))[0])
         except ConfigLibraryError as exc:
             QApplication.restoreOverrideCursor()
             QMessageBox.critical(self, "Config error", str(exc))
@@ -529,8 +531,9 @@ class ProjectViewWindow(QMainWindow):
             QMessageBox.information(
                 self, "Regions updated",
                 f"{len(result['updated'])} region(s) now use this config.\n\n"
-                "Each keeps its own dimensions; only the processing parameters "
-                "were changed. They will reprocess from Step 1.")
+                f"{result.get('cleared', 0)} stale result file(s) were deleted, so "
+                "these regions now read as unprocessed. Each keeps its own "
+                "dimensions; only the processing parameters changed.")
 
     def _open_sample_folder(self, leaf_key: str) -> None:
         """Open one image, or one of its regions, in the segmentation view.

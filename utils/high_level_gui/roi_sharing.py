@@ -1148,11 +1148,69 @@ def ensure_roi_artifacts(
     }
 
 
+# Files in a region session that are NOT results: the region's definition, its
+# cached crop (derived from the polygon, independent of any config) and the config
+# itself. Everything else is output and is removed when the config changes.
+_REGION_KEEP_PREFIXES = (ROI_JSON_NAME, ROI_CROP_NAME, ROI_CONFIG_PREFIX)
+
+
+def is_region_result_file(name: str) -> bool:
+    """True if a file in a region session is a computed OUTPUT.
+
+    The single definition of "result" for a region, used both to clear them and to
+    report status. The polygon, the cached crop and the config are not results: the
+    crop is derived from the polygon and is independent of any parameter, so a
+    region that has merely been opened has produced nothing.
+    """
+    return not os.path.basename(str(name)).startswith(_REGION_KEEP_PREFIXES)
+
+
+def region_result_files(roi_dir: str) -> List[str]:
+    """Names of a region's computed outputs, or [] if it has none."""
+    try:
+        return [f for f in sorted(os.listdir(roi_dir))
+                if is_region_result_file(f)]
+    except OSError:
+        return []
+
+
+def clear_region_results(roi_dir: str) -> int:
+    """Delete a region's computed outputs, keeping its definition and config.
+
+    Applying a new config to a region MUST discard what the old parameters
+    produced. Leaving them means the region opens showing segmentation from
+    parameters that are no longer displayed anywhere -- there is then no way to
+    tell which settings produced which result.
+
+    Implemented as a keep-list rather than a delete-list on purpose: a
+    delete-list has to be updated whenever the pipeline learns to write a new
+    output, and anything it misses survives as stale data. Only three things are
+    ever worth keeping, and they are all config-independent.
+
+    Returns the number of files removed.
+    """
+    if not roi_dir or not os.path.isdir(roi_dir):
+        return 0
+    removed = 0
+    for name in region_result_files(roi_dir):
+        path = os.path.join(roi_dir, name)
+        try:
+            if os.path.isdir(path):
+                shutil.rmtree(path)
+            else:
+                os.remove(path)
+            removed += 1
+        except OSError as exc:
+            print(f"  [ROI] could not remove {name}: {exc}")
+    return removed
+
+
 def apply_template_to_regions(
     sample_dirs: Sequence[str],
     template: Dict[str, Any],
     only_regions: Optional[Sequence[str]] = None,
     targets: Optional[Sequence] = None,
+    config_name: str = "",
 ) -> Dict[str, Any]:
     """Push a template's PARAMETERS into saved regions, keeping true dimensions.
 
@@ -1178,6 +1236,7 @@ def apply_template_to_regions(
     updated: List[str] = []
     skipped: List[Dict[str, Any]] = []
     errors: List[Dict[str, str]] = []
+    cleared = 0
     wanted = set(only_regions) if only_regions is not None else None
 
     # Explicit pairs win, and define which folders are visited at all.
@@ -1222,6 +1281,12 @@ def apply_template_to_regions(
         base[dim_key] = dict(full_dims)
         base["mode"] = mode          # follows the channel, never the template
         base.pop(_other_dim_key(dim_key), None)   # no stale block from a template
+        if config_name:
+            # Recorded so the project view's Config column names the config that
+            # was applied. Without it the column showed the fixed on-disk filename
+            # ("processing_config_<mode>"), which never changed however many
+            # different configs were applied.
+            base["config_name"] = config_name
 
         allowed = per_folder.get(sample_dir) if per_folder is not None else wanted
         full_shape = _full_shape_of(info)
@@ -1247,6 +1312,22 @@ def apply_template_to_regions(
                     z0=int(bbox.get("z0") or 0), z1=bbox.get("z1"))
                 path = os.path.join(
                     session["roi_dir"], f"{ROI_CONFIG_PREFIX}{mode}.yaml")
+
+                # Destructive by design: results from the previous parameters are
+                # removed before the new config lands, so a region can never show
+                # data that its displayed settings did not produce. Skipped only
+                # when the config is byte-identical, where there is nothing to
+                # be confused about.
+                previous = None
+                if os.path.isfile(path):
+                    try:
+                        with open(path, "r") as fh:
+                            previous = _yaml.safe_load(fh) or {}
+                    except Exception:
+                        previous = None
+                if previous != new_cfg:
+                    cleared += clear_region_results(session["roi_dir"])
+
                 with open(path, "w") as fh:
                     _yaml.safe_dump(new_cfg, fh, default_flow_style=False,
                                     sort_keys=False)
@@ -1254,7 +1335,8 @@ def apply_template_to_regions(
             except Exception as exc:
                 errors.append({"roi_dir": session["roi_dir"], "error": str(exc)})
 
-    return {"updated": updated, "skipped": skipped, "errors": errors}
+    return {"updated": updated, "skipped": skipped, "errors": errors,
+            "cleared": cleared}
 
 
 def _other_dim_key(dim_key: str) -> str:

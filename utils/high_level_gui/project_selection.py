@@ -381,10 +381,15 @@ def roi_status(sample_folder: str, roi_name: str) -> str:
         return STATUS_UNKNOWN
     if any(f.startswith("metrics_df_") and f.endswith(".csv") for f in out_files):
         return STATUS_PROCESSED
-    # A polygon on its own is a defined-but-unprocessed region; anything more
-    # means the pipeline has started on it.
-    others = [f for f in out_files if f != "roi_polygon.json"]
-    return STATUS_IN_PROGRESS if others else STATUS_UNPROCESSED
+    # Only computed OUTPUTS count as progress. The polygon, the cached crop and the
+    # config are not results -- treating them as such made a region that had merely
+    # been opened (which builds the crop) report itself as part-processed.
+    try:
+        from .roi_sharing import region_result_files
+        return (STATUS_IN_PROGRESS if region_result_files(roi_dir)
+                else STATUS_UNPROCESSED)
+    except Exception:
+        return STATUS_UNPROCESSED
 
 
 def prettify_step_name(method: str) -> str:
@@ -1107,23 +1112,32 @@ if _HAVE_QT:
 
         @staticmethod
         def _roi_config_name(roi_dir: str) -> str:
-            """Name of a region's own config, which it owns independently."""
+            """Name of the config a region is using, or "" if it has none yet.
+
+            Read from the config's recorded ``config_name``, never from the
+            filename: a region's config is always written as
+            ``processing_config_<mode>.yaml``, so falling back to the filename
+            stem displayed the same fixed string no matter which config had
+            actually been applied.
+            """
             if not roi_dir:
                 return ""
             try:
                 for f in sorted(os.listdir(roi_dir)):
-                    if f.lower().endswith((".yaml", ".yml")):
-                        try:
-                            import yaml  # type: ignore
-                            with open(os.path.join(roi_dir, f), "r",
-                                      encoding="utf-8") as fh:
-                                cfg = yaml.safe_load(fh) or {}
-                            named = cfg.get("config_name") or cfg.get("name")
-                            if named:
-                                return str(named)
-                        except Exception:
-                            pass
-                        return os.path.splitext(f)[0]
+                    if not f.lower().endswith((".yaml", ".yml")):
+                        continue
+                    try:
+                        import yaml  # type: ignore
+                        with open(os.path.join(roi_dir, f), "r",
+                                  encoding="utf-8") as fh:
+                            cfg = yaml.safe_load(fh) or {}
+                    except Exception:
+                        continue
+                    named = cfg.get("config_name") or cfg.get("name")
+                    if named:
+                        return str(named)
+                    # Derived from the channel and never explicitly assigned.
+                    return "(inherited)"
             except OSError:
                 pass
             return ""
