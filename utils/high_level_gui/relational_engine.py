@@ -340,6 +340,22 @@ class RelationalEngine:
                     )
 
             elif step_type == "filter":
+                # A filter with nothing before it applies to the channel recorded
+                # on the step. Without this the step silently did nothing, which
+                # looked like the filter had been applied when it had not.
+                if not last_mask_path and step.get("input"):
+                    src = _dat(sample_channels.get(step["input"]))
+                    if src:
+                        last_mask_path = src
+                        last_mask_name = name_registry.get(step["input"],
+                                                           step["input"])
+                    else:
+                        print(f"  [Size Filter] SKIPPED: no segmentation for "
+                              f"{step['input']}")
+                if not last_mask_path:
+                    print("  [Size Filter] SKIPPED: nothing to filter. Add an "
+                          "intersection first, or re-add the filter so it records "
+                          "which channel it applies to.")
                 if last_mask_path:
                     min_v = step['min_vol']
                     # Objects are areas in 2D and volumes in 3D; the threshold is

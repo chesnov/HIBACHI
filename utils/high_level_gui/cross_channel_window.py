@@ -316,18 +316,55 @@ class CrossChannelAnalyzerWindow(QMainWindow):
         return "Area" if self.project_is_2d() else "Volume"
 
     def add_filter_step(self):
+        """Add a size filter, recording WHAT it filters.
+
+        A filter with a preceding mask-producing step applies to that result. With
+        nothing before it, it needs a channel, and that channel has to be recorded
+        in the step -- it cannot be inferred later from the checked boxes, because
+        `get_checked_channels` returns list order rather than click order, so
+        "the first checked channel" is not "the one the user meant". Leaving it
+        unrecorded also made the step a silent no-op in `run_recipe`, which only
+        acted when a previous result existed.
+        """
+        has_previous = any(st.get("type") in ("intersect", "filter")
+                           for st in self.recipe_steps)
+
+        source = None
+        if not has_previous:
+            checked = self.get_checked_channels()
+            if len(checked) == 1:
+                source = checked[0]
+            else:
+                options = self.get_checked_channels() or sorted(
+                    {c for d in self.pm.sample_registry.values() for c in d})
+                if not options:
+                    QMessageBox.warning(self, "No channels",
+                                        "No channels are available to filter.")
+                    return
+                pick, ok = QInputDialog.getItem(
+                    self, "Size Filter",
+                    "This filter has nothing before it in the recipe, so it needs "
+                    "a channel to filter.\n\nFilter which channel?",
+                    options, 0, False)
+                if not ok:
+                    return
+                source = pick
+
         unit = self.size_unit()
         val, ok = QInputDialog.getDouble(
             self, "Size Filter", f"Minimum {self.size_word().lower()} ({unit}):",
             10.0, 0, 1000000, 2)
-        if ok:
-            # 'min_vol' is kept as the key for backward compatibility with recipes
-            # already saved to disk; only the wording is mode-aware.
-            step = {"type": "filter", "min_vol": val,
-                    "size_unit": unit,
-                    "name": f"Size filter: keep objects > {val:g} {unit}"}
-            self.recipe_steps.append(step)
-            self.recipe_list.addItem(step["name"])
+        if not ok:
+            return
+
+        target = (source.split("_", 2)[-1] if source else "previous result")
+        # 'min_vol' is kept as the key for backward compatibility with recipes
+        # already saved to disk; 'input' and 'size_unit' are additions.
+        step = {"type": "filter", "min_vol": val, "size_unit": unit,
+                "input": source,
+                "name": f"Size filter ({target}): keep objects > {val:g} {unit}"}
+        self.recipe_steps.append(step)
+        self.recipe_list.addItem(step["name"])
 
     def add_analysis_step(self):
         checked = self.get_checked_channels()

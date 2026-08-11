@@ -267,19 +267,6 @@ class SpatialNullDialog(QDialog):
                     return "um\u00b2" if str(mode).endswith("_2d") else "um\u00b3"
         return "um\u00b3"
 
-    def _recipe_source_channel(self):
-        """Channel a filter-first recipe operates on: the checked one."""
-        for ch in self.checked:
-            if ch in self.all_channels:
-                return ch
-        # Fall back to the first real channel offered, so a recipe is still
-        # usable when nothing was checked.
-        for i in range(self.cb_primary.count()):
-            data = self.cb_primary.itemData(i)
-            if isinstance(data, str) and not data.startswith("__"):
-                return data
-        return None
-
     def _recipe_program(self):
         """The recipe's mask-producing steps, as a program for the runner.
 
@@ -313,12 +300,14 @@ class SpatialNullDialog(QDialog):
                     names.append(inputs[0].split("_", 2)[-1])
             elif kind == "filter":
                 if not program:
-                    # A filter with nothing before it needs a source channel. It
-                    # cannot come from the primary selector, which is sitting on
-                    # "Recipe result" -- that would be circular. The channel the
-                    # user checked in the analyzer is what the recipe operates on,
-                    # so that is the source.
-                    src = self._recipe_source_channel()
+                    # The channel comes from the step itself. It used to be guessed
+                    # from the checked boxes, which was wrong: get_checked_channels
+                    # returns list order, not click order, so with channels 0 and 2
+                    # checked the guess picked channel 0 -- and if channel 0 was
+                    # also the fixed partner, the run silently measured channel 0
+                    # against itself. Guessing is not recoverable here, so an
+                    # unrecorded input is refused instead.
+                    src = step.get("input")
                     if not src:
                         return [], ""
                     program.append({"type": "channel", "channel": src})
@@ -651,8 +640,11 @@ class SpatialNullDialog(QDialog):
         program, label = self._recipe_program()
         if not program:
             self.lbl_program.setText(
-                "The recipe's filter has no channel or intersection before it — "
-                "add one, or pick a channel above.")
+                "This size filter does not record which channel it applies to, "
+                "and has no intersection before it to act on. Remove it and add "
+                "it again — it will ask which channel to filter. (Guessing from "
+                "the checked boxes is what previously made a run measure one "
+                "channel against itself.)")
             return
         self.lbl_program.setText(
             " → ".join(_describe_program_step(st) for st in program)
@@ -691,19 +683,49 @@ class SpatialNullDialog(QDialog):
             return "_and_".join(names[:2]) if len(names) > 1 else "overlap"
         return str(self.cb_primary.currentData() or "").split("_", 2)[-1]
 
+    def _primary_source_channels(self):
+        """Channels the randomised objects are actually built from."""
+        if self.primary_is_recipe:
+            program, _ = self._recipe_program()
+            out = []
+            for st in program:
+                for key in ("channel", "channel_b"):
+                    if st.get(key):
+                        out.append(st[key])
+            return out
+        if self.primary_is_overlap:
+            return list(self.intersect_inputs)
+        data = self.cb_primary.currentData()
+        return [data] if isinstance(data, str) and not data.startswith("__") else []
+
     def _check_partner(self, *_):
-        """Warn when the partner cannot yield a meaningful distance."""
+        """Warn when the partner cannot yield a meaningful distance.
+
+        The self-distance case is checked against the RESOLVED source channels, not
+        against the combo's current data. When "Recipe result" is selected the combo
+        holds a sentinel, so comparing it to the partner never matched and a run
+        measuring a channel against itself went through silently.
+        """
         partner = self.cb_partner.currentText()
         if partner.startswith("None"):
             self.lbl_partner_warn.setText("")
             return
+
+        sources = self._primary_source_channels()
         msg = ""
         if self.primary_is_overlap and partner in self.intersect_inputs:
             msg = (f"The overlap lies inside {partner.split('_', 2)[-1]} by "
                    f"construction, so its distance to it is always 0 — pick a "
                    f"third channel.")
-        elif partner == self.cb_primary.currentData():
-            msg = "The partner is the same channel as the objects being randomised."
+        elif sources and all(sc == partner for sc in sources):
+            msg = (f"The objects being randomised come from "
+                   f"{partner.split('_', 2)[-1]}, which is also the fixed partner. "
+                   f"This measures that channel against ITSELF — pick a different "
+                   f"partner, or a different source for the recipe's filter.")
+        elif partner in sources:
+            msg = (f"{partner.split('_', 2)[-1]} is both the fixed partner and one "
+                   f"of the channels the randomised objects are built from, so the "
+                   f"distances are constrained by construction.")
         self.lbl_partner_warn.setText(msg)
 
     def _wire_signals(self):
@@ -875,9 +897,22 @@ class SpatialNullDialog(QDialog):
         if p["primary_is_recipe"] and not p["primary_recipe"]:
             QMessageBox.warning(
                 self, "Recipe not usable",
-                "The recipe's filter step has no channel or intersection before "
-                "it, so there is nothing to filter. Add one, or randomise a "
-                "channel directly.")
+                "The recipe's size filter does not record which channel it "
+                "applies to, and it has no intersection before it to act on.\n\n"
+                "Remove the filter step and add it again — it will ask which "
+                "channel to filter and store the answer.")
+            return
+
+        _sources = self._primary_source_channels()
+        if (p["partner_channel"] and _sources
+                and all(sc == p["partner_channel"] for sc in _sources)):
+            QMessageBox.critical(
+                self, "Would measure a channel against itself",
+                f"The randomised objects come from "
+                f"{p['partner_channel'].split('_', 2)[-1]}, which is also the "
+                f"fixed partner.\n\nEvery distance would be that channel to "
+                f"itself. Pick a different partner, or a different source for the "
+                f"recipe's filter.")
             return
         if (not p["primary_channel"] and not p["intersection_spec"]
                 and not p["primary_recipe"]):
