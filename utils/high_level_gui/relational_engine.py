@@ -146,6 +146,13 @@ class RelationalEngine:
 
     @staticmethod
     def filter_by_volume(path_in, out_path, shape, spacing, min_vol_um3):
+        """Keep objects at or above a physical size threshold.
+
+        The parameter is named for volume because the signature predates 2D
+        support, but the quantity is voxel count x voxel size: an AREA in 2D and a
+        VOLUME in 3D. Callers should present it with the unit that matches the
+        project's mode.
+        """
         """Removes objects smaller than a physical volume threshold and relabels 1..N."""
         data = np.memmap(path_in, dtype=np.int32, mode='r', shape=shape)
         unit_vol = np.prod(spacing)
@@ -335,10 +342,14 @@ class RelationalEngine:
             elif step_type == "filter":
                 if last_mask_path:
                     min_v = step['min_vol']
+                    # Objects are areas in 2D and volumes in 3D; the threshold is
+                    # the same number either way, only the unit differs.
+                    _unit = "um\u00b2" if len(shape) == 2 else "um\u00b3"
                     last_mask_path = RelationalEngine.filter_by_volume(
                         last_mask_path, step_out_path, shape, spacing, min_v
                     )
                     last_mask_name = f"{last_mask_name}_Filtered"
+                    print(f"  [Size Filter] Kept objects > {min_v:g} {_unit}")
                     
                     # Relabel after volume removal
                     temp_mask = np.memmap(last_mask_path, dtype=np.int32, mode='r+', shape=shape)

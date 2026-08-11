@@ -264,7 +264,8 @@ def _describe_step(step: Dict[str, Any]) -> str:
     if kind == "filter":
         lo = step.get("min_size") or 0
         hi = step.get("max_size")
-        return f"filter(>={lo:g}" + (f", <={hi:g})" if hi else ")")
+        unit = step.get("size_unit") or "um^n"
+        return f"size>={lo:g}{unit}" + (f", <={hi:g}{unit}" if hi else "")
     return str(kind)
 
 
@@ -282,7 +283,7 @@ def filter_labels_by_size(labels: np.ndarray,
     recipe's own analysis reports on.
 
     `min_size`/`max_size` are um^2 in 2D and um^3 in 3D, matching the recipe's
-    "Min Volume" prompt.
+    size-filter prompt, which shows whichever unit the project's mode implies.
     """
     struct = ndimage.generate_binary_structure(labels.ndim, labels.ndim)
     comps, _ = ndimage.label(labels > 0, structure=struct)

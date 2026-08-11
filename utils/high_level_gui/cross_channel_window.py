@@ -31,6 +31,9 @@ def _safe_name(name: str) -> str:
 
 class CrossChannelAnalyzerWindow(QMainWindow):
     def __init__(self, project_manager):
+        # Resolved lazily by project_is_2d(); objects are areas in 2D and volumes
+        # in 3D, and the UI should say which.
+        self._is_2d_cache = None
         super().__init__()
         self.pm = project_manager
         self.setWindowTitle("Cross-Channel Relational Analyzer")
@@ -98,7 +101,7 @@ class CrossChannelAnalyzerWindow(QMainWindow):
         self.btn_synth.setStyleSheet("background-color: #8A2BE2; color: white;") # Purple
         
         self.btn_intersect = QPushButton("+ Intersection")
-        self.btn_filter = QPushButton("+ Volume Filter")
+        self.btn_filter = QPushButton("+ Size Filter")
         self.btn_dist = QPushButton("+ Distance Analysis")
         
         self.btn_synth.clicked.connect(self.open_synthetic_dialog)
@@ -280,10 +283,49 @@ class CrossChannelAnalyzerWindow(QMainWindow):
         self.recipe_steps.append(step)
         self.recipe_list.addItem(step["name"])
 
+    def project_is_2d(self):
+        """True when this project was processed by the 2D pipeline.
+
+        Read from a sample's saved config rather than inferred from array shapes:
+        a 3-axis array can be (Z, Y, X) or (C, Y, X), so the recorded mode is the
+        only reliable discriminator. Cached, because it cannot change within a
+        project and the lookup touches the disk.
+        """
+        if getattr(self, "_is_2d_cache", None) is not None:
+            return self._is_2d_cache
+        is_2d = None
+        for sample_data in self.pm.sample_registry.values():
+            for ch_path in sample_data.values():
+                try:
+                    _, mode = get_sample_metadata(ch_path)
+                except Exception:
+                    continue
+                if mode:
+                    is_2d = str(mode).endswith("_2d")
+                    break
+            if is_2d is not None:
+                break
+        self._is_2d_cache = bool(is_2d) if is_2d is not None else False
+        return self._is_2d_cache
+
+    def size_unit(self):
+        """'um²' in 2D, 'um³' in 3D — objects are areas or volumes, not both."""
+        return "um\u00b2" if self.project_is_2d() else "um\u00b3"
+
+    def size_word(self):
+        return "Area" if self.project_is_2d() else "Volume"
+
     def add_filter_step(self):
-        val, ok = QInputDialog.getDouble(self, "Filter", "Min Volume (um³):", 10.0, 0, 1000000, 2)
+        unit = self.size_unit()
+        val, ok = QInputDialog.getDouble(
+            self, "Size Filter", f"Minimum {self.size_word().lower()} ({unit}):",
+            10.0, 0, 1000000, 2)
         if ok:
-            step = {"type": "filter", "min_vol": val, "name": f"Filter: Keep objects > {val} um³"}
+            # 'min_vol' is kept as the key for backward compatibility with recipes
+            # already saved to disk; only the wording is mode-aware.
+            step = {"type": "filter", "min_vol": val,
+                    "size_unit": unit,
+                    "name": f"Size filter: keep objects > {val:g} {unit}"}
             self.recipe_steps.append(step)
             self.recipe_list.addItem(step["name"])
 

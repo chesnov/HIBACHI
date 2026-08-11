@@ -72,7 +72,8 @@ def _describe_program_step(step) -> str:
         b = str(step.get("channel_b", "")).split("_", 2)[-1]
         return f"{a} ∩ {b}"
     if kind == "filter":
-        return f"keep > {float(step.get('min_size') or 0):g} um²/um³"
+        unit = step.get("size_unit") or "um²/um³"
+        return f"keep > {float(step.get('min_size') or 0):g} {unit}"
     return str(kind)
 
 
@@ -249,6 +250,23 @@ class SpatialNullDialog(QDialog):
                     return step
         return None
 
+    def _size_unit(self) -> str:
+        """'um²' in 2D, 'um³' in 3D, from a sample's recorded pipeline mode.
+
+        Falls back to 3D wording only if no mode can be read; a 3-axis array is
+        ambiguous between (Z, Y, X) and (C, Y, X), so shape is not usable here.
+        """
+        try:
+            from .runner import _mode_of
+        except ImportError:
+            return "um\u00b3"
+        for channels in self.pm.sample_registry.values():
+            for path in channels.values():
+                mode = _mode_of(path)
+                if mode:
+                    return "um\u00b2" if str(mode).endswith("_2d") else "um\u00b3"
+        return "um\u00b3"
+
     def _recipe_source_channel(self):
         """Channel a filter-first recipe operates on: the checked one."""
         for ch in self.checked:
@@ -305,8 +323,13 @@ class SpatialNullDialog(QDialog):
                         return [], ""
                     program.append({"type": "channel", "channel": src})
                     names = [src.split("_", 2)[-1]]
-                program.append({"type": "filter",
-                                "min_size": float(step.get("min_vol") or 0.0)})
+                program.append({
+                    "type": "filter",
+                    "min_size": float(step.get("min_vol") or 0.0),
+                    # The recipe step records the unit it prompted with; reuse it
+                    # rather than re-deriving, so the dialog, the manifest and the
+                    # recipe list all read identically.
+                    "size_unit": step.get("size_unit") or self._size_unit()})
         if not program:
             return [], ""
 
