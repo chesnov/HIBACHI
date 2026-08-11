@@ -93,6 +93,34 @@ class BatchProcessor:
 
         return spacing_val, z_scale_factor_val
 
+    def _leaf_mode(self, leaf_key: str) -> str:
+        """Processing mode for a leaf, region or full image.
+
+        A region has no directory of its own at ``<folder>::<region>``, so passing
+        the raw key to get_image_details returns mode 'error' and the leaf gets
+        skipped as an invalid folder. The mode of a region is its CHANNEL's mode,
+        so the key is split first.
+
+        Exists as one method because the two batch entry points each did this
+        check independently -- routing only the work through _resolve_target left
+        the pre-checks rejecting every region before the work was reached.
+        """
+        from .project_selection import split_leaf_key
+        folder_path, _roi = split_leaf_key(leaf_key)
+        try:
+            return self.project_manager.get_image_details(folder_path).get(
+                'mode', 'unknown')
+        except Exception:
+            return 'error'
+
+    @staticmethod
+    def _leaf_label(leaf_key: str) -> str:
+        """Readable name for a leaf, e.g. 'sample1 [ROI 2]', for logs and dialogs."""
+        from .project_selection import split_leaf_key
+        folder_path, roi_name = split_leaf_key(leaf_key)
+        base = os.path.basename(folder_path)
+        return f"{base} [{roi_name}]" if roi_name else base
+
     def _resolve_target(self, leaf_key: str, load_pixels: bool = False):
         """Everything a strategy needs for one leaf, image or saved region.
 
@@ -248,13 +276,13 @@ class BatchProcessor:
         if complete_folders:
             lines.append(f"  Fully complete  ({len(complete_folders)} folder(s)):")
             for fp in complete_folders:
-                lines.append(f"    • {os.path.basename(fp)}")
+                lines.append(f"    • {self._leaf_label(fp)}")
             lines.append("")
 
         if partial_folders:
             lines.append(f"  Partially complete  ({len(partial_folders)} folder(s)):")
             for fp in partial_folders:
-                lines.append(f"    • {os.path.basename(fp)}")
+                lines.append(f"    • {self._leaf_label(fp)}")
             lines.append("")
 
         lines.append("How would you like to proceed?")
@@ -565,7 +593,7 @@ class BatchProcessor:
         start_batch = time.time()
 
         for i, fp in enumerate(folders):
-            name = os.path.basename(fp)
+            name = self._leaf_label(fp)
             if progress_callback is not None:
                 try:
                     progress_callback({
@@ -578,11 +606,10 @@ class BatchProcessor:
                     pass
 
             print(f"\nProcessing {i+1}/{total}: {name}")
-            details = self.project_manager.get_image_details(fp)
-            mode = details.get('mode', 'unknown')
+            mode = self._leaf_mode(fp)
 
             if mode not in self.supported_strategies:
-                reason = "unsupported mode" if details['mode'] != 'error' else "invalid folder"
+                reason = "unsupported mode" if mode != 'error' else "invalid folder"
                 print(f"  [Skip] {name} — {reason} ({mode}).")
                 skipped += 1
                 continue
@@ -649,7 +676,7 @@ class BatchProcessor:
             for fp in self.project_manager.image_folders:
                 status_info = self._scan_folder_status(fp)
                 scan_results[fp] = status_info
-                name = os.path.basename(fp)
+                name = self._leaf_label(fp)
                 status = status_info['status']
 
                 if status == 'complete':
@@ -706,14 +733,13 @@ class BatchProcessor:
         for i, fp in enumerate(self.project_manager.image_folders):
             print(f"\nProcessing {i+1}/{total}...")
 
-            details = self.project_manager.get_image_details(fp)
-            mode = details.get('mode', 'unknown')
+            mode = self._leaf_mode(fp)
 
             if mode not in self.supported_strategies:
-                if details['mode'] != 'error':
-                    print(f"  [Skip] {os.path.basename(fp)} — unsupported mode: {mode}")
+                if mode != 'error':
+                    print(f"  [Skip] {self._leaf_label(fp)} — unsupported mode: {mode}")
                 else:
-                    print(f"  [Skip] {os.path.basename(fp)} — invalid folder.")
+                    print(f"  [Skip] {self._leaf_label(fp)} — invalid folder.")
                 skipped += 1
                 continue
 
