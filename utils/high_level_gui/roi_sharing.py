@@ -982,23 +982,31 @@ def build_roi_config(
     """
     import copy as _copy
 
+    from .metadata import dimension_key_for_mode, require_dimensions
+
     roi_config = _copy.deepcopy(base_config)
     is_2d_mode = str(mode).endswith('_2d')
-    dim_key = 'pixel_dimensions' if is_2d_mode else 'voxel_dimensions'
+    dim_key = dimension_key_for_mode(mode)
 
-    orig_dims = base_config.get(dim_key, {'x': 1.0, 'y': 1.0, 'z': 1.0})
-    orig_x = float(orig_dims.get('x', 1.0))
-    orig_y = float(orig_dims.get('y', 1.0))
+    # No fallback. A region derives its extent by scaling the full image's, so an
+    # absent or mismatched dimension block cannot be substituted for -- doing so
+    # produced sub-micron totals and silently rescaled every physical parameter.
+    orig_dims = require_dimensions(base_config, mode,
+                                   source="the full image's config")
+    orig_x = orig_dims['x']
+    orig_y = orig_dims['y']
 
     full_h = int(full_shape[-2])
     full_w = int(full_shape[-1])
 
-    new_dims = dict(orig_dims)
+    # Built from the validated axes only, so a stray 'z' cannot leak into a 2D
+    # config -- a pixel_dimensions block carrying z is a sign of the old fallback.
+    new_dims = {}
     new_dims['x'] = orig_x * ((x1 - x0) / full_w)
     new_dims['y'] = orig_y * ((y1 - y0) / full_h)
 
     if not is_2d_mode and 'z' in orig_dims and len(full_shape) == 3:
-        orig_z = float(orig_dims.get('z', 1.0))
+        orig_z = orig_dims['z']
         full_z = int(full_shape[0])
         effective_z1 = z1 if z1 is not None else full_z
         new_dims['z'] = orig_z * ((effective_z1 - z0) / full_z)
@@ -1048,6 +1056,7 @@ def ensure_roi_artifacts(
     read when the crop has to be rebuilt.
     """
     import yaml as _yaml
+    from .metadata import MissingDimensionsError
 
     info = describe_channel(sample_dir)
     if info is None:
@@ -1093,12 +1102,15 @@ def ensure_roi_artifacts(
 
     if config is None:
         if base_config is None:
-            try:
-                with open(os.path.join(sample_dir, os.path.basename(
-                        _channel_config_path(info))), "r") as fh:
-                    base_config = _yaml.safe_load(fh) or {}
-            except Exception:
-                base_config = {}
+            # Not wrapped in a swallow: an unreadable channel config used to become
+            # {}, which the dimension fallback then turned into invented extents.
+            channel_cfg = _channel_config_path(info)
+            if not channel_cfg or not os.path.isfile(channel_cfg):
+                raise MissingDimensionsError(
+                    f"No config found for {os.path.basename(sample_dir)}, so this "
+                    "region's physical dimensions cannot be derived.")
+            with open(channel_cfg, "r") as fh:
+                base_config = _yaml.safe_load(fh) or {}
         full_shape = _full_shape_of(info)
         config = build_roi_config(y0, x0, y1, x1, base_config, full_shape,
                                   mode, z0=z0, z1=z1)
@@ -1156,9 +1168,22 @@ def apply_template_to_regions(
     skipped: List[Dict[str, Any]] = []
     errors: List[Dict[str, str]] = []
 
+    from .metadata import dimension_key_for_mode
+
     for sample_dir in sample_dirs:
         info = describe_channel(sample_dir)
         if info is None:
+            continue
+        # A template must carry dimensions for THIS channel's dimensionality.
+        # Without this check a 3D template applied to a 2D channel produced regions
+        # whose extents came from the old 1.0 fallback.
+        needed = dimension_key_for_mode(info["mode"])
+        if not isinstance(template.get(needed), dict) or not template[needed]:
+            errors.append({
+                "roi_dir": sample_dir,
+                "error": (f"template has no '{needed}', so it cannot supply "
+                          f"dimensions for a '{info['mode']}' channel"),
+            })
             continue
         full_shape = _full_shape_of(info)
         for session in list_roi_sessions(sample_dir):

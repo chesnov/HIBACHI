@@ -20,6 +20,76 @@ except ImportError:
 
 
 
+class MissingDimensionsError(ValueError):
+    """A config has no usable physical dimensions, so nothing may be processed.
+
+    Deliberately fatal with no fallback. Defaulting a TOTAL extent to 1.0 -- which
+    is what used to happen -- is indistinguishable from a correctly calibrated
+    1-micron image, so it cannot be detected downstream. It silently rescales every
+    physical parameter by the pixel count: on a 2916 px axis it turns a 0.7 um
+    smoothing sigma into a 2084 px blur, and every measurement it produces is
+    wrong by the same factor. A run that cannot be trusted must not start.
+    """
+
+
+def dimension_key_for_mode(mode) -> str:
+    """Config key holding the physical extent for a processing mode."""
+    return 'pixel_dimensions' if str(mode).endswith('_2d') else 'voxel_dimensions'
+
+
+def require_dimensions(config: Dict[str, Any], mode: str,
+                       source: str = "") -> Dict[str, float]:
+    """Total physical extent (microns) from a config, or raise.
+
+    Requires the key matching `mode` -- a 2D config needs 'pixel_dimensions' and a
+    3D config 'voxel_dimensions'. That distinction matters: a 3D config carries
+    dimensions under the 3D key, so reading it as 2D finds nothing, and the old
+    fallback then invented sub-micron totals. Applying a 3D template to a 2D image
+    is exactly how that happens.
+
+    Every axis must be a finite positive number. Zero or negative extents are as
+    unusable as a missing block.
+    """
+    key = dimension_key_for_mode(mode)
+    where = f" in {source}" if source else ""
+    section = config.get(key)
+
+    if not isinstance(section, dict) or not section:
+        other = ('voxel_dimensions' if key == 'pixel_dimensions'
+                 else 'pixel_dimensions')
+        hint = ""
+        if isinstance(config.get(other), dict) and config.get(other):
+            hint = (f"\n\nIt has '{other}' instead, which belongs to the other "
+                    f"dimensionality. This config is set to mode '{mode}'; the two "
+                    "must agree. A config or template from a "
+                    f"{'3D' if other == 'voxel_dimensions' else '2D'} project "
+                    "cannot supply dimensions for this one.")
+        raise MissingDimensionsError(
+            f"No '{key}' found{where}.{hint}\n\nSet this image's physical "
+            "dimensions before processing. Processing cannot continue without "
+            "them: every size, distance and density would be wrong."
+        )
+
+    axes = ('x', 'y') if key == 'pixel_dimensions' else ('x', 'y', 'z')
+    out: Dict[str, float] = {}
+    for axis in axes:
+        raw = section.get(axis)
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            raise MissingDimensionsError(
+                f"'{key}.{axis}'{where} is not a number (got {raw!r}). Set this "
+                "image's physical dimensions before processing."
+            )
+        if not np.isfinite(value) or value <= 0:
+            raise MissingDimensionsError(
+                f"'{key}.{axis}'{where} is {value!r}, which cannot be a physical "
+                "size. Set this image's physical dimensions before processing."
+            )
+        out[axis] = value
+    return out
+
+
 class ChannelExtractionError(RuntimeError):
     """Raised when a channel could not be written, carrying the specific reason.
 

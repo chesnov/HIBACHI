@@ -47,7 +47,8 @@ class BatchProcessor:
     def _calculate_spacing_for_batch(
         self,
         config: Dict[str, Any],
-        image_shape: Tuple[int, ...]
+        image_shape: Tuple[int, ...],
+        label: str = "",
     ) -> Tuple[Union[Tuple[float, float, float], Tuple[float, float, float]], float]:
         """
         Calculates voxel spacing based on config dimensions and image shape.
@@ -61,16 +62,19 @@ class BatchProcessor:
             - spacing (tuple): (Z, Y, X) or (1.0, Y, X) spacing values.
             - z_scale_factor (float): Anisotropy factor for visualization/calculations.
         """
-        is_2d_mode = config.get('mode', '').endswith("_2d")
-        dim_section_key = 'pixel_dimensions' if is_2d_mode else 'voxel_dimensions'
-        dimensions = config.get(dim_section_key, {})
+        from .metadata import require_dimensions
 
-        try:
-            total_x_um = float(dimensions.get('x', 1.0))
-            total_y_um = float(dimensions.get('y', 1.0))
-            total_z_um = 1.0 if is_2d_mode else float(dimensions.get('z', 1.0))
-        except (ValueError, TypeError):
-            total_x_um, total_y_um, total_z_um = 1.0, 1.0, 1.0
+        mode = config.get('mode', '')
+        is_2d_mode = str(mode).endswith("_2d")
+
+        # No fallback: raises MissingDimensionsError rather than defaulting a TOTAL
+        # extent to 1.0. That default made a whole 2916 px axis one micron across,
+        # which turned a 0.7 um smoothing sigma into a 2084 px blur and would have
+        # made every measurement wrong by the same factor.
+        dimensions = require_dimensions(config, mode, source=label or "this image")
+        total_x_um = dimensions['x']
+        total_y_um = dimensions['y']
+        total_z_um = 1.0 if is_2d_mode else dimensions['z']
 
         num_dims = len(image_shape)
         spacing_val: Tuple[float, ...] = (1.0, 1.0, 1.0)
@@ -219,7 +223,8 @@ class BatchProcessor:
 
             config_params = target['config']
             image_shape = target['image_shape']
-            spacing, z_scale = self._calculate_spacing_for_batch(config_params, image_shape)
+            spacing, z_scale = self._calculate_spacing_for_batch(
+                config_params, image_shape, label=target['label'])
 
             strategy_instance = StrategyClass(
                 config=dict(config_params),
@@ -243,6 +248,13 @@ class BatchProcessor:
                 result['status'] = 'partial'
 
         except Exception as e:
+            from .metadata import MissingDimensionsError
+            if isinstance(e, MissingDimensionsError):
+                # Distinct from a generic scan failure: this one is actionable and
+                # blocks processing entirely.
+                result['status'] = 'no_dimensions'
+                print(f"  [Dimensions missing] {folder_path}: {e}")
+                return result
             print(f"  [Scan Error] {folder_path}: {e}")
         finally:
             if strategy_instance is not None:
@@ -413,7 +425,7 @@ class BatchProcessor:
             processed_dir = target['processed_dir']
 
             spacing, z_scale = self._calculate_spacing_for_batch(
-                config_params, image_stack.shape
+                config_params, image_stack.shape, label=target['label']
             )
 
             # 2. Instantiate Strategy

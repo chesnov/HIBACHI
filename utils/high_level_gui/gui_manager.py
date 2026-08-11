@@ -1363,16 +1363,20 @@ class DynamicGUIManager(QObject):
 
     def _calculate_spacing(self) -> None:
         """Parses spacing from config or defaults to 1.0."""
+        from .metadata import require_dimensions
+
         is_2d_mode = self.processing_mode.endswith("_2d")
-        dim_key = 'pixel_dimensions' if is_2d_mode else 'voxel_dimensions'
-        dim = self.config.get(dim_key, {})
-        
-        try:
-            tx = float(dim.get('x', 1.0))
-            ty = float(dim.get('y', 1.0))
-            tz = float(dim.get('z', 1.0))
-        except (ValueError, TypeError):
-            tx, ty, tz = 1.0, 1.0, 1.0
+        # No fallback. Defaulting a TOTAL extent to 1.0 made a whole 2916 px axis
+        # one micron across, which silently rescaled every physical parameter --
+        # a 0.7 um smoothing sigma became a 2084 px blur. An unset extent stops
+        # the run instead.
+        label = (self.active_roi_name
+                 or os.path.basename(os.path.dirname(self.processed_dir))
+                 or "this image")
+        dim = require_dimensions(self.config, self.processing_mode, source=label)
+        tx = dim['x']
+        ty = dim['y']
+        tz = 1.0 if is_2d_mode else dim['z']
 
         shape = self.image_stack.shape
         
