@@ -1151,42 +1151,83 @@ def ensure_roi_artifacts(
 def apply_template_to_regions(
     sample_dirs: Sequence[str],
     template: Dict[str, Any],
+    only_regions: Optional[Sequence[str]] = None,
+    targets: Optional[Sequence] = None,
 ) -> Dict[str, Any]:
-    """Push a template config into every saved region of the given channels.
+    """Push a template's PARAMETERS into saved regions, keeping true dimensions.
 
-    A region's config is the template's parameter blocks with the DIMENSION block
-    re-derived for that region's own crop -- reusing the channel's dimensions would
-    describe an array of the wrong size, and copying the region's old parameters
-    would defeat the point of applying a template. Each region's existing bbox is
-    read from its polygon record so nothing has to be recomputed from pixels.
+    Dimensions are taken from each channel's own full-image config and rescaled to
+    the region's crop. They are never taken from the template, because physical
+    extent is a property of the IMAGE, not of the settings being applied. A config
+    exported from a region already carries crop-scaled extents, so scaling those
+    again by the crop fraction shrank them a second time -- measured at 4x wrong,
+    which passes every sanity check while making every physical result wrong.
+
+    `only_regions` restricts the update to named regions across `sample_dirs`.
+    `targets` is more precise -- a sequence of (sample_dir, region_name) pairs --
+    and is what the project view passes when specific region ROWS were checked, so
+    a channel's other regions are left alone.
 
     Returns ``{updated: [...], skipped: [...], errors: [...]}``.
     """
+    import copy as _copy
     import yaml as _yaml
+
+    from .metadata import dimension_key_for_mode, require_dimensions
 
     updated: List[str] = []
     skipped: List[Dict[str, Any]] = []
     errors: List[Dict[str, str]] = []
+    wanted = set(only_regions) if only_regions is not None else None
 
-    from .metadata import dimension_key_for_mode
+    # Explicit pairs win, and define which folders are visited at all.
+    per_folder: Optional[Dict[str, set]] = None
+    if targets:
+        per_folder = {}
+        for folder, region in targets:
+            per_folder.setdefault(folder, set()).add(region)
+        sample_dirs = list(per_folder)
 
     for sample_dir in sample_dirs:
         info = describe_channel(sample_dir)
         if info is None:
             continue
-        # A template must carry dimensions for THIS channel's dimensionality.
-        # Without this check a 3D template applied to a 2D channel produced regions
-        # whose extents came from the old 1.0 fallback.
-        needed = dimension_key_for_mode(info["mode"])
-        if not isinstance(template.get(needed), dict) or not template[needed]:
+        mode = info["mode"]
+        dim_key = dimension_key_for_mode(mode)
+
+        # The template's parameter blocks belong to a specific pipeline, so a
+        # template from a differently-shaped project must not be applied.
+        tmpl_mode = template.get("mode")
+        if tmpl_mode and str(tmpl_mode) != str(mode):
             errors.append({
                 "roi_dir": sample_dir,
-                "error": (f"template has no '{needed}', so it cannot supply "
-                          f"dimensions for a '{info['mode']}' channel"),
+                "error": (f"template is for mode '{tmpl_mode}' but this channel is "
+                          f"'{mode}'; the parameters are not interchangeable"),
             })
             continue
+
+        # Extents come from the channel, so an ROI-derived template works too.
+        channel_cfg_path = _channel_config_path(info)
+        try:
+            with open(channel_cfg_path, "r") as fh:
+                channel_cfg = _yaml.safe_load(fh) or {}
+            full_dims = require_dimensions(
+                channel_cfg, mode,
+                source=f"{os.path.basename(sample_dir)} (full image)")
+        except Exception as exc:
+            errors.append({"roi_dir": sample_dir, "error": str(exc)})
+            continue
+
+        base = _copy.deepcopy(template)
+        base[dim_key] = dict(full_dims)
+        base["mode"] = mode          # follows the channel, never the template
+        base.pop(_other_dim_key(dim_key), None)   # no stale block from a template
+
+        allowed = per_folder.get(sample_dir) if per_folder is not None else wanted
         full_shape = _full_shape_of(info)
         for session in list_roi_sessions(sample_dir):
+            if allowed is not None and session["name"] not in allowed:
+                continue
             if not session["has_polygon"]:
                 skipped.append({"roi_dir": session["roi_dir"],
                                 "reason": "no polygon"})
@@ -1202,15 +1243,10 @@ def apply_template_to_regions(
                 continue
             try:
                 new_cfg = build_roi_config(
-                    y0, x0, y1, x1, template, full_shape or (1, 1),
-                    info["mode"], z0=int(bbox.get("z0") or 0),
-                    z1=bbox.get("z1"))
-                # mode follows the channel, never the template, so a template
-                # exported from a 3D project cannot silently convert a 2D region.
-                new_cfg["mode"] = info["mode"]
+                    y0, x0, y1, x1, base, full_shape or (1, 1), mode,
+                    z0=int(bbox.get("z0") or 0), z1=bbox.get("z1"))
                 path = os.path.join(
-                    session["roi_dir"],
-                    f"{ROI_CONFIG_PREFIX}{info['mode']}.yaml")
+                    session["roi_dir"], f"{ROI_CONFIG_PREFIX}{mode}.yaml")
                 with open(path, "w") as fh:
                     _yaml.safe_dump(new_cfg, fh, default_flow_style=False,
                                     sort_keys=False)
@@ -1219,6 +1255,12 @@ def apply_template_to_regions(
                 errors.append({"roi_dir": session["roi_dir"], "error": str(exc)})
 
     return {"updated": updated, "skipped": skipped, "errors": errors}
+
+
+def _other_dim_key(dim_key: str) -> str:
+    """The dimension key belonging to the other dimensionality."""
+    return ('voxel_dimensions' if dim_key == 'pixel_dimensions'
+            else 'pixel_dimensions')
 
 
 def count_regions(sample_dirs: Sequence[str]) -> int:

@@ -465,6 +465,73 @@ class ProjectViewWindow(QMainWindow):
                 f"{deleted} region(s) deleted. Channels with no regions left "
                 "will open on the full image.")
 
+    def _set_region_config(self, region_targets: list) -> None:
+        """Apply a chosen config to exactly the checked regions.
+
+        Only the regions' own configs are written; the channels' full-image configs
+        are untouched. Dimensions come from each region's own geometry, so a config
+        exported from one region can be reused on regions of any other size.
+        """
+        import yaml as _yaml
+        from .config_library import ConfigLibraryError
+        from .roi_sharing import apply_template_to_regions
+
+        names = sorted({n for _f, n in region_targets})
+        # Offer only configs matching these regions' mode, which is their channel's.
+        mode = self._checked_folders_mode([f for f, _n in region_targets])
+        template_path = self._pick_template(mode)
+        if not template_path:
+            return
+        summary = (", ".join(names[:6]) + ("\u2026" if len(names) > 6 else ""))
+        if QMessageBox.question(
+                self, "Apply config to regions",
+                f"Apply {os.path.basename(template_path)} to "
+                f"{len(region_targets)} region(s)?\n\n{summary}\n\n"
+                "Only these regions change. Their channels' full-image configs are "
+                "untouched, and each region keeps its own dimensions.\n\n"
+                "Processing parameters will be replaced, so they reprocess from "
+                "Step 1.",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No) != QMessageBox.Yes:
+            return
+
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            with open(template_path, "r", encoding="utf-8") as fh:
+                template = _yaml.safe_load(fh) or {}
+            result = apply_template_to_regions(
+                [], template, targets=list(region_targets))
+        except ConfigLibraryError as exc:
+            QApplication.restoreOverrideCursor()
+            QMessageBox.critical(self, "Config error", str(exc))
+            return
+        except Exception as exc:
+            QApplication.restoreOverrideCursor()
+            QMessageBox.critical(self, "Error",
+                                 f"Config application failed:\n{exc}")
+            return
+        finally:
+            QApplication.restoreOverrideCursor()
+
+        # Rebuild so each region's Config column reflects the change.
+        try:
+            self._content_view.refresh()
+        except Exception:
+            pass
+        if result["errors"]:
+            detail = "\n".join(
+                f"\u2022 {os.path.basename(e['roi_dir'])}: {e['error']}"
+                for e in result["errors"][:8])
+            QMessageBox.warning(
+                self, "Some regions were not updated",
+                f"Updated {len(result['updated'])} of {len(region_targets)} "
+                f"region(s).\n\n{detail}")
+        else:
+            QMessageBox.information(
+                self, "Regions updated",
+                f"{len(result['updated'])} region(s) now use this config.\n\n"
+                "Each keeps its own dimensions; only the processing parameters "
+                "were changed. They will reprocess from Step 1.")
+
     def _open_sample_folder(self, leaf_key: str) -> None:
         """Open one image, or one of its regions, in the segmentation view.
 
@@ -886,13 +953,27 @@ class ProjectViewWindow(QMainWindow):
         """Apply a template YAML to the checked (single-channel) image folders."""
         if self._content_view is None:
             return
-        # Set Config applies to channels. A channel's saved regions each own their
-        # config, so propagating is a separate, explicit decision rather than an
-        # implicit side effect of retargeting the channel.
+        # Act on the rows that were actually checked. Resolving region rows up to
+        # their channel -- as this used to -- retargeted the FULL IMAGE when the
+        # user had only checked regions, which is both not what they asked for and
+        # destructive to a config they did not select.
         from .project_selection import split_leaf_key
         keys = self._content_view.checked_folders()
-        folders = sorted({split_leaf_key(k)[0] for k in keys})
-        if not folders:
+        region_targets = []          # (sample_dir, roi_name)
+        folders = []                 # channel rows, checked in their own right
+        for key in keys:
+            folder, roi_name = split_leaf_key(key)
+            if roi_name:
+                region_targets.append((folder, roi_name))
+            else:
+                folders.append(folder)
+        folders = sorted(set(folders))
+        if not folders and not region_targets:
+            return
+
+        # Regions only: apply straight to them and leave every channel alone.
+        if region_targets and not folders:
+            self._set_region_config(region_targets)
             return
 
         # Resolve the mode of the checked folders so the picker only offers
