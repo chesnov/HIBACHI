@@ -45,20 +45,45 @@ Source: "..\..\install\install.ps1";     DestDir: "{app}\bootstrap"; Flags: igno
 Source: "..\..\install\environment.yml";  DestDir: "{app}\bootstrap"; Flags: ignoreversion
 
 [Run]
-; Show the console during setup: the slow part (downloading micromamba, solving
-; and creating the conda env) takes minutes, and micromamba prints live download
-; / solve progress. Running it VISIBLE means the user sees it working instead of
-; staring at a status bar that filled in the first second and then sits still.
-; (App launch is separate and stays windowless.)
+; RUN HIDDEN. install.ps1 now raises its own WinForms progress window (a bar,
+; the current package name and an elapsed timer), which is the progress UI on
+; every OS -- matching the macOS .app and the Linux one-liner.
+;
+; This used to run VISIBLE so that users could see micromamba's live download
+; output and not think the installer had hung. That worked, but a raw console
+; full of solver output alarms a non-technical audience, and it duplicated the
+; wizard's own status page. The dedicated window is friendlier and says the one
+; thing that actually matters: leave this open, it takes a few minutes.
+;
+; If you need to debug a failing bootstrap, run it by hand to see the console:
+;   powershell -ExecutionPolicy Bypass -File "%LOCALAPPDATA%\HIBACHI\bootstrap\install.ps1"
 Filename: "powershell.exe"; \
   Parameters: "-ExecutionPolicy Bypass -NoProfile -File ""{app}\bootstrap\install.ps1"" -InstallDir ""{app}"""; \
-  StatusMsg: "Setting up HIBACHI. A console window shows live progress; this takes several minutes..."; \
-  Flags: waituntilterminated
+  StatusMsg: "Setting up HIBACHI. A progress window shows what is happening; this takes several minutes..."; \
+  Flags: runhidden waituntilterminated
 
 [UninstallRun]
 ; Best-effort cleanup of the installed environment + checkout on uninstall.
 ; Remove the chosen install dir ({app}), not a hardcoded default path.
 Filename: "cmd.exe"; Parameters: "/c rmdir /s /q ""{app}"""; Flags: runhidden; RunOnceId: "RemoveHibachiHome"
 
+[UninstallDelete]
+; make_shortcuts.py writes these at RUNTIME, so they are not in [Icons] and the
+; uninstaller does not otherwise know about them -- they used to survive as dead
+; icons. It writes both a .lnk and a .bat fallback, to the Desktop and the Start
+; Menu, so all four are removed here.
+;
+; On managed/corporate machines the Desktop is often redirected into OneDrive,
+; which {userdesktop} resolves correctly (make_shortcuts.py reads the same shell
+; folder from the registry), so both agree on the location.
+Type: files; Name: "{userdesktop}\HIBACHI.lnk"
+Type: files; Name: "{userdesktop}\HIBACHI.bat"
+Type: files; Name: "{userprograms}\HIBACHI.lnk"
+Type: files; Name: "{userprograms}\HIBACHI.bat"
+; Logs and launcher state (~/.hibachi). Left behind, this carried a stale
+; "skipped_rev" across a reinstall, so a freshly installed app could silently
+; decline to offer an update it had been told to skip months earlier.
+Type: filesandordirs; Name: "{%USERPROFILE}\.hibachi"
+
 [Messages]
-WelcomeLabel2=This will install [name] for the current user.%n%nThe first setup downloads the scientific packages (a few hundred MB) and may take several minutes. An internet connection is required.
+WelcomeLabel2=This will install [name] for the current user.%n%nThe first setup downloads the scientific packages (a few hundred MB) and may take several minutes. A progress window will show you what is happening. An internet connection is required.
