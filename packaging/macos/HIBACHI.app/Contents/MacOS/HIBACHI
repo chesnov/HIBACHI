@@ -1,20 +1,6 @@
 #!/bin/bash
-# =============================================================================
-# HIBACHI.app launcher (macOS)
-# -----------------------------------------------------------------------------
-# This is the executable inside HIBACHI.app. On first launch it bootstraps the
-# environment (via the bundled install.sh); on every launch it hands off to the
-# self-updating Python launcher. Setup progress is shown with macOS
-# notifications/dialogs so the user is never staring at a frozen icon.
-#
-# VERSION-AWARE BOOTSTRAP: the old logic only ran install.sh when there was no
-# checkout at all, so dragging a NEW .dmg over an EXISTING install never
-# refreshed the app -- it just re-launched the stale checkout in ~/HIBACHI/app.
-# We now also re-run the bootstrap whenever the version stamped into THIS bundle
-# differs from the version recorded at the last successful bootstrap. Because
-# install.sh force-syncs the checkout to the current release (and is idempotent),
-# a freshly-installed .app now actually installs its version.
-# =============================================================================
+# HIBACHI.app launcher (macOS). Bootstraps the environment via the bundled
+# install.sh when needed, then hands off to the self-updating Python launcher.
 set -uo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -28,65 +14,99 @@ ENV_NAME="hibachi"
 ENV_PREFIX="${INSTALL_DIR}/micromamba/envs/${ENV_NAME}"
 ENV_PY="${ENV_PREFIX}/bin/python"
 LOG="${INSTALL_DIR}/setup.log"
+LAUNCH_LOG="${INSTALL_DIR}/launch.log"
 MARKER="${INSTALL_DIR}/.bootstrapped_version"
 
 notify() { osascript -e "display notification \"$1\" with title \"HIBACHI\"" >/dev/null 2>&1 || true; }
 alert()  { osascript -e "display dialog \"$1\" buttons {\"OK\"} default button 1 with title \"HIBACHI\"" >/dev/null 2>&1 || true; }
 
-# Version stamped into this .app bundle (build_dmg.sh sets CFBundleShortVersionString).
+# build_dmg.sh stamps CFBundleShortVersionString; MARKER records the version of
+# the last successful bootstrap.
 BUNDLE_VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "${PLIST}" 2>/dev/null || echo "0.0.0")"
 INSTALLED_VERSION="$(cat "${MARKER}" 2>/dev/null || echo "")"
 
-# Decide whether we need to (re)bootstrap.
+# Cheap (~ms) check, so it can run on every launch. Deep validation lives in
+# install.sh, which is the only thing that can repair a shortfall.
+env_usable() {
+    [ -x "${ENV_PY}" ] || return 1
+    "${ENV_PY}" -c "pass" >/dev/null 2>&1 || return 1
+    return 0
+}
+
+# make_shortcuts.py::_make_macos() writes ~/Applications/HIBACHI.app -- correct
+# for a `curl | bash` install, but a second identically-named app when this
+# bundle exists. It execs a hardcoded env prefix with none of the checks below,
+# so clicking it after any env problem dies silently.
+remove_duplicate_launcher() {
+    local stray="${HOME}/Applications/HIBACHI.app"
+    [ -d "${stray}" ] || return 0
+    case "${HERE}" in "${stray}"/*) return 0 ;; esac   # never delete ourselves
+    rm -rf "${stray}" 2>/dev/null || return 0
+    killall Dock >/dev/null 2>&1 || true               # refresh Launchpad
+}
+remove_duplicate_launcher
+
 need_bootstrap=0
-if [ ! -d "${APP_DIR}/.git" ] || [ ! -x "${MAMBA}" ]; then
-    need_bootstrap=1                          # first run or a broken install
+reason=""
+if [ ! -d "${APP_DIR}/.git" ]; then
+    need_bootstrap=1; reason="no application checkout"
+elif [ ! -x "${MAMBA}" ]; then
+    need_bootstrap=1; reason="no package manager"
+elif ! env_usable; then
+    need_bootstrap=1; reason="the Python environment is missing or unusable"
+elif [ -z "${INSTALLED_VERSION}" ]; then
+    # install.sh writes MARKER only on success, so no marker => never finished.
+    need_bootstrap=1; reason="the previous setup did not finish"
 elif [ "${BUNDLE_VERSION}" != "${INSTALLED_VERSION}" ]; then
-    need_bootstrap=1                          # a different/newer .app was installed over the old one
+    need_bootstrap=1; reason="a different version of the app was installed"
 fi
 
 if [ "${need_bootstrap}" = "1" ]; then
-    mkdir -p "${INSTALL_DIR}"
-    : > "${LOG}"
-    notify "Setting up HIBACHI (first run). This takes a few minutes…"
-
-    # Run the bootstrap in the background so we can report progress. Run
-    # synchronously (as before), the app just showed a start notification and
-    # then appeared frozen/crashed for minutes while the env built.
-    HIBACHI_SKIP_SHORTCUT=1 bash "${RES}/install.sh" >"${LOG}" 2>&1 &
-    install_pid=$!
-
-    # Heartbeat: install.sh prints "==> <phase>" headers to the log; surface the
-    # latest one every few seconds so the user can see it is alive AND what it is
-    # doing (downloading micromamba, creating the environment, cloning, ...).
-    last_step=""
-    while kill -0 "${install_pid}" 2>/dev/null; do
-        step="$(grep '^==>' "${LOG}" 2>/dev/null | tail -n 1 | sed 's/^==> *//')"
-        if [ -n "${step}" ] && [ "${step}" != "${last_step}" ]; then
-            notify "Setting up HIBACHI: ${step}"
-            last_step="${step}"
-        fi
-        sleep 8
-    done
-
-    # `wait` reports the background job's exit status even though it has finished.
-    if wait "${install_pid}"; then
-        printf '%s\n' "${BUNDLE_VERSION}" > "${MARKER}"
-        notify "Setup complete. Launching HIBACHI…"
-    else
-        alert "HIBACHI setup failed. Please send this log to support: ${LOG}"
+    if [ ! -f "${RES}/install.sh" ]; then
+        alert "HIBACHI.app is incomplete (the bundled installer is missing). Please re-download it."
         exit 1
     fi
+
+    mkdir -p "${INSTALL_DIR}"
+    : > "${LOG}"
+    notify "Setting up HIBACHI (${reason}). This takes a few minutes…"
+
+    # Foreground: install.sh raises its own progress window, so the old
+    # background run + notification heartbeat is no longer needed.
+    HIBACHI_SKIP_SHORTCUT=1 bash "${RES}/install.sh" >"${LOG}" 2>&1
+    install_rc=$?
+
+    if [ "${install_rc}" -ne 0 ]; then
+        alert "HIBACHI setup did not finish. Please send this log to support: ${LOG}"
+        exit 1
+    fi
+
+    if ! env_usable; then
+        alert "HIBACHI setup reported success but the environment is still unusable. Please send this log to support: ${LOG}"
+        exit 1
+    fi
+
+    printf '%s\n' "${BUNDLE_VERSION}" > "${MARKER}"
+    notify "Setup complete. Launching HIBACHI…"
 fi
 
-# Normal launch: the Python launcher self-updates then starts the app. Use the
-# env's own interpreter directly rather than `micromamba run` -- it needs nothing
-# on PATH, keeps a single process under the bundle's Dock tile, and (as we
-# learned on Windows) doesn't hide the child's output/errors. run_app.py itself
-# restores the env's PATH so `git` (self-update) still resolves.
-export HIBACHI_HOME="${INSTALL_DIR}"
-if [ -x "${ENV_PY}" ]; then
-    exec "${ENV_PY}" "${APP_DIR}/launcher/run_app.py"
-else
-    exec "${MAMBA}" run -n "${ENV_NAME}" python "${APP_DIR}/launcher/run_app.py"
+# Never exec into a missing env: the old `micromamba run` fallback here failed
+# instantly and invisibly, which is the silent-vanish bug.
+if ! env_usable; then
+    alert "HIBACHI cannot start: the Python environment at ${ENV_PREFIX} is missing or unusable. Re-run setup from Terminal with:
+
+HIBACHI_FORCE_REBUILD=1 bash '${RES}/install.sh'"
+    exit 1
 fi
+
+# Keep one previous log so a crash-then-relaunch keeps the evidence.
+if [ -f "${LAUNCH_LOG}" ]; then
+    mv -f "${LAUNCH_LOG}" "${LAUNCH_LOG}.1" 2>/dev/null || true
+fi
+
+# Use the env's interpreter directly, not `micromamba run`: nothing needed on
+# PATH, one process under the bundle's Dock tile, child output not swallowed.
+# The redirect is inherited through run_app.py's os.execv into segment.py, so
+# this one file captures launcher, dependency update and app.
+export HIBACHI_HOME="${INSTALL_DIR}"
+exec "${ENV_PY}" "${APP_DIR}/launcher/run_app.py" >>"${LAUNCH_LOG}" 2>&1

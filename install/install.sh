@@ -1,56 +1,22 @@
 #!/usr/bin/env bash
-# =============================================================================
-# HIBACHI installer for macOS / Linux
-# -----------------------------------------------------------------------------
-# One-line install (from your GitHub README):
+# HIBACHI installer for macOS / Linux.
 #
 #   curl -fsSL https://raw.githubusercontent.com/chesnov/HIBACHI/main/install/install.sh | bash
 #
-# What it does (no admin rights, nothing touched system-wide):
-#   1. Downloads micromamba (a single ~5 MB binary that bundles conda).
-#   2. Builds the 'hibachi' environment from environment.yml (Python + git + all deps).
-#   3. git-clones the app into the install directory.
-#   4. Creates a double-click launcher (.desktop on Linux, .app on macOS).
+# Downloads micromamba, builds the 'hibachi' env from environment.yml, clones the
+# app, creates a double-click launcher. No admin rights, nothing system-wide.
 #
-# =============================================================================
-# WHY THERE IS A PROGRESS WINDOW  (the most important thing in this file)
-# -----------------------------------------------------------------------------
-# The first install downloads ~1 GB of scientific packages and takes several
-# minutes. Transient macOS notifications were not enough: users concluded the
-# app had glitched and quit mid-install. That left a half-built environment
-# which (before the fix below) could never be repaired by retrying -- so the app
-# then crashed on every launch, deep in an import, with no visible error.
+# The env build is split in two, so a progress window can cover the slow part and
+# so pip is always ours to run:
+#   phase A  conda-level packages (python, git, pip)   -- fast
+#   phase B  the pip: subsection (napari, PyQt5, ...)  -- slow, several minutes
 #
-# So this script puts up a real, always-visible progress window with a moving
-# bar, the current package name, and an elapsed timer. It is written in tkinter
-# and EMBEDDED in this file as a heredoc rather than shipped as a separate
-# module, because this script must work in two contexts where a sibling file
-# would not exist: piped straight from curl, and copied alone into
-# HIBACHI.app/Contents/Resources by build_dmg.sh.
-#
-# ORDERING CONSTRAINT: tkinter comes from the conda env's own Python, which does
-# not exist yet at the start. So the environment build is split in two --
-#   phase A: conda-level packages (python, git, pip)  -- fast, ~1 min
-#   phase B: the pip: subsection (napari, PyQt5, ...) -- slow, many minutes
-# and the window is raised between them, before the slow part. If some other
-# tkinter-capable Python is already on the machine we raise it immediately
-# instead. Either way the window is up for the whole slow phase.
-#
-# -----------------------------------------------------------------------------
-# RECOVERY FROM A HALF-BUILT ENVIRONMENT
-# -----------------------------------------------------------------------------
-# Splitting the build as above also fixes the original trap. The old logic
-# branched on "does the env prefix exist?" and took `micromamba env update` on
-# every retry -- which skips the pip: subsection entirely when the conda-level
-# solve finds nothing to do. Missing pip packages were therefore never
-# reinstalled, no matter how often the user re-ran the installer.
-#
-# Now pip is ALWAYS run explicitly by us (step 4), on both the create and the
-# update path, mirroring pass 2 of run_app.py::_update_environment(). On top of
-# that we validate an existing env by importing what the app needs and rebuild
-# from scratch if the probe fails, and a Cancel from the progress window deletes
-# the partial env so the next attempt starts clean.
-# =============================================================================
+# The split also fixes an unrepairable state: `micromamba env update` skips the
+# pip: subsection when the conda solve is a no-op, so an env left half-built by
+# an interrupted install was never repaired by retrying -- pip saw the aborted
+# run's .dist-info records, considered those packages satisfied, and skipped them
+# forever. Now pip always runs explicitly, an existing env is validated by
+# importing what the app needs, and a failed probe rebuilds from scratch.
 set -euo pipefail
 
 # ------------------------- CONFIG (edit for your repo) ----------------------- #
@@ -83,11 +49,14 @@ CANCEL_FILE="${INSTALL_DIR}/.installer_cancelled"
 PIP_LOG="${INSTALL_DIR}/pip-install.log"
 GUI_PID=""
 
-# Modules the app imports at startup, in roughly the order the failing chain
-# hits them (segment.py -> utils.high_level_gui.helper_funcs -> app_launch,
-# relational_engine, cross_channel_window, metadata, ...). Import names, not
-# distribution names: scikit-learn -> sklearn, simpleitk -> SimpleITK, etc.
-# Probing these is what distinguishes a complete env from a half-built one.
+# Import names (not distribution names) of everything the app needs. Probing
+# these catches a half-built env, including one where an interrupted pip left a
+# package recorded in .dist-info but not fully written.
+#
+# ALL are fatal, including slideio (.vsi/.svs) and aicspylibczi (.czi): the code
+# imports those lazily/guardedly (slide_reader.py:122, metadata.py:13-19) so the
+# app starts without them, but an install that cannot read those formats is a
+# failed install, not a degraded one.
 REQUIRED_MODULES="yaml numpy pandas scipy tifffile PyQt5.QtWidgets vispy \
 napari magicgui dask.array dask_image.ndmeasure sklearn seaborn skan \
 SimpleITK slideio numba zarr plotly nbformat napari_animation aicspylibczi \
@@ -103,10 +72,8 @@ command -v tar  >/dev/null 2>&1 || { echo "ERROR: tar is required." >&2; exit 1;
 # Progress reporting
 # ============================================================================ #
 
-# progress <pct> <ceil> <title> <detail>
-# Writes the status file atomically (the GUI polls it 4x/second). `ceil` is the
-# upper bound the GUI may creep towards while waiting for the next update --
-# that slow creep is what keeps the bar from ever looking frozen.
+# progress <pct> <ceil> <title> <detail>. Written atomically; the GUI polls it
+# 4x/second and may creep up to `ceil` while waiting for the next update.
 progress() {
   local pct="$1" ceil="$2" title="$3" detail="${4:-}"
   [ -d "${INSTALL_DIR}" ] || return 0
@@ -127,8 +94,7 @@ progress_state() {   # progress_state <done|failed> [message]
 # Did the user press Cancel in the progress window?
 cancelled() { [ -f "${CANCEL_FILE}" ]; }
 
-# Abort cleanly on cancel: remove the partial env so the NEXT attempt starts
-# from a clean `create` rather than inheriting a half-built environment.
+# Remove the partial env so the next attempt starts from a clean `create`.
 check_cancel() {
   cancelled || return 0
   trap - ERR
@@ -171,18 +137,12 @@ trap gui_stop EXIT
 write_gui_script() {
   mkdir -p "${INSTALL_DIR}"
   cat > "${GUI_SCRIPT}" <<'PYGUI'
-"""HIBACHI installer progress window (spawned by install.sh; not imported).
+"""Installer progress window, spawned by install.sh. tkinter-only: it runs
+before the app's dependencies exist.
 
-Polls a small JSON status file written by the installer and renders a progress
-bar, the current activity, and an elapsed timer. Deliberately tkinter-only: it
-runs before the application's dependencies exist.
-
-Two behaviours matter more than looks:
-  * The bar creeps slowly towards `ceil` between real updates, so a long
-    download never looks frozen -- the reason users were quitting mid-install.
-  * Closing the window (or pressing Cancel) writes a cancel file instead of
-    killing the installer, so install.sh can tear down the partial environment
-    and leave a clean slate for the next attempt.
+The bar creeps towards `ceil` between updates so a long download never looks
+frozen. Cancel writes a cancel file rather than killing the installer, so
+install.sh can tear down the partial env first.
 """
 
 import json
@@ -248,7 +208,7 @@ class ProgressWindow:
         self.button = tk.Button(root, text="Cancel", width=10, command=self.on_close)
         self.button.pack(pady=(0, 10))
 
-        # Come to the front once, then stop being obnoxious about it.
+        # Front once, then release topmost.
         try:
             root.lift()
             root.attributes("-topmost", True)
@@ -278,15 +238,12 @@ class ProgressWindow:
                 self.ceil = max(self.ceil, float(status.get("ceil", self.target)))
             except (TypeError, ValueError):
                 pass
-            # While cancelling, keep our own message: the installer is still
-            # reporting the work it was in the middle of, and overwriting the
-            # "Cancelling..." text would look like the Cancel had been ignored.
+            # Keep our own message while cancelling.
             if not self.cancelling:
                 self.title_var.set(str(status.get("title") or ""))
                 self.detail_var.set(str(status.get("detail") or ""))
 
-        # Ease towards the reported target; once caught up, creep slowly towards
-        # the ceiling so the bar is always visibly alive.
+        # Ease towards target, then creep so the bar is always moving.
         if self.shown < self.target:
             self.shown += max((self.target - self.shown) * EASE, 0.05)
         elif self.shown < self.ceil:
@@ -322,9 +279,8 @@ class ProgressWindow:
                 fh.write("cancelled by user\n")
         except Exception:
             pass
-        # install.sh notices the cancel file, cleans up, and writes state=failed,
-        # which brings us back through finish(). Close on our own after a while
-        # in case it is wedged inside a long download.
+        # install.sh sees the file, cleans up, writes state=failed -> finish().
+        # Self-close if it is wedged in a long download.
         self.root.after(20000, self.root.destroy)
 
 
@@ -346,16 +302,10 @@ if __name__ == "__main__":
 PYGUI
 }
 
-# Find a Python that can actually open a tkinter window. Skips /usr/bin/python3
-# on macOS: when the Command Line Tools are absent it is a stub that pops its own
-# install dialog, which is exactly the kind of confusion we are trying to remove.
-#
-# The env's own interpreter is only offered once GUI_ALLOW_ENV_PY=1, i.e. after
-# the environment is final. Before that the env is a deletion candidate (step 2
-# rebuilds a half-built env), and running the window from a prefix we are about
-# to `rm -rf` would pull Tcl/Tk's library files out from under a live process --
-# the window could disappear mid-install, which is the exact failure this whole
-# mechanism exists to prevent.
+# A Python that can open a tkinter window. The env's own interpreter is only
+# offered once GUI_ALLOW_ENV_PY=1, i.e. after the env is final -- before that it
+# is a deletion candidate, and running Tk from a prefix we `rm -rf` would pull
+# Tcl/Tk's library files out from under a live process.
 GUI_ALLOW_ENV_PY=0
 
 pick_gui_python() {
@@ -364,8 +314,8 @@ pick_gui_python() {
   candidates="${candidates} $(command -v python3 2>/dev/null || true)"
   for cand in ${candidates}; do
     [ -n "${cand}" ] && [ -x "${cand}" ] || continue
-    # Only macOS has the CLT stub problem; on Linux /usr/bin/python3 is real and
-    # is usually the only interpreter available before the env is built.
+    # On macOS an absent CLT makes /usr/bin/python3 a stub that pops its own
+    # install dialog. On Linux it is real, and often the only one available.
     if [ "$(uname -s)" = "Darwin" ] && [ "${cand}" = "/usr/bin/python3" ]; then
       continue
     fi
@@ -399,10 +349,8 @@ gui_stop() {
 # Environment helpers
 # ============================================================================ #
 
-# Print the `pip:` subsection of environment.yml, one requirement per line.
-# Prefers PyYAML when the env can import it; falls back to awk, because PyYAML
-# is only a transitive dependency here (via napari) and so may itself be one of
-# the packages missing from a half-built env.
+# The `pip:` subsection, one requirement per line. Falls back to awk because
+# PyYAML is only a transitive dep here (via napari) and may itself be missing.
 pip_requirements() {
   if [ -x "${ENV_PY}" ] && "${ENV_PY}" -c "import yaml" >/dev/null 2>&1; then
     "${ENV_PY}" - "${ENV_YML}" <<'PY'
@@ -434,8 +382,7 @@ PY
   fi
 }
 
-# environment.yml with the `pip:` subsection removed, so the conda-level solve
-# can run on its own and we can drive (and report progress for) pip ourselves.
+# environment.yml minus the `pip:` subsection, so we drive pip ourselves.
 write_conda_only_yml() {
   awk '
     /^[[:space:]]*-[[:space:]]*pip:[[:space:]]*$/ {
@@ -450,8 +397,8 @@ write_conda_only_yml() {
   ' "${ENV_YML}" > "$1"
 }
 
-# Import every REQUIRED_MODULE in one interpreter. Prints one line per failure
-# and returns non-zero if anything is missing. Always call from an `if`.
+# Import every REQUIRED_MODULE in one interpreter; one line per failure,
+# non-zero if any are missing. Always call from an `if`.
 env_health_check() {
   [ -x "${ENV_PY}" ] || { echo "python interpreter missing at ${ENV_PY}"; return 1; }
   # shellcheck disable=SC2086  # word splitting of the module list is intended
@@ -469,8 +416,8 @@ if missing:
 PY
 }
 
-# An interrupted `pip install` can leave `~`-prefixed directories behind from a
-# killed uninstall step. pip treats those as real packages, so clear them first.
+# An interrupted pip can leave `~`-prefixed dirs from a killed uninstall step;
+# pip treats those as real packages.
 prune_pip_debris() {
   local sp
   for sp in "${ENV_PREFIX}"/lib/python*/site-packages; do
@@ -558,9 +505,7 @@ rm -f "${CONDA_ONLY_YML}"
 [ -x "${ENV_PY}" ] || err "Environment build did not produce an interpreter at ${ENV_PY}"
 check_cancel
 
-# The env's Python now exists and is final (nothing deletes it past this point),
-# so it is safe to use for the window. If we could not open one earlier -- no
-# system python3 with tkinter -- this is the moment, right before the slow phase.
+# The env's Python now exists and is final, so it is safe for the window.
 GUI_ALLOW_ENV_PY=1
 gui_start
 progress 30 32 "Preparing to install packages" ""
@@ -568,10 +513,8 @@ progress 30 32 "Preparing to install packages" ""
 # ============================================================================ #
 # 4. Phase B: the pip: subsection, with live progress
 # ============================================================================ #
-# Always explicit, on both the create and update paths: `micromamba env update`
-# skips the pip subsection when the conda solve is a no-op, which is what made
-# interrupted installs unrepairable. Version specifiers mean pip no-ops on
-# already-satisfied packages, so this is safe to run every time.
+# Version specifiers mean pip no-ops on satisfied packages, so this is safe to
+# run every time.
 say "Installing scientific packages (the slow part)"
 prune_pip_debris
 PIP_REQS_FILE="${INSTALL_DIR}/.pip-requirements.txt"
@@ -581,10 +524,8 @@ if [ ! -s "${PIP_REQS_FILE}" ]; then
   warn "No pip: subsection found in ${ENV_YML}; skipping the pip phase."
 else
   : > "${PIP_LOG}"
-  # Parse pip's own narration into progress updates. `Collecting <pkg>` fires
-  # once per wheel it resolves, so counting those against EXPECTED_PKGS gives a
-  # bar that tracks real work; the exact total does not matter, because the GUI
-  # clamps to the phase ceiling and creeps between updates.
+  # `Collecting <pkg>` fires once per resolved wheel, so counting those against
+  # EXPECTED_PKGS tracks real work. An inexact total only affects smoothness.
   set +e
   "${ENV_PY}" -m pip install --no-input --progress-bar off -r "${PIP_REQS_FILE}" 2>&1 \
     | tee -a "${PIP_LOG}" \
@@ -623,9 +564,8 @@ check_cancel
 # ============================================================================ #
 # 5. Verify before letting the caller record success
 # ============================================================================ #
-# The .app stub writes .bootstrapped_version only when this script exits 0, so
-# failing here is what makes it report "setup failed" instead of recording a
-# successful bootstrap over a broken install.
+# The .app stub writes .bootstrapped_version only on exit 0, so failing here is
+# what stops a broken install being recorded as good.
 say "Verifying the environment"
 progress 94 95 "Verifying installation" "importing required packages"
 if health_output="$(env_health_check 2>&1)"; then
@@ -653,16 +593,31 @@ fi
 # ============================================================================ #
 # 7. Create the double-click launcher
 # ============================================================================ #
-# Publish the chosen install dir so make_shortcuts.py builds a shortcut for THIS
-# location rather than assuming the default (matches the Windows fix).
+# Publish the install dir so make_shortcuts.py targets THIS location.
 export HIBACHI_HOME="${INSTALL_DIR}"
+
+# On macOS make_shortcuts.py writes ~/Applications/HIBACHI.app -- right for a
+# `curl | bash` install, but a second identically-named app when the bundle
+# exists, and that copy bypasses the bundle's version and env checks. So with a
+# bundle present we neither create it nor leave an existing one behind.
+if [ "$(uname -s)" = "Darwin" ] && [ -d "/Applications/HIBACHI.app" ] \
+   && [ -d "${HOME}/Applications/HIBACHI.app" ]; then
+  say "Removing a duplicate launcher app (${HOME}/Applications/HIBACHI.app)"
+  rm -rf "${HOME}/Applications/HIBACHI.app" || true
+  killall Dock >/dev/null 2>&1 || true
+fi
+
 if [ "${HIBACHI_SKIP_SHORTCUT:-0}" = "1" ]; then
   say "Skipping shortcut creation (launched from a native app bundle)"
+elif [ "$(uname -s)" = "Darwin" ] && [ -d "/Applications/HIBACHI.app" ]; then
+  # Belt-and-braces: a hand-run without HIBACHI_SKIP_SHORTCUT must not be able
+  # to recreate the duplicate.
+  say "Skipping shortcut creation (HIBACHI.app is already installed)"
 else
   say "Creating desktop launcher"
   progress 98 99 "Creating launcher" ""
-  # Prefer the env's own interpreter over `micromamba run`: it needs nothing on
-  # PATH and doesn't swallow stdout/stderr the way `micromamba run` can.
+  # Env interpreter, not `micromamba run`: nothing needed on PATH, and it does
+  # not swallow stdout/stderr.
   "${ENV_PY}" "${APP_DIR}/launcher/make_shortcuts.py"
 fi
 
