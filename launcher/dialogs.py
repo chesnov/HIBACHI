@@ -6,6 +6,7 @@ GUI stack (PyQt/napari). Every function degrades safely with no display:
 
     * ask_update      -> "later"  (never update without explicit consent)
     * choose_rollback -> None     (cancel)
+    * confirm_uninstall -> False  (never delete without explicit consent)
     * ask_yes_no      -> False
     * notify          -> prints to the console
 
@@ -31,6 +32,10 @@ _ACCENT = "#c75b39"      # primary action (warm "hibachi" ember)
 _ACCENT_ACTIVE = "#a94a2d"
 _BORDER = "#e2e4e8"
 _SEL = "#f3d9cf"         # list selection tint
+
+# Returned by choose_rollback() when the user picks Uninstall instead of a
+# version. A sentinel keeps the existing Optional[str] contract intact.
+UNINSTALL = "__uninstall__"
 
 _ICON = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "hibachi.png")
 
@@ -264,7 +269,14 @@ def choose_rollback(versions: List[Dict[str, str]], current_rev: str) -> Optiona
         result["rev"] = None
         _finish(root)
 
+    def uninstall() -> None:
+        result["rev"] = UNINSTALL
+        _finish(root)
+
     ttk.Button(btns, text="Cancel", command=cancel).pack(side="left")
+    ttk.Button(btns, text="Uninstall HIBACHI...", command=uninstall).pack(
+        side="left", padx=(8, 0)
+    )
     ttk.Button(btns, text="Switch to this version", style="Accent.TButton",
                command=do_switch).pack(side="right")
     lb.bind("<Double-Button-1>", lambda _e: do_switch())
@@ -296,6 +308,81 @@ def ask_yes_no(title: str, message: str) -> bool:
     ttk.Button(btns, text="No", command=lambda: answer(False)).pack(side="left")
     ttk.Button(btns, text="Yes", style="Accent.TButton",
                command=lambda: answer(True)).pack(side="right")
+    root.protocol("WM_DELETE_WINDOW", lambda: answer(False))
+    _run(root)
+    return result["yes"]
+
+
+def confirm_uninstall(paths: List[str]) -> bool:
+    """Confirm complete removal. Lists exactly what will be deleted.
+
+    Returns False with no display, so an uninstall never proceeds unattended.
+    The confirm button stays disabled until the checkbox is ticked: this dialog
+    is one keypress away from the version list, and the action is irreversible.
+    """
+    tk, root, ui = _new_root()
+    if tk is None:
+        return False
+    from tkinter import ttk
+
+    result = {"yes": False}
+    _header(tk, root, ui, "Uninstall HIBACHI")
+    body = _body(tk, root)
+
+    ttk.Label(
+        body,
+        text="This permanently deletes HIBACHI, its Python environment and its "
+             "logs. Nothing is backed up and this cannot be undone.",
+        wraplength=430, justify="left",
+    ).pack(anchor="w", padx=22, pady=(16, 4))
+
+    ttk.Label(body, text="The following will be removed:",
+              style="Muted.TLabel").pack(anchor="w", padx=22, pady=(6, 4))
+
+    listwrap = tk.Frame(body, bg=_CARD)
+    listwrap.pack(fill="both", expand=True, padx=22)
+    lb = tk.Listbox(listwrap, width=60, height=min(6, max(2, len(paths))),
+                    activestyle="none", font=ui["mono"], bd=0, relief="flat",
+                    highlightthickness=1, highlightbackground=_BORDER,
+                    bg=_CARD, fg=_TEXT)
+    for p in paths:
+        lb.insert("end", f" {p}")
+    lb.pack(fill="both", expand=True)
+
+    ttk.Label(
+        body,
+        text="Your image data and exported results are NOT stored here and are "
+             "not affected.",
+        style="Muted.TLabel", wraplength=430, justify="left",
+    ).pack(anchor="w", padx=22, pady=(8, 0))
+
+    # Bind to THIS root explicitly. A masterless BooleanVar attaches to
+    # tkinter._default_root, which is whatever root was created last -- and
+    # _finish() only quits the mainloop, leaving destroy() to _run(). Any path
+    # that skips _run leaves a live stale root, and the variable then reads from
+    # the wrong interpreter so the checkbox silently never takes effect.
+    agreed = tk.BooleanVar(master=root, value=False)
+    btns = ttk.Frame(body)
+
+    def answer(value: bool) -> None:
+        result["yes"] = value
+        _finish(root)
+
+    confirm = ttk.Button(btns, text="Uninstall", style="Accent.TButton",
+                         command=lambda: answer(True), state="disabled")
+
+    def toggled() -> None:
+        confirm.configure(state="normal" if agreed.get() else "disabled")
+
+    ttk.Checkbutton(body, text="I understand these files will be deleted",
+                    variable=agreed, command=toggled).pack(
+        anchor="w", padx=22, pady=(10, 0)
+    )
+
+    btns.pack(fill="x", padx=22, pady=(12, 18))
+    ttk.Button(btns, text="Cancel", command=lambda: answer(False)).pack(side="left")
+    confirm.pack(side="right")
+
     root.protocol("WM_DELETE_WINDOW", lambda: answer(False))
     _run(root)
     return result["yes"]

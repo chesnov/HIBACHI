@@ -261,6 +261,11 @@ def _run_rollback(repo_root: str) -> None:
 
     current = updater.current_rev(repo_root) or ""
     chosen = dialogs.choose_rollback(versions, current)
+    if chosen == dialogs.UNINSTALL:
+        import uninstall
+
+        uninstall.run(repo_root)
+        return
     if not chosen:
         return
 
