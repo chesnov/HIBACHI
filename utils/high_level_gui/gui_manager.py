@@ -795,6 +795,7 @@ class DynamicGUIManager(QObject):
         # an uncalibrated image has spacing exactly 1.0.
         self.viewer.add_shapes(
             name=layer_name,
+            ndim=3 if is_3d else 2,
             shape_type='polygon',
             edge_color='yellow',
             face_color=[1, 1, 0, 0.08],

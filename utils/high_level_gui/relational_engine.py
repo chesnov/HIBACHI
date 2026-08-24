@@ -187,7 +187,7 @@ class RelationalEngine:
         if is_2d:
             from ..module_2d.calculate_features_2d import analyze_segmentation_2d
         else:
-            from ..module_3d.calculate_features_3d import analyze_segmentation_3d
+            from ..module_3d.calculate_features_3d import analyze_segmentation
 
         mask = np.memmap(mask_path, dtype=np.int32, mode='r', shape=shape)
 
@@ -201,10 +201,10 @@ class RelationalEngine:
                 calculate_skeletons=False,   # Expensive and unused downstream
             )
         else:
-            metrics_df, _ = analyze_segmentation_3d(
+            metrics_df, _ = analyze_segmentation(
                 mask,
                 intensity_image=None,
-                spacing_zyx=spacing,
+                spacing=spacing,             # 3D takes (Z, Y, X) directly
                 calculate_distances=False,
                 calculate_skeletons=False,
             )

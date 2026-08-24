@@ -250,6 +250,10 @@ class OverlayROIPanel:
                 continue
 
             colour = _REGION_COLOURS[index % len(_REGION_COLOURS)]
+            shape_kwargs = {}
+            if scale is not None and len(scale) == len(self.full_shape or ()):
+                shape_kwargs["scale"] = scale
+
             layer = self.viewer.add_shapes(
                 verts,
                 name=f"{name}{SAVED_LAYER_SUFFIX}",
@@ -257,12 +261,8 @@ class OverlayROIPanel:
                 edge_color=colour,
                 face_color=[0, 0, 0, 0.0],
                 edge_width=2,
+                **shape_kwargs,
             )
-            if scale is not None and len(scale) == len(self.full_shape or ()):
-                try:
-                    layer.scale = scale
-                except Exception:
-                    pass
             # Read-only by intent: this shows what is committed to disk, and
             # editing it would imply the change propagates, which it does not.
             try:
@@ -322,18 +322,19 @@ class OverlayROIPanel:
         # the wrong Z.
         ref_scale = self._reference_scale()
 
+        shape_kwargs = {}
+        if ref_scale is not None and len(ref_scale) == len(self.full_shape):
+            shape_kwargs["scale"] = ref_scale
+
         layer = self.viewer.add_shapes(
             name=ROI_LAYER_NAME,
+            ndim=3 if is_3d else 2,
             shape_type="polygon",
             edge_color="yellow",
             face_color=[1, 1, 0, 0.08],
             edge_width=3,
+            **shape_kwargs,
         )
-        if ref_scale is not None and len(ref_scale) == len(self.full_shape):
-            try:
-                layer.scale = ref_scale
-            except Exception:
-                pass
 
         self._z_polygons = {}
         self._last_count = 0
