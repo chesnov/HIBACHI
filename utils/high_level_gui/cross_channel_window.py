@@ -512,9 +512,12 @@ class CrossChannelAnalyzerWindow(QMainWindow):
         # A (C, Z, Y, X) or (C, Y, X) file would otherwise hand back a shape the
         # .dat memmaps do not have. The config's mode says how many trailing
         # axes are spatial, which is the only reliable discriminator: a 3-axis
-        # array may be (Z, Y, X) or (C, Y, X).
+        # array may be (Z, Y, X) or (C, Y, X). Keep exactly the `want` trailing
+        # spatial axes and drop any leading (channel) axes. Do NOT squeeze
+        # singleton axes generally: a genuine thin-Z volume is (1, Y, X) and must
+        # stay 3D, or the 3D viewport and turntable would be lost for
+        # single-channel / few-slice samples.
         want = 2 if str(mode or "").endswith("_2d") else 3
-        shape = tuple(s for s in shape if s > 1) or shape
         if len(shape) > want:
             shape = shape[-want:]
         if len(shape) == 3:

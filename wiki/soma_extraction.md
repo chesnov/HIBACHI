@@ -105,6 +105,14 @@ matching rejection counter in the run output:
     close cells collapse into one seed. → *Rejected: Spatial Overlap*, plus a
     `[TRAP]` line printed whenever one object receives multiple somas.
 
+The same distance also applies **between seeds in different objects**. When a new
+seed lands closer than this to an already-placed one, the step tries to shrink it
+(toward its own brightest/thickest core, within the same seeding mode) until it
+clears; if it cannot clear without falling apart, the seed is dropped.
+→ *Pushed Apart -> Dropped.* A high count here means genuinely distinct cells are
+sitting within **Min Peak Separation** of each other — lower that value if they
+are being lost.
+
 ### Step C — leave erosion off
 
 **Soma Erosion Iterations** should be **0** almost always. It erodes every core
@@ -115,8 +123,8 @@ cases and otherwise shrinks or destroys good seeds.
 
 Inspect the **Cell bodies** layer: one seed per cell, sitting in the cell body.
 When a cell is missing its seed, read the run's diagnostic counts (*Too Small,
-Thickness Bound, Aspect Ratio, Spatial Overlap*) to see which gate removed it, and
-loosen that one gate. When a cell has several seeds, raise **Min Peak Separation**
+Thickness Bound, Aspect Ratio, Spatial Overlap, Pushed Apart -> Dropped*) to see why
+it was removed, and loosen the matching control. When a cell has several seeds, raise **Min Peak Separation**
 or tighten the mode threshold (higher percentile / higher ratio) so its centre
 resolves as one core — or leave it, since Step 4 can re-merge a modest over-split.
 
