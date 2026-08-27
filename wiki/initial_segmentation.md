@@ -168,9 +168,9 @@ only if real processes are fragmented *after* you have done what you can with
 thresholds and gap-closing.
 
 > **Under the hood.** Trace-linking runs *before* the global size filter, so
-> fragments it rejoins are size-tested as one object. In 3D it is also
-> soma-aware: objects detected by the Scale-0 pass are flagged so the linker can
-> treat cell bodies differently from processes.
+> fragments it rejoins are size-tested as one object. It is also soma-aware in
+> both 2D and 3D: objects detected by the Scale-0 pass are flagged so the linker
+> can treat cell bodies differently from processes.
 
 ---
 
@@ -187,10 +187,13 @@ thresholds and gap-closing.
 | **Minimum Size** (`min_size`) | int | `1000` **voxels** | `200` **pixels** | Global; applied after merge. |
 | **Trace Gap** (`trace_max_gap`) | float µm | `0.0` | `0.0` | Orientation trace-linking. `0` = off. |
 
-**Advanced / not in the default config** (present in code, run on built-in
-defaults unless a config exposes them): `subtract_background_radius` (white
-top-hat background removal, `0` = off), and the Frangi shape constants
-`frangi_alpha` / `frangi_beta` / `frangi_gamma`.
+**Fixed internal constants (not user-modifiable).** The Frangi vesselness shape
+constants are not present in any config and are not read from the parameter set by
+either pipeline, so they are always fixed and cannot be changed from the app:
+
+*   `frangi_alpha` = `0.5`, `frangi_gamma` = `2.0` — identical in 2D and 3D.
+*   `frangi_beta` = `0.5` for scales below 2.0 µm, and `1.0` for scales at or
+    above 2.0 µm (the code raises beta at coarser scales). Same rule in 2D and 3D.
 
 ---
 

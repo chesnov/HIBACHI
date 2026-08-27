@@ -272,9 +272,6 @@ class FluorescenceStrategy(ProcessingStrategy):
                 original_volume=self.intermediate_state['original_volume_ref'],
                 spacing=self.spacing,
                 segmentation_threshold=self.intermediate_state['segmentation_threshold'],
-                hull_boundary_thickness_phys=float(
-                    params.get("hull_boundary_thickness_phys", 2.0)
-                ),
                 edge_trim_distance_threshold=float(
                     params.get("edge_trim_distance_threshold", 4.5)
                 ),
@@ -283,12 +280,7 @@ class FluorescenceStrategy(ProcessingStrategy):
                 ),
                 min_size_voxels=int(params.get("min_size_voxels", 50)),
                 hull_closing_radius=int(params.get("hull_closing_radius", 1)),
-                heal_iterations=int(params.get("heal_iterations", 1)),
-                edge_distance_chunk_size_z=int(
-                    params.get("edge_distance_chunk_size_z", 32)
-                ),
                 z_erosion_iterations=int(params.get("z_erosion_iterations", 0)),
-                post_smoothing_iter=int(params.get("post_smoothing_iter", 0)),
                 otsu_scale_factor=float(params.get("otsu_scale_factor", 0.8)),
                 temp_root_path=self.temp_dir
             )

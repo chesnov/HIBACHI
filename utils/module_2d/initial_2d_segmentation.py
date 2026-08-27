@@ -16,7 +16,7 @@ import dask_image.ndfilters
 import dask_image.ndmeasure
 from dask.diagnostics import ProgressBar
 from scipy import ndimage
-from scipy.ndimage import generate_binary_structure, white_tophat
+from scipy.ndimage import generate_binary_structure
 from skimage.filters import frangi, sato  # type: ignore
 from skimage.morphology import disk  # type: ignore
 from tqdm import tqdm
@@ -190,7 +190,6 @@ def _process_block_worker_2d(
     frangi_alpha: float,
     frangi_beta: float,
     frangi_gamma: float,
-    subtract_background_radius: int
 ) -> Optional[str]:
     """Worker function for processing a 2D block (Vesselness Mode)."""
     input_memmap = None
@@ -204,10 +203,6 @@ def _process_block_worker_2d(
         output_memmap = np.memmap(output_path, dtype=output_dtype, mode='r+', shape=output_shape)
 
         block_data = input_memmap[read_slices].astype(np.float32)
-
-        if subtract_background_radius > 0:
-            struct_size = int(2 * subtract_background_radius + 1)
-            block_data = white_tophat(block_data, size=struct_size)
 
         combined_scales = np.zeros_like(block_data, dtype=np.float32)
 
@@ -256,7 +251,6 @@ def enhance_tubular_structures_blocked_2d(
     frangi_beta: float = 0.5,
     frangi_gamma: float = 2.0,
     skip_enhancement: bool = False,
-    subtract_background_radius: int = 0
 ) -> Tuple[np.memmap, str, str]:
     """Enhances tubular structures using 2D chunked processing (Vesselness Mode)."""
     print(f"  [Enhance] Image: {image.shape}, Spacing: {spacing}")
@@ -293,7 +287,7 @@ def enhance_tubular_structures_blocked_2d(
                           output_memmap_info=(output_path, image.shape, np.float32),
                           sigmas_voxel_2d=sigmas_voxel_2d, black_ridges=black_ridges, 
                           frangi_alpha=frangi_alpha, frangi_beta=frangi_beta, 
-                          frangi_gamma=frangi_gamma, subtract_background_radius=subtract_background_radius)
+                          frangi_gamma=frangi_gamma)
 
     chunks = list(_get_chunk_slices_2d(image.shape, (2048, 2048), overlap=overlap_px))
     pool = mp.Pool(processes=max(1, os.cpu_count()-2), initializer=_init_worker)
@@ -793,7 +787,6 @@ def segment_cells_first_pass_raw_2d(
     high_threshold_percentile: Union[float, List[float]] = 100.0,
     threshold_mode: str = "Percentile",
     skip_tubular_enhancement: bool = False,
-    subtract_background_radius: int = 0,
     trace_max_gap: float = 0.0,
     temp_root_path: Optional[str] = None,
     **kwargs: Any
@@ -894,21 +887,16 @@ def segment_cells_first_pass_raw_2d(
                 # z-slice -- a full 2D plane at a time -- so with a single plane the
                 # math here is identical.
                 #
-                # Window (no new GUI knob): honor an explicit background radius if
-                # provided, else auto-derive a window a few times the LARGEST
+                # Window (no GUI knob): auto-derive a window a few times the LARGEST
                 # tubular scale (xy pixels) so the opening removes regional
-                # background while preserving real processes, else fall back to
-                # global stats.
-                r = int(subtract_background_radius)
-                if r > 0:
-                    win = 2 * r + 1
+                # background while preserving real processes; if no usable scale
+                # exists, fall back to global stats.
+                phys = max([s for s in tubular_scales if s and s > 0], default=0.0)
+                xy_spacing = max(min(spacing_2d), 1e-9)
+                if phys > 0:
+                    win = int(np.clip(round(6.0 * phys / xy_spacing) * 2 + 1, 15, 151))
                 else:
-                    phys = max([s for s in tubular_scales if s and s > 0], default=0.0)
-                    xy_spacing = max(min(spacing_2d), 1e-9)
-                    if phys > 0:
-                        win = int(np.clip(round(6.0 * phys / xy_spacing) * 2 + 1, 15, 151))
-                    else:
-                        win = 0
+                    win = 0
 
                 plane = image[...].astype(np.float32)
                 # Local background: removes the (possibly structured) pedestal while
@@ -1008,7 +996,7 @@ def segment_cells_first_pass_raw_2d(
                     enh_mm, _, enh_dir = enhance_tubular_structures_blocked_2d(
                         smoothed_mm, scales=[scale], spacing=spacing_2d,
                         skip_enhancement=skip_tubular_enhancement,
-                        subtract_background_radius=subtract_background_radius, temp_root_path=temp_root_path
+                        temp_root_path=temp_root_path
                     )
                 
                 # Independent Thresholding

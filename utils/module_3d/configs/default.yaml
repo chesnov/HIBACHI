@@ -61,13 +61,6 @@ execute_trim_edges_fluorescence:
       min: 0.0
       max: 20.0
       step: 0.1
-    hull_boundary_thickness_phys:
-      label: Hull Boundary Thickness (um)
-      type: float
-      value: 1.0
-      min: 0.1
-      max: 10.0
-      step: 0.1
     brightness_cutoff_factor:
       label: Brightness Cutoff Factor
       type: float

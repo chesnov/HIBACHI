@@ -16,7 +16,7 @@ import dask_image.ndfilters
 import dask_image.ndmeasure
 from dask.diagnostics import ProgressBar
 from scipy import ndimage
-from scipy.ndimage import generate_binary_structure, white_tophat
+from scipy.ndimage import generate_binary_structure
 from skimage.filters import frangi, sato  # type: ignore
 from tqdm import tqdm
 
@@ -207,7 +207,6 @@ def _process_block_worker(
     frangi_alpha: float,
     frangi_beta: float,
     frangi_gamma: float,
-    subtract_background_radius: int
 ) -> Optional[str]:
     """
     Worker function for processing a 3D block (Enhancement Step).
@@ -242,10 +241,6 @@ def _process_block_worker(
                 continue
 
             slice_2d = block_data[z]
-            if subtract_background_radius > 0:
-                struct_size = int(2 * subtract_background_radius + 1)
-                slice_2d = white_tophat(slice_2d, size=struct_size)
-
             combined_scales = np.zeros_like(slice_2d, dtype=np.float32)
             
             for sigma in sigmas_voxel_2d:
@@ -292,7 +287,6 @@ def enhance_tubular_structures_blocked(
     frangi_beta: float = 0.5,
     frangi_gamma: float = 2,
     skip_tubular_enhancement: bool = False,
-    subtract_background_radius: int = 0
 ) -> Tuple[np.memmap, str, str]:
     """
     Enhances structures using chunked 3D processing (Vesselness Mode).
@@ -333,8 +327,7 @@ def enhance_tubular_structures_blocked(
                           output_memmap_info=(output_path, volume.shape, np.float32),
                           sigmas_voxel_2d=sigmas_voxel_2d, 
                           black_ridges=black_ridges, frangi_alpha=frangi_alpha, 
-                          frangi_beta=frangi_beta, frangi_gamma=frangi_gamma,
-                          subtract_background_radius=subtract_background_radius)
+                          frangi_beta=frangi_beta, frangi_gamma=frangi_gamma)
 
     chunks = list(_get_chunk_slices(volume.shape, (64, 512, 512), overlap=overlap_px))
     pool = mp.Pool(processes=max(1, os.cpu_count()-2), initializer=_init_worker)
@@ -834,7 +827,6 @@ def segment_cells_first_pass_raw(
     high_threshold_percentile: Union[float, List[float]] = 95.0,
     threshold_mode: str = "Percentile",
     skip_tubular_enhancement: bool = False,
-    subtract_background_radius: int = 0,
     trace_max_gap: float = 0.0,
     temp_root_path: Optional[str] = None,
     **kwargs: Any
@@ -920,26 +912,17 @@ def segment_cells_first_pass_raw(
                 # structured background (e.g. nonspecific antibody staining) per
                 # region instead of assuming a single uniform noise level, so the
                 # threshold stage sees comparable statistics across clean and noisy
-                # images. The window reuses the SAME `subtract_background_radius`
-                # knob already used by the tophat step (double duty -- no new knob).
-                # radius == 0 falls back to a per-slice global standardization
-                # (still noise-referenced, just not spatially adaptive).
-                # Window selection (no new GUI knob):
-                #  - if a background radius is explicitly provided, honor it;
-                #  - else auto-derive a window a few times the LARGEST tubular scale
-                #    (converted to xy pixels), so the opening removes regional
-                #    background while preserving real processes;
-                #  - else (no usable scale) fall back to per-slice global stats.
-                r = int(subtract_background_radius)
-                if r > 0:
-                    win = 2 * r + 1
+                # images.
+                # Window selection (no GUI knob): auto-derive a window a few times
+                # the LARGEST tubular scale (converted to xy pixels), so the opening
+                # removes regional background while preserving real processes; if no
+                # usable scale exists, fall back to per-slice global stats.
+                phys = max([s for s in tubular_scales if s and s > 0], default=0.0)
+                xy_spacing = max(min(spacing[1], spacing[2]), 1e-9)
+                if phys > 0:
+                    win = int(np.clip(round(6.0 * phys / xy_spacing) * 2 + 1, 15, 151))
                 else:
-                    phys = max([s for s in tubular_scales if s and s > 0], default=0.0)
-                    xy_spacing = max(min(spacing[1], spacing[2]), 1e-9)
-                    if phys > 0:
-                        win = int(np.clip(round(6.0 * phys / xy_spacing) * 2 + 1, 15, 151))
-                    else:
-                        win = 0
+                    win = 0
 
                 bg_report: List[float] = []
                 sc_report: List[float] = []
@@ -1057,7 +1040,7 @@ def segment_cells_first_pass_raw(
                     enh_mm, _, enh_dir = enhance_tubular_structures_blocked(
                         smoothed_mm, scales=[scale], spacing=spacing,
                         skip_tubular_enhancement=skip_tubular_enhancement,
-                        subtract_background_radius=subtract_background_radius, temp_root_path=temp_root_path
+                        temp_root_path=temp_root_path
                     )
                 
                 # Independent Thresholding Pass

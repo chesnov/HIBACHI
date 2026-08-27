@@ -311,7 +311,6 @@ def apply_hull_trimming_2d(
     original_image: np.ndarray,
     spacing: Union[Tuple[float, float], Tuple[float, float, float]],
     segmentation_threshold: float,
-    hull_boundary_thickness_phys: float,
     edge_trim_distance_threshold: float,
     brightness_cutoff_factor: float,
     min_size_pixels: int,

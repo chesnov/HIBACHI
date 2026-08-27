@@ -279,7 +279,6 @@ class Fluorescence2DStrategy(ProcessingStrategy):
                 original_image=original_image,
                 spacing=self.spacing,
                 segmentation_threshold=self.intermediate_state.get('segmentation_threshold', 0.0),
-                hull_boundary_thickness_phys=float(params.get("hull_boundary_thickness_phys", 1.0)),
                 edge_trim_distance_threshold=float(params.get("edge_trim_distance_threshold", 2.5)),
                 brightness_cutoff_factor=float(params.get("brightness_cutoff_factor", 1.5)),
                 min_size_pixels=int(params.get("min_size_pixels", 20)),

@@ -7,12 +7,169 @@ from typing import List, Dict, Optional, Tuple, Any
 
 import numpy as np
 from scipy import ndimage
-from scipy.spatial import KDTree 
 from skimage.feature import peak_local_max
 from skimage.segmentation import watershed
 from skimage.measure import regionprops
 from sklearn.decomposition import PCA
 from tqdm import tqdm
+
+
+# ==== injected shared soma-fix helpers (bug #1 fragmentation, bug #2 push-apart) ====
+from skimage.measure import label as _cc_label
+from sklearn.decomposition import PCA
+
+
+def _core_is_elongated(coords_local, spacing, max_aspect, ndim):
+    """PCA elongation test with correct handling of the degenerate case.
+    A near-zero smallest principal axis means an (effectively) 1-voxel-thick
+    line, i.e. maximally elongated -> True. Fewer than 11 voxels -> not judged
+    (False). Same rule used by the first-pass check and the recovery re-check."""
+    if coords_local.shape[0] <= 10:
+        return False
+    try:
+        cp = coords_local * np.array(spacing)
+        pca = PCA(n_components=ndim).fit(cp)
+        ev = np.sort(np.abs(pca.explained_variance_))[::-1]
+    except Exception:
+        return False
+    smallest = ev[-1]
+    if smallest <= 1e-12:
+        return True
+    return (math.sqrt(ev[0]) / math.sqrt(smallest)) > max_aspect
+
+
+def _finalize_core(coords, dt_vals, spacing, min_seed_vol, max_aspect, ndim):
+    """Bug #1 primitive. Given candidate voxel `coords` (N x ndim int, any
+    consistent frame) and their DT values, keep only the LARGEST connected
+    fragment, recompute the peak as that fragment's max-DT voxel, and re-apply
+    the size + aspect gates (aspect at the SAME max_aspect). Returns
+    (ok, keep_mask, peak_coord) where keep_mask is a boolean over the INPUT rows
+    (so the caller can index its own aligned arrays with no coordinate matching).
+    Used by the aspect-recovery path and by every tighter-percentile probe."""
+    if coords.shape[0] < min_seed_vol:
+        return False, None, None
+    mn = coords.min(0)
+    loc = coords - mn
+    shp = tuple(loc.max(0) + 1)
+    m = np.zeros(shp, bool)
+    m[tuple(loc.T)] = True
+    lab = _cc_label(m, connectivity=ndim)  # full connectivity
+    if lab.max() <= 0:
+        return False, None, None
+    ids = lab[tuple(loc.T)]                 # fragment id per input voxel
+    counts = np.bincount(ids)
+    counts[0] = 0
+    keep_id = int(counts.argmax())
+    keep = ids == keep_id                    # boolean over input rows
+    if keep.sum() < min_seed_vol:
+        return False, None, None
+    kc = coords[keep]
+    peak = kc[int(np.argmax(dt_vals[keep]))]
+    if _core_is_elongated(kc, spacing, max_aspect, ndim):
+        return False, None, None
+    return True, keep, peak
+
+
+class _PeakGrid:
+    """O(1) spatial hash of placed peaks (physical units), cell size =
+    min_physical_peak_separation. Only prior-label peaks are inserted, so any
+    hit is a cross-label conflict. Works for 2D or 3D by point length."""
+    def __init__(self, cell):
+        self.cell = float(cell) if cell and cell > 0 else 1.0
+        self.d = {}
+
+    def _key(self, p):
+        return tuple(int(math.floor(c / self.cell)) for c in p)
+
+    def add(self, p):
+        self.d.setdefault(self._key(p), []).append(np.asarray(p, float))
+
+    def min_dist(self, p):
+        """Smallest distance from p to any stored peak (searches the 3^ndim
+        neighbourhood of cells). Returns np.inf if none nearby."""
+        p = np.asarray(p, float)
+        base = self._key(p)
+        best = np.inf
+        rng = [-1, 0, 1]
+        import itertools
+        for off in itertools.product(rng, repeat=len(base)):
+            k = tuple(b + o for b, o in zip(base, off))
+            for q in self.d.get(k, ()):
+                dd = float(np.linalg.norm(p - q))
+                if dd < best:
+                    best = dd
+        return best
+
+
+def _shrink_to_clear(coords, dt_vals, rank_vals, spacing, grid,
+                     min_sep, min_seed_vol, max_aspect, ndim):
+    """Bug #2 primitive (Option C, asymmetric, same-family). Shrink the newcomer
+    by keeping the brightest/thickest fraction of its OWN `rank_vals`
+    (intensity for an Int candidate, DT for a DT candidate -> family preserved),
+    searching for the LOOSEST shrink that both stays valid and clears every
+    prior-label peak in `grid` by `min_sep`. Returns (kept_coords, peak_phys)
+    or None (-> pushed_and_dropped)."""
+
+    def core_at(q):
+        # q in [0,100): keep rank_vals >= percentile(rank_vals, q); q=0 keeps all
+        if q <= 0:
+            sel = np.ones(rank_vals.shape[0], bool)
+        else:
+            sel = rank_vals >= np.percentile(rank_vals, q)
+        if sel.sum() < min_seed_vol:
+            return None
+        ok, keep, peak = _finalize_core(coords[sel], dt_vals[sel], spacing,
+                                        min_seed_vol, max_aspect, ndim)
+        if not ok:
+            return None
+        # return the surviving global coords + peak for this probe
+        return coords[sel][keep], peak
+
+    def clears(fin):
+        if fin is None:
+            return False
+        _, peak = fin
+        return grid.min_dist(np.asarray(peak, float) * np.array(spacing)) >= min_sep
+
+    # Step 1: monotone binary search for q_max = largest q with a still-valid core.
+    lo, hi = 0.0, 99.0
+    if core_at(lo) is None:
+        return None  # even the full candidate is not a valid core (shouldn't happen)
+    q_max = lo
+    for _ in range(24):  # fine resolution on [0,99]
+        mid = (lo + hi) / 2.0
+        if core_at(mid) is not None:
+            q_max = mid; lo = mid
+        else:
+            hi = mid
+
+    # Step 2: smallest q in (0, q_max] whose core clears. Binary search assuming
+    # monotone clearance, then a linear scan fallback to catch non-monotonicity.
+    lo, hi = 0.0, q_max
+    found = None
+    for _ in range(24):
+        mid = (lo + hi) / 2.0
+        fin = core_at(mid)
+        if fin is not None and clears(fin):
+            found = mid; hi = mid
+        else:
+            lo = mid
+    if found is not None:
+        fin = core_at(found)
+        if clears(fin):
+            kc, peak = fin
+            return kc, np.asarray(peak, float) * np.array(spacing)
+    # Fallback: linear scan of integer percentiles up to q_max (catches any
+    # non-monotone clearance the binary search stepped over).
+    for q in range(1, int(math.floor(q_max)) + 1):
+        fin = core_at(float(q))
+        if clears(fin):
+            kc, peak = fin
+            return kc, np.asarray(peak, float) * np.array(spacing)
+    return None
+
+# ==== end injected helpers ====
+
 
 # Attempt to get psutil for RAM profiling, fallback if not installed
 try:
@@ -118,7 +275,8 @@ def extract_soma_masks_2d(
         "cores_too_small": 0,
         "thickness_rejected": 0,
         "aspect_ratio_rejected": 0,
-        "spatial_overlap_rejected": 0
+        "spatial_overlap_rejected": 0,
+        "pushed_and_dropped": 0
     }
 
     # 3. Output Mask Initialization
@@ -129,8 +287,10 @@ def extract_soma_masks_2d(
         final_seed_mask = np.zeros_like(segmentation_mask, dtype=np.int32)
 
     next_label_id = 1
-    all_placed_centroids = []
-    spatial_index: Optional[KDTree] = None
+    # Global spatial hash of placed peaks (physical units), cell size =
+    # min_physical_peak_separation. Committed per-label AFTER placement, so during
+    # a label it holds only prior-label peaks -> every hit is a cross-label conflict.
+    _placed_grid = _PeakGrid(min_physical_peak_separation)
 
     # 4. Strategy Definitions
     # Strategies are ordered by Strict Priority Score (higher score = wins overlap).
@@ -231,31 +391,36 @@ def extract_soma_masks_2d(
                 peak_idx = int(np.argmax(dt_vals))
                 peak_coord_g = g_coords[peak_idx]
 
-                # 2D PCA elongation check
-                if mask_arr.sum() > 10:
-                    try:
-                        coords_phys = local_coords * np.array(spacing)
-                        pca = PCA(n_components=2).fit(coords_phys)
-                        ev = np.sort(np.abs(pca.explained_variance_))[::-1]
-                        if (
-                            ev[1] > 1e-12
-                            and (math.sqrt(ev[0]) / math.sqrt(ev[1]))
-                            > max_allowed_core_aspect_ratio
-                        ):
-                            # Recovery: shave off elongated tails (lower DT pixels)
-                            # to isolate the roughly-circular peak region.
-                            core_threshold = max_thick - (absolute_min_thickness_um * 0.5)
-                            valid_core = dt_vals >= core_threshold
+                # Per-coord intensity, retained so an Int candidate can later be
+                # shrunk by its OWN brightness (family-preserving push-apart).
+                int_vals = t_int[tuple(tile_coords.T)]
 
-                            if np.sum(valid_core) < min_seed_vol:
-                                diag_stats["aspect_ratio_rejected"] += 1
-                                return
-
-                            # Update coordinates to represent only the recovered core.
-                            g_coords = g_coords[valid_core]
-                            mask_arr = valid_core  # 1D bool; mask_arr.sum() = new count
-                    except Exception:
-                        pass
+                # Elongation check (2D). A near-zero minor axis (a 1-voxel-thick
+                # line) is the degenerate, maximally-elongated case -> treated as
+                # elongated by _core_is_elongated.
+                if mask_arr.sum() > 10 and _core_is_elongated(
+                    local_coords, spacing, max_allowed_core_aspect_ratio, 2
+                ):
+                    # Recovery: shave the low-DT tails, then keep the LARGEST
+                    # connected fragment, recompute the peak, and RE-CHECK size +
+                    # aspect (same threshold). A survivor that is still elongated
+                    # (a real process with no compact body) is rejected.
+                    core_threshold = max_thick - (absolute_min_thickness_um * 0.5)
+                    valid_core = dt_vals >= core_threshold
+                    ok, keep, pk = _finalize_core(
+                        g_coords[valid_core], dt_vals[valid_core], spacing,
+                        min_seed_vol, max_allowed_core_aspect_ratio, 2
+                    )
+                    if not ok:
+                        diag_stats["aspect_ratio_rejected"] += 1
+                        return
+                    # Re-align every per-coord array to the recovered core.
+                    vc = valid_core
+                    g_coords = g_coords[vc][keep]
+                    dt_vals  = dt_vals[vc][keep]
+                    int_vals = int_vals[vc][keep]
+                    peak_coord_g = pk
+                    mask_arr = np.ones(g_coords.shape[0], dtype=bool)  # vol == len(coords)
 
                 # Tiling check: centroid must fall inside this tile's target box
                 # to prevent duplicate detections across overlapping tiles.
@@ -264,13 +429,17 @@ def extract_soma_masks_2d(
                     t['target'][0] <= cent[0] < t['target'][2]
                     and t['target'][1] <= cent[1] < t['target'][3]
                 ):
+                    rank_vals = int_vals if strat['type'] == 'Int' else dt_vals
                     label_candidates.append({
                         'coords': g_coords.astype(np.int32),
                         'peak_coord': peak_coord_g,
-                        'vol': mask_arr.sum(),
+                        'vol': int(mask_arr.sum()),
                         'score': strat['score'],
                         'strat_name': f"{strat['type']}_{strat['val']}",
                         'frag_max_thick': max_thick,
+                        'family': strat['type'],
+                        'dt_vals': np.asarray(dt_vals, np.float32),
+                        'rank_vals': np.asarray(rank_vals, np.float32),
                     })
 
             # Strategy loop with Early Stopping
@@ -346,6 +515,7 @@ def extract_soma_masks_2d(
             # 2. Secondary: Volume (if score ties, larger soma wins)
             label_candidates.sort(key=lambda x: (x['score'], x['vol']), reverse=True)
 
+            this_label_peaks = []  # committed to the global grid after this label
             for cand in label_candidates:
                 coords = cand['coords']
                 peak_phys = cand['peak_coord'] * np.array(spacing)
@@ -370,6 +540,22 @@ def extract_soma_masks_2d(
                             f"(Limit is {min_physical_peak_separation:.1f} µm)"
                         )
 
+                # Cross-label separation (bug #2): grid holds only prior-label
+                # peaks, so any hit is a different cell. Shrink the newcomer
+                # asymmetrically within its own strategy family to a tighter core
+                # whose peak clears by min_physical_peak_separation; drop if none.
+                if _placed_grid.min_dist(peak_phys) < min_physical_peak_separation:
+                    res = _shrink_to_clear(
+                        coords, cand['dt_vals'], cand['rank_vals'], np.array(spacing),
+                        _placed_grid, min_physical_peak_separation,
+                        min_seed_vol, max_allowed_core_aspect_ratio, 2
+                    )
+                    if res is None:
+                        diag_stats["pushed_and_dropped"] += 1
+                        continue
+                    coords, peak_phys = res
+                    coords = coords.astype(np.int32)
+
                 # Pixel Overlap Check (cross-label deduplication)
                 idx_tuple = tuple(coords.T)
                 if np.any(final_seed_mask[idx_tuple] > 0):
@@ -380,7 +566,10 @@ def extract_soma_masks_2d(
                 final_seed_mask[idx_tuple] = next_label_id
                 next_label_id += 1
                 label_placed_peaks.append(peak_phys)
-                all_placed_centroids.append(peak_phys)
+                this_label_peaks.append(peak_phys)
+
+            for _p in this_label_peaks:
+                _placed_grid.add(_p)
 
         # Update main status
         main_pbar.set_postfix({"Seeds": next_label_id - 1, "RAM": f"{get_ram_usage():.1f}GB"})
@@ -404,6 +593,7 @@ def extract_soma_masks_2d(
     print(f"    Rejected -> Thickness Bound:    {diag_stats['thickness_rejected']}")
     print(f"    Rejected -> Aspect Ratio:       {diag_stats['aspect_ratio_rejected']}")
     print(f"    Rejected -> Spatial Overlap:    {diag_stats['spatial_overlap_rejected']}")
+    print(f"    Pushed Apart -> Dropped:        {diag_stats['pushed_and_dropped']}")
     print("="*60 + "\n")
 
     if isinstance(final_seed_mask, np.memmap):
