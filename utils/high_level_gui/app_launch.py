@@ -673,6 +673,23 @@ def interactive_segmentation_with_config(selected_folder: str = None,
         _give_layer_list_room(viewer, control_dock)
         refresh_nav()
 
+        # 3D rotation recorder (3D samples only), docked beneath the layer list.
+        # The cross-channel overlay adds this too; single-channel projects open
+        # here instead, so without this the turntable would be unavailable to
+        # them. Gated on a 3D image and a non-2D mode; failure must never block
+        # the viewer, so it is best-effort.
+        try:
+            _shape = getattr(image_stack, "shape", None)
+            _is_3d = (
+                _shape is not None and len(_shape) >= 3
+                and not str(mode or "").endswith("_2d")
+            )
+            if _is_3d:
+                from ..module_3d.turntable import add_turntable_button
+                add_turntable_button(viewer)
+        except Exception as exc:
+            log.warning("Could not add 3D rotation recorder: %s", exc)
+
     except Exception as e:
         log.exception("Failed to open segmentation viewer for %r", selected_folder)
         QMessageBox.critical(None, "Error", str(e))

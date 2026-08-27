@@ -990,9 +990,21 @@ if _HAVE_QT:
                     self.tree.addTopLevelItem(parent)
                 self.tree.expandAll()
             else:
+                any_regions = False
                 for name, channels in registry.items():
                     (ch_key, folder), = channels.items()
-                    self.tree.addTopLevelItem(self._make_leaf(name, folder, ch_key))
+                    leaf = self._make_leaf(name, folder, ch_key)
+                    if leaf.childCount() > 0:
+                        any_regions = True
+                    self.tree.addTopLevelItem(leaf)
+                # Single-channel channel rows are top-level items, so their ROI
+                # child rows only get a disclosure arrow when the root is
+                # decorated. Enable it (and expand) when any channel actually has
+                # regions; otherwise keep the flat, arrow-free list. Set both ways
+                # so a refresh that loses its last region reverts to flat.
+                self.tree.setRootIsDecorated(any_regions)
+                if any_regions:
+                    self.tree.expandAll()
             self._loading = False
             self.selection_changed.emit()
 
