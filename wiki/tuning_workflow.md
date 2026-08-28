@@ -31,7 +31,10 @@ recombine over-split pieces. Both steps affect how many objects you end up with:
 *   Step 3 sets the **number of seeds** — too few and cells that should be
     distinct never get separate seeds; too many and one cell gets several.
 *   Step 4 can **merge seeds back together** (its merge heuristics and the seed-
-    merge distance) and can **drop fragments** below its minimum size.
+    merge distance). It also absorbs two kinds of leftover into a neighbouring
+    cell: a fragment with no seed, and any cell that ends up below **Min Final
+    Cell Size**. Step 4 **never deletes anything** — a small cell with no
+    neighbour to merge into is kept as it is.
 
 So when a cell count looks wrong, the cause can be in either step, and the two
 interact. The practical consequence is the tuning order below: get the seeds
@@ -41,10 +44,12 @@ splitting and merging on good input rather than compensating for bad seeds.
 > **Under the hood.** Step 3 emits a label image of seeds. Step 4 runs a
 > marker-controlled watershed using those markers, then a graph-based merge pass
 > that collapses adjacent basins when the boundary between them is not a real
-> valley. A final size filter and orphan-reassignment pass can also remove or
-> absorb small fragments. Watershed itself never creates an object without a
-> seed, but the merge and size passes downstream can still change the final
-> count relative to the number of seeds.
+> valley. Two whole-image clean-up passes then absorb small fragments into a
+> neighbour: one for seedless fragments, one for cells below the size floor.
+> Neither deletes. Watershed itself never creates an object without a seed, but
+> the merge and size passes downstream can still change the final count relative
+> to the number of seeds — always downward, and always by combining, never by
+> discarding.
 
 ---
 
@@ -424,9 +429,13 @@ over-seeded cells) merge back into single cells.
 *   **Max Seed Merge Distance** — an upper bound on how far apart two seeds can be
     and still be considered for merging; lower it to stop distant seeds being
     combined.
-*   **Min Final Cell Size** — drops finished cells below this size. Lower it if
-    small real cells vanish; raise it to clear debris. Unit is voxels (3D) /
-    pixels (2D).
+*   **Min Final Cell Size** — the size floor for a finished cell. Any cell below
+    it is merged into its most-contacted neighbour, whether or not it holds a seed.
+    Nothing is deleted: a small cell with no neighbouring cell to merge into is
+    kept at full size, which is what preserves a genuinely small cell (including
+    one Step 3 never seeded). Because it runs after the two levers above, it
+    overrides them — so check this value before re-tuning the levers if splits you
+    expected keep vanishing. `0` disables it. Unit is voxels (3D) / pixels (2D).
 
 If no setting of these levers gets the count right, the seeds themselves are the
 problem — return to Step 3 and re-check the **Cell bodies** layer, remembering

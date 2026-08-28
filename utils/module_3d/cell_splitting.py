@@ -321,7 +321,11 @@ def _separate_multi_soma_cells_chunk(
         return chunk_result, {}, label_to_seeds_map
 
     next_local_label = label_offset
-    min_size_thresh = kwargs.get('min_size_threshold', 0)
+    # NOTE: `min_size_threshold` is deliberately NOT read here. The worker sees one
+    # chunk, so a basin straddling a chunk boundary has an arbitrarily truncated
+    # size and would be judged undersized purely because it was clipped. The size
+    # rule is applied once, globally, after stitching -- see
+    # `_merge_undersized_cells` in `separate_multi_soma_cells`.
 
     # 2. Process Multi-Soma Objects
     for cell_label in present_multi_soma:
@@ -557,20 +561,23 @@ def _separate_multi_soma_cells_chunk(
                         best_neighbor = n_ids[np.argmax(n_counts)]
                         final_local_mask[frag_mask] = best_neighbor
                     else:
-                        _frag_sz = int(np.sum(frag_mask))
-                        if min_size_thresh > 0 and _frag_sz < min_size_thresh:
-                            final_local_mask[frag_mask] = 0
-                            flush_print(
-                                f"  [PROFILE|ORPHAN] worker DELETE: cell={cell_label} "
-                                f"uid={uid} orphan_size={_frag_sz} < min_size="
-                                f"{min_size_thresh} (no differently-labelled neighbour)"
-                            )
-                        else:
-                            flush_print(
-                                f"  [PROFILE|ORPHAN] worker KEEP orphan: cell={cell_label} "
-                                f"uid={uid} orphan_size={_frag_sz} (no neighbour; kept "
-                                f"because min_size_thresh={min_size_thresh})"
-                            )
+                        # No differently-labelled neighbour: this is an isolated
+                        # satellite of its OWN cell (already labelled `uid`, whose
+                        # seed sits on another component). It is genuine foreground
+                        # and is KEPT unconditionally.
+                        #
+                        # This branch used to delete the fragment when it fell below
+                        # `min_size_threshold`, which was the only place step 4 ever
+                        # destroyed signal -- and it destroyed exactly the case that
+                        # must be preserved. Size-based handling now happens globally,
+                        # post-stitch, in `_merge_undersized_cells`, where it MERGES
+                        # rather than deletes and where fragment sizes are true (a
+                        # chunk-clipped fragment looks arbitrarily small here).
+                        flush_print(
+                            f"  [PROFILE|ORPHAN] worker KEEP orphan: cell={cell_label} "
+                            f"uid={uid} orphan_size={int(np.sum(frag_mask))} "
+                            f"(isolated satellite; never deleted)"
+                        )
 
         # D. Map to Global IDs
         # Relabel locally to be sequential (1..N) before assigning global IDs
@@ -608,9 +615,13 @@ def _reassign_disconnected_islands(
     A seedless fragment with no differently-labelled neighbour is an isolated
     satellite of its OWN cell (it is already labelled ``label_id`` and that cell
     carries its seed on another fragment). It is left untouched -- it is genuine
-    foreground and must not be removed here. Deliberate size-based noise removal
-    lives upstream (the worker's ``min_size_threshold``) and in artifact removal;
-    this refinement pass is strictly foreground-conserving.
+    foreground and must not be removed here. This refinement pass is strictly
+    foreground-conserving.
+
+    Size-based handling is NOT done here and is no longer done in the worker
+    either: it runs immediately after this pass, in ``_merge_undersized_cells``,
+    which MERGES an undersized cell into a neighbour instead of deleting it.
+    Outright removal of small objects belongs to the step 1 / step 2 size filters.
 
     Instrumented so foreground conservation is visible in the run log.
     """
@@ -704,6 +715,170 @@ def _reassign_disconnected_islands(
         f"  [PROFILE|ISLAND|SUMMARY] foreground voxels before={fg_before} "
         f"after={fg_after} delta={fg_after - fg_before}"
         + ("  *** FOREGROUND LOST -- UNEXPECTED ***" if fg_after < fg_before
+           else "  (conserved)")
+    )
+
+    return segmentation
+
+
+def _merge_undersized_cells(
+    segmentation: np.ndarray,
+    min_size_threshold: int,
+    max_rounds: int = 20,
+) -> np.ndarray:
+    """
+    Merge any final cell smaller than ``min_size_threshold`` into its most-contacted
+    neighbouring cell. Never deletes anything.
+
+    Why this exists
+    ---------------
+    The watershed in the worker splits a multi-soma cell into one basin per seed.
+    A basin can come out genuinely too small to be a cell -- but it is real signal
+    belonging to the cell it was cut from, so the right response is to give it back
+    to a sibling basin, not to delete it. Before this pass, ``min_size_threshold``
+    only ever applied to *seedless* fragments, and only to delete them; a small
+    basin that happened to contain a seed was never size-tested at all.
+
+    Why here and not in the worker
+    ------------------------------
+    The worker sees a single chunk, so a basin straddling a chunk boundary has an
+    arbitrarily truncated size there and would be merged purely because it was
+    clipped. Run after stitching, every label's size is its true, whole size.
+
+    Guarantees
+    ----------
+    * **Nothing is ever deleted.** A label below the threshold with no
+      differently-labelled neighbour is KEPT at full size. That is what preserves
+      a genuinely small cell -- whether or not soma extraction gave it a seed, and
+      including the degenerate case where every basin of one cell is undersized
+      (merging then cascades until a single label remains, which has no sibling
+      left and is kept whole). Foreground is exactly conserved.
+    * **Smallest-first, and iterated.** Absorbing a fragment grows the recipient,
+      which can lift it over the threshold, so the set is re-evaluated between
+      rounds rather than judged once against stale sizes.
+    * This rule OVERRIDES the graph merge decisions: a boundary the intensity
+      heuristics deliberately kept is still merged if the basin is undersized.
+      That is intentional -- the size floor is the final word on what counts as a
+      cell -- and every such merge is logged.
+
+    Only labels that touch another label can be merged, and basins only ever touch
+    siblings cut from the same original object, so a cell that was never split
+    cannot be affected by this pass.
+    """
+    if min_size_threshold is None or min_size_threshold <= 0:
+        flush_print("  [Refine] Undersized-cell merge skipped (threshold <= 0).")
+        return segmentation
+
+    flush_print(
+        f"  [Refine] Merging cells below {min_size_threshold} voxels into their "
+        "largest-contact neighbour (nothing is deleted)..."
+    )
+
+    fg_before = int(np.count_nonzero(segmentation))
+    dilate_struct = ndimage.generate_binary_structure(3, 3)
+
+    n_merged = n_kept = 0
+    px_merged = px_kept = 0
+    detail_cap = 80
+    detail_shown = 0
+    kept_isolated: Set[int] = set()   # below threshold, no neighbour -> stop retrying
+
+    round_idx = 0                     # defined even if max_rounds <= 0
+    for round_idx in range(max_rounds):
+        counts = np.bincount(segmentation.ravel())
+        if counts.size <= 1:
+            break
+        # Candidate labels: present, below threshold, not already settled.
+        candidates = [
+            int(lbl) for lbl in np.nonzero(counts)[0]
+            if lbl != 0
+            and counts[lbl] < min_size_threshold
+            and int(lbl) not in kept_isolated
+        ]
+        if not candidates:
+            break
+
+        # Smallest first: the least cell-like fragment is given away before it can
+        # act as a recipient for another.
+        candidates.sort(key=lambda l: counts[l])
+
+        objs = ndimage.find_objects(segmentation)
+        merged_this_round = 0
+
+        for label_id in candidates:
+            if label_id - 1 >= len(objs):
+                continue
+            sl = objs[label_id - 1]
+            if sl is None:
+                continue  # already absorbed earlier in this round
+
+            sl_pad = tuple(
+                slice(max(0, s.start - 1), min(d, s.stop + 1))
+                for s, d in zip(sl, segmentation.shape)
+            )
+            target_view = segmentation[sl_pad]
+            frag_mask = (target_view == label_id)
+            frag_size = int(np.sum(frag_mask))
+            if frag_size == 0:
+                continue
+            # Re-check against the live size: an earlier merge in this same round
+            # may have grown this label past the threshold.
+            if frag_size >= min_size_threshold:
+                continue
+
+            dilated = ndimage.binary_dilation(frag_mask, structure=dilate_struct)
+            raw_neighbors = target_view[dilated]
+            neighbor_ids = raw_neighbors[
+                (raw_neighbors != 0) & (raw_neighbors != label_id)
+            ]
+
+            if neighbor_ids.size > 0:
+                counts_n = np.bincount(neighbor_ids)
+                best_neighbor = int(np.argmax(counts_n))
+                target_view[frag_mask] = best_neighbor
+                segmentation[sl_pad] = target_view
+                n_merged += 1
+                px_merged += frag_size
+                merged_this_round += 1
+                if detail_shown < detail_cap:
+                    flush_print(
+                        f"    [PROFILE|UNDERSIZE] label={label_id} size={frag_size} "
+                        f"< {min_size_threshold} -> MERGE into {best_neighbor} "
+                        f"(contact={int(counts_n[best_neighbor])} voxels)"
+                    )
+                    detail_shown += 1
+            else:
+                # Isolated and undersized: a small cell in its own right. Keep it.
+                kept_isolated.add(label_id)
+                n_kept += 1
+                px_kept += frag_size
+                if detail_shown < detail_cap:
+                    flush_print(
+                        f"    [PROFILE|UNDERSIZE] label={label_id} size={frag_size} "
+                        f"< {min_size_threshold} -> KEEP (no neighbouring cell to "
+                        f"merge into; small cells are never deleted)"
+                    )
+                    detail_shown += 1
+
+        if merged_this_round == 0:
+            break
+    else:
+        flush_print(
+            f"  [PROFILE|UNDERSIZE] *** reached the {max_rounds}-round cap; some "
+            "undersized cells may remain. This is safe (nothing is deleted) but "
+            "suggests min_size_threshold is very large relative to your cells. ***"
+        )
+
+    fg_after = int(np.count_nonzero(segmentation))
+    flush_print(
+        f"  [PROFILE|UNDERSIZE|SUMMARY] merged={n_merged} (voxels={px_merged}) | "
+        f"kept_small_isolated={n_kept} (voxels={px_kept}) | rounds_used"
+        f"={round_idx + 1}"
+    )
+    flush_print(
+        f"  [PROFILE|UNDERSIZE|SUMMARY] foreground voxels before={fg_before} "
+        f"after={fg_after} delta={fg_after - fg_before}"
+        + ("  *** FOREGROUND LOST -- UNEXPECTED ***" if fg_after != fg_before
            else "  (conserved)")
     )
 
@@ -1177,6 +1352,23 @@ def separate_multi_soma_cells(
         flush_print(
             f"  [PROFILE|CONSERVE] POST-ISLAND: foreground_voxels={_fg_island} "
             f"| objects={_nobj_island} | delta_vs_stitch={_fg_island - _fg_stitch}"
+        )
+
+        # Size floor, applied globally so every label's size is its true whole size
+        # (a chunk-clipped basin looks arbitrarily small inside the worker). Runs
+        # AFTER the island pass so satellites have been reattached and the sizes
+        # being judged are final. Merges only -- never deletes.
+        ret = _merge_undersized_cells(
+            ret, int(kwargs.get('min_size_threshold', 0) or 0)
+        )
+
+        # [PROFILE|CONSERVE] Post-undersize inventory.
+        _fg_undersize = int(np.count_nonzero(ret))
+        _nobj_undersize = int(np.unique(ret[ret > 0]).size)
+        flush_print(
+            f"  [PROFILE|CONSERVE] POST-UNDERSIZE: foreground_voxels={_fg_undersize} "
+            f"| objects={_nobj_undersize} | delta_vs_island="
+            f"{_fg_undersize - _fg_island}"
         )
 
         flush_print("  Refining (Filling voids + Relabeling)...")
