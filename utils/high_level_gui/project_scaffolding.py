@@ -259,6 +259,14 @@ def apply_template_config_to_project(
                 # Fallback: use template dimensions only if the image has none
                 merged_main[dim_key] = template[dim_key]
 
+        # Carry the calibration's provenance with the calibration itself. merged_main
+        # is rebuilt from scratch, so anything not copied here is dropped -- and
+        # dropping this would silently downgrade a calibrated image to 'unknown'
+        # just because the user applied a different parameter set.
+        from .dimension_entry import DIMENSION_SOURCE_KEY
+        if DIMENSION_SOURCE_KEY in current_main:
+            merged_main[DIMENSION_SOURCE_KEY] = current_main[DIMENSION_SOURCE_KEY]
+
         # Keep the folder's existing mode; use template mode only as a last resort
         merged_main['mode'] = (
             folder_mode if folder_mode != 'unknown'
@@ -445,23 +453,23 @@ def _match_dimension_override(
     return None
 
 
-def _has_real_scale(meta: Dict[str, Any]) -> bool:
-    """True if `meta` carries a physical scale worth trusting.
+def _has_real_scale(meta: Dict[str, Any], mode: Any = "") -> bool:
+    """True if `meta` carries a physical scale worth trusting on every axis.
 
     The ``found`` flag alone is not enough. Many writers (tifffile included)
     store XResolution=(1,1) with ResolutionUnit=NONE on an uncalibrated image,
     which ``read_tiff_metadata`` resolves to exactly 1.0 micron/pixel and reports
     as found=True. That is indistinguishable from "no calibration at all", so a
-    unit x/y spacing is treated as missing and reported to the user instead of
-    silently producing dimensions that are really just pixel counts.
+    unit spacing is treated as missing and the user is asked instead of silently
+    producing dimensions that are really just pixel counts.
+
+    Now delegates to ``dimension_entry.scale_gaps`` so the check is per-axis and
+    mode-aware. The old version tested only X and Y, so a 3D image with a genuine
+    X/Y but no Z spacing passed as fully calibrated -- and Z is the axis
+    microscopes most often fail to record.
     """
-    if not meta.get('found'):
-        return False
-    try:
-        return not (float(meta.get('x', 1.0)) == 1.0
-                    and float(meta.get('y', 1.0)) == 1.0)
-    except (TypeError, ValueError):
-        return False
+    from .dimension_entry import scale_gaps
+    return not scale_gaps(meta, mode)
 
 def organize_channel_project(
     source_files: List[str],
@@ -471,6 +479,7 @@ def organize_channel_project(
     preset_details: Dict[str, str],
     progress=None,
     should_cancel=None,
+    manual_overrides: Optional[Dict[str, Dict[str, Optional[float]]]] = None,
 ) -> Dict[str, Any]:
     """Setup Logic for MULTI-CHANNEL mode.
 
@@ -478,10 +487,17 @@ def organize_channel_project(
     what is happening during what may be a multi-minute extraction; `should_cancel`
     is polled and raises SetupCancelled when it returns True.
 
+    `manual_overrides` carries dimensions the user typed into the dimension-entry
+    dialog, keyed and shaped exactly like the CSV overrides so both flow through
+    one precedence chain rather than two. It is consulted only for axes the CSV
+    did not supply, because the dialog only ever asks about axes automatic
+    detection could not resolve.
+
     Returns a summary: ``{'organized': [...], 'missing_channel': [...],
     'failed': [...], 'unscaled': [...], 'csv': name|None}``. ``unscaled`` lists
-    source images that had neither usable scale metadata nor a CSV row, so the
-    caller can tell the user their dimensions are effectively pixel counts.
+    source images that ended up with pixel counts for dimensions on at least one
+    axis, so the caller can tell the user. With the dialog in place this should
+    normally be empty -- a non-empty list means the user declined to supply them.
     """
     config_template_path = preset_details['path']
     fallback_mode = preset_details['default_mode']
@@ -625,23 +641,56 @@ def organize_channel_project(
         # single-channel path gives it. Its columns are already TOTAL microns per
         # axis, so they replace the products above rather than scaling them. One
         # row per source image covers every channel extracted from that image.
+        # Per-axis precedence: CSV, then manually-entered values, then the file's
+        # own metadata. Tracked per axis rather than per image because a CSV (or
+        # dialog) can pin one axis and leave another unknown. The previous
+        # `if override: ... elif not _has_real_scale(...)` meant ANY csv row
+        # suppressed the unscaled report for the axes it did NOT supply, so a CSV
+        # with only 'Width (um)' silently left Y and Z as pixel counts.
+        from .dimension_entry import (
+            combine_sources, per_axis_sources, scale_gaps,
+            stamp_dimensions_source,
+        )
+
+        totals = {'x': total_w, 'y': total_h, 'z': total_d}
+        gaps = set(scale_gaps(meta, mode))
+        csv_axes, manual_axes = set(), set()
+
         override = _match_dimension_override(overrides, src_file)
         if override:
-            if override['x'] is not None:
-                total_w = override['x']
-            if override['y'] is not None:
-                total_h = override['y']
-            if override['z'] is not None:
-                total_d = override['z']
-            axes = ", ".join(a for a in ('x', 'y', 'z') if override[a] is not None)
-            print(f"      Dimensions ({axes}) taken from CSV.")
-        elif not _has_real_scale(meta):
-            # Neither source has real scale: total_* are pixel counts in micron
-            # clothing. Record it so the caller can tell the user, instead of
-            # letting silently wrong physical measurements flow downstream.
+            for axis in ('x', 'y', 'z'):
+                if override.get(axis) is not None:
+                    totals[axis] = override[axis]
+                    csv_axes.add(axis)
+            if csv_axes:
+                print(f"      Dimensions ({', '.join(sorted(csv_axes))}) "
+                      "taken from CSV.")
+
+        manual = _match_dimension_override(manual_overrides or {}, src_file)
+        if manual:
+            for axis in ('x', 'y', 'z'):
+                # CSV wins: the dialog was only ever asked to fill CSV's gaps.
+                if axis in csv_axes:
+                    continue
+                if manual.get(axis) is not None:
+                    totals[axis] = manual[axis]
+                    manual_axes.add(axis)
+            if manual_axes:
+                print(f"      Dimensions ({', '.join(sorted(manual_axes))}) "
+                      "entered manually.")
+
+        total_w, total_h, total_d = totals['x'], totals['y'], totals['z']
+
+        axis_sources = per_axis_sources(mode, meta, csv_axes, manual_axes)
+        dim_source = combine_sources(axis_sources)
+
+        still_missing = sorted(
+            a for a in gaps if a not in csv_axes and a not in manual_axes)
+        if still_missing:
             summary['unscaled'].append(src_file)
-            print(f"      Warning: no usable scale metadata and no CSV row for "
-                  f"{src_file}; dimensions recorded in PIXELS.")
+            print(f"      Warning: no usable scale for axis/axes "
+                  f"{', '.join(still_missing)} of {src_file}; those dimensions "
+                  "are recorded in PIXELS.")
 
         summary['organized'].append(img_subdir)
 
@@ -666,6 +715,9 @@ def organize_channel_project(
                 cfg[dimension_key]['z'] = total_d
             cfg['mode'] = mode
             cfg['synthetic'] = False  # real extracted channel
+            # Provenance of the numbers above. Legacy configs lack this key and
+            # read back as 'unknown', so nothing existing breaks.
+            stamp_dimensions_source(cfg, dim_source)
             with open(new_config_path, 'w') as f:
                 yaml.dump(cfg, f, default_flow_style=False, sort_keys=False)
         except Exception:
@@ -836,8 +888,12 @@ def _channel_index_of(channel_dir: str) -> Optional[int]:
     return None
 
 
-def organize_processing_dir(drctry: str, preset_details: Dict[str, str],
-                            only_files: Optional[Sequence[str]] = None) -> None:
+def organize_processing_dir(
+    drctry: str,
+    preset_details: Dict[str, str],
+    only_files: Optional[Sequence[str]] = None,
+    manual_overrides: Optional[Dict[str, Dict[str, Optional[float]]]] = None,
+) -> Dict[str, Any]:
     """
     Setup Logic for SINGLE-CHANNEL / LEGACY mode.
     Includes Robust Matching for CSV filenames vs Disk filenames.
@@ -846,6 +902,15 @@ def organize_processing_dir(drctry: str, preset_details: Dict[str, str],
     a project can be set up on one image now and extended later. Files left out
     stay where they are, loose in the folder, and can be organized in a second pass
     -- the per-image subfolders this creates do not disturb them.
+
+    `manual_overrides` carries dimensions the user typed into the dimension-entry
+    dialog, shaped like the CSV overrides.
+
+    Returns a summary dict in the same shape the multi-channel path returns
+    (``{'organized', 'unscaled', 'csv', ...}``). It previously returned None,
+    which is why the wizard's unscaled warning never fired for single-channel
+    projects: the wizard only collects summaries it is given. An uncalibrated
+    single-channel project was therefore completely silent.
     """
     config_template_path = preset_details['path']
     fallback_mode = preset_details['default_mode']
@@ -910,7 +975,24 @@ def organize_processing_dir(drctry: str, preset_details: Dict[str, str],
     is_2d_mode = mode.endswith('_2d')
     dimension_key = 'pixel_dimensions' if is_2d_mode else 'voxel_dimensions'
 
+    from .dimension_entry import (
+        SOURCE_CSV, SOURCE_UNKNOWN, combine_sources, per_axis_sources,
+        scale_gaps, stamp_dimensions_source,
+    )
+
     generated_rows = []
+
+    # Reported to the caller so the wizard can warn about pixel-count dimensions
+    # for single-channel projects too. This path used to return None, so the
+    # wizard had nothing to warn from.
+    summary: Dict[str, Any] = {
+        'organized': [],
+        'unscaled': [],
+        'csv': csv_files[0] if csv_files else None,
+    }
+    # filename -> {axis: source}. Only populated on the auto-generate path; a
+    # user-supplied CSV is itself the statement of physical size, handled below.
+    axis_sources: Dict[str, Dict[str, str]] = {}
 
     # 3. Generate Metadata (if needed)
     #
@@ -954,16 +1036,49 @@ def organize_processing_dir(drctry: str, preset_details: Dict[str, str],
                 print(f"    Warning: could not read pixel data of {img_file} "
                       f"({exc}); using neutral dimensions.")
 
-            found = bool(meta.get('found'))
-            spacing_x = float(meta.get('x', 1.0)) if found else 1.0
-            spacing_y = float(meta.get('y', 1.0)) if found else 1.0
-            spacing_z = float(meta.get('z', 1.0)) if found else 1.0
+            # Per-axis scale check, NOT the bare `found` flag. `found` is True for
+            # a TIFF carrying XResolution=(1,1)/ResolutionUnit=NONE, whose spacing
+            # resolves to exactly 1.0 um/px -- i.e. an uncalibrated image that
+            # previously sailed through as calibrated, making its dimensions its
+            # pixel counts with no warning anywhere.
+            gaps = set(scale_gaps(meta, mode))
+            spacing_x = float(meta.get('x', 1.0)) if 'x' not in gaps else 1.0
+            spacing_y = float(meta.get('y', 1.0)) if 'y' not in gaps else 1.0
+            spacing_z = float(meta.get('z', 1.0)) if 'z' not in gaps else 1.0
+
+            totals = {
+                'x': spacing_x * width,
+                'y': spacing_y * height,
+                'z': spacing_z * z_slices,
+            }
+
+            # Dimensions the user typed for the axes automatic detection missed.
+            manual = _match_dimension_override(manual_overrides or {}, img_file)
+            manual_axes = set()
+            if manual:
+                for axis in ('x', 'y', 'z'):
+                    if axis in gaps and manual.get(axis) is not None:
+                        totals[axis] = manual[axis]
+                        manual_axes.add(axis)
+                if manual_axes:
+                    print(f"    Dimensions ({', '.join(sorted(manual_axes))}) "
+                          "entered manually.")
+
+            axis_sources[img_file] = per_axis_sources(
+                mode, meta, (), manual_axes)
+
+            still_missing = sorted(a for a in gaps if a not in manual_axes)
+            if still_missing:
+                summary['unscaled'].append(img_file)
+                print(f"    Warning: no usable scale for axis/axes "
+                      f"{', '.join(still_missing)} of {img_file}; those "
+                      "dimensions are recorded in PIXELS.")
 
             generated_rows.append({
                 'Filename': img_file,
-                'Width (um)': spacing_x * width,
-                'Height (um)': spacing_y * height,
-                'Depth (um)': spacing_z * z_slices,
+                'Width (um)': totals['x'],
+                'Height (um)': totals['y'],
+                'Depth (um)': totals['z'],
                 'Slices': z_slices,
                 'Basename': basename,
             })
@@ -1053,6 +1168,14 @@ def organize_processing_dir(drctry: str, preset_details: Dict[str, str],
                 cfg[dimension_key]['z'] = float(row.get('Depth (um)', 0.0))
             cfg['mode'] = mode
             cfg['synthetic'] = False  # real image (not procedurally generated)
+            # Provenance. On the auto-generate path we tracked it per axis above.
+            # When the rows came from a user-supplied CSV, the CSV *is* the
+            # statement of physical size, so that is the source.
+            tracked = axis_sources.get(matched_file)
+            stamp_dimensions_source(
+                cfg,
+                combine_sources(tracked) if tracked else SOURCE_CSV,
+            )
             with open(new_config_path, 'w') as f:
                 yaml.dump(cfg, f, default_flow_style=False, sort_keys=False)
         except Exception: pass
@@ -1088,3 +1211,6 @@ def organize_processing_dir(drctry: str, preset_details: Dict[str, str],
             f"{len(raw_images)} image file(s) in this folder.{detail}\n\n"
             "Your images were left untouched."
         )
+
+    summary['organized'] = organized_dirs
+    return summary

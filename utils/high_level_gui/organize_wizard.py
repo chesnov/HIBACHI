@@ -539,12 +539,14 @@ if _HAVE_QT:
         done = pyqtSignal()
 
         def __init__(self, raw_files: List[str], raw_dir: str,
-                     plan: List[Tuple], single: bool):
+                     plan: List[Tuple], single: bool,
+                     manual_overrides: Optional[dict] = None):
             super().__init__()
             self.raw_files = raw_files
             self.raw_dir = raw_dir
             self.plan = plan
             self.single = single
+            self.manual_overrides = manual_overrides or {}
             self.targets: List[str] = []
             self.summaries: List[dict] = []
             self.error: str = ""
@@ -573,10 +575,17 @@ if _HAVE_QT:
                         break
                     if self.single:
                         self.progress.emit("Organizing project…", 0, 1)
-                        organize_processing_dir(
+                        summary = organize_processing_dir(
                             self.raw_dir, preset,
-                            only_files=self.raw_files or None)
+                            only_files=self.raw_files or None,
+                            manual_overrides=self.manual_overrides)
                         self.targets.append(target)
+                        # Collected just like the multi-channel branch. This
+                        # branch used to discard its result, which is why an
+                        # uncalibrated single-channel project warned about
+                        # nothing at all.
+                        if isinstance(summary, dict):
+                            self.summaries.append(summary)
                     else:
                         self.progress.emit(
                             f"Extracting channel {ch_idx}…", 0, 1)
@@ -584,6 +593,7 @@ if _HAVE_QT:
                             self.raw_files, self.raw_dir, target, ch_idx, preset,
                             progress=lambda msg, d, t: self.progress.emit(msg, d, t),
                             should_cancel=self._should_cancel,
+                            manual_overrides=self.manual_overrides,
                         )
                         self.targets.append(target)
                         if isinstance(summary, dict):
@@ -740,6 +750,17 @@ if _HAVE_QT:
                     self.project_dir, channel_target_name(ch_idx, preset_key)))
                 plan.append((ch_idx, self.presets[preset_key], target))
 
+            # Physical scale is resolved BEFORE any work starts, on the GUI
+            # thread. Two reasons it belongs here rather than inside the worker:
+            # a modal dialog cannot be raised from a QThread, and asking after
+            # extraction would mean either re-writing configs afterwards or
+            # aborting a multi-minute run. Nothing is asked when the metadata
+            # (or a CSV) already supplies every axis, so a calibrated dataset
+            # never sees this.
+            manual_overrides = self._resolve_missing_dimensions(raw_files, plan)
+            if manual_overrides is None:
+                return False   # user cancelled at the dimension prompt
+
             dialog = QProgressDialog("Setting up project…", "Cancel", 0, 100, self)
             dialog.setWindowModality(Qt.WindowModal)
             dialog.setMinimumDuration(0)
@@ -747,7 +768,8 @@ if _HAVE_QT:
             dialog.setAutoReset(False)
             dialog.setValue(0)
 
-            worker = _SetupWorker(raw_files, self.raw_dir, plan, single)
+            worker = _SetupWorker(raw_files, self.raw_dir, plan, single,
+                                  manual_overrides=manual_overrides)
             loop = QEventLoop()
 
             def _on_progress(message: str, done: int, total: int) -> None:
@@ -793,6 +815,113 @@ if _HAVE_QT:
 
             self._verify_created(worker.targets, worker.summaries)
             self._report_unscaled(worker.summaries)
+
+        def _resolve_missing_dimensions(self, raw_files, plan):
+            """Ask for physical extents that automatic detection could not supply.
+
+            Runs on the GUI thread before setup starts. Returns an overrides dict
+            (possibly empty) shaped like the CSV overrides, or ``None`` if the
+            user cancelled.
+
+            An axis is only ever asked about when BOTH automatic routes fail --
+            the file's own metadata has no trustworthy spacing for it, and no CSV
+            row pins it down. A correctly calibrated dataset therefore sees
+            nothing, which is the whole requirement: manual entry is a fallback,
+            not a step.
+
+            Probing reads headers only (never pixel data), except for the pixel
+            counts used to prefill the dialog, which come from the shape.
+            """
+            from .dimension_entry import collect_manual_dimensions, plan_manual_entry
+            from .metadata import MetadataExtractor
+            from .gui_text_utils import clean_filename_for_matching
+            from .project_scaffolding import (
+                _match_dimension_override, load_dimension_overrides,
+            )
+
+            # Mode comes from the chosen preset(s): it decides whether Z is even
+            # a question. If presets disagree (mixed 2D/3D channels), asking for
+            # the superset is right -- an unused Z is harmless, a missing one is not.
+            modes = set()
+            for _ch_idx, preset, _target in plan:
+                modes.add(str(preset.get('default_mode', '')))
+            mode = '' if any(not m.endswith('_2d') for m in modes) else 'fluorescence_2d'
+
+            csv_overrides = {}
+            try:
+                csv_overrides = load_dimension_overrides(self.raw_dir) or {}
+            except Exception as exc:
+                print(f"[dimensions] could not read metadata CSV ({exc}).")
+
+            files_meta = []
+            for name in raw_files:
+                path = os.path.join(self.raw_dir, name)
+                meta, pixels = None, {}
+                try:
+                    if MetadataExtractor._slide_source(name)[0] is not None:
+                        meta = MetadataExtractor.read_slide_metadata(path)
+                    elif name.lower().endswith('.czi'):
+                        meta = MetadataExtractor.get_czi_metadata(path)
+                    else:
+                        meta = MetadataExtractor.read_tiff_metadata(path)
+                except Exception as exc:
+                    # An unreadable header is a missing scale, not a crash: the
+                    # user is asked, which is exactly the desired outcome.
+                    print(f"[dimensions] could not read metadata of {name} ({exc}).")
+                try:
+                    pixels = self._probe_pixel_counts(path, name, self.raw_dir)
+                except Exception:
+                    pixels = {}
+                files_meta.append((name, meta, pixels))
+
+            needs = plan_manual_entry(
+                files_meta, mode,
+                csv_overrides=csv_overrides,
+                match_override=_match_dimension_override,
+            )
+            if not needs:
+                return {}
+
+            values = collect_manual_dimensions(
+                self, needs, mode, clean_name=clean_filename_for_matching)
+            if values is None:
+                return None
+            return values
+
+        @staticmethod
+        def _probe_pixel_counts(path, name, self_root=""):
+            """Pixel counts per axis, to prefill and sanity-check the dialog.
+
+            Best-effort and cheap: shape only, no pixel data where avoidable. The
+            counts are shown next to each field so the user can see the spacing
+            their number implies, which is the easiest way to catch a factor-of-
+            ten typo.
+            """
+            from .metadata import MetadataExtractor
+            if MetadataExtractor._slide_source(name)[0] is not None:
+                # Slide scenes are sized via the slide reader rather than
+                # tifffile. Prefill is a convenience, so failing to get counts
+                # only costs the hint next to the field, never the prompt.
+                try:
+                    from .slide_reader import scene_shape
+                    # Returns (Z, Y, X) or (Y, X), or None on any failure.
+                    shape = scene_shape(name, self_root) or ()
+                    if len(shape) == 3:
+                        return {'z': shape[0], 'y': shape[1], 'x': shape[2]}
+                    if len(shape) == 2:
+                        return {'z': 1, 'y': shape[0], 'x': shape[1]}
+                except Exception:
+                    pass
+                return {}
+            import tifffile as tiff
+            with tiff.TiffFile(path) as handle:
+                series = handle.series[0]
+                shape = series.shape
+            if len(shape) >= 3:
+                return {'z': shape[0], 'y': shape[-2], 'x': shape[-1]}
+            if len(shape) == 2:
+                return {'z': 1, 'y': shape[0], 'x': shape[1]}
+            return {}
 
         def _report_unscaled(self, summaries: List[dict]) -> None:
             """Tell the user when images ended up with pixel counts for dimensions.

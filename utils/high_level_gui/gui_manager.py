@@ -43,6 +43,77 @@ except Exception:  # pragma: no cover
 
 
 # =============================================================================
+# 0. Processing-mode registry
+# =============================================================================
+# Single source of truth for which modes this build can open. It lives at module
+# level (rather than inline in DynamicGUIManager.__init__) so callers can check a
+# mode BEFORE building a napari viewer -- constructing the viewer first and
+# discovering the mode is unsupported afterwards leaked a live GL context on
+# every attempt.
+
+#: mode string -> strategy class. The one place this mapping is defined; both
+#: DynamicGUIManager and the pre-viewer validation in app_launch read it.
+STRATEGY_CLASSES: Dict[str, Any] = {
+    'fluorescence': FluorescenceStrategy,
+    'fluorescence_2d': Fluorescence2DStrategy,
+}
+
+SUPPORTED_MODES: Tuple[str, ...] = tuple(STRATEGY_CLASSES)
+
+#: Modes that earlier versions wrote into configs and this build no longer has.
+#: Named explicitly so the user gets "this was removed, here's the fix" instead
+#: of a bare "Unsupported mode", which says nothing actionable.
+RETIRED_MODES: Dict[str, str] = {
+    'ramified': 'fluorescence',
+    'ramified_2d': 'fluorescence_2d',
+}
+
+
+def is_supported_mode(mode: Any) -> bool:
+    """True if this build can open a config with this mode."""
+    return str(mode) in STRATEGY_CLASSES
+
+
+def unsupported_mode_message(mode: Any, folder: str = "") -> str:
+    """Explain an unopenable mode and how to fix it.
+
+    A config carrying a retired mode is not corrupt -- it was written by an older
+    HIBACHI whose pipeline has since been replaced. The fix is to apply a current
+    config, which preserves the image's dimensions, so the message says so
+    rather than leaving the user with a dead project.
+    """
+    mode_str = str(mode) if mode else "(none)"
+    where = f"\n\nFolder:\n{folder}" if folder else ""
+
+    if mode_str in RETIRED_MODES:
+        replacement = RETIRED_MODES[mode_str]
+        return (
+            f"This image is configured for '{mode_str}', which was removed from "
+            "HIBACHI and is no longer available.\n\n"
+            "To use it again, select it in the project window and choose "
+            f"'Set New Channel Config', picking a '{replacement}' config. Your "
+            "image dimensions are preserved; only the processing parameters "
+            f"change.{where}"
+        )
+
+    supported = ", ".join(SUPPORTED_MODES)
+    return (
+        f"This image's config specifies mode '{mode_str}', which this version of "
+        f"HIBACHI cannot open.\n\nSupported modes are: {supported}.\n\n"
+        "Use 'Set New Channel Config' in the project window to apply a current "
+        f"config (your image dimensions are preserved).{where}"
+    )
+
+
+class UnsupportedModeError(ValueError):
+    """A config's mode has no strategy in this build. Carries a usable message."""
+
+    def __init__(self, mode: Any, folder: str = ""):
+        self.mode = mode
+        super().__init__(unsupported_mode_message(mode, folder))
+
+
+# =============================================================================
 # 1. Output Redirector
 # =============================================================================
 
@@ -281,13 +352,13 @@ class DynamicGUIManager(QObject):
 
         # Initialize Strategy
         try:
-            strategy_class = {
-                'fluorescence': FluorescenceStrategy,
-                'fluorescence_2d': Fluorescence2DStrategy
-            }.get(self.processing_mode)
+            strategy_class = STRATEGY_CLASSES.get(self.processing_mode)
 
             if not strategy_class:
-                raise ValueError(f"Unsupported mode: {self.processing_mode}")
+                # Callers should validate with is_supported_mode() *before*
+                # constructing a viewer -- reaching here means a viewer already
+                # exists and its caller must close it (see app_launch).
+                raise UnsupportedModeError(self.processing_mode, self.inputdir)
 
             self.strategy = strategy_class(
                 self.config,
@@ -340,10 +411,7 @@ class DynamicGUIManager(QObject):
 
     def _get_strategy_class(self):
         """Returns the strategy class for the current processing mode."""
-        return {
-            'fluorescence': FluorescenceStrategy,
-            'fluorescence_2d': Fluorescence2DStrategy,
-        }.get(self.processing_mode)
+        return STRATEGY_CLASSES.get(self.processing_mode)
 
     def _rebuild_strategy(self) -> None:
         """
@@ -1602,9 +1670,23 @@ class DynamicGUIManager(QObject):
         """Loads visualization data."""
         self.strategy.load_checkpoint_data(self.viewer, checkpoint_step)
 
-    def cleanup_step(self, step_number: int) -> None:
-        """Cleans artifacts for a specific step."""
-        self.strategy.cleanup_step_artifacts(self.viewer, step_number)
+    def cleanup_step(self, step_number: int, keep_layers: bool = False) -> None:
+        """Cleans artifacts for a specific step.
+
+        `keep_layers=True` deletes the step's files but leaves its napari layers
+        alone. Passing viewer=None is what suppresses layer removal, since
+        `_remove_layer_safely` no-ops on a None viewer -- the same path the batch
+        processor already uses.
+
+        This exists for the re-process case: destroying the layer for a step that
+        is about to re-add it forces napari to free and reallocate the GPU
+        texture. Repeating that on every re-run churned the driver, and on at
+        least one AMD setup ended in a GPU context loss and a SIGABRT. Updating
+        the layer in place (which `_add_layer_safely` does when the layer still
+        exists) avoids the churn entirely.
+        """
+        self.strategy.cleanup_step_artifacts(
+            None if keep_layers else self.viewer, step_number)
 
     # ------------------------------------------------------------------ #
     # Valid frontier + non-destructive navigation
@@ -1929,10 +2011,17 @@ class DynamicGUIManager(QObject):
         # Prepare Execution
         self.strategy.save_config(self.config)
         
-        # If not repeating interaction analysis, clean subsequent steps
-        if logical_step != "execute_interaction_analysis":
-            for i in range(step_index + 1, self.num_steps + 1):
-                self.cleanup_step(i)
+        # Clear results this run invalidates.
+        #
+        # `step_index` is 0-based and cleanup_step is 1-based, so `step_index + 1`
+        # is THIS step, not the next one -- the old loop started there and so
+        # removed the current step's own layer moments before re-adding it. Its
+        # files are still deleted (a step that fails partway must not leave a
+        # previous run's artifact behind, which would make resume think it
+        # succeeded), but its layers are kept so the re-add updates in place.
+        self.cleanup_step(step_index + 1, keep_layers=True)
+        for i in range(step_index + 2, self.num_steps + 1):
+            self.cleanup_step(i)
         
         # Ensure state has image reference
         if 'original_volume_ref' not in self.strategy.intermediate_state:

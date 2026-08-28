@@ -566,89 +566,97 @@ class CrossChannelAnalyzerWindow(QMainWindow):
             pass
 
         viewer = napari.Viewer(title=f"Cross-Channel Preview: {sample_name}")
-        try:
-            _qw = viewer.window._qt_window
-            _qw.showMaximized(); _qw.raise_(); _qw.activateWindow()
-        except Exception:
-            pass
-        
-        # Predefined colormaps for raw channels
-        colormaps = ['cyan', 'magenta', 'yellow', 'green', 'red', 'blue']
-        
-        # 3. Load Raw Data and Segmentation for EVERY channel in this sample
-        shape = None
-        spacing = (1.0, 1.0, 1.0)
-        
-        for i, (ch_name, ch_path) in enumerate(sample_data.items()):
-            # Find files
-            tif_file = next((os.path.join(ch_path, f) for f in os.listdir(ch_path) if f.lower().endswith(('.tif', '.tiff'))), None)
-            dat_file = RelationalEngine._find_dat(ch_path)
-            
-            # Fetch metadata from the first valid channel we find
-            if shape is None and tif_file:
-                with tiff.TiffFile(tif_file) as tif:
-                    shape = tif.series[0].shape
-                # Try to get spacing from strategy config
-                meta, _ = get_sample_metadata(ch_path)
-                if meta:
-                    # Very simple spacing calc: total_um / pixels
-                    # (Note: In a production version, we use the exact strategy spacing)
-                    spacing = (meta.get('z', 1.0)/shape[0], meta.get('y', 1.0)/shape[1], meta.get('x', 1.0)/shape[2]) if len(shape)==3 else (meta.get('y', 1.0)/shape[0], meta.get('x', 1.0)/shape[1])
-
-            # Add Raw Intensity
-            if tif_file:
-                raw_img = tiff.imread(tif_file)
-                cmap = colormaps[i % len(colormaps)]
-                viewer.add_image(raw_img, name=f"Raw: {ch_name}", colormap=cmap, blending='additive', opacity=0.5)
-
-            # Add Segmentation Labels (Semi-transparent)
-            if dat_file:
-                seg_data = np.memmap(dat_file, dtype=np.int32, mode='r', shape=shape)
-                viewer.add_labels(seg_data, name=f"Seg: {ch_name}", opacity=0.3)
-
-        # 4. Execute Relational Recipe
-        temp_dir = os.path.join(list(sample_data.values())[0], "relational_preview_temp")
-        os.makedirs(temp_dir, exist_ok=True)
-        
-        # Run calculation
-        derived_masks, metrics_df = RelationalEngine.run_recipe(
-            sample_name, self.pm.sample_registry, self.recipe_steps,
-            sample_out_dir, shape, spacing, roi_name=roi_name
-        )
-
-        # Add the Red Proximity Lines
-        if metrics_df is not None:
-            self._draw_proximity_bridges(viewer, metrics_df, shape, spacing)
-
-        # 5. Add Derived Results (High Opacity Labels)
-        for res in derived_masks:
-            data = np.memmap(res['path'], dtype=np.int32, mode='r', shape=shape)
-            viewer.add_labels(data, name=f"DERIVED: {res['name']}")
-
-        # Final Adjustments
-        if len(shape) == 3:
-            viewer.dims.ndisplay = 3
-            # Set scale to handle anisotropy if 3D
-            # (Napari scale is z_scale, y_scale, x_scale)
-            # Use spacing[0]/spacing[2] for z-scale factor
-            z_scale = spacing[0]/spacing[2] if len(spacing)==3 else 1.0
-            for layer in viewer.layers:
-                layer.scale = (z_scale, 1, 1)
-
-        # One-click hide/show-all toggle under the layer list.
-        try:
-            from .app_launch import add_channel_visibility_toggle
-            add_channel_visibility_toggle(viewer)
-        except Exception as exc:
-            print(f"Could not add channel visibility toggle: {exc}")
-
-        # 3D rotation recorder (3D samples only), docked beneath the layer list.
-        if shape and len(shape) == 3:
+        # Any failure below leaves a live napari window (Qt owns it, so it is not
+        # collected when this frame unwinds), holding a GL context and the loaded
+        # image for the rest of the session. Close it instead.
+        #
+        # Imported lazily: a module-level import would close the cycle
+        # cross_channel_window -> app_launch -> project_view_window -> here.
+        from .app_launch import close_viewer_on_error
+        with close_viewer_on_error(viewer):
             try:
-                from ..module_3d.turntable import add_turntable_button
-                add_turntable_button(viewer)
+                _qw = viewer.window._qt_window
+                _qw.showMaximized(); _qw.raise_(); _qw.activateWindow()
+            except Exception:
+                pass
+        
+            # Predefined colormaps for raw channels
+            colormaps = ['cyan', 'magenta', 'yellow', 'green', 'red', 'blue']
+        
+            # 3. Load Raw Data and Segmentation for EVERY channel in this sample
+            shape = None
+            spacing = (1.0, 1.0, 1.0)
+        
+            for i, (ch_name, ch_path) in enumerate(sample_data.items()):
+                # Find files
+                tif_file = next((os.path.join(ch_path, f) for f in os.listdir(ch_path) if f.lower().endswith(('.tif', '.tiff'))), None)
+                dat_file = RelationalEngine._find_dat(ch_path)
+            
+                # Fetch metadata from the first valid channel we find
+                if shape is None and tif_file:
+                    with tiff.TiffFile(tif_file) as tif:
+                        shape = tif.series[0].shape
+                    # Try to get spacing from strategy config
+                    meta, _ = get_sample_metadata(ch_path)
+                    if meta:
+                        # Very simple spacing calc: total_um / pixels
+                        # (Note: In a production version, we use the exact strategy spacing)
+                        spacing = (meta.get('z', 1.0)/shape[0], meta.get('y', 1.0)/shape[1], meta.get('x', 1.0)/shape[2]) if len(shape)==3 else (meta.get('y', 1.0)/shape[0], meta.get('x', 1.0)/shape[1])
+
+                # Add Raw Intensity
+                if tif_file:
+                    raw_img = tiff.imread(tif_file)
+                    cmap = colormaps[i % len(colormaps)]
+                    viewer.add_image(raw_img, name=f"Raw: {ch_name}", colormap=cmap, blending='additive', opacity=0.5)
+
+                # Add Segmentation Labels (Semi-transparent)
+                if dat_file:
+                    seg_data = np.memmap(dat_file, dtype=np.int32, mode='r', shape=shape)
+                    viewer.add_labels(seg_data, name=f"Seg: {ch_name}", opacity=0.3)
+
+            # 4. Execute Relational Recipe
+            temp_dir = os.path.join(list(sample_data.values())[0], "relational_preview_temp")
+            os.makedirs(temp_dir, exist_ok=True)
+        
+            # Run calculation
+            derived_masks, metrics_df = RelationalEngine.run_recipe(
+                sample_name, self.pm.sample_registry, self.recipe_steps,
+                sample_out_dir, shape, spacing, roi_name=roi_name
+            )
+
+            # Add the Red Proximity Lines
+            if metrics_df is not None:
+                self._draw_proximity_bridges(viewer, metrics_df, shape, spacing)
+
+            # 5. Add Derived Results (High Opacity Labels)
+            for res in derived_masks:
+                data = np.memmap(res['path'], dtype=np.int32, mode='r', shape=shape)
+                viewer.add_labels(data, name=f"DERIVED: {res['name']}")
+
+            # Final Adjustments
+            if len(shape) == 3:
+                viewer.dims.ndisplay = 3
+                # Set scale to handle anisotropy if 3D
+                # (Napari scale is z_scale, y_scale, x_scale)
+                # Use spacing[0]/spacing[2] for z-scale factor
+                z_scale = spacing[0]/spacing[2] if len(spacing)==3 else 1.0
+                for layer in viewer.layers:
+                    layer.scale = (z_scale, 1, 1)
+
+            # One-click hide/show-all toggle under the layer list.
+            try:
+                from .app_launch import add_channel_visibility_toggle
+                add_channel_visibility_toggle(viewer)
             except Exception as exc:
-                print(f"Could not add 3D rotation recorder: {exc}")
+                print(f"Could not add channel visibility toggle: {exc}")
+
+            # 3D rotation recorder (3D samples only), docked beneath the layer list.
+            if shape and len(shape) == 3:
+                try:
+                    from ..module_3d.turntable import add_turntable_button
+                    add_turntable_button(viewer)
+                except Exception as exc:
+                    print(f"Could not add 3D rotation recorder: {exc}")
 
     def _draw_proximity_bridges(self, viewer, df, shape, spacing):
         """Delegate to the module-level bridge drawer (used by preview_recipe)."""
@@ -916,92 +924,100 @@ def open_sample_overlay(project_manager, sample_name, analysis_name=None, parent
     title = (f"Overlay: {analysis_label} | {sample_name}"
              if analysis_name else f"Sample: {sample_name}")
     viewer = napari.Viewer(title=title)
-    try:
-        _qw = viewer.window._qt_window
-        _qw.showMaximized(); _qw.raise_(); _qw.activateWindow()
-    except Exception:
-        pass
-    colormaps = ['cyan', 'magenta', 'yellow', 'green', 'red', 'blue']
-    shape = None
-    spacing = (1.0, 1.0, 1.0)
+    # Any failure below leaves a live napari window (Qt owns it, so it is not
+    # collected when this frame unwinds), holding a GL context and the loaded
+    # image for the rest of the session. Close it instead.
+    #
+    # Imported lazily: a module-level import would close the cycle
+    # cross_channel_window -> app_launch -> project_view_window -> here.
+    from .app_launch import close_viewer_on_error
+    with close_viewer_on_error(viewer):
+        try:
+            _qw = viewer.window._qt_window
+            _qw.showMaximized(); _qw.raise_(); _qw.activateWindow()
+        except Exception:
+            pass
+        colormaps = ['cyan', 'magenta', 'yellow', 'green', 'red', 'blue']
+        shape = None
+        spacing = (1.0, 1.0, 1.0)
 
-    # 1. Raw intensity (visible) + base segmentation (hidden, toggle-able).
-    for i, (ch_name, ch_path) in enumerate(sample_data.items()):
-        tif_file = next((os.path.join(ch_path, f) for f in os.listdir(ch_path)
-                         if f.lower().endswith(('.tif', '.tiff'))), None)
-        dat_file = RelationalEngine._find_dat(ch_path)
+        # 1. Raw intensity (visible) + base segmentation (hidden, toggle-able).
+        for i, (ch_name, ch_path) in enumerate(sample_data.items()):
+            tif_file = next((os.path.join(ch_path, f) for f in os.listdir(ch_path)
+                             if f.lower().endswith(('.tif', '.tiff'))), None)
+            dat_file = RelationalEngine._find_dat(ch_path)
 
-        if shape is None and tif_file:
-            with tiff.TiffFile(tif_file) as tif:
-                shape = tif.series[0].shape
-            meta, _ = get_sample_metadata(ch_path)
-            if meta:
-                spacing = (
-                    (meta.get('z', 1.0)/shape[0], meta.get('y', 1.0)/shape[1], meta.get('x', 1.0)/shape[2])
-                    if len(shape) == 3 else
-                    (meta.get('y', 1.0)/shape[0], meta.get('x', 1.0)/shape[1])
+            if shape is None and tif_file:
+                with tiff.TiffFile(tif_file) as tif:
+                    shape = tif.series[0].shape
+                meta, _ = get_sample_metadata(ch_path)
+                if meta:
+                    spacing = (
+                        (meta.get('z', 1.0)/shape[0], meta.get('y', 1.0)/shape[1], meta.get('x', 1.0)/shape[2])
+                        if len(shape) == 3 else
+                        (meta.get('y', 1.0)/shape[0], meta.get('x', 1.0)/shape[1])
+                    )
+
+            if tif_file:
+                raw_img = tiff.imread(tif_file)
+                cmap = colormaps[i % len(colormaps)]
+                viewer.add_image(raw_img, name=f"Raw: {ch_name}", colormap=cmap,
+                                 blending='additive', opacity=0.5)
+            if dat_file:
+                seg_data = np.memmap(dat_file, dtype=np.int32, mode='r', shape=shape)
+                viewer.add_labels(seg_data, name=f"Seg: {ch_name}", opacity=0.3,
+                                  visible=False)
+
+        # 2. Cross-channel-specific layers (only for a selected analysis; shown).
+        if sample_out_dir:
+            for f in [x for x in os.listdir(sample_out_dir) if x.endswith('.dat')]:
+                try:
+                    data = np.memmap(os.path.join(sample_out_dir, f), dtype=np.int32, mode='r', shape=shape)
+                    viewer.add_labels(data, name=f"DERIVED: {f.replace('.dat', '')}")
+                except Exception as e:
+                    print(f"Could not load {f}: {e}")
+
+            csv_path = os.path.join(sample_out_dir, f"{sample_name}_relational_metrics.csv")
+            if os.path.exists(csv_path):
+                try:
+                    draw_proximity_bridges(viewer, pd.read_csv(csv_path), shape, spacing)
+                except Exception as e:
+                    print(f"Could not draw bridges: {e}")
+
+        # 3. Viewport for 3D.
+        if shape and len(shape) == 3:
+            viewer.dims.ndisplay = 3
+            z_scale = spacing[0]/spacing[2] if len(spacing) == 3 else 1.0
+            for layer in viewer.layers:
+                layer.scale = (z_scale, 1, 1)
+
+        # One-click hide/show-all toggle under the layer list (shared with the
+        # per-channel segmenter view). Lazy import avoids a circular import.
+        try:
+            from .app_launch import add_channel_visibility_toggle
+            add_channel_visibility_toggle(viewer)
+        except Exception as exc:
+            print(f"Could not add channel visibility toggle: {exc}")
+
+        # 3D rotation recorder (3D samples only), docked beneath the layer list.
+        if shape and len(shape) == 3:
+            try:
+                from ..module_3d.turntable import add_turntable_button
+                add_turntable_button(viewer)
+            except Exception as exc:
+                print(f"Could not add 3D rotation recorder: {exc}")
+
+        # Shared sub-region controls. Every channel of a sample has the same pixel
+        # dimensions, so a polygon drawn here is valid in all of them -- this is the
+        # one place an ROI can be defined once and handed to several channels.
+        # Requires `shape`, which is the coordinate frame the polygon is stored in.
+        if shape:
+            try:
+                from .roi_overlay_panel import add_overlay_roi_panel
+                add_overlay_roi_panel(
+                    viewer, sample_name, list(sample_data.values()), shape
                 )
+            except Exception as exc:
+                print(f"Could not add shared ROI panel: {exc}")
 
-        if tif_file:
-            raw_img = tiff.imread(tif_file)
-            cmap = colormaps[i % len(colormaps)]
-            viewer.add_image(raw_img, name=f"Raw: {ch_name}", colormap=cmap,
-                             blending='additive', opacity=0.5)
-        if dat_file:
-            seg_data = np.memmap(dat_file, dtype=np.int32, mode='r', shape=shape)
-            viewer.add_labels(seg_data, name=f"Seg: {ch_name}", opacity=0.3,
-                              visible=False)
-
-    # 2. Cross-channel-specific layers (only for a selected analysis; shown).
-    if sample_out_dir:
-        for f in [x for x in os.listdir(sample_out_dir) if x.endswith('.dat')]:
-            try:
-                data = np.memmap(os.path.join(sample_out_dir, f), dtype=np.int32, mode='r', shape=shape)
-                viewer.add_labels(data, name=f"DERIVED: {f.replace('.dat', '')}")
-            except Exception as e:
-                print(f"Could not load {f}: {e}")
-
-        csv_path = os.path.join(sample_out_dir, f"{sample_name}_relational_metrics.csv")
-        if os.path.exists(csv_path):
-            try:
-                draw_proximity_bridges(viewer, pd.read_csv(csv_path), shape, spacing)
-            except Exception as e:
-                print(f"Could not draw bridges: {e}")
-
-    # 3. Viewport for 3D.
-    if shape and len(shape) == 3:
-        viewer.dims.ndisplay = 3
-        z_scale = spacing[0]/spacing[2] if len(spacing) == 3 else 1.0
-        for layer in viewer.layers:
-            layer.scale = (z_scale, 1, 1)
-
-    # One-click hide/show-all toggle under the layer list (shared with the
-    # per-channel segmenter view). Lazy import avoids a circular import.
-    try:
-        from .app_launch import add_channel_visibility_toggle
-        add_channel_visibility_toggle(viewer)
-    except Exception as exc:
-        print(f"Could not add channel visibility toggle: {exc}")
-
-    # 3D rotation recorder (3D samples only), docked beneath the layer list.
-    if shape and len(shape) == 3:
-        try:
-            from ..module_3d.turntable import add_turntable_button
-            add_turntable_button(viewer)
-        except Exception as exc:
-            print(f"Could not add 3D rotation recorder: {exc}")
-
-    # Shared sub-region controls. Every channel of a sample has the same pixel
-    # dimensions, so a polygon drawn here is valid in all of them -- this is the
-    # one place an ROI can be defined once and handed to several channels.
-    # Requires `shape`, which is the coordinate frame the polygon is stored in.
-    if shape:
-        try:
-            from .roi_overlay_panel import add_overlay_roi_panel
-            add_overlay_roi_panel(
-                viewer, sample_name, list(sample_data.values()), shape
-            )
-        except Exception as exc:
-            print(f"Could not add shared ROI panel: {exc}")
-
-    return True
+        return True

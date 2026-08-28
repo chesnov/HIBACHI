@@ -596,6 +596,42 @@ def build_segmentation_control_panel(viewer, gui_manager):
     return container, refresh_nav
 
 
+def close_viewer_on_error(viewer):
+    """Context manager: close `viewer` if the guarded block raises, then re-raise.
+
+    A napari window is owned by Qt, so it is NOT garbage-collected when the
+    function that created it unwinds. Any failure between creating a viewer and
+    finishing its setup therefore leaves a live window holding a GL context and
+    whatever data was loaded, for the rest of the session -- and because those
+    windows are visible top-level napari widgets, `_has_open_napari_viewer()`
+    counts them, so the app can no longer reach its quit condition either.
+
+    Accumulating contexts this way is a plausible route to a GPU driver reset
+    (observed once as `amdgpu: ... context is lost` followed by SIGABRT), which
+    is why this is a guard rather than a nicety.
+
+    Cleanup never masks the original exception.
+    """
+    import contextlib
+
+    @contextlib.contextmanager
+    def _guard():
+        try:
+            yield
+        except BaseException:
+            if viewer is not None:
+                try:
+                    viewer.close()
+                    lifecycle("viewer.setup.failed.closed")
+                except Exception as close_exc:
+                    log.warning("Could not close a partially-set-up viewer: %s",
+                                close_exc)
+                gc.collect()
+            raise
+
+    return _guard()
+
+
 def _handle_napari_close() -> None:
     """Callback when Napari closes."""
     lifecycle("napari.destroyed", note="qt window destroyed signal fired")
@@ -611,7 +647,9 @@ def interactive_segmentation_with_config(selected_folder: str = None,
     saved region.
     """
     try:
-        from .gui_manager import DynamicGUIManager
+        from .gui_manager import (
+            DynamicGUIManager, is_supported_mode, unsupported_mode_message,
+        )
     except ImportError:
         return
 
@@ -637,6 +675,23 @@ def interactive_segmentation_with_config(selected_folder: str = None,
         with open(os.path.join(selected_folder, yml), 'r') as f:
             config = yaml.safe_load(f)
         mode = config.get('mode')
+
+        # Validate the mode BEFORE anything expensive or stateful is built.
+        # Creating the viewer first and finding out afterwards left a live napari
+        # window -- and its GL context and image -- orphaned on every attempt,
+        # because the failure happens inside DynamicGUIManager's constructor, so
+        # there is no manager to run shutdown_and_cleanup(). Those windows are
+        # also visible top-level napari widgets, so _has_open_napari_viewer()
+        # counted them and the app could no longer reach its quit condition.
+        if not is_supported_mode(mode):
+            lifecycle("viewer.open.rejected", folder=os.path.basename(selected_folder),
+                      mode=mode, reason="unsupported mode")
+            log.warning("Refusing to open %r: unsupported mode %r",
+                        selected_folder, mode)
+            QMessageBox.warning(None, "This config cannot be opened",
+                                unsupported_mode_message(mode, selected_folder))
+            app_state.show_project_view_signal.emit()
+            return
 
         image_stack = tiff.memmap(file_loc, mode='r') 
         lifecycle("viewer.open",
@@ -692,6 +747,23 @@ def interactive_segmentation_with_config(selected_folder: str = None,
 
     except Exception as e:
         log.exception("Failed to open segmentation viewer for %r", selected_folder)
+        # A viewer created before the failure MUST be closed here. Setup did not
+        # finish, so no DynamicGUIManager exists to tear it down, and napari
+        # windows are not garbage-collected while Qt still holds them: the window
+        # stayed open, holding its GL context and the image, for the rest of the
+        # session. Repeated attempts accumulated contexts, and a visible orphan
+        # also blocks the app's "no project window and no open viewer" quit path.
+        if viewer is not None:
+            try:
+                viewer.close()
+                lifecycle("viewer.open.failed.closed",
+                          folder=os.path.basename(selected_folder or ""))
+            except Exception as close_exc:
+                # Never let cleanup mask the original error.
+                log.warning("Could not close the partially-opened viewer: %s",
+                            close_exc)
+            viewer = None
+            gc.collect()
         QMessageBox.critical(None, "Error", str(e))
         app_state.show_project_view_signal.emit()
 

@@ -63,6 +63,10 @@ _IMAGE_SPECIFIC_KEYS = (
     "saved_state",
     "voxel_dimensions",
     "pixel_dimensions",
+    # Provenance of THIS image's dimensions. Travels with the dimensions, so it
+    # must be stripped alongside them -- a preset carrying "manual" would claim
+    # every image it is applied to was manually calibrated.
+    "dimensions_source",
     "synthetic",
 )
 

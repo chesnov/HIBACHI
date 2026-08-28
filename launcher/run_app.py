@@ -302,6 +302,61 @@ def _tail(path: str, max_lines: int, max_chars: int = 20000) -> str:
     return text.rstrip() or "(empty)"
 
 
+#: Signatures a GPU/driver reset leaves in the child's output. A reset aborts the
+#: process from native code, so faulthandler often writes nothing and the crash
+#: report's most useful section is empty -- the giveaway is here instead.
+_GPU_RESET_SIGNATURES = (
+    "context is lost",              # amdgpu: "The CS has cancelled because the context is lost"
+    "guilty of a hard recovery",    # amdgpu, same event
+    "GPU hang",
+    "gpu hung",
+    "Xid",                          # nvidia driver error line
+    "DEVICE_LOST",                  # vulkan/GL device loss
+    "ring gfx timeout",             # amdgpu ring timeout
+    "GL_INVALID_OPERATION out of memory",
+)
+
+
+def _detect_gpu_reset(child_output: str) -> str | None:
+    """Return the matching signature if the child output shows a GPU reset."""
+    haystack = (child_output or "").lower()
+    for sig in _GPU_RESET_SIGNATURES:
+        if sig.lower() in haystack:
+            return sig
+    return None
+
+
+def _gpu_reset_advice(signature: str) -> str:
+    """Actionable text for a graphics-driver crash.
+
+    Worth calling out specifically: the workaround already exists
+    (HIBACHI_SOFTWARE_OPENGL=1) but a user hitting this has no way to know that
+    from a bare SIGABRT, and the native traceback is usually empty for this
+    crash class, so the report looks uninformative.
+    """
+    return (
+        "\n" + "!" * 72 + "\n"
+        "LIKELY A GRAPHICS DRIVER CRASH, NOT AN ANALYSIS ERROR\n\n"
+        f"The app's output contains {signature!r}, which means the graphics\n"
+        "driver reset the GPU and aborted the process. Your data and results on\n"
+        "disk are unaffected: this happens in the display layer, after results\n"
+        "are written.\n\n"
+        "Try this first -- render with software OpenGL:\n"
+        "    HIBACHI_SOFTWARE_OPENGL=1\n"
+        "Set it in the environment before launching. It is slower to draw but\n"
+        "bypasses the GPU driver entirely, and is the supported workaround for\n"
+        "driverless, virtual-machine and remote-desktop setups.\n\n"
+        "Also worth doing:\n"
+        "  - update your graphics driver;\n"
+        "  - reduce how many viewer windows are open at once;\n"
+        "  - if it recurs on one dataset, note what you were doing and report it.\n"
+        "\nNote: the NATIVE CRASH TRACEBACK below is often EMPTY for this kind of\n"
+        "crash, because the abort comes from the driver rather than from Python.\n"
+        "That is expected and does not mean diagnostics are broken.\n"
+        + "!" * 72 + "\n"
+    )
+
+
 def _collect_crash_report(code: int) -> tuple[str, str | None]:
     """Assemble a single diagnostics blob from the log files and save a copy.
 
@@ -328,16 +383,26 @@ def _collect_crash_report(code: int) -> tuple[str, str | None]:
     )
     sections = [header]
     app_side_present = False  # did the child (segment.py/logging_setup) write anything?
+    child_output = ""
     for fname, label, n in files:
         body = _tail(os.path.join(directory, fname), n)
         if fname in ("faulthandler.log", "hibachi-app.log") and body not in ("(not present)", "(empty)"):
             app_side_present = True
+        if fname == "hibachi-child.log":
+            child_output = body
         sections.append(f"\n{'=' * 72}\n{label}  [{fname}]\n{'=' * 72}\n{body}\n")
+
+    # A graphics-driver reset explains both the abort AND the empty native
+    # traceback, so this goes first when detected.
+    gpu_signature = _detect_gpu_reset(child_output)
+    if gpu_signature:
+        sections.insert(1, _gpu_reset_advice(gpu_signature))
+        _LAUNCHER_LOG.warning("crash looks like a GPU driver reset (%r)", gpu_signature)
 
     # If the app-side logs are absent, the crash window would otherwise look
     # empty of anything useful. Say so plainly and point at the likely cause so
     # the report is self-explanatory rather than mysteriously blank.
-    if not app_side_present:
+    if not app_side_present and not gpu_signature:
         note = (
             "\n" + "!" * 72 + "\n"
             "NOTE: No app-side diagnostics were found (faulthandler.log / "
