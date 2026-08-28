@@ -37,6 +37,28 @@ try:  # whole-slide formats count as raw images for folder classification
 except Exception:
     pass
 
+
+def _unsupported_label(path: str) -> Optional[str]:
+    """Vendor name if `path` is a known format no reader here can open."""
+    try:
+        from .slide_formats import unsupported_format_label
+        return unsupported_format_label(path)
+    except Exception:
+        return None
+
+
+def is_readable_image(path: str) -> bool:
+    """True if `path` is a file HIBACHI can actually read pixels from.
+
+    Distinct from "looks like an image". Used by the drop zone so a file that
+    cannot be read is not accepted as though it could be -- the drop handler
+    previously accepted ANY local path, so dropping a .lif highlighted the target
+    and reported "you selected an image file", both of which were untrue.
+    """
+    name = os.path.basename(str(path)).lower()
+    return bool(name) and name.endswith(_RAW_IMAGE_EXTS)
+
+
 # --------------------------------------------------------------------------- #
 # Classification (pure logic)
 # --------------------------------------------------------------------------- #
@@ -59,6 +81,15 @@ class Classification:
     channel_dirs: List[str] = field(default_factory=list)     # MULTICHANNEL_PROJECT: Channel_* dirs
     raw_images: List[str] = field(default_factory=list)       # RAW_IMAGES: loose image files
     redirected_from_file: bool = False  # True if the user picked a file and we used its folder
+    # The file the user actually picked, kept so callers can act ON IT rather than
+    # only on its folder. Without this, dropping a file that is not part of the
+    # project it sits next to was indistinguishable from opening the folder: the
+    # project loaded, the dropped file was ignored, and nothing was said about it.
+    source_file: Optional[str] = None
+    # Set when `source_file` is a recognised microscopy format that no reader here
+    # can open (e.g. Leica .lif). Distinguishes "unreadable image" from "not an
+    # image", which need different messages.
+    unsupported_format: Optional[str] = None
     note: str = ""                      # short human-readable summary for the UI
 
     @property
@@ -479,19 +510,25 @@ def classify_path(path: Optional[str]) -> Classification:
 
     path = os.path.abspath(path)
     redirected = False
+    source_file = None
+    unsupported = None
     if os.path.isfile(path):
         redirected = True
+        source_file = path
+        unsupported = _unsupported_label(path)
         path = os.path.dirname(path)
 
     if not os.path.isdir(path):
         return Classification(MISSING, path, redirected_from_file=redirected,
+                              source_file=source_file, unsupported_format=unsupported,
                               note="That location doesn't exist.")
 
     project_folders = _valid_image_subfolders(path)
     if project_folders:
         return Classification(
             PROJECT, path, project_folders=project_folders,
-            redirected_from_file=redirected,
+            redirected_from_file=redirected, source_file=source_file,
+            unsupported_format=unsupported,
             note=f"Project with {len(project_folders)} image folder"
                  f"{'s' if len(project_folders) != 1 else ''} ready to process.",
         )
@@ -505,7 +542,8 @@ def classify_path(path: Optional[str]) -> Classification:
     if channel_dirs:
         return Classification(
             MULTICHANNEL_PROJECT, path, channel_dirs=channel_dirs,
-            redirected_from_file=redirected,
+            redirected_from_file=redirected, source_file=source_file,
+            unsupported_format=unsupported,
             note=f"Multi-channel project with {len(channel_dirs)} channel"
                  f"{'s' if len(channel_dirs) != 1 else ''}.",
         )
@@ -513,7 +551,8 @@ def classify_path(path: Optional[str]) -> Classification:
     raw = _loose_images(path)
     if raw:
         return Classification(
-            RAW_IMAGES, path, raw_images=raw, redirected_from_file=redirected,
+            RAW_IMAGES, path, raw_images=raw, redirected_from_file=redirected, source_file=source_file,
+            unsupported_format=unsupported,
             note=f"{len(raw)} unorganized image{'s' if len(raw) != 1 else ''} — "
                  f"can be set up as a new project.",
         )
@@ -522,12 +561,15 @@ def classify_path(path: Optional[str]) -> Classification:
     if roots:
         return Classification(
             PARENT_OF_PROJECTS, path, project_roots=roots,
-            redirected_from_file=redirected,
+            redirected_from_file=redirected, source_file=source_file,
+            unsupported_format=unsupported,
             note=f"Contains {len(roots)} project"
                  f"{'s' if len(roots) != 1 else ''} — choose one to open.",
         )
 
     return Classification(EMPTY, path, redirected_from_file=redirected,
+                          source_file=source_file,
+                          unsupported_format=unsupported,
                           note="No images or projects found in this folder.")
 
 
@@ -656,8 +698,26 @@ if _HAVE_QT:
                     return p
             return None
 
+        def _is_acceptable(self, path: Optional[str]) -> bool:
+            """A folder, or a file we can actually read.
+
+            A plain "is there a path?" test accepted anything, so dropping an
+            unreadable image highlighted the target and was reported back as
+            "you selected an image file". A file we cannot read is still
+            ACCEPTED here on purpose -- so the drop produces a specific "cannot
+            read this format" message instead of the cursor refusing and giving
+            the user nothing at all. What is rejected is a non-image file.
+            """
+            if not path:
+                return False
+            if os.path.isdir(path):
+                return True
+            if is_readable_image(path):
+                return True
+            return _unsupported_label(path) is not None
+
         def dragEnterEvent(self, event):  # noqa: N802 (Qt naming)
-            if self._first_local_path(event):
+            if self._is_acceptable(self._first_local_path(event)):
                 self.setStyleSheet(self._hover_style)
                 event.acceptProposedAction()
             else:
@@ -669,7 +729,7 @@ if _HAVE_QT:
         def dropEvent(self, event):  # noqa: N802
             self.setStyleSheet(self._base_style)
             p = self._first_local_path(event)
-            if p:
+            if self._is_acceptable(p):
                 event.acceptProposedAction()
                 self.dropped.emit(p)
             else:

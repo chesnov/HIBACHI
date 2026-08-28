@@ -296,6 +296,16 @@ class ProjectViewWindow(QMainWindow):
         """
         info = classify_path(selected_path)
 
+        # An unreadable format is settled here, before anything else. It used to
+        # fall through every filter: the folder was opened (or reported empty)
+        # and the file the user actually chose was never mentioned again.
+        if info.unsupported_format:
+            from .slide_formats import unsupported_format_message
+            QMessageBox.warning(
+                self, "Unsupported file format",
+                unsupported_format_message(info.source_file or ""))
+            return
+
         if info.redirected_from_file:
             QMessageBox.information(
                 self, "Using folder",
@@ -339,6 +349,13 @@ class ProjectViewWindow(QMainWindow):
         self.cross_channel_btn.setEnabled(True)
         self.project_path_label.setText(f"Project Path: {info.path}")
         self._load_or_organize(info.path)
+
+        # If the user picked a specific FILE, say what became of it. A folder can
+        # be an organized project and still hold loose images beside it, so
+        # dropping one of those loaded the project and silently ignored the file
+        # that was actually chosen -- from the user's side, nothing happened.
+        if info.source_file:
+            self._report_dropped_file(info.path, info.source_file)
 
     def open_multichannel(self, info) -> None:
         """Show the sample→channel tree for a multi-channel project, in-place."""
@@ -731,6 +748,78 @@ class ProjectViewWindow(QMainWindow):
             self._content_view.refresh()
         self._update_action_buttons()
 
+    def _report_dropped_file(self, project_dir: str, source_file: str) -> None:
+        """Say what happened to a file the user specifically picked.
+
+        Three outcomes, all of which were previously silent:
+
+        * already organized  -> confirm it, so the user knows it is the row they
+          can see rather than wondering whether the drop registered;
+        * organizable but not yet in the project -> OFFER TO ADD IT, which is the
+          thing the user was asking for by dropping it;
+        * present but unreadable -> say so plainly.
+
+        The middle case is the reported bug: a project folder can hold loose
+        images beside its organized ones, and `_load_or_organize` returns as soon
+        as it finds any organized folder, so the dropped file was never
+        considered.
+        """
+        from .project_scaffolding import unorganized_sources
+        from .slide_reader import folder_name_for_source
+
+        base = os.path.basename(source_file)
+        stem = os.path.splitext(base)[0]
+
+        # Already part of the project? Its folder exists under the project root.
+        try:
+            organized = {
+                d for d in os.listdir(project_dir)
+                if os.path.isdir(os.path.join(project_dir, d))
+            }
+        except OSError:
+            organized = set()
+        if stem in organized:
+            return  # visible as a row already; nothing to explain
+
+        try:
+            pending = unorganized_sources(project_dir)
+        except Exception:
+            pending = []
+
+        # Source keys for a slide are "file::scene", so match on the file part.
+        mine = [k for k in pending
+                if os.path.basename(k.split("::")[0]) == base]
+
+        if not mine:
+            # Not organized and not organizable: nothing here can read it.
+            from .slide_formats import (
+                unsupported_format_label, unsupported_format_message,
+            )
+            if unsupported_format_label(source_file):
+                QMessageBox.warning(self, "Unsupported file format",
+                                    unsupported_format_message(source_file))
+            else:
+                QMessageBox.warning(
+                    self, "File not added",
+                    f"{base} is not part of this project and HIBACHI could not "
+                    "read it as an image.\n\n"
+                    "Readable formats: TIFF (.tif/.tiff), Zeiss CZI (.czi), and "
+                    "whole-slide formats (.vsi, .svs, .ndpi, .scn, .afi, "
+                    ".qptiff, .zvi, .ome.tif, .dcm)."
+                )
+            return
+
+        scenes = ""
+        if len(mine) > 1:
+            scenes = f"\n\nIt contains {len(mine)} scenes, each becoming its own sample."
+        if QMessageBox.question(
+            self, "Add this image to the project?",
+            f"{base} is in this folder but is not part of the project yet."
+            f"{scenes}\n\nAdd it now?",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes
+        ) == QMessageBox.Yes:
+            self._add_images(project_dir)
+
     def _add_images(self, project_dir: str) -> None:
         """Organize raw images still sitting unorganized in the project folder.
 
@@ -743,9 +832,34 @@ class ProjectViewWindow(QMainWindow):
 
         pending = unorganized_sources(project_dir)
         if not pending:
-            QMessageBox.information(
-                self, "Nothing to add",
-                "Every image in this folder is already organized.")
+            # "Everything is organized" is false when the folder holds files that
+            # simply could not be read -- which is exactly the case a user chasing
+            # a missing image lands in. Name them instead.
+            from .slide_formats import unsupported_format_label
+            unreadable = []
+            try:
+                for f in sorted(os.listdir(project_dir)):
+                    if (os.path.isfile(os.path.join(project_dir, f))
+                            and unsupported_format_label(f)):
+                        unreadable.append(f)
+            except OSError:
+                pass
+
+            if unreadable:
+                shown = "\n".join(f"\u2022 {f}  ({unsupported_format_label(f)})"
+                                  for f in unreadable[:8])
+                if len(unreadable) > 8:
+                    shown += f"\n\u2026 and {len(unreadable) - 8} more"
+                QMessageBox.warning(
+                    self, "Nothing could be added",
+                    "Every readable image in this folder is already organized, "
+                    "but these files are in a format HIBACHI cannot read:\n\n"
+                    f"{shown}\n\nExport them as OME-TIFF or TIFF and add those "
+                    "files instead.")
+            else:
+                QMessageBox.information(
+                    self, "Nothing to add",
+                    "Every image in this folder is already organized.")
             return
 
         chosen = self._pick_sources(pending)

@@ -59,8 +59,8 @@ GUI_PID=""
 # failed install, not a degraded one.
 REQUIRED_MODULES="yaml numpy pandas scipy tifffile PyQt5.QtWidgets vispy \
 napari magicgui dask.array dask_image.ndmeasure sklearn seaborn skan \
-SimpleITK slideio numba zarr plotly nbformat napari_animation aicspylibczi \
-fcswrite PartSegCore_compiled_backend"
+SimpleITK slideio readlif numba zarr plotly nbformat napari_animation \
+aicspylibczi fcswrite PartSegCore_compiled_backend"
 
 say()  { printf '\n\033[1;36m==> %s\033[0m\n' "$*"; }
 warn() { printf '\n\033[1;33mWARNING: %s\033[0m\n' "$*" >&2; }

@@ -40,6 +40,9 @@ dependencies:
       # pip rather than conda: wheels exist for macOS arm64 + x86_64, Linux and
       # Windows, and unlike the Bio-Formats route it needs no JVM.
       - slideio>=2.7.4
+      # Leica .lif. slideio has no LIF driver, so this is a second reader rather
+      # than a redundant one. Pure Python, no JVM, same constraint as above.
+      - readlif>=0.6.5
       - seaborn~=0.13.2
       - tifffile>=2023.1.1
       - zarr~=3.0.2

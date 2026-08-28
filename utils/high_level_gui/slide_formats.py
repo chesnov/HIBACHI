@@ -58,6 +58,11 @@ class FormatSpec:
     # A file that is only a header, with pixels in a sibling directory. Copying
     # the header alone leaves a readable file with no image data.
     sidecar_dir: bool = False
+    # Which library reads this format. Everything here is slideio except Leica
+    # .lif, which slideio has no driver for and which is read by readlif instead.
+    # Declared per format rather than inferred so a format cannot silently be
+    # routed to a library that cannot open it.
+    backend: str = "slideio"
 
 
 # Ordered most-specific-extension first; .ome.tif must beat .tif.
@@ -112,7 +117,25 @@ FORMATS: Tuple[FormatSpec, ...] = (
         support=EXPERIMENTAL, scenes=BY_SIZE,
         note="one scene per DICOM series. " + _SUPPORT_UNKNOWN_NOTE,
     ),
+    FormatSpec(
+        driver="LIF", label="Leica LAS X", extensions=(".lif",),
+        support=EXPERIMENTAL, scenes=ALL_TISSUE, backend="readlif",
+        note="one .lif holds many acquisitions, each becoming its own sample. "
+             "Read by readlif, not slideio (which has no LIF driver). Mosaic "
+             "and time-series acquisitions are skipped with a reason rather "
+             "than partially imported. " + _SUPPORT_UNKNOWN_NOTE,
+    ),
 )
+
+#: Backends other than slideio, so callers can dispatch without hardcoding.
+BACKEND_SLIDEIO = "slideio"
+BACKEND_READLIF = "readlif"
+
+
+def backend_for_path(path: str) -> Optional[str]:
+    """Which reader library serves this path, or None if HIBACHI can't read it."""
+    spec = spec_for_path(path)
+    return spec.backend if spec else None
 
 # Deliberately NOT routed through slideio:
 #   .czi          -- already handled by aicspylibczi; rerouting risks a working path
@@ -127,6 +150,66 @@ EXCLUDED_EXTENSIONS = (".czi", ".tif", ".tiff")
 # macro image is a few megapixels, so this separates them by two orders of
 # magnitude rather than by a fine margin.
 TISSUE_AREA_FRACTION = 0.10
+
+
+# --------------------------------------------------------------------------- #
+# Known-but-unsupported microscopy formats
+# --------------------------------------------------------------------------- #
+# Formats a user will plausibly hand HIBACHI that no reader here can open. They
+# are listed so an unreadable file gets NAMED rather than silently ignored: an
+# unrecognised extension previously fell through every filter, so a folder
+# holding one classified as empty ("No images or projects found") while the user
+# was looking straight at an image file. Being told "HIBACHI cannot read Leica
+# .lif" is actionable; being told the folder is empty is not.
+#
+# None of these can be served by slideio: its driver set is AFI, CZI, DCM, GDAL,
+# NDPI, OMETIFF, PHTIFF, QPTIFF, SCN, SVS, VSI, ZVI. Adding one here to FORMATS
+# would match on extension and then fail when the driver was requested, which is
+# worse than a clear refusal.
+UNSUPPORTED_FORMATS: Tuple[Tuple[str, str], ...] = (
+    # .lif is READ (see the LIF FormatSpec above) and must not be listed here.
+    (".xlef", "Leica LAS X (project index)"),
+    (".nd2", "Nikon NIS-Elements"),
+    (".oib", "Olympus FluoView"),
+    (".oif", "Olympus FluoView"),
+    (".lsm", "Zeiss LSM"),
+    (".ims", "Bitplane Imaris"),
+    (".sld", "3i SlideBook"),
+    (".ipl", "Image-Pro"),
+    (".nrrd", "NRRD"),
+    (".mrc", "MRC"),
+)
+
+
+def unsupported_format_label(path: str) -> Optional[str]:
+    """Vendor name if `path` is a known format HIBACHI cannot read, else None."""
+    name = os.path.basename(str(path)).lower()
+    for ext, label in UNSUPPORTED_FORMATS:
+        if name.endswith(ext):
+            return label
+    return None
+
+
+def unsupported_format_message(path: str) -> str:
+    """Explain that a file's format cannot be read, and what to do instead.
+
+    Deliberately names the format and gives a concrete route out. The failure a
+    user hits here is not "something went wrong" but "this file was never
+    readable", and the fix is an export step in their acquisition software.
+    """
+    name = os.path.basename(str(path))
+    label = unsupported_format_label(path) or "this"
+    ext = os.path.splitext(name)[1] or ""
+    return (
+        f"HIBACHI cannot read {label} files ({ext}).\n\n"
+        f"File:\n{name}\n\n"
+        "Export the image from your acquisition software as OME-TIFF or TIFF "
+        "(one file per image), then set the project up from those files. "
+        "Multi-channel exports are supported: HIBACHI extracts each channel "
+        "itself.\n\n"
+        "Readable formats: TIFF (.tif/.tiff), Zeiss CZI (.czi), and whole-slide "
+        "formats (.vsi, .svs, .ndpi, .scn, .afi, .qptiff, .zvi, .ome.tif, .dcm)."
+    )
 
 
 def spec_for_path(path: str) -> Optional[FormatSpec]:
@@ -301,6 +384,18 @@ def inspect_slide(path: str) -> SlideInfo:
     if spec is None:
         return SlideInfo(path=path, driver="", label="", support=EXPERIMENTAL,
                          error="not a format HIBACHI reads through slideio")
+
+    # A format served by another library must not be probed with slideio: the
+    # driver does not exist, so this would report a confusing driver error for a
+    # file HIBACHI can in fact read. Callers route these via that backend
+    # instead (see slide_reader._lif_backend).
+    if spec.backend != BACKEND_SLIDEIO:
+        return SlideInfo(
+            path=path, driver=spec.driver, label=spec.label,
+            support=spec.support,
+            error=f"{spec.label} is read by '{spec.backend}', not slideio; "
+                  "use that backend's inspector instead",
+        )
 
     info = SlideInfo(path=path, driver=spec.driver, label=spec.label,
                      support=spec.support)

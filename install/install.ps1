@@ -110,7 +110,7 @@ $GuiProc    = $null
 $RequiredModules = @(
     "yaml", "numpy", "pandas", "scipy", "tifffile", "PyQt5.QtWidgets", "vispy",
     "napari", "magicgui", "dask.array", "dask_image.ndmeasure", "sklearn",
-    "seaborn", "skan", "SimpleITK", "slideio", "numba", "zarr", "plotly",
+    "seaborn", "skan", "SimpleITK", "slideio", "readlif", "numba", "zarr", "plotly",
     "nbformat", "napari_animation", "aicspylibczi", "fcswrite",
     "PartSegCore_compiled_backend"
 )

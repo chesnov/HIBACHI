@@ -29,7 +29,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
-from .slide_formats import spec_for_path, inspect_slide
+from .slide_formats import backend_for_path, spec_for_path, inspect_slide
 
 # Separates a file path from a scene name inside it. Chosen because it cannot
 # appear in a filename on Windows and is vanishingly rare on POSIX.
@@ -90,6 +90,32 @@ def folder_name_for_source(key: str) -> str:
     return f"{stem}_{safe}".strip("_")
 
 
+# --------------------------------------------------------------------------- #
+# Backend dispatch
+# --------------------------------------------------------------------------- #
+# Everything below is slideio except Leica .lif, which slideio has no driver for.
+# Dispatching here rather than at each call site means every existing caller --
+# the setup wizard, unorganized_sources, the dimension probe, extraction -- gets
+# LIF support without changing, because a .lif source key is shaped exactly like
+# a multi-scene slide key.
+def _lif_backend(source_key: str):
+    """The lif_reader module if this source is a .lif, else None."""
+    filename, _ = parse_source_key(source_key)
+    if not str(filename).lower().endswith(".lif"):
+        return None
+    try:
+        from . import lif_reader
+        return lif_reader
+    except ImportError:
+        return None
+
+
+def backend_name(source_key: str) -> Optional[str]:
+    """Which reader library serves a source key ('slideio' | 'readlif' | None)."""
+    filename, _ = parse_source_key(source_key)
+    return backend_for_path(filename)
+
+
 def list_sources(path: str) -> List[str]:
     """Source keys for every usable image in a slide file.
 
@@ -97,6 +123,10 @@ def list_sources(path: str) -> List[str]:
     so it behaves exactly like the existing formats. Returns [] if the file can't
     be read, leaving the caller to report the reason from ``inspect_slide``.
     """
+    _lif = _lif_backend(path)
+    if _lif is not None:
+        return _lif.list_sources(path)
+
     info = inspect_slide(path)
     if info.error:
         return []
@@ -168,6 +198,9 @@ def open_scene(source_key: str, root: str = "") -> _SceneHandle:
 # --------------------------------------------------------------------------- #
 def scene_channel_count(source_key: str, root: str = "") -> int:
     """Channels in the scene a source key names, or 1 if it can't be read."""
+    _lif = _lif_backend(source_key)
+    if _lif is not None:
+        return _lif.scene_channel_count(source_key, root)
     try:
         with open_scene(source_key, root) as scene:
             return int(scene.num_channels)
@@ -184,6 +217,10 @@ def scene_metadata(source_key: str, root: str = "") -> Dict[str, Any]:
     1e6 conversion. A slide with no Z calibration reports z=0, which would become
     a zero voxel dimension downstream, so it falls back to 1.0 and says so.
     """
+    _lif = _lif_backend(source_key)
+    if _lif is not None:
+        return _lif.scene_metadata(source_key, root)
+
     meta: Dict[str, Any] = {"x": 1.0, "y": 1.0, "z": 1.0, "found": False}
     try:
         with open_scene(source_key, root) as scene:
@@ -209,6 +246,9 @@ def scene_metadata(source_key: str, root: str = "") -> Dict[str, Any]:
 
 def scene_shape(source_key: str, root: str = "") -> Optional[Tuple[int, ...]]:
     """(Z, Y, X) or (Y, X) pixel shape of a scene, without reading pixels."""
+    _lif = _lif_backend(source_key)
+    if _lif is not None:
+        return _lif.scene_shape(source_key, root)
     try:
         with open_scene(source_key, root) as scene:
             w, h = (int(v) for v in scene.size)
@@ -220,6 +260,9 @@ def scene_shape(source_key: str, root: str = "") -> Optional[Tuple[int, ...]]:
 
 def scene_channel_names(source_key: str, root: str = "") -> List[str]:
     """Channel names as the scanner recorded them, e.g. ['DAPI','FITC','Cy5']."""
+    _lif = _lif_backend(source_key)
+    if _lif is not None:
+        return _lif.scene_channel_names(source_key, root)
     try:
         with open_scene(source_key, root) as scene:
             out = []
@@ -268,6 +311,12 @@ def extract_scene_channel(
     be broken into.
     Returns True only if a non-empty file was produced.
     """
+    _lif = _lif_backend(source_key)
+    if _lif is not None:
+        return _lif.extract_scene_channel(
+            source_key, dest_path, channel_idx, root=root, tile=tile,
+            level=level, progress=progress, should_cancel=should_cancel)
+
     import tifffile as tiff
 
     with open_scene(source_key, root) as scene:
