@@ -236,6 +236,11 @@ execute_calculate_features_fluorescence_2d:
       label: Calculate Skeletons
       type: bool
       value: true
+    calculate_solidity:
+      label: Calculate Solidity
+      hint: Convex-hull ratio (pixel count / convex hull pixel count).
+      type: bool
+      value: true
 pixel_dimensions:
   x: 848.5299999999999
   y: 848.5299999999999

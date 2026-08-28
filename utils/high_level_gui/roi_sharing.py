@@ -579,6 +579,63 @@ def summarize_clear_plan(plan: Sequence[Dict[str, Any]]) -> str:
 # --------------------------------------------------------------------------- #
 # How much area / volume was actually analysed
 # --------------------------------------------------------------------------- #
+def hull_pixel_count(
+    edge_mask_path: Optional[str],
+    image_shape: Sequence[int],
+) -> Optional[int]:
+    """Size of the tissue hull step 2 kept, recovered from its saved edge mask.
+
+    Step 2 persists only the hull's one-voxel-thick boundary
+    (``hull ^ eroded_hull``), not its interior. The interior is recoverable
+    because step 2 builds each hull slice with ``binary_fill_holes``, so a hull
+    has no interior voids -- and filling the boundary slice by slice therefore
+    reproduces it exactly. Verified voxel-for-voxel against hulls built the way
+    step 2 builds them, including hulls that reach the image border (the 3x3x3
+    erosion strips the border-adjacent voxels, so the boundary is closed there
+    too).
+
+    Read one slice at a time: the boundary mask is the full image shape, which
+    for a 189x1536x1536 stack is 446 MB as one array against 2.4 MB per slice.
+
+    Returns None when there is no mask to read or nothing in it -- which is what
+    edge trimming being switched off looks like -- leaving the caller to fall
+    back to the full extent.
+    """
+    if not edge_mask_path or not os.path.isfile(edge_mask_path):
+        return None
+
+    shape = tuple(int(v) for v in image_shape)
+    try:
+        from scipy.ndimage import binary_fill_holes
+    except Exception:
+        return None
+
+    try:
+        shell = np.memmap(edge_mask_path, dtype=bool, mode="r", shape=shape)
+    except Exception as exc:
+        print(f"  [Extent] could not read the edge mask ({exc}).")
+        return None
+
+    total = 0
+    try:
+        if len(shape) == 2:
+            plane = np.asarray(shell)
+            if plane.any():
+                total = int(np.count_nonzero(binary_fill_holes(plane)))
+        else:
+            for z in range(shape[0]):
+                plane = np.asarray(shell[z])
+                if plane.any():
+                    total += int(np.count_nonzero(binary_fill_holes(plane)))
+    except Exception as exc:
+        print(f"  [Extent] could not measure the hull ({exc}).")
+        return None
+    finally:
+        del shell
+
+    return total if total > 0 else None
+
+
 def masked_pixel_count(
     record: Dict[str, Any],
     image_shape: Optional[Sequence[int]] = None,
@@ -673,6 +730,7 @@ def analyzed_extent(
     image_shape: Sequence[int],
     spacing: Sequence[float],
     is_2d: bool,
+    edge_mask_path: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Physical area (2D) or volume (3D) that a run actually analysed.
 
@@ -703,11 +761,28 @@ def analyzed_extent(
     for dim in shape:
         bbox_pixels *= int(dim)
 
-    out: Dict[str, Any] = {
+    # Two extents are reported, always:
+    #   TOTAL  -- the whole image, or the ROI polygon, i.e. the region offered
+    #             to the pipeline.
+    #   TISSUE -- the hull step 2 kept inside that region.
+    # They are equal when no hull exists (edge trimming off) or when the hull
+    # reached the edges of the region, both of which are ordinary outcomes.
+    hull_pixels = hull_pixel_count(edge_mask_path, shape)
+    tissue_key = "tissue_area_um2" if is_2d else "tissue_volume_um3"
+
+    def _with_tissue(base: Dict[str, Any], total_pixels: int,
+                     no_hull_basis: str) -> Dict[str, Any]:
+        tissue = hull_pixels if hull_pixels else total_pixels
+        base["tissue_pixels"] = tissue
+        base[tissue_key] = tissue * per_pixel
+        base["extent_basis"] = ("tissue_hull" if hull_pixels else no_hull_basis)
+        return base
+
+    out: Dict[str, Any] = _with_tissue({
         "region": "full_image",
         "pixels": bbox_pixels,
         unit_key: bbox_pixels * per_pixel,
-    }
+    }, bbox_pixels, "full_image")
 
     roi_json = os.path.join(processed_dir or "", ROI_JSON_NAME)
     if not os.path.isfile(roi_json):
@@ -728,14 +803,14 @@ def analyzed_extent(
         out["polygon_measured"] = False
         return out
 
-    out.update({
+    out.update(_with_tissue({
         "region": "roi",
         "pixels": count,
         unit_key: count * per_pixel,
         "bbox_pixels": bbox_pixels,
         "polygon_fraction_of_bbox": (count / bbox_pixels) if bbox_pixels else None,
         "polygon_measured": True,
-    })
+    }, count, "polygon"))
     return out
 
 

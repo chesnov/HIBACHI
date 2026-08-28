@@ -149,7 +149,11 @@ class ProcessingStrategy(abc.ABC):
         is_2d = len(self.image_shape) == 2
         try:
             from .roi_sharing import analyzed_extent as _extent
-            return _extent(self.processed_dir, self.image_shape, self.spacing, is_2d)
+            # The hull is recovered from step 2's saved edge mask, so the path
+            # comes from the checkpoint table rather than being rebuilt here.
+            edge_mask = self.get_checkpoint_files().get("edge_mask")
+            return _extent(self.processed_dir, self.image_shape, self.spacing,
+                           is_2d, edge_mask_path=edge_mask)
         except Exception as exc:
             # Never let reporting break a completed analysis: fall back to the
             # image extent and say the ROI could not be measured.
@@ -165,21 +169,33 @@ class ProcessingStrategy(abc.ABC):
                 zs = ys = xs = 1.0
             per_px = (ys * xs) if is_2d else (zs * ys * xs)
             key = "area_um2" if is_2d else "volume_um3"
-            return {"region": "full_image", "pixels": pixels, key: pixels * per_px}
+            tissue_key = "tissue_area_um2" if is_2d else "tissue_volume_um3"
+            return {"region": "full_image", "pixels": pixels,
+                    key: pixels * per_px, "tissue_pixels": pixels,
+                    tissue_key: pixels * per_px, "extent_basis": "full_image"}
 
     def stamp_analyzed_extent(self, metrics_df):
         """Add the analysed region as constant columns on a metrics table.
 
-        Kept to two columns so the table stays readable; the fuller breakdown
-        goes in the summary written by ``write_analysis_summary``. Putting the
-        denominator on every row means a density needs no other file.
+        Two extents, because a count can reasonably be normalised by either:
+        ``analyzed_*`` is the whole region offered to the pipeline (the image, or
+        the ROI polygon) and ``tissue_*`` is the hull step 2 kept inside it. They
+        are equal when no hull exists or when it reached the region's edges.
+        ``extent_basis`` says which of those produced the tissue figure. The
+        fuller breakdown goes in the summary written by
+        ``write_analysis_summary``; putting the denominators on every row means a
+        density needs no other file.
         """
         if metrics_df is None or metrics_df.empty:
             return metrics_df
         extent = self.analyzed_extent()
-        key = "area_um2" if len(self.image_shape) == 2 else "volume_um3"
+        is_2d = len(self.image_shape) == 2
+        key = "area_um2" if is_2d else "volume_um3"
+        tissue_key = "tissue_area_um2" if is_2d else "tissue_volume_um3"
         metrics_df["analyzed_region"] = extent.get("region", "full_image")
+        metrics_df["extent_basis"] = extent.get("extent_basis")
         metrics_df[f"analyzed_{key}"] = extent.get(key)
+        metrics_df[tissue_key] = extent.get(tissue_key)
         return metrics_df
 
     def write_analysis_summary(self, metrics_df=None) -> Optional[str]:
@@ -204,21 +220,29 @@ class ProcessingStrategy(abc.ABC):
             except Exception:
                 n = 0
 
+        tissue_key = "tissue_area_um2" if is_2d else "tissue_volume_um3"
+        tissue_size = extent.get(tissue_key)
+
         row: Dict[str, Any] = {
             "mode": self.mode_name,
             "analyzed_region": extent.get("region"),
+            "extent_basis": extent.get("extent_basis"),
             "image_shape": "x".join(str(int(v)) for v in self.image_shape),
             "analyzed_pixels": extent.get("pixels"),
             f"analyzed_{key}": size,
+            "tissue_pixels": extent.get("tissue_pixels"),
+            tissue_key: tissue_size,
             "object_count": n,
         }
         # Per-mm densities: um^2 -> mm^2 is 1e6, um^3 -> mm^3 is 1e9. These are
-        # the units this kind of count is normally reported in.
+        # the units this kind of count is normally reported in. Both denominators
+        # are reported so neither choice has to be made here.
+        per_mm = "density_per_mm2" if is_2d else "density_per_mm3"
+        divisor = 1e6 if is_2d else 1e9
         if size:
-            if is_2d:
-                row["density_per_mm2"] = n / (size / 1e6)
-            else:
-                row["density_per_mm3"] = n / (size / 1e9)
+            row[per_mm] = n / (size / divisor)
+        if tissue_size:
+            row[f"tissue_{per_mm}"] = n / (tissue_size / divisor)
         if extent.get("region") == "roi":
             row["roi_bbox_pixels"] = extent.get("bbox_pixels")
             row["roi_polygon_fraction_of_bbox"] = extent.get(
@@ -237,7 +261,9 @@ class ProcessingStrategy(abc.ABC):
             return None
 
         unit = "um^2" if is_2d else "um^3"
-        print(f"  [Extent] {extent.get('region')}: {size:.1f} {unit}, "
+        tissue_txt = (f"{tissue_size:.1f}" if tissue_size else "n/a")
+        print(f"  [Extent] {extent.get('region')}: total {size:.1f} {unit}, "
+              f"tissue {tissue_txt} {unit} ({extent.get('extent_basis')}), "
               f"{n} object(s) -> {os.path.basename(path)}")
         return path
 

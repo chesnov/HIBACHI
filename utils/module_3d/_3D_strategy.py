@@ -553,6 +553,7 @@ class FluorescenceStrategy(ProcessingStrategy):
                 temp_dir=self.temp_dir,
                 calculate_distances=params.get("calculate_distances", True),
                 calculate_skeletons=params.get("calculate_skeletons", True),
+                calculate_solidity=params.get("calculate_solidity", False),
                 skeleton_export_path=skel_dat_path,
                 fcs_export_path=fcs_path,
                 return_detailed=True,

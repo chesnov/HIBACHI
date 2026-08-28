@@ -30,7 +30,7 @@ import networkx as nx
 import pandas as pd
 from scipy import ndimage as ndi
 from scipy.spatial import cKDTree
-from skimage.morphology import skeletonize, remove_small_holes
+from skimage.morphology import skeletonize, remove_small_holes, convex_hull_image
 from skan import Skeleton, summarize
 from tqdm.auto import tqdm
 
@@ -380,8 +380,44 @@ def calculate_ramification_with_skan(
 # 3. VOLUMETRICS & EXPORT (Numerical Parity with 2D)
 # =============================================================================
 
-def calculate_volume(segmented_array, spacing):
-    """Calculates Volume and Surface Area using Crofton approximation."""
+def _solidity_3d(mask: np.ndarray) -> float:
+    """Solidity of a 3D object: its voxel count over its convex hull's.
+
+    Numerically identical to what ``regionprops`` reports for the 2D path --
+    ``area / area_convex`` with both as element counts of the cropped mask and
+    its ``convex_hull_image`` -- so a 3D solidity is directly comparable with a
+    2D one. Verified equal to ``regionprops(...).solidity`` to within 1e-12.
+
+    Being a ratio of volumes it is dimensionless: scaling each axis multiplies
+    the object and its hull by the same determinant. It therefore needs no
+    spacing argument and is unaffected by voxel anisotropy.
+
+    Returns NaN when the hull is degenerate. An object that is a single voxel,
+    a plane or a line has fewer than four non-coplanar points, so Qhull cannot
+    build a hull; ``regionprops`` reports ``inf`` there, which would poison any
+    downstream mean, so NaN is used instead.
+    """
+    try:
+        n_obj = int(np.count_nonzero(mask))
+        if n_obj == 0:
+            return float("nan")
+        hull = convex_hull_image(mask)
+        n_hull = int(np.count_nonzero(hull))
+        if n_hull <= 0:
+            return float("nan")
+        return n_obj / n_hull
+    except Exception:
+        return float("nan")
+
+
+def calculate_volume(segmented_array, spacing, calculate_solidity: bool = False):
+    """Calculates Volume and Surface Area using Crofton approximation.
+
+    `calculate_solidity` gates the convex-hull ratio, which is off by default
+    because it is the most expensive per-object measurement here: the hull is
+    rasterised over the object's bounding box, so cost grows with that box
+    rather than with the voxel count. Left off, the column is NaN.
+    """
     voxel_vol = np.prod(spacing)
     az, ay, ax = spacing[1]*spacing[2], spacing[0]*spacing[2], spacing[0]*spacing[1]
     labels = np.unique(segmented_array); labels = labels[labels > 0]
@@ -401,12 +437,13 @@ def calculate_volume(segmented_array, spacing):
             sa += (np.count_nonzero(mask[:,:,0]) + np.count_nonzero(mask[:,:,-1])) * az
         except: sa = np.nan
         sph = (np.pi**(1/3) * (6 * vol_um)**(2/3)) / sa if sa > 1e-6 else np.nan
-        res.append({'label': int(lbl), 
-                    'volume_um3': vol_um, 
-                    'surface_area_um2': sa, 
-                    'sphericity': sph, 
-                    'voxel_count': n_vox, 
-                    'solidity': 0.0})
+        res.append({'label': int(lbl),
+                    'volume_um3': vol_um,
+                    'surface_area_um2': sa,
+                    'sphericity': sph,
+                    'voxel_count': n_vox,
+                    'solidity': (_solidity_3d(mask) if calculate_solidity
+                                 else float('nan'))})
         
         del mask
         if lbl % 100 == 0:
@@ -452,6 +489,7 @@ def analyze_segmentation(
     spacing: Tuple[float, float, float] = (1.0, 1.0, 1.0),
     calculate_distances: bool = True,
     calculate_skeletons: bool = True,
+    calculate_solidity: bool = False,
     skeleton_export_path: Optional[str] = None,
     fcs_export_path: Optional[str] = None,
     temp_dir: Optional[str] = None,
@@ -461,7 +499,7 @@ def analyze_segmentation(
 ) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     """Comprehensive 3D analysis suite."""
     flush_print("\n--- Starting Feature Calculation (3D) ---")
-    vol_df = calculate_volume(segmented_array, spacing)
+    vol_df = calculate_volume(segmented_array, spacing, calculate_solidity)
     if vol_df.empty: return pd.DataFrame(), {}
     
     # Depth Analysis

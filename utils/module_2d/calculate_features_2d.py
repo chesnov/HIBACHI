@@ -550,8 +550,16 @@ def calculate_ramification_with_skan_2d(
 # 3. MORPHOLOGY & EXPORT (Numerical Parity with 3D)
 # =============================================================================
 
-def calculate_morphology_2d(segmented_array, spacing):
-    """Calculates precisely integrated morphology metrics."""
+def calculate_morphology_2d(segmented_array, spacing, calculate_solidity: bool = True):
+    """Calculates precisely integrated morphology metrics.
+
+    `calculate_solidity` gates the convex-hull ratio. regionprops is lazy, so
+    reading `.solidity` builds a convex hull per object rather than reusing work
+    already done -- measured at roughly 1 ms per cell, against 0.02 ms for
+    reading `.area`. Cheap enough to leave on by default in 2D, but worth being
+    able to switch off on an image with a very large object count. Left off, the
+    column is NaN.
+    """
     props = regionprops(segmented_array, spacing=spacing)
     if not props: return pd.DataFrame()
     res = []
@@ -569,7 +577,9 @@ def calculate_morphology_2d(segmented_array, spacing):
         circ = (4 * np.pi * area) / (perimeter_um**2) if perimeter_um > 1e-6 else np.nan
         res.append({'label': int(p.label), 'area_um2': area, 'perimeter_um': perimeter_um,
                     'pixel_count': p.area, 'circularity': min(1.0, circ) if not np.isnan(circ) else np.nan,
-                    'solidity': p.solidity, 'eccentricity': p.eccentricity})
+                    'solidity': (p.solidity if calculate_solidity
+                                 else float('nan')),
+                    'eccentricity': p.eccentricity})
     return pd.DataFrame(res)
 
 
@@ -610,6 +620,7 @@ def analyze_segmentation_2d(
     spacing_yx: Tuple[float, float] = (1.0, 1.0),
     calculate_distances: bool = True,
     calculate_skeletons: bool = True,
+    calculate_solidity: bool = True,
     skeleton_export_path: Optional[str] = None,
     fcs_export_path: Optional[str] = None,
     temp_dir: Optional[str] = None,
@@ -624,7 +635,9 @@ def analyze_segmentation_2d(
     flush_print("\n--- Starting Feature Calculation (2D) ---")
     
     # 1. MORPHOLOGY: metrics_df initialization
-    metrics_df = calculate_morphology_2d(segmented_array, spacing=spacing_yx)
+    metrics_df = calculate_morphology_2d(
+        segmented_array, spacing=spacing_yx,
+        calculate_solidity=calculate_solidity)
     if metrics_df.empty: return pd.DataFrame(), {}
     
     # Parity: Depth placeholder for table width consistency

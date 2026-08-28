@@ -243,6 +243,11 @@ execute_calculate_features_fluorescence:
       label: Calculate Skeletons
       type: bool
       value: true
+    calculate_solidity:
+      label: Calculate Solidity
+      hint: Convex-hull ratio (voxel count / convex hull voxel count)
+      type: bool
+      value: false
 
 # --- Global Settings ---
 voxel_dimensions:

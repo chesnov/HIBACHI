@@ -551,6 +551,7 @@ class Fluorescence2DStrategy(ProcessingStrategy):
                 temp_dir=self.temp_dir,
                 calculate_distances=params.get("calculate_distances", True),
                 calculate_skeletons=params.get("calculate_skeletons", True),
+                calculate_solidity=params.get("calculate_solidity", True),
                 skeleton_export_path=skel_dat_path,  # Write skeletons to disk to prevent RAM crash
                 fcs_export_path=fcs_out_path,       # Triggers the FCS writer logic
                 return_detailed=True,               # Required to populate the GUI layers
