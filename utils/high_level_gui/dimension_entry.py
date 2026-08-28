@@ -143,6 +143,66 @@ def _is_real_spacing(value) -> bool:
     return num != 1.0
 
 
+#: How close an implied spacing must be to exactly 1.0 um/pixel before the total
+#: is treated as "this is really just the pixel count". Deliberately tight: the
+#: failure mode being caught produces a ratio of exactly 1.0, so a loose
+#: tolerance would only add false prompts on genuinely near-unit images.
+UNIT_SCALE_REL_TOL = 1e-3
+
+#: Reason an axis is being asked about, so the dialog can word itself correctly.
+REASON_MISSING = "missing"        # no scale at all -> field starts empty
+REASON_UNIT_SCALE = "unit_scale"  # total == pixel count -> field pre-filled to confirm
+
+
+def implied_spacing(total, pixels) -> Optional[float]:
+    """Microns per pixel implied by a total extent and a pixel count."""
+    try:
+        total_f, pixels_f = float(total), float(pixels)
+    except (TypeError, ValueError):
+        return None
+    if total_f != total_f or pixels_f != pixels_f:      # NaN
+        return None
+    if pixels_f <= 0 or total_f <= 0:
+        return None
+    return total_f / pixels_f
+
+
+def looks_like_pixel_count(total, pixels, rel_tol: float = UNIT_SCALE_REL_TOL) -> bool:
+    """True if `total` microns is indistinguishable from `pixels` pixels.
+
+    A second line of defence, deliberately placed on the RESULT rather than on
+    the metadata. ``scale_gaps`` can only judge a per-pixel spacing the image
+    file reported; it cannot see a total that arrived some other way. The
+    clearest example is a metadata CSV with pixel counts pasted into the
+    'Width (um)' column: those numbers are present, positive and finite, so
+    every existing check passes them and the config is stamped as calibrated
+    from a CSV -- while implying exactly 1.0 um/pixel.
+
+    A real 1.0 um/pixel image does exist, so this must never be treated as an
+    error. It only decides whether to ASK, with the value pre-filled so
+    confirming is one click.
+    """
+    spacing = implied_spacing(total, pixels)
+    if spacing is None:
+        return False
+    return abs(spacing - 1.0) <= rel_tol
+
+
+def unit_scale_axes(
+    totals: Optional[Dict[str, Any]],
+    pixels: Optional[Dict[str, Any]],
+    mode,
+    rel_tol: float = UNIT_SCALE_REL_TOL,
+) -> Tuple[str, ...]:
+    """Axes whose total extent is indistinguishable from their pixel count."""
+    if not totals or not pixels:
+        return ()
+    return tuple(
+        a for a in axes_for_mode(mode)
+        if looks_like_pixel_count(totals.get(a), pixels.get(a), rel_tol)
+    )
+
+
 def scale_gaps(meta: Optional[Dict[str, Any]], mode) -> Tuple[str, ...]:
     """Axes for which `meta` provides no trustworthy scale.
 
@@ -156,34 +216,69 @@ def scale_gaps(meta: Optional[Dict[str, Any]], mode) -> Tuple[str, ...]:
     return tuple(a for a in axes if not _is_real_spacing(meta.get(a)))
 
 
+def resulting_totals(
+    meta: Optional[Dict[str, Any]],
+    pixels: Optional[Dict[str, Any]],
+    mode,
+    csv_override: Optional[Dict[str, Optional[float]]] = None,
+) -> Dict[str, Optional[float]]:
+    """The total extent each axis would end up with, before any manual entry.
+
+    Mirrors what the scaffolding computes (``spacing * pixel_count``, with a CSV
+    row replacing the product per axis) so the suspicious-total check judges the
+    same numbers that would actually be written to the config.
+    """
+    out: Dict[str, Optional[float]] = {}
+    pixels = pixels or {}
+    for axis in axes_for_mode(mode):
+        if csv_override and csv_override.get(axis) is not None:
+            out[axis] = float(csv_override[axis])
+            continue
+        spacing = (meta or {}).get(axis)
+        count = pixels.get(axis)
+        try:
+            out[axis] = float(spacing) * float(count)
+        except (TypeError, ValueError):
+            out[axis] = None
+    return out
+
+
 def plan_manual_entry(
     files_meta: Sequence[Tuple[str, Optional[Dict[str, Any]], Dict[str, int]]],
     mode,
     csv_overrides: Optional[Dict[str, Dict[str, Optional[float]]]] = None,
     match_override=None,
+    check_unit_scale: bool = True,
 ) -> List[Dict[str, Any]]:
-    """Work out who needs to be asked, and for which axes.
+    """Work out who needs to be asked, and for which axes, and why.
 
     `files_meta` is a sequence of ``(filename, metadata_dict, pixel_counts)``
-    where `pixel_counts` maps axis -> pixel count, used to prefill the dialog.
+    where `pixel_counts` maps axis -> pixel count.
 
-    An axis is asked about only when BOTH automatic routes fail: the file's own
-    metadata has no real spacing for it, and no CSV row pins it down. This is
-    what keeps the dialog out of the way of correctly calibrated data, and it
-    also closes the partial-CSV hole -- a CSV giving only 'Width (um)' used to
-    suppress the warning for Y and Z as well.
+    An axis is asked about for one of two reasons:
+
+    ``REASON_MISSING``
+        Both automatic routes failed -- the file's metadata has no trustworthy
+        spacing for the axis and no CSV row pins it down. The field starts empty.
+        This is also what closes the partial-CSV hole: a CSV giving only
+        'Width (um)' used to suppress the warning for Y and Z as well.
+
+    ``REASON_UNIT_SCALE``
+        A value *was* found, but the resulting total is indistinguishable from
+        the axis's pixel count, i.e. exactly 1.0 um/pixel. Checked on the RESULT
+        rather than on the metadata, so it catches a total that arrived from a
+        CSV as well -- pixel counts pasted into the 'Width (um)' column are
+        present, positive and finite, so nothing else questions them. A genuine
+        1.0 um/pixel image is possible, so the field is PRE-FILLED with the
+        value and confirming it is one click.
 
     Returns one entry per file needing input:
-    ``{'filename', 'axes', 'pixels', 'from_csv'}``.
+    ``{'filename', 'axes', 'pixels', 'from_csv', 'reasons', 'current'}``.
     """
     csv_overrides = csv_overrides or {}
     plan: List[Dict[str, Any]] = []
 
     for filename, meta, pixels in files_meta:
-        missing = set(scale_gaps(meta, mode))
-        if not missing:
-            continue
-
         override = None
         if csv_overrides:
             if match_override is not None:
@@ -191,21 +286,47 @@ def plan_manual_entry(
             else:
                 override = csv_overrides.get(filename)
 
+        missing = set(scale_gaps(meta, mode))
         from_csv = set()
         if override:
             for axis in list(missing):
-                value = override.get(axis)
-                if value is not None:
+                if override.get(axis) is not None:
                     missing.discard(axis)
                     from_csv.add(axis)
 
-        if missing:
-            plan.append({
-                "filename": filename,
-                "axes": tuple(a for a in axes_for_mode(mode) if a in missing),
-                "pixels": dict(pixels or {}),
-                "from_csv": tuple(sorted(from_csv)),
-            })
+        totals = resulting_totals(meta, pixels, mode, override)
+
+        # Suspicious totals only matter for axes we believe we HAVE a value for;
+        # a missing axis is already being asked about, and its placeholder total
+        # (pixel count x 1.0) would otherwise flag every one of them redundantly.
+        suspicious = set()
+        if check_unit_scale:
+            suspicious = {
+                a for a in unit_scale_axes(totals, pixels, mode)
+                if a not in missing
+            }
+
+        ask = missing | suspicious
+        if not ask:
+            continue
+
+        reasons = {}
+        current: Dict[str, Optional[float]] = {}
+        for axis in axes_for_mode(mode):
+            if axis in missing:
+                reasons[axis] = REASON_MISSING
+            elif axis in suspicious:
+                reasons[axis] = REASON_UNIT_SCALE
+                current[axis] = totals.get(axis)
+
+        plan.append({
+            "filename": filename,
+            "axes": tuple(a for a in axes_for_mode(mode) if a in ask),
+            "pixels": dict(pixels or {}),
+            "from_csv": tuple(sorted(from_csv)),
+            "reasons": reasons,
+            "current": current,
+        })
     return plan
 
 
@@ -300,12 +421,41 @@ def _build_dialog_classes():
             outer = QVBoxLayout(self)
 
             n = len(self._plan)
+            # Counted over AXES, not files: one image can be missing a Z scale
+            # while its X total merely looks suspicious, and describing that as
+            # purely a confirmation would understate what the user has to do.
+            all_reasons = [
+                r for e in self._plan for r in (e.get("reasons") or {}).values()
+            ]
+            any_missing = any(r == REASON_MISSING for r in all_reasons)
+            any_suspect = any(r == REASON_UNIT_SCALE for r in all_reasons)
+            if any_suspect and not any_missing:
+                lead = (
+                    f"<b>Please confirm the dimensions of {n} image(s).</b><br><br>"
+                    "Their recorded size is exactly the same as their size in "
+                    "pixels, which means 1 micron per pixel. That is sometimes "
+                    "correct, but far more often it means the scale was never "
+                    "set, or pixel counts were entered in a microns column."
+                )
+            elif any_suspect:
+                lead = (
+                    f"<b>{n} image(s) need their dimensions checked.</b><br><br>"
+                    "Some have no usable scale at all. Others have a recorded "
+                    "size identical to their pixel count (1 micron per pixel), "
+                    "which is occasionally right but usually means the scale was "
+                    "never set. Pre-filled values are the current ones -- change "
+                    "them or confirm them."
+                )
+            else:
+                lead = (
+                    f"<b>{n} image(s) have no usable scale information.</b><br><br>"
+                    "HIBACHI could not read a physical scale from the image "
+                    "metadata, and no metadata CSV supplied one."
+                )
             head = QLabel(
-                f"<b>{n} image(s) have no usable scale information.</b><br><br>"
-                "HIBACHI could not read a physical scale from the image "
-                "metadata, and no metadata CSV supplied one. Enter the "
-                "<b>total</b> physical size of each image below.<br><br>"
-                "Without this, every size, distance and density would be "
+                lead
+                + "<br><br>Enter the <b>total</b> physical size of each image "
+                "below. Without it, every size, distance and density would be "
                 "measured in pixels while being reported in microns."
             )
             head.setWordWrap(True)
@@ -366,6 +516,15 @@ def _build_dialog_classes():
                 note.setWordWrap(True)
                 layout.addWidget(note)
 
+            reasons = entry.get("reasons") or {}
+            current = entry.get("current") or {}
+            if any(r == REASON_UNIT_SCALE for r in reasons.values()):
+                warn = QLabel(
+                    "<i>Recorded size equals the pixel count (1 µm/pixel). "
+                    "Correct it, or confirm if that is genuinely right.</i>")
+                warn.setWordWrap(True)
+                layout.addWidget(warn)
+
             form = QFormLayout()
             pixels = entry.get("pixels") or {}
             for axis in entry["axes"]:
@@ -374,7 +533,15 @@ def _build_dialog_classes():
                 spin.setRange(0.0, 1e9)
                 spin.setSingleStep(1.0)
                 spin.setSpecialValueText("(not set)")
-                spin.setValue(0.0)          # 0 == not set; validated on accept
+
+                # A suspicious-but-present axis is PRE-FILLED with its current
+                # value, so a user who knows the image really is 1 µm/pixel just
+                # presses OK. A missing axis starts at 0 ("(not set)") and must
+                # be filled in. Same widget, different starting point, because
+                # the two cases need different amounts of work from the user.
+                prefill = current.get(axis)
+                spin.setValue(float(prefill) if prefill else 0.0)
+
                 px = pixels.get(axis)
                 if px:
                     spin.setSuffix(
@@ -383,7 +550,10 @@ def _build_dialog_classes():
                         f"Total extent along {axis.upper()}. This axis is "
                         f"{int(px)} pixels, so entering T gives a spacing of "
                         f"T/{int(px)} µm per pixel.")
-                form.addRow(_AXIS_LABEL.get(axis, axis), spin)
+                label = _AXIS_LABEL.get(axis, axis)
+                if reasons.get(axis) == REASON_UNIT_SCALE:
+                    label += " \u26a0"        # marks the axis to double-check
+                form.addRow(label, spin)
                 self._spins[(idx, axis)] = spin
             layout.addLayout(form)
             return frame

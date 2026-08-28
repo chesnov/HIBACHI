@@ -648,8 +648,8 @@ def organize_channel_project(
         # suppressed the unscaled report for the axes it did NOT supply, so a CSV
         # with only 'Width (um)' silently left Y and Z as pixel counts.
         from .dimension_entry import (
-            combine_sources, per_axis_sources, scale_gaps,
-            stamp_dimensions_source,
+            SOURCE_PIXELS_ASSUMED, combine_sources, per_axis_sources,
+            scale_gaps, stamp_dimensions_source, unit_scale_axes,
         )
 
         totals = {'x': total_w, 'y': total_h, 'z': total_d}
@@ -669,15 +669,18 @@ def organize_channel_project(
         manual = _match_dimension_override(manual_overrides or {}, src_file)
         if manual:
             for axis in ('x', 'y', 'z'):
-                # CSV wins: the dialog was only ever asked to fill CSV's gaps.
-                if axis in csv_axes:
-                    continue
                 if manual.get(axis) is not None:
+                    # Manual wins over BOTH the CSV and the metadata. The dialog
+                    # only asks about axes that were missing or whose total was
+                    # indistinguishable from the pixel count, so a value coming
+                    # back means a human has just entered or confirmed it -- and
+                    # the thing it may be correcting is precisely a bad CSV cell.
                     totals[axis] = manual[axis]
                     manual_axes.add(axis)
+                    csv_axes.discard(axis)
             if manual_axes:
                 print(f"      Dimensions ({', '.join(sorted(manual_axes))}) "
-                      "entered manually.")
+                      "entered or confirmed manually.")
 
         total_w, total_h, total_d = totals['x'], totals['y'], totals['z']
 
@@ -686,11 +689,33 @@ def organize_channel_project(
 
         still_missing = sorted(
             a for a in gaps if a not in csv_axes and a not in manual_axes)
-        if still_missing:
+
+        # Belt and braces: flag any FINAL total that is indistinguishable from
+        # its pixel count and was not manually confirmed. The wizard normally
+        # prompts for these, but this function is also reachable without it, and
+        # a CSV carrying pixel counts in the micron columns passes every other
+        # check. Excluded when manually confirmed -- the user has attested that
+        # 1 um/pixel is correct for that axis.
+        suspect = [
+            a for a in unit_scale_axes(
+                totals, {'x': width, 'y': height, 'z': z_slices}, mode)
+            if a not in manual_axes and a not in still_missing
+        ]
+
+        if still_missing or suspect:
             summary['unscaled'].append(src_file)
+        if still_missing:
             print(f"      Warning: no usable scale for axis/axes "
                   f"{', '.join(still_missing)} of {src_file}; those dimensions "
                   "are recorded in PIXELS.")
+        if suspect:
+            print(f"      Warning: {src_file} axis/axes {', '.join(suspect)} "
+                  "have a total equal to the pixel count (1 um/pixel). This is "
+                  "usually an uncalibrated image or pixel counts entered in a "
+                  "microns column.")
+            for _axis in suspect:
+                axis_sources[_axis] = SOURCE_PIXELS_ASSUMED
+            dim_source = combine_sources(axis_sources)
 
         summary['organized'].append(img_subdir)
 
@@ -888,6 +913,24 @@ def _channel_index_of(channel_dir: str) -> Optional[int]:
     return None
 
 
+def _probe_pixel_counts_quiet(path: str) -> Dict[str, int]:
+    """Pixel counts per axis from a TIFF, shape only. {} on any failure.
+
+    Used to test whether a recorded total is really a pixel count, so it must
+    never raise: a probe failure just means that check is skipped for the image.
+    """
+    try:
+        with tiff.TiffFile(path) as handle:
+            shape = handle.series[0].shape
+    except Exception:
+        return {}
+    if len(shape) >= 3:
+        return {'z': int(shape[0]), 'y': int(shape[-2]), 'x': int(shape[-1])}
+    if len(shape) == 2:
+        return {'z': 1, 'y': int(shape[0]), 'x': int(shape[1])}
+    return {}
+
+
 def organize_processing_dir(
     drctry: str,
     preset_details: Dict[str, str],
@@ -976,8 +1019,9 @@ def organize_processing_dir(
     dimension_key = 'pixel_dimensions' if is_2d_mode else 'voxel_dimensions'
 
     from .dimension_entry import (
-        SOURCE_CSV, SOURCE_UNKNOWN, combine_sources, per_axis_sources,
-        scale_gaps, stamp_dimensions_source,
+        SOURCE_CSV, SOURCE_MANUAL, SOURCE_PIXELS_ASSUMED, SOURCE_UNKNOWN,
+        combine_sources, per_axis_sources, scale_gaps, stamp_dimensions_source,
+        unit_scale_axes,
     )
 
     generated_rows = []
@@ -1057,22 +1101,42 @@ def organize_processing_dir(
             manual_axes = set()
             if manual:
                 for axis in ('x', 'y', 'z'):
-                    if axis in gaps and manual.get(axis) is not None:
+                    # Not restricted to `gaps`: the dialog also asks about axes
+                    # whose total equals the pixel count, which ARE present in
+                    # the metadata. Restricting to gaps would silently discard
+                    # exactly those corrections.
+                    if manual.get(axis) is not None:
                         totals[axis] = manual[axis]
                         manual_axes.add(axis)
                 if manual_axes:
                     print(f"    Dimensions ({', '.join(sorted(manual_axes))}) "
-                          "entered manually.")
+                          "entered or confirmed manually.")
 
-            axis_sources[img_file] = per_axis_sources(
-                mode, meta, (), manual_axes)
+            per_axis = per_axis_sources(mode, meta, (), manual_axes)
 
             still_missing = sorted(a for a in gaps if a not in manual_axes)
-            if still_missing:
+
+            # Same belt-and-braces check as the multi-channel path: a final
+            # total equal to its pixel count means 1 um/pixel, which is far more
+            # often an uncalibrated image than a real one.
+            suspect = [
+                a for a in unit_scale_axes(
+                    totals, {'x': width, 'y': height, 'z': z_slices}, mode)
+                if a not in manual_axes and a not in still_missing
+            ]
+            for _axis in suspect:
+                per_axis[_axis] = SOURCE_PIXELS_ASSUMED
+            axis_sources[img_file] = per_axis
+
+            if still_missing or suspect:
                 summary['unscaled'].append(img_file)
+            if still_missing:
                 print(f"    Warning: no usable scale for axis/axes "
                       f"{', '.join(still_missing)} of {img_file}; those "
                       "dimensions are recorded in PIXELS.")
+            if suspect:
+                print(f"    Warning: {img_file} axis/axes {', '.join(suspect)} "
+                      "have a total equal to the pixel count (1 um/pixel).")
 
             generated_rows.append({
                 'Filename': img_file,
@@ -1159,23 +1223,62 @@ def organize_processing_dir(
         if not os.path.exists(new_config_path):
             shutil.copy2(config_template_path, new_config_path)
 
+        # Totals for this image, from whichever source supplied them. Rows on the
+        # auto-generate path were built above (already manual-aware); rows from a
+        # user CSV arrive here untouched, so the manual override and the
+        # unit-scale check have to be applied at this point too -- doing it only
+        # in the auto-generate branch left a CSV of pixel counts unchallenged.
+        row_totals = {
+            'x': float(row.get('Width (um)', 1.0) or 1.0),
+            'y': float(row.get('Height (um)', 1.0) or 1.0),
+            'z': float(row.get('Depth (um)', 0.0) or 0.0),
+        }
+        tracked = axis_sources.get(matched_file)
+        row_manual_axes = set()
+
+        if tracked is None:
+            # Came from a user-supplied CSV.
+            manual_row = _match_dimension_override(
+                manual_overrides or {}, matched_file)
+            if manual_row:
+                for axis in ('x', 'y', 'z'):
+                    if manual_row.get(axis) is not None:
+                        row_totals[axis] = manual_row[axis]
+                        row_manual_axes.add(axis)
+                if row_manual_axes:
+                    print(f"  Dimensions ({', '.join(sorted(row_manual_axes))}) "
+                          f"of {matched_file} entered or confirmed manually.")
+
+            row_pixels = _probe_pixel_counts_quiet(dst)
+            row_suspect = [
+                a for a in unit_scale_axes(row_totals, row_pixels, mode)
+                if a not in row_manual_axes
+            ]
+            per_axis_row = {
+                a: (SOURCE_MANUAL if a in row_manual_axes else SOURCE_CSV)
+                for a in ('x', 'y') + (() if is_2d_mode else ('z',))
+            }
+            if row_suspect:
+                for a in row_suspect:
+                    per_axis_row[a] = SOURCE_PIXELS_ASSUMED
+                summary['unscaled'].append(matched_file)
+                print(f"  Warning: {matched_file} axis/axes "
+                      f"{', '.join(row_suspect)} have a total equal to the pixel "
+                      "count (1 um/pixel). This usually means pixel counts were "
+                      "entered in a microns column.")
+            tracked = per_axis_row
+
         try:
             with open(new_config_path, 'r') as f: cfg = yaml.safe_load(f) or {}
             if dimension_key not in cfg: cfg[dimension_key] = {}
-            cfg[dimension_key]['x'] = float(row.get('Width (um)', 1.0))
-            cfg[dimension_key]['y'] = float(row.get('Height (um)', 1.0))
+            cfg[dimension_key]['x'] = row_totals['x']
+            cfg[dimension_key]['y'] = row_totals['y']
             if not is_2d_mode:
-                cfg[dimension_key]['z'] = float(row.get('Depth (um)', 0.0))
+                cfg[dimension_key]['z'] = row_totals['z']
             cfg['mode'] = mode
             cfg['synthetic'] = False  # real image (not procedurally generated)
-            # Provenance. On the auto-generate path we tracked it per axis above.
-            # When the rows came from a user-supplied CSV, the CSV *is* the
-            # statement of physical size, so that is the source.
-            tracked = axis_sources.get(matched_file)
-            stamp_dimensions_source(
-                cfg,
-                combine_sources(tracked) if tracked else SOURCE_CSV,
-            )
+            # Provenance, per axis, collapsed to one value for the config.
+            stamp_dimensions_source(cfg, combine_sources(tracked))
             with open(new_config_path, 'w') as f:
                 yaml.dump(cfg, f, default_flow_style=False, sort_keys=False)
         except Exception: pass
