@@ -23,7 +23,6 @@ try:
     from .soma_extraction_2d import extract_soma_masks_2d
     from .cell_splitting_2d import separate_multi_soma_cells_2d
     from .calculate_features_2d import analyze_segmentation_2d
-    from .interaction_analysis_2d import calculate_interaction_metrics_2d
     from .calculate_features_2d import export_to_fcs # Ensure this is imported for FCS updates
 except ImportError as e:
     print(f"CRITICAL ERROR: Could not import 2D segmentation modules: {e}")
@@ -34,13 +33,16 @@ class Fluorescence2DStrategy(ProcessingStrategy):
     """
     Orchestrates the 2D segmentation workflow for fluorescent cells.
 
-    This strategy manages a 6-step pipeline (mirroring the 3D workflow):
+    This strategy manages a 5-step pipeline (mirroring the 3D workflow):
     1. Raw Segmentation (Frangi/Sato 2D + Thresholding)
     2. Edge Trimming (Hull-based artifact removal)
     3. Soma Extraction (Core detection)
     4. Cell Separation (Splitting multi-soma objects)
     5. Feature Calculation (Morphometrics, Skeletonization)
-    6. Interaction Analysis (Overlap with other channels)
+
+    Cross-channel work is not part of this pipeline: it operates on the finished
+    segmentations of several channels at once and lives in the Cross-Channel
+    Analyzer (`cross_channel_window` / `relational_engine`).
     """
 
     def _get_mode_name(self) -> str:
@@ -118,9 +120,6 @@ class Fluorescence2DStrategy(ProcessingStrategy):
             "metrics_fcs": os.path.join(
                 self.processed_dir, f"metrics_{p}.fcs"
             ),
-            "last_interaction_meta": os.path.join(
-                self.processed_dir, "last_interaction_meta.yaml"
-            )
         })
         return files
 
@@ -722,49 +721,6 @@ class Fluorescence2DStrategy(ProcessingStrategy):
                 except Exception:
                     pass
         
-        # Step 6 Viz (Interaction Analysis)
-        if checkpoint_step >= 6:
-            meta_path = files.get("last_interaction_meta")
-            if meta_path and os.path.exists(meta_path):
-                try:
-                    with open(meta_path, 'r') as f:
-                        meta = yaml.safe_load(f)
-                    
-                    ref_path = meta.get('ref_seg_path')
-                    ref_raw = meta.get('ref_raw_path')
-                    ref_name = meta.get('ref_name', 'Ref')
-                    inter_path = meta.get('intersection_path')
-                    
-                    # 2D Scaling Logic (Y, X)
-                    display_scale = (self.spacing[1], self.spacing[2]) if len(self.spacing) == 3 else self.spacing
-
-                    # A. Load Reference Mask
-                    if ref_path and os.path.exists(ref_path):
-                        ref_data = np.memmap(ref_path, dtype=np.int32, mode='r', shape=self.image_shape)
-                        
-                        # Apply distinct random colors for the reference objects
-                        unique_lbls = np.unique(ref_data)
-                        unique_lbls = unique_lbls[unique_lbls > 0]
-                        cmap = {lbl: (*colorsys.hsv_to_rgb(random.random(), 0.6, 0.9), 1.0) for lbl in unique_lbls}
-                        
-                        l = viewer.add_labels(ref_data, name=f"Ref: {ref_name}", scale=display_scale)
-                        l.color = cmap
-                    
-                    # B. Load Intersection Mask (Where the overlap happens)
-                    if inter_path and os.path.exists(inter_path):
-                        int_data = np.memmap(inter_path, dtype=np.int32, mode='r', shape=self.image_shape)
-                        viewer.add_labels(int_data, name=f"Overlap ({ref_name})", scale=display_scale, opacity=0.7)
-
-                    # C. Load Reference Raw Intensity (for context)
-                    if ref_raw and os.path.exists(ref_raw):
-                        try:
-                            ref_img = tiff.imread(ref_raw)
-                            viewer.add_image(ref_img, name=f"Ref Intensity ({ref_name})", 
-                                             colormap='magenta', blending='additive', scale=display_scale)
-                        except Exception: pass
-
-                except Exception as e:
-                    print(f"  [Error] Failed to load 2D interaction visualization: {e}")
 
     def cleanup_step_artifacts(self, viewer, step_number: int):
         """Cleans artifacts for 2D steps."""

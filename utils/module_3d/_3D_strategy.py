@@ -22,7 +22,6 @@ try:
     from .soma_extraction import extract_soma_masks
     from .cell_splitting import separate_multi_soma_cells
     from .calculate_features_3d import analyze_segmentation, export_to_fcs
-    from .interaction_analysis import calculate_interaction_metrics
 except ImportError as e:
     print(f"CRITICAL ERROR: Could not import 3D segmentation modules: {e}")
     raise
@@ -32,13 +31,16 @@ class FluorescenceStrategy(ProcessingStrategy):
     """
     Orchestrates the 3D segmentation workflow for Fluorescent cells.
 
-    This strategy manages a 6-step pipeline:
+    This strategy manages a 5-step pipeline:
     1. Raw Segmentation (Hessian/Frangi + Thresholding)
     2. Edge Trimming (Hull-based artifact removal)
     3. Soma Extraction (Core detection)
     4. Cell Separation (Splitting multi-soma objects)
     5. Feature Calculation (Morphometrics, Skeletonization)
-    6. Interaction Analysis (Overlap with other channels)
+
+    Cross-channel work is not part of this pipeline: it operates on the finished
+    segmentations of several channels at once and lives in the Cross-Channel
+    Analyzer (`cross_channel_window` / `relational_engine`).
     """
 
     def _get_mode_name(self) -> str:
@@ -115,9 +117,6 @@ class FluorescenceStrategy(ProcessingStrategy):
             "metrics_fcs": os.path.join(
                 self.processed_dir, f"metrics_{p}.fcs"
             ),
-            "last_interaction_meta": os.path.join(
-                self.processed_dir, "last_interaction_meta.yaml"
-            )
         })
         return files
 
@@ -693,85 +692,6 @@ class FluorescenceStrategy(ProcessingStrategy):
                 except Exception as e:
                     print(f"Error loading neighbor lines: {e}")
 
-        # 3. Load Interaction Viz (Step 6)
-        if checkpoint_step >= 6:
-            meta_path = files.get("last_interaction_meta")
-            if meta_path and os.path.exists(meta_path):
-                print(f"  Loading Interaction Viz from {meta_path}")
-                try:
-                    with open(meta_path, 'r') as f:
-                        meta = yaml.safe_load(f)
-                    ref_path = meta.get('ref_seg_path')
-                    ref_raw = meta.get('ref_raw_path')
-                    ref_name = meta.get('ref_name', 'Ref')
-                    inter_path = meta.get('intersection_path')
-
-                    display_scale = (self.z_scale_factor, 1, 1)
-
-                    # A. Reference Mask
-                    if ref_path and os.path.exists(ref_path):
-                        f_size = os.path.getsize(ref_path)
-                        exp_size = np.prod(self.image_shape) * 4
-                        if f_size != exp_size:
-                            print("    WARNING: Reference mask size mismatch.")
-                        else:
-                            ref_data = np.memmap(
-                                ref_path, dtype=np.int32, mode='r',
-                                shape=self.image_shape
-                            )
-                            # Generate simple random colormap
-                            unique_lbls = np.unique(ref_data)
-                            unique_lbls = unique_lbls[unique_lbls > 0]
-                            cmap = {}
-                            for lbl in unique_lbls:
-                                h = 0.55 + (0.1 * random.random())
-                                s = 0.4 + (0.4 * random.random())
-                                v = 0.8 + (0.2 * random.random())
-                                r, g, b = colorsys.hsv_to_rgb(h, s, v)
-                                cmap[lbl] = (r, g, b, 1.0)
-
-                            l = viewer.add_labels(
-                                ref_data, name=f"Ref: {ref_name}",
-                                scale=display_scale
-                            )
-                            l.color = cmap
-
-                            # Hide standard processing layers to reduce clutter
-                            for lay in viewer.layers:
-                                if any(x in lay.name for x in [
-                                    "Raw", "Trimmed", "Edge", "Cell bodies"
-                                ]):
-                                    lay.visible = False
-
-                    # B. Intersection Mask
-                    if inter_path and os.path.exists(inter_path):
-                        int_data = np.memmap(
-                            inter_path, dtype=np.int32, mode='r',
-                            shape=self.image_shape
-                        )
-                        viewer.add_labels(
-                            int_data,
-                            name=f"Overlap Regions ({ref_name})",
-                            scale=display_scale,
-                            opacity=0.8
-                        )
-
-                    # C. Reference Intensity
-                    if ref_raw and os.path.exists(ref_raw):
-                        try:
-                            ref_img = tiff.imread(ref_raw)
-                            if ref_img.shape == self.image_shape:
-                                viewer.add_image(
-                                    ref_img, name=f"Ref Intensity",
-                                    blending='additive', colormap='magenta',
-                                    scale=display_scale
-                                )
-                        except Exception:
-                            pass
-
-                except Exception as e:
-                    print(f"Error loading interaction viz: {e}")
-                    traceback.print_exc()
 
     def cleanup_step_artifacts(self, viewer, step_number: int):
         """

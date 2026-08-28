@@ -59,14 +59,57 @@ GUI_PID=""
 # failed install, not a degraded one.
 REQUIRED_MODULES="yaml numpy pandas scipy tifffile PyQt5.QtWidgets vispy \
 napari magicgui dask.array dask_image.ndmeasure sklearn seaborn skan \
-SimpleITK slideio readlif numba zarr plotly nbformat napari_animation \
-aicspylibczi fcswrite PartSegCore_compiled_backend"
+SimpleITK slideio numba zarr plotly nbformat napari_animation aicspylibczi \
+fcswrite PartSegCore_compiled_backend"
 
 say()  { printf '\n\033[1;36m==> %s\033[0m\n' "$*"; }
 warn() { printf '\n\033[1;33mWARNING: %s\033[0m\n' "$*" >&2; }
 
 command -v curl >/dev/null 2>&1 || { echo "ERROR: curl is required." >&2; exit 1; }
 command -v tar  >/dev/null 2>&1 || { echo "ERROR: tar is required." >&2; exit 1; }
+
+# ============================================================================ #
+# Native (no-dependency) feedback -- macOS
+# ============================================================================ #
+# The tkinter progress window needs a python3 that can import tkinter. Before
+# phase A there may be none: `pick_gui_python` deliberately skips
+# /usr/bin/python3 on Darwin (without Command Line Tools it is a stub that pops
+# Apple's own installer), and on a stock Mac that is the only python3 present.
+# The .app stub also redirects this script's output to a log, so with no window
+# and no console the user sees nothing at all while the environment downloads --
+# indistinguishable from the app having silently died.
+#
+# osascript is always present on macOS and needs nothing installed, so it covers
+# that interval. Notifications are non-blocking; failures use a dialog, which
+# cannot be missed.
+IS_MACOS=0
+[ "$(uname -s)" = "Darwin" ] && IS_MACOS=1
+
+_LAST_NATIVE_TITLE=""
+
+native_notify() {
+  [ "${IS_MACOS}" = "1" ] || return 0
+  osascript -e "display notification \"${1//\"/}\" with title \"HIBACHI setup\"" \
+    >/dev/null 2>&1 || true
+}
+
+native_alert() {
+  [ "${IS_MACOS}" = "1" ] || return 0
+  osascript -e "display dialog \"${1//\"/}\" buttons {\"OK\"} default button 1 \
+    with title \"HIBACHI setup\" with icon caution" >/dev/null 2>&1 || true
+}
+
+# True when there is no progress window, so the native path is the only feedback.
+no_window() { [ -z "${GUI_PID}" ]; }
+
+# One notification per distinct stage, so a milestone is visible without the
+# stream of per-package updates becoming a notification storm.
+native_stage() {
+  no_window || return 0
+  [ "${1}" = "${_LAST_NATIVE_TITLE}" ] && return 0
+  _LAST_NATIVE_TITLE="${1}"
+  native_notify "${1}"
+}
 
 # ============================================================================ #
 # Progress reporting
@@ -81,6 +124,7 @@ progress() {
     "${pct}" "${ceil}" "${title//\"/}" "${detail//\"/}" > "${STATUS_FILE}.tmp" 2>/dev/null || return 0
   mv -f "${STATUS_FILE}.tmp" "${STATUS_FILE}" 2>/dev/null || true
   printf '    %s%s\n' "${title}" "${detail:+ -- ${detail}}"
+  native_stage "${title}"
 }
 
 progress_state() {   # progress_state <done|failed> [message]
@@ -112,8 +156,20 @@ err() {
   trap - ERR
   printf '\n\033[1;31mERROR: %s\033[0m\n' "$*" >&2
   progress_state failed "$*"
-  # Leave the window up briefly so the user can read the failure and find the log.
-  [ -n "${GUI_PID}" ] && sleep 12
+  if no_window; then
+    # No window and, under the .app, no console either: without this the script
+    # exits with the reason written only to a log the user has not been told
+    # about.
+    native_alert "Setup could not finish.
+
+$*
+
+The full log is at:
+${INSTALL_DIR}/setup.log"
+  else
+    # Leave the window up briefly so the user can read the failure and find the log.
+    sleep 12
+  fi
   gui_stop
   exit 1
 }
@@ -125,7 +181,17 @@ on_error() {
   printf 'If an earlier attempt was interrupted, force a clean rebuild with:\n' >&2
   printf '  HIBACHI_FORCE_REBUILD=1 bash %s\n\n' "$0" >&2
   progress_state failed "Setup failed. See ${INSTALL_DIR}/setup.log"
-  [ -n "${GUI_PID}" ] && sleep 12
+  if no_window; then
+    native_alert "Setup stopped unexpectedly (exit ${rc}).
+
+The full log is at:
+${INSTALL_DIR}/setup.log
+
+Opening HIBACHI again will retry, and repairs an interrupted install
+automatically."
+  else
+    sleep 12
+  fi
   gui_stop
 }
 trap on_error ERR
@@ -432,6 +498,15 @@ prune_pip_debris() {
 mkdir -p "${INSTALL_DIR}"
 rm -f "${CANCEL_FILE}"
 gui_start                     # opens now if the machine already has a usable python3
+
+# Say something immediately. Until phase A produces the env's interpreter there
+# may be no window at all (see the native-feedback section), and the .app stub
+# sends this script's output to a log, so this notification is the only sign the
+# setup started.
+if no_window; then
+  native_notify "Setting up HIBACHI. This takes several minutes -- you can keep working."
+fi
+
 progress 1 4 "Preparing" ""
 
 say "Detecting platform"
@@ -623,7 +698,11 @@ fi
 
 trap - ERR
 progress_state done "Setup complete."
-sleep 1                       # let the window read the final state and self-close
+if no_window; then
+  native_notify "Setup complete. Starting HIBACHI..."
+else
+  sleep 1                     # let the window read the final state and self-close
+fi
 gui_stop
 
 say "Done!"

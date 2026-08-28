@@ -1,163 +1,163 @@
 # HIBACHI
 ### Heuristic-Informed Batch Analysis for Cell Histological Identification
 
-**HIBACHI** is a modular application designed for the automated segmentation, separation, and analysis of cells in large 2D and 3D microscopy datasets. It utilizes memory mapping and chunked processing to handle large volumes, while employing heuristic graph-based algorithms to separate complex, touching cell structures.
-
-## 🚀 Key Features
-
-*   **Memory Management:** Uses `numpy.memmap` and `dask` to process datasets that exceed physical RAM.
-*   **Robust Separation:** Solves the "clumped cell" problem using a custom graph-based merge algorithm that analyzes geometric "necks" and intensity valleys.
-*   **Batch Processing:** "Set and Forget" automated processing of entire experiment folders with crash recovery and resume capability.
-*   **Interactive GUI:** Built on **Napari** and **PyQt5** for visualizing results and tuning parameters step-by-step.
-*   **Modular Workflow:** 6-step pipeline covering everything from raw signal enhancement to multi-channel interaction analysis.
-
----
-
-## 📸 Visual Examples
+**HIBACHI** segments, separates and measures cells in large 2D and 3D microscopy
+datasets. It uses memory mapping and chunked processing to work on volumes larger
+than RAM, and graph-based heuristics to separate touching cells that a watershed
+alone would either merge or over-split.
 
 <p align="center">
-  <img src="assets/example_segmentation.png" alt="HIBACHI Segmentation Example" width="800">
+  <img src="assets/example_segmentation.png" alt="HIBACHI segmentation example" width="900">
   <br>
-  <em>Figure 1: Automated 3D segmentation of fluorescence microglia (colored labels) with closest neighbor (red lines) overlay.</em>
+  <em>Left: raw fluorescence intensity. Centre: separated cells, one colour per
+  cell. Right: skeletonised cells with the shortest distance between neighbours
+  marked in red.</em>
 </p>
 
 ---
 
-## 🛠️ Installation
+## What it does
 
-HIBACHI installs with a **native installer** on Windows and macOS, or a **single command** on Linux. You do **not** need to install Python, conda, or git yourself — the installer sets up a private, self-contained environment. After installation, **HIBACHI updates itself automatically** every time you open it.
-
-### 🪟 Windows
-
-1.  Download **`HIBACHI-Setup.exe`** from the [**latest release**](https://github.com/chesnov/HIBACHI/releases/latest).
-2.  Double-click it and follow the wizard. The first setup downloads the scientific packages (a few hundred MB), so allow a few minutes and keep your internet connection on.
-3.  Launch **HIBACHI** from the Desktop shortcut or Start Menu.
-
-> ℹ️ If Windows shows a blue **"Windows protected your PC"** box, click **More info → Run anyway**. This appears only because the installer is not yet code-signed.
-
-### 🍎 macOS
-
-1.  Download **`HIBACHI.dmg`** from the [**latest release**](https://github.com/chesnov/HIBACHI/releases/latest).
-2.  Open the `.dmg` and drag **HIBACHI** into your **Applications** folder.
-3.  The **first time** you open it, **right-click the app → Open → Open** (needed only once, because the app is not yet notarized). The first launch downloads the packages, so allow a few minutes.
-
-### 🐧 Linux
-
-Open a terminal and paste:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/chesnov/HIBACHI/main/install/install.sh | bash
-```
-
-This builds the environment and adds a launcher to your applications menu / Desktop. Start HIBACHI from there afterwards.
-
-### 🔄 Automatic updates
-
-Each time HIBACHI starts, it briefly checks GitHub for updates and applies them before opening. If you are offline, it simply opens the version you already have — so you never need to reinstall to stay current.
-
-<details>
-<summary><b>Advanced / developer install (run from source)</b></summary>
-
-If you would rather manage the environment yourself (e.g. for development), you need [conda / Miniforge](https://github.com/conda-forge/miniforge) and Git.
-
-```bash
-# 1. Clone the repository
-git clone https://github.com/chesnov/HIBACHI.git
-cd HIBACHI
-
-# 2. Create the environment (all dependencies: Napari, SimpleITK, Dask, ...)
-conda env create -f install/environment.yml
-
-# 3. Run the application
-conda activate hibachi
-python segment.py
-```
-
-To skip the auto-updater while developing, launch with the `HIBACHI_NO_UPDATE=1` environment variable set. The full maintainer guide — branch strategy, building the `.exe`/`.dmg` installers, and code-signing — is in [`INSTALL.md`](INSTALL.md).
-
-</details>
+*   **Works past RAM.** Every intermediate result is a memory-mapped file on
+    disk, so image size is bounded by disk rather than memory.
+*   **Separates clumped cells.** A marker-controlled watershed splits at cell
+    cores, then a graph-based pass re-merges cuts that are not real boundaries,
+    judged on intensity valleys and local contrast.
+*   **Measures.** Morphology, intensity, ramification from skeletons, and
+    surface-to-surface nearest-neighbour distances, per cell.
+*   **Relates channels.** Overlap, containment and proximity between channels,
+    with a Monte-Carlo spatial null to test whether an arrangement differs from
+    random.
+*   **Batches.** Whole projects unattended, with resume after an interruption.
+*   **Interactive.** Built on **napari** and **PyQt5**: tune each step and see the
+    result before committing.
 
 ---
 
-## 📂 Data Preparation & Project Structure
+## Installing
 
-To use the **Batch Processor** and **Automatic Initialization**, your data must be organized specifically.
+You do not need Python, conda or git.
 
-### 1. Input Directory
-Place all your raw images in a single folder. Do not create subfolders yet.
-*   **Supported Formats:** `.tif`, `.tiff`, `.czi` (Carl Zeiss Image).
+*   **Windows** — download `HIBACHI-Setup.exe` from the
+    [latest release](https://github.com/chesnov/HIBACHI/releases/latest) and
+    double-click it.
+*   **macOS** — download `HIBACHI.dmg` from the
+    [latest release](https://github.com/chesnov/HIBACHI/releases/latest) and drag
+    **HIBACHI** to Applications. macOS blocks unsigned apps on first open;
+    [INSTALL.md](INSTALL.md) has the steps to allow it.
+*   **Linux** —
 
-### 2. Metadata (Dimensions)
-HIBACHI requires physical dimensions (voxel size in microns) to perform accurate segmentation. It determines these using the following hierarchy:
+    ```bash
+    curl -fsSL https://raw.githubusercontent.com/chesnov/HIBACHI/main/install/install.sh | bash
+    ```
 
-1.  **CZI Files:** Metadata is automatically extracted from the file header.
-2.  **OME-TIFF Files:** Metadata is extracted from the OME-XML header or standard TIFF resolution tags.
-3.  **Fallback CSV:** If your TIFFs are missing metadata or if you want to override the detected values, provide a `metadata.csv` in the input folder.
+The first run downloads the scientific packages, which takes a few minutes.
+HIBACHI then checks for updates on launch and asks before installing one.
 
-**Optional CSV Format:**
-
-| Filename | Width (um) | Height (um) | Depth (um) |
-| :--- | :--- | :--- | :--- |
-| `image_01.tif` | 1024.5 | 1024.5 | 50.0 |
-| `image_02.tif` | 512.0 | 512.0 | 20.0 |
-
-*   **Width/Height (um)**: Total physical length of the image in X and Y.
-*   **Depth (um)**: Total physical depth (Z-axis). For 2D images, use 0.
-
-### 3. Automatic Initialization
-When you load this folder in the GUI for the first time:
-1.  HIBACHI will detect the flat structure.
-2.  It will ask to **Organize** the project.
-    *   *Note:* If using `.czi` or multi-channel `.tif` files, it will ask which channel you wish to extract and analyze.
-3.  It will move (or extract) every image into its own subfolder (e.g., `./image_01/image_01.tif`).
-4.  It will generate a `processing_config.yaml` for each image, pre-filled with the voxel dimensions detected from the file or the CSV.
+**[INSTALL.md](INSTALL.md)** covers troubleshooting, environment variables,
+rolling back to an earlier version, uninstalling, and releasing.
 
 ---
 
-## 🧠 Processing Workflow
+## Getting started
 
-The pipeline consists of 6 modular steps. You can tune parameters for each step via the GUI sidebar.
+1.  Put your images in a folder.
+2.  Open that folder in HIBACHI — drag it onto the welcome screen, or use
+    **Browse**.
+3.  HIBACHI offers to set it up as a project: pick a starting config per channel,
+    and confirm the physical dimensions if it cannot read them from the files.
+4.  Open one image, tune the five steps, then process the rest as a batch.
 
-1.  **Raw Segmentation:** Uses Hessian filters (Frangi/Sato) to detect tubular structures and global thresholding for volume.
-2.  **Edge Trimming:** Generates a convex hull around the tissue and removes artifacts caused by edge damage/fluorescence.
-3.  **Soma Extraction:** "Peels" the binary mask using iterative erosion to find the core seeds (cell bodies) within dense clumps.
-4.  **Cell Separation:** Uses the seeds from Step 3 to perform a Marker-Controlled Watershed on the remaining mask, followed by a graph-based merge to fix over-segmentation.
-5.  **Feature Calculation:** Computes Volume/Area, Shape factors, Skeleton/Ramification stats, and Pairwise Distances.
-6.  **Interaction Analysis:** Analyzes spatial overlap and distance between the segmented cells and a reference channel (e.g., Plaques, Vessels).
+Readable formats: **TIFF**, **Zeiss CZI**, **Leica LIF**, and whole-slide formats
+(**VSI**, **SVS**, **NDPI**, **SCN**, **AFI**, **QPTIFF**, **ZVI**, **OME-TIFF**,
+**DICOM**). A slide or `.lif` holding several acquisitions becomes several
+samples.
 
----
+Physical dimensions come from a metadata CSV if you supply one, otherwise from
+the file's own metadata. When neither has them, HIBACHI asks rather than
+assuming — every size, distance and density depends on them. Each config records
+where its dimensions came from.
 
-## 📚 Documentation (Wiki)
-
-Detailed documentation for the architecture, logic, and parameter tuning of each module can be found in the `wiki/` folder.
-
-### Core Application
-*   **[Entry Point (segment.py)](wiki/segment.md):** Application bootstrap and error handling.
-*   **[GUI Manager (gui_manager.py)](wiki/gui_manager.md):** Manages the sidebar interactions and state.
-*   **[Batch Processor (batch_processor.py)](wiki/batch_processor.md):** Logic for iterating over folders and managing headless processing.
-*   **[Strategies (processing_strategies.py)](wiki/processing_strategies.md):** The controller logic managing data flow between steps.
-
-### The Pipeline (Step-by-Step)
-*   **[Step 1: Raw Segmentation](wiki/initial_segmentation.md):** Tubular enhancement and thresholding logic.
-*   **[Step 2: Edge Trimming](wiki/remove_artifacts.md):** Convex hull and boundary cleaning.
-*   **[Step 3: Soma Extraction](wiki/soma_extraction.md):** **(Read for Tuning)** How to detect cell seeds.
-*   **[Step 4: Cell Separation](wiki/cell_splitting.md):** **(Read for Tuning)** How to split touching cells and fix straight-line artifacts.
-*   **[Step 5: Features](wiki/calculate_features.md):** Metrics, skeletonization, and distance mapping.
-*   **[Step 6: Interactions](wiki/interaction_analysis.md):** Multi-channel overlap and proximity analysis.
-
-### Utilities
-*   **[Helpers (segmentation_helpers.py)](wiki/segmentation_helpers.md):** Shared math and system utilities.
+See **[Project setup](wiki/project_setup.md)** for the details.
 
 ---
 
-## 📄 Outputs
+## The pipeline
 
-For every image, the following files are generated in `image_folder/image_name_processed_MODE/`:
+Five steps, each tunable in the sidebar with the result visible before you move
+on.
 
-*   `final_segmentation_*.dat`: The final integer label mask (Memmap).
-*   `metrics_df_*.csv`: Spreadsheet containing Volume, Depth, Shape, Neighbor, and Skeleton stats per cell.
-*   `skeleton_array_*.dat`: Visualization of the 1-pixel skeletons.
-*   `cell_bodies.dat`: Intermediate mask of detected seeds.
-*   `points_matrix_*.csv`: Data used to draw neighbor connection lines.
-*   `interaction_*.csv`: Statistics regarding overlap with reference channels.
-*   `processing_config_*.yaml`: A record of the exact parameters used for this run.
+| Step | Does |
+| :--- | :--- |
+| **1. Raw segmentation** | Multi-scale Hessian (Frangi/Sato) tubularity plus intensity thresholding, one threshold per scale, OR-merged |
+| **2. Edge trimming** | Builds a per-slice tissue hull and removes objects damaged at the tissue edge |
+| **3. Soma extraction** | Finds one core seed per cell by distance-transform peeling and intensity percentiles |
+| **4. Cell separation** | Watershed from those seeds, then a graph pass that re-merges cuts which are not real boundaries |
+| **5. Feature calculation** | Morphology, intensity, skeleton ramification, nearest-neighbour distances |
+
+Beyond the per-channel pipeline:
+
+*   **[Cross-Channel Analyzer](wiki/cross_channel_analysis.md)** — build a recipe
+    of intersections, size filters and distance analyses, and run it across the
+    project.
+*   **[Spatial Null](wiki/spatial_null.md)** — re-place the real masks at random
+    in the same tissue to test whether an observed arrangement is non-random.
+*   **[Sub-regions](wiki/roi_regions.md)** — draw a polygon and treat it as an
+    image of its own, for fast tuning or for analysing part of a sample.
+
+---
+
+## Outputs
+
+Per image, in `<image>_processed_<mode>/`:
+
+| File | Contents |
+| :--- | :--- |
+| `metrics_df_<mode>.csv` | One row per cell: morphology, intensity, skeleton and neighbour metrics |
+| `analysis_summary_<mode>.csv` | One row per image: analysed extent, object count, densities |
+| `final_segmentation_<mode>.dat` | The per-cell label mask |
+| `skeleton_array_<mode>.dat` | One-voxel-wide skeletons |
+| `branch_data_<mode>.csv` | Per-branch skeleton statistics |
+| `distances_matrix_<mode>.csv` | Full pairwise surface-to-surface distances |
+| `points_matrix_<mode>.csv` | Closest-approach coordinates, used for the red lines above |
+| `metrics_<mode>.fcs` | The numeric columns, for flow-cytometry tools |
+| `processing_config_<mode>.yaml` | The exact parameters used, with the pipeline version |
+
+Cross-channel results go to `<project>/RELATIONAL_ANALYSIS/<analysis>/`, with a
+`MASTER_RELATIONAL_RESULTS.csv` across samples.
+
+---
+
+## Documentation
+
+In `wiki/`.
+
+**Getting started**
+*   [Project setup](wiki/project_setup.md) — opening projects, formats, physical
+    dimensions
+*   [Tuning workflow](wiki/tuning_workflow.md) — how to approach the parameters
+
+**The five steps**
+*   [Step 1: Raw segmentation](wiki/initial_segmentation.md)
+*   [Step 2: Edge trimming](wiki/remove_artifacts.md)
+*   [Step 3: Soma extraction](wiki/soma_extraction.md) — *read before tuning*
+*   [Step 4: Cell separation](wiki/cell_splitting.md) — *read before tuning*
+*   [Step 5: Feature calculation](wiki/calculate_features.md)
+
+**Beyond one channel**
+*   [Cross-Channel Analyzer](wiki/cross_channel_analysis.md)
+*   [Spatial Null](wiki/spatial_null.md)
+*   [Sub-regions](wiki/roi_regions.md)
+
+**Working at scale**
+*   [Batch processing](wiki/batch_processor.md)
+*   [Config Library](wiki/config_library.md) — reusing tuned configs across
+    projects
+
+**Reference**
+*   [Strategies](wiki/processing_strategies.md) — how the steps are wired together
+*   [GUI Manager](wiki/gui_manager.md) — navigation, dirty state, ROI sessions
+*   [`segment.py`](wiki/segment.md) — startup and diagnostics ordering
+*   [Helpers](wiki/segmentation_helpers.md) — shared numerical utilities
+*   [Diagnostics](wiki/diagnostics.md) — logs, crash reports, troubleshooting
+*   [INSTALL.md](INSTALL.md) — installing, environment variables, releasing
