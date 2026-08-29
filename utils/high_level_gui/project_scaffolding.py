@@ -931,6 +931,37 @@ def _probe_pixel_counts_quiet(path: str) -> Dict[str, int]:
     return {}
 
 
+def _extractable_sources(drctry: str,
+                         only_files: Optional[Sequence[str]] = None
+                         ) -> List[str]:
+    """Source keys in `drctry` that need extracting rather than moving.
+
+    Returns keys (so one slide or Zarr store contributes one entry per scene or
+    array), excluding plain TIFFs, which the caller handles by moving. Restricted
+    to `only_files` when the caller narrowed the selection.
+    """
+    try:
+        from .organize_wizard import detect_raw
+    except Exception:
+        return []
+    try:
+        detected = list(detect_raw(drctry).get("files") or [])
+    except Exception:
+        return []
+
+    if only_files is not None:
+        wanted = {os.path.basename(str(f)) for f in only_files}
+        detected = [k for k in detected if os.path.basename(str(k)) in wanted]
+
+    out: List[str] = []
+    for key in detected:
+        name = str(key).split("::", 1)[0].rstrip("/\\").lower()
+        if name.endswith(('.tif', '.tiff')):
+            continue          # a finished TIFF: moved, not extracted
+        out.append(key)
+    return out
+
+
 def organize_processing_dir(
     drctry: str,
     preset_details: Dict[str, str],
@@ -976,18 +1007,41 @@ def organize_processing_dir(
     csv_files = [f for f in all_files
                  if f.lower().endswith('.csv') and not _is_generated_csv(f)]
 
+    # ---------------------------------------------------------------------- #
+    # Sources that must be EXTRACTED rather than moved
+    # ---------------------------------------------------------------------- #
+    # This path is the legacy one: it MOVES a finished TIFF into a per-image
+    # subfolder. Everything else HIBACHI reads -- Zarr stores, whole-slide
+    # files, .lif, .czi -- has to have a channel extracted to a TIFF first,
+    # which is what organize_channel_project already does. Three separate
+    # assumptions downstream make widening the filter above insufficient on its
+    # own: the auto-generate branch calls read_tiff_metadata, probes pixel
+    # dimensions with tiff.imread, and then shutil.move()s the source. So those
+    # sources are delegated to the extraction path instead of being reimplemented
+    # here.
+    #
+    # Before this, a folder of Zarr stores (or slides, or .lif) reached the check
+    # below and raised "No .tif or .tiff files found." -- true, but useless: the
+    # folder was full of images the app had just finished listing correctly.
+    # Only .czi got a message that said what to do about it.
+    extractable = _extractable_sources(drctry, only_files)
+    extract_summary: Optional[Dict[str, Any]] = None
+    if extractable:
+        print(f"  {len(extractable)} source(s) need channel extraction; "
+              "routing them through the extraction path.")
+        extract_summary = organize_channel_project(
+            extractable, drctry, drctry, 0, preset_details,
+            manual_overrides=manual_overrides,
+        )
+
     if not raw_images:
-        # Single-channel setup reads TIFFs directly; .czi is only handled by the
-        # multi-channel path, which extracts each channel to a TIFF first. Say so,
-        # rather than reporting a bare "no files found" over a folder of .czi.
-        czi = [f for f in all_files if f.lower().endswith('.czi')]
-        if czi:
-            raise ValueError(
-                f"This folder contains {len(czi)} .czi file(s) but no .tif/.tiff "
-                "files. Set it up as a multi-channel project so each channel is "
-                "extracted to a TIFF first."
-            )
-        raise ValueError('No .tif or .tiff files found.')
+        if extract_summary is not None:
+            # Nothing else to do: every source in this folder was extractable.
+            return extract_summary
+        raise ValueError(
+            'No readable images found. Single-channel setup organizes .tif / '
+            '.tiff files; nothing in this folder could be read as an image.'
+        )
 
     # 1. Handle DataFrame
     df = None
@@ -1301,7 +1355,7 @@ def organize_processing_dir(
     # nothing at all. Returning normally there reports success to the caller,
     # which re-classifies the still-unorganized folder and re-opens the wizard --
     # the reported loop. Raise so the user sees what went wrong instead.
-    if not organized_dirs:
+    if not organized_dirs and extract_summary is None:
         detail = ""
         if missing_files:
             examples = ", ".join(missing_files[:3])
@@ -1316,4 +1370,15 @@ def organize_processing_dir(
         )
 
     summary['organized'] = organized_dirs
+    if extract_summary is not None:
+        # A mixed folder (TIFFs beside stores or slides) is organized by both
+        # halves of this function, so the two summaries are merged rather than
+        # one silently replacing the other -- the wizard's "dimensions were
+        # recorded in pixels" warning reads 'unscaled', and dropping either half
+        # would under-report it.
+        summary['organized'] = list(extract_summary.get('organized') or []) \
+            + organized_dirs
+        summary['unscaled'] = list(extract_summary.get('unscaled') or []) \
+            + list(summary.get('unscaled') or [])
+        summary['csv'] = summary.get('csv') or extract_summary.get('csv')
     return summary
