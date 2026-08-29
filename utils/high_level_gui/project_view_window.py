@@ -843,10 +843,10 @@ class ProjectViewWindow(QMainWindow):
                 self, "Project setup did not complete",
                 "This folder has no organized images yet, so there is no "
                 "existing configuration to copy for a new one.\n\n"
-                "That normally means project setup was cancelled or dismissed "
-                "before it finished -- if the images carry no pixel size, setup "
-                "asks for the physical dimensions first, and closing that "
-                "prompt stops the run.\n\n"
+                "Either project setup was never offered for this folder, or it "
+                "was cancelled before it finished. If the images carry no pixel "
+                "size, setup asks for the physical dimensions first, and "
+                "closing that prompt stops the run.\n\n"
                 "Open this folder again to restart setup.")
             return
 
@@ -1016,13 +1016,33 @@ class ProjectViewWindow(QMainWindow):
                 return
 
             # Not organized yet -- are there raw images to set up into a project?
+            #
+            # This gate decides whether the setup wizard is offered AT ALL, so an
+            # image it cannot see is an image the user can never set up. It used
+            # to require os.path.isfile, which is false for every Zarr store
+            # because a store is a DIRECTORY -- so a folder of stores fell
+            # through to "nothing to organize", the wizard never appeared, and
+            # the only thing the user saw was the unrelated dropped-file prompt
+            # that runs afterwards. is_image_path answers for files and stores
+            # alike; project_selection and organize_wizard use it for the same
+            # reason.
             from .gui_text_utils import is_os_sidecar
             from .project_selection import _RAW_IMAGE_EXTS as _LOADABLE_RAW_EXTS
+            try:
+                from .slide_formats import is_image_path as _is_image_path
+            except Exception:
+                _is_image_path = None
+
+            def _loadable(name: str) -> bool:
+                full = os.path.join(selected_path, name)
+                if _is_image_path is not None:
+                    return bool(_is_image_path(full))
+                return (name.lower().endswith(_LOADABLE_RAW_EXTS)
+                        and os.path.isfile(full))
+
             raw_files = [
                 f for f in os.listdir(selected_path)
-                if f.lower().endswith(_LOADABLE_RAW_EXTS)
-                and os.path.isfile(os.path.join(selected_path, f))
-                and not is_os_sidecar(f)
+                if _loadable(f) and not is_os_sidecar(f)
             ]
             if raw_files:
                 # Re-entry guard. When setup succeeds, this folder is a project, so
