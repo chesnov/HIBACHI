@@ -11,6 +11,23 @@ from tqdm import tqdm
 
 # Import shared helpers
 try:
+    from .streaming_stats import accumulate_label_statistics
+    from .streaming_passes import (
+        accumulate_label_soma_map,
+        apply_label_mapping,
+        global_merge_pass,
+        merge_undersized_streaming,
+    )
+except ImportError:  # pragma: no cover - direct script execution
+    from streaming_stats import accumulate_label_statistics
+    from streaming_passes import (
+        accumulate_label_soma_map,
+        apply_label_mapping,
+        global_merge_pass,
+        merge_undersized_streaming,
+    )
+
+try:
     from .segmentation_helpers import (
         flush_print,
         _watershed_with_simpleitk,
@@ -23,6 +40,85 @@ except ImportError:
         _watershed_with_simpleitk,
         distance_transform_edt
     )
+
+
+def _soma_first_chunk_order(
+    n_chunks: int,
+    shape_in_chunks: Tuple[int, int, int],
+    chunk_slices: List[Tuple[slice, slice, slice]],
+    soma_locs: List[Optional[Tuple[slice, slice, slice]]],
+    relevant_soma_ids: Set[int],
+) -> List[int]:
+    """
+    Order in which to visit chunks: breadth-first outward from the chunks that hold
+    somata, instead of raster order.
+
+    Order did not matter before, because every chunk was solved in isolation. It
+    matters now: a chunk can only continue a cut if a neighbour has already been
+    resolved, so the sweep has to start where the information is -- the chunks
+    holding two or more somata of one cell, which are the only places the merge
+    tests are meaningful -- and radiate outward from there. Breadth-first also keeps
+    the two sides of a contested region roughly balanced, so their claims meet near
+    the real contact rather than one cell racing down the other's arbor.
+
+    Chunks with one soma seed the sweep next, and anything still unvisited is
+    appended in raster order, so no chunk is ever skipped.
+    """
+    from collections import deque
+
+    # Which somata land in which chunk, from bounding boxes the caller already has.
+    per_chunk: List[Set[int]] = [set() for _ in chunk_slices]
+    for s_idx, s_slice in enumerate(soma_locs):
+        if s_slice is None:
+            continue
+        soma_id = s_idx + 1
+        if soma_id not in relevant_soma_ids:
+            continue
+        for i, cs in enumerate(chunk_slices):
+            if all(a.start < b.stop and b.start < a.stop for a, b in zip(s_slice, cs)):
+                per_chunk[i].add(soma_id)
+    counts = [len(s) for s in per_chunk]
+
+    def neighbours(index: int) -> List[int]:
+        cz, cy, cx = np.unravel_index(index, shape_in_chunks)
+        out = []
+        for dz in (-1, 0, 1):
+            for dy in (-1, 0, 1):
+                for dx in (-1, 0, 1):
+                    if dz == dy == dx == 0:
+                        continue
+                    nz, ny, nx = int(cz) + dz, int(cy) + dy, int(cx) + dx
+                    if not (0 <= nz < shape_in_chunks[0]):
+                        continue
+                    if not (0 <= ny < shape_in_chunks[1]):
+                        continue
+                    if not (0 <= nx < shape_in_chunks[2]):
+                        continue
+                    out.append(int(np.ravel_multi_index((nz, ny, nx), shape_in_chunks)))
+        return out
+
+    order: List[int] = []
+    visited: Set[int] = set()
+
+    def sweep(sources: List[int]) -> None:
+        q = deque()
+        for s in sources:
+            if s not in visited:
+                visited.add(s)
+                q.append(s)
+        while q:
+            i = q.popleft()
+            order.append(i)
+            for nb in neighbours(i):
+                if nb not in visited:
+                    visited.add(nb)
+                    q.append(nb)
+
+    sweep(sorted([i for i in range(n_chunks) if counts[i] >= 2],
+                 key=lambda i: (-counts[i], i)))
+    sweep(sorted([i for i in range(n_chunks) if counts[i] == 1]))
+    sweep(list(range(n_chunks)))
+    return order
 
 
 def _get_chunk_slices(
@@ -209,10 +305,39 @@ def _build_adjacency_graph_for_cell(
     min_local_intensity_difference: float,
     min_path_intensity_ratio_heuristic: float,
     max_interface_to_cell_mean_ratio: float = 0.85,
+    node_seed_tags: Optional[Dict[int, Set[int]]] = None,
+    require_local_somas: bool = False,
 ) -> Tuple[Dict[int, Any], Dict[Tuple[int, int], Any]]:
     """
     Builds a Region Adjacency Graph (RAG) for segments within a single cell.
     Returns nodes and edges with merge metrics.
+
+    ``node_seed_tags`` is a fallback for ``orig_somas``: {segment label -> set of
+    seed ids}. A segment grown from a marker inherited from a neighbouring chunk
+    belongs to a real cell whose soma may sit in a different chunk entirely, so
+    ``soma_mask_local`` shows nothing inside it. Without the fallback that segment
+    would report no somas, ``ref_intensity`` would collapse to the 1.0 default, and
+    both merge tests would be evaluated against a meaningless reference. The tag
+    restores the intended semantics -- interface brightness measured against the
+    somata of the two cells involved -- for interfaces the worker could not
+    previously produce at all.
+
+    ``require_local_somas`` records an interface as KEEP without scoring it when
+    either side has no soma in this crop. Measured reason: a chunk that only inherited
+    markers can produce a boundary in the middle of bright tissue (the landscape uses
+    `d_seeds`, which places it midway between the marker regions rather than at a
+    valley). The interface tests then correctly report *** BRIGHT CUT *** and merge --
+    and because merging unions the seed sets, that one verdict propagates over the
+    whole volume and fuses two genuinely separate cells. On a control scene where the
+    split is unambiguous this happened in 3 of 5 tilings.
+
+    So merge decisions are confined to the chunks that can actually judge them, next
+    to the somata. The cost is that two spurious seeds on one real cell whose somata
+    land in different chunks are no longer rejoined by the levers; that case wants a
+    single global pass over the assembled volume, which is what the streaming
+    aggregates in `streaming_stats.py` are for.
+
+    Leaving both arguments at their defaults reproduces the previous behaviour exactly.
     """
     nodes = {}
     edges = {}
@@ -229,9 +354,13 @@ def _build_adjacency_graph_for_cell(
     for lbl in seg_lbls:
         mask = (current_cell_segments_mask_local == lbl)
         seeds_inside = np.unique(soma_mask_local[mask])
+        somas_present = [s for s in seeds_inside if s > 0]
+        if not somas_present and node_seed_tags:
+            # Segment grown from an inherited marker: its soma is in another chunk.
+            somas_present = sorted(node_seed_tags.get(int(lbl), ()))
         nodes[lbl] = {
             'volume': np.sum(mask),
-            'orig_somas': [s for s in seeds_inside if s > 0]
+            'orig_somas': somas_present
         }
 
     # Find Edges and Calculate Metrics
@@ -261,6 +390,18 @@ def _build_adjacency_graph_for_cell(
             # Reference intensity: mean of somas involved
             somas_A = nodes[lbl_A]['orig_somas']
             somas_B = nodes[lbl_B]['orig_somas']
+
+            if require_local_somas and not (
+                np.any(soma_mask_local[mask_A] > 0)
+                and np.any(soma_mask_local[mask_B] > 0)
+            ):
+                # Propagated interface: not judgeable here. Keep the cut.
+                edges[edge_key] = {
+                    'should_merge_decision': False,
+                    'reason': 'propagated_interface_not_scored',
+                }
+                continue
+
             all_somas = somas_A + somas_B
             soma_ints = [
                 soma_props_for_cell[s]['mean_intensity']
@@ -289,11 +430,31 @@ def _separate_multi_soma_cells_chunk(
     spacing: Optional[Tuple[float, float, float]],
     label_offset: int,
     multi_soma_cell_labels_list: List[int],
+    prior_labels: Optional[np.ndarray] = None,
+    prior_seed_map: Optional[Dict[int, Set[int]]] = None,
     **kwargs
 ) -> Tuple[np.ndarray, Dict, Dict[int, Set[int]]]:
     """
     Worker: Separates multi-soma cells within a specific 3D chunk.
-    
+
+    ``prior_labels`` / ``prior_seed_map`` (both optional) carry what neighbouring,
+    already-processed chunks decided: the labels they wrote inside this chunk's
+    extent, and the seed set each of those labels was tagged with. They are used as
+    additional watershed markers.
+
+    This is what lets a cut travel. A chunk holding fewer than two of a cell's somas
+    used to take the ``len(seeds_in_crop) < 2`` shortcut and dump its entire piece of
+    the cell into one untagged label, so a boundary computed where the somas are
+    stopped at the first chunk wall and the stitcher had no seed information to keep
+    the two cells apart. With the neighbours' labels acting as markers, and their
+    seed tags carried onto the labels they produce, the existing seed-aware stitcher
+    does the rest.
+
+    When no priors are supplied every code path below reduces to what it was: the
+    identity count equals ``len(seeds_in_crop)``, markers are numbered in the same
+    order, and the emitted seed tags are the same sets. A single-chunk run is
+    therefore unchanged.
+
     Returns:
         chunk_result: The processed sub-volume labels.
         (unused dict),
@@ -348,14 +509,79 @@ def _separate_multi_soma_cells_chunk(
         seeds_in_crop = np.unique(local_soma[local_mask])
         seeds_in_crop = seeds_in_crop[seeds_in_crop > 0]
 
-        # Case: < 2 seeds visible in this chunk? Treat as single object.
-        if len(seeds_in_crop) < 2:
+        # ---- INHERITED MARKERS -------------------------------------------------
+        # Labels a neighbouring chunk already resolved inside this crop, each with
+        # the seed set it was tagged with. Two markers belong to the same cell when
+        # their seed sets overlap, so seeds are grouped by union-find and one marker
+        # is emitted per group. A prior with no tag (a chunk that itself had nothing
+        # to go on) carries no claim and is ignored.
+        seed_parent: Dict[int, int] = {}
+
+        def _find_seed(x: int) -> int:
+            seed_parent.setdefault(x, x)
+            while seed_parent[x] != x:
+                seed_parent[x] = seed_parent[seed_parent[x]]
+                x = seed_parent[x]
+            return x
+
+        def _union_seeds(a: int, b: int) -> None:
+            ra, rb = _find_seed(a), _find_seed(b)
+            if ra != rb:
+                seed_parent[max(ra, rb)] = min(ra, rb)
+
+        for s_id in seeds_in_crop:
+            _find_seed(int(s_id))
+
+        prior_tags: Dict[int, Set[int]] = {}
+        local_prior = None
+        if prior_labels is not None and prior_seed_map:
+            local_prior = prior_labels[bbox_padded]
+            for p in np.unique(local_prior[local_mask]):
+                p = int(p)
+                if p <= 0:
+                    continue
+                tag = {int(t) for t in (prior_seed_map.get(p) or ())}
+                if not tag:
+                    continue
+                prior_tags[p] = tag
+                tag_list = sorted(tag)
+                for t in tag_list[1:]:
+                    _union_seeds(tag_list[0], t)
+
+        # One identity per seed group. Seeds physically present are indexed first so
+        # that, with no priors, marker numbering is exactly what it always was.
+        identity_index: Dict[int, int] = {}
+        identity_seeds: List[Set[int]] = []
+
+        def _identity_of(seed: int) -> int:
+            root = _find_seed(int(seed))
+            idx = identity_index.get(root)
+            if idx is None:
+                identity_seeds.append(set())
+                idx = len(identity_seeds)
+                identity_index[root] = idx
+            return idx
+
+        for s_id in seeds_in_crop:
+            identity_seeds[_identity_of(int(s_id)) - 1].add(int(s_id))
+        for p, tag in prior_tags.items():
+            identity_seeds[_identity_of(sorted(tag)[0]) - 1] |= tag
+
+        n_identities = len(identity_seeds)
+
+        # Case: fewer than 2 cells to tell apart here? Treat as single object.
+        # Unchanged, except that the label now inherits the seed tags of whatever
+        # reached it, so the stitcher can still tell whose piece this is.
+        if n_identities < 2:
             new_label = next_local_label
             chunk_view = chunk_result[bbox_padded]
             chunk_view[local_mask] = new_label
             chunk_result[bbox_padded] = chunk_view
-            
-            label_to_seeds_map[new_label] = set(seeds_in_crop)
+
+            inherited: Set[int] = set(int(s) for s in seeds_in_crop)
+            for tag in prior_tags.values():
+                inherited |= tag
+            label_to_seeds_map[new_label] = inherited
             next_local_label += 1
             continue
 
@@ -391,13 +617,27 @@ def _separate_multi_soma_cells_chunk(
                             f"int_frac_of_brightest={int_ratio:.2f} | "
                             f"size_frac_of_largest={size_ratio:.2f}{flag_str}")
 
+        # Somata belonging to an inherited marker sit outside this chunk, so their
+        # intensity is taken from the global table the coordinator already computes.
+        # The merge tests need it for `ref_intensity`; without it they would score a
+        # propagated interface against the 1.0 fallback.
+        _global_int = kwargs.get('global_soma_intensities', {})
+        for _tag in identity_seeds:
+            for _s in _tag:
+                if _s not in soma_props and _s in _global_int:
+                    soma_props[_s] = {'mean_intensity': _global_int[_s]}
+
         # A. Seeded Watershed
         # Use SimpleITK helper for speed/memory efficiency
         
         # First, generate the markers (seeds)
+        # Inherited regions go down first so that a soma always outranks them where
+        # they overlap. With no priors this is the original two-line loop.
         markers = np.zeros_like(local_mask, dtype=np.int32)
-        for idx, s_id in enumerate(seeds_in_crop):
-            markers[local_soma == s_id] = idx + 1
+        for p, tag in prior_tags.items():
+            markers[(local_prior == p) & local_mask] = _identity_of(sorted(tag)[0])
+        for s_id in seeds_in_crop:
+            markers[local_soma == s_id] = _identity_of(int(s_id))
 
         # ---- LANDSCAPE GENERATION ----
         # NOTE: We do NOT use d_seeds = distance_transform_edt(markers == 0) in the
@@ -450,7 +690,25 @@ def _separate_multi_soma_cells_chunk(
         # 5. Final Landscape
         # speed_power = 1.5 slightly increases the penalty of thin necks to prevent Voronoi cuts.
         speed_power = kwargs.get('speed_power', 1.5)
-        landscape = d_seeds / (speed ** speed_power)
+        if prior_tags and kwargs.get('propagated_pure_cost', True):
+            # Chunks with an inherited marker only. `d_seeds` measures straight-line
+            # distance from the nearest marker, which is a reasonable proxy while
+            # every marker is a point-like soma. An inherited marker is a whole
+            # region, so between two of them the boundary lands at the Euclidean
+            # midpoint -- typically in the middle of bright tissue rather than at the
+            # dark contact. Measured consequence: the interface tests then correctly
+            # report `cell_mean_ratio=0.9488 *** BRIGHT CUT ***` and merge, and two
+            # genuinely separate cells fuse. On a control scene where the split is
+            # unambiguous, switching this branch to the pure cost field is the
+            # difference between the pipeline returning 1 cell and returning 2.
+            #
+            # This is the formulation the comment block above already prescribes.
+            # Nothing tuned changes: chunks whose markers are all somata keep
+            # `d_seeds / speed**p` exactly, and this branch did not exist before.
+            # Set `propagated_pure_cost=False` to fall back.
+            landscape = 1.0 / (speed ** speed_power)
+        else:
+            landscape = d_seeds / (speed ** speed_power)
 
         ws_local = _watershed_with_simpleitk(landscape, markers)
         ws_local[~local_mask] = 0
@@ -460,8 +718,10 @@ def _separate_multi_soma_cells_chunk(
         flush_print(f"  [PROFILE|WS] watershed output: labels={ws_ids} | voxel_counts={ws_counts}")
         cell_mean_int = float(np.mean(local_intensity[local_mask]))
         for ws_id, ws_cnt in zip(ws_ids, ws_counts):
-            seed_id = seeds_in_crop[ws_id - 1] if (ws_id - 1) < len(seeds_in_crop) else '?'
-            soma_int = soma_props.get(seed_id, {}).get('mean_intensity', float('nan'))
+            _ident = sorted(identity_seeds[ws_id - 1]) if (ws_id - 1) < len(identity_seeds) else []
+            seed_id = _ident[0] if len(_ident) == 1 else (_ident or '?')
+            _ref_seed = _ident[0] if _ident else None
+            soma_int = soma_props.get(_ref_seed, {}).get('mean_intensity', float('nan'))
             basin_mask = ws_local == ws_id
             basin_mean = float(np.mean(local_intensity[basin_mask]))
             # Fraction of voxels in this basin that are brighter than the cell mean.
@@ -497,6 +757,8 @@ def _separate_multi_soma_cells_chunk(
             kwargs.get('min_local_intensity_difference', 0.0),
             kwargs.get('min_path_intensity_ratio', 1.0),
             kwargs.get('max_interface_to_cell_mean_ratio', 0.85),
+            node_seed_tags={i + 1: s for i, s in enumerate(identity_seeds)},
+            require_local_somas=True,
         )
 
         # [PROFILING] Summarize what the graph decided before any merging happens.
@@ -509,7 +771,7 @@ def _separate_multi_soma_cells_chunk(
         for edge_key, edge_val in keep_edges:
             flush_print(f"    [PROFILE|GRAPH] KEEP:  {edge_key}")
 
-        merge_map = {i: i for i in range(len(seeds_in_crop) + 2)}
+        merge_map = {i: i for i in range(n_identities + 2)}
         for (id_a, id_b), metrics in edges.items():
             if metrics['should_merge_decision']:
                 root_a, root_b = merge_map[id_a], merge_map[id_b]
@@ -589,7 +851,15 @@ def _separate_multi_soma_cells_chunk(
             mask_l = (final_local_mask_clean == local_id)
             
             seeds_in_segment = np.unique(local_soma[mask_l])
-            seeds_in_segment_set = set(seeds_in_segment[seeds_in_segment > 0])
+            seeds_in_segment_set = set(
+                int(s) for s in seeds_in_segment[seeds_in_segment > 0]
+            )
+            # Plus the seed sets of any markers inside this segment. With no priors
+            # every marker is a soma voxel, so this adds nothing and the tag is the
+            # same set as before.
+            for _mid in np.unique(markers[mask_l]):
+                if _mid > 0 and (_mid - 1) < len(identity_seeds):
+                    seeds_in_segment_set |= identity_seeds[_mid - 1]
             
             global_lbl = next_local_label
             chunk_result_view[mask_l] = global_lbl
@@ -980,10 +1250,38 @@ def separate_multi_soma_cells(
     )
     chunk_data = {}  # Stores (path, shape, seed_map)
 
+    chunk_grid = (
+        len(range(0, segmentation_mask.shape[0], max(1, chunk_shape[0] - overlap))),
+        len(range(0, segmentation_mask.shape[1], max(1, chunk_shape[1] - overlap))),
+        len(range(0, segmentation_mask.shape[2], max(1, chunk_shape[2] - overlap))),
+    )
+    relevant_somas: Set[int] = set()
+    for _c in multi_soma_labels:
+        relevant_somas |= set(cell_to_somas.get(_c, set()))
+    chunk_order = _soma_first_chunk_order(
+        len(chunk_slices), chunk_grid, chunk_slices, soma_locs, relevant_somas
+    )
+
+    # Running record of what has been decided so far, so a chunk can pick up its
+    # neighbours' cuts and continue them. Labels only -- the .npy files, the
+    # stitcher and everything downstream are untouched.
+    prior_path = os.path.join(memmap_dir, f"prior_{os.getpid()}.mmp")
+    prior_mask = np.memmap(
+        prior_path, dtype=np.int32, mode='w+', shape=segmentation_mask.shape
+    )
+    prior_mask[:] = 0
+    prior_seed_map: Dict[int, Set[int]] = {}
+
     flush_print(f"  Processing {len(chunk_slices)} chunks...")
+    flush_print(
+        f"  [PROFILE|ORDER] visiting soma-bearing chunks first "
+        f"({sum(1 for i in chunk_order[:len(chunk_slices)] if True)} chunks, "
+        f"grid={chunk_grid}), then radiating outward"
+    )
 
     try:
-        for i, sl in enumerate(tqdm(chunk_slices, desc="Processing Chunks")):
+        for i in tqdm(chunk_order, desc="Processing Chunks"):
+            sl = chunk_slices[i]
             seg_chunk = segmentation_mask[sl]
             int_chunk = intensity_volume[sl]
             soma_chunk = soma_mask[sl]
@@ -991,19 +1289,37 @@ def separate_multi_soma_cells(
             # Use large offsets to avoid ID collisions between chunks initially
             chunk_offset = (i + 1) * 1_000_000
 
+            prior_chunk = np.array(prior_mask[sl])
+
             res, _, seed_map = _separate_multi_soma_cells_chunk(
                 seg_chunk, int_chunk, soma_chunk,
-                spacing, chunk_offset, multi_soma_labels, 
+                spacing, chunk_offset, multi_soma_labels,
+                prior_labels=prior_chunk,
+                prior_seed_map=prior_seed_map,
                 global_offset=(sl[0].start, sl[1].start, sl[2].start), # <--- NEW
                 **kwargs
             )
+            del prior_chunk
 
             path = os.path.join(memmap_dir, f"chunk_{i}_{os.getpid()}.npy")
             np.save(path, res)
 
             chunk_data[i] = {'path': path, 'shape': res.shape, 'seed_map': seed_map}
-            del res # Free RAM immediately
+            prior_seed_map.update(seed_map)
+
+            # First writer wins, so a decision already taken stays put and the
+            # markers handed to later chunks do not shift under them.
+            prior_view = prior_mask[sl]
+            _fill = (prior_view == 0) & (res > 0)
+            prior_view[_fill] = res[_fill]
+            prior_mask[sl] = prior_view
+
+            del res, prior_view, _fill # Free RAM immediately
             gc.collect()
+
+        del prior_mask
+        if os.path.exists(prior_path):
+            os.remove(prior_path)
 
         # 3. Seed-Aware Stitching Logic
         flush_print("  Stitching with Transitive Seed Verification...")
@@ -1336,19 +1652,73 @@ def separate_multi_soma_cells(
         if os.path.exists(final_path):
             os.remove(final_path)
 
+        # Aggregates for every pass below: label sizes, intensity sums, and the
+        # adjacency graph with each interface's bounding box. One bounded-memory
+        # sweep replaces the whole-volume `np.unique` / `bincount` / `find_objects`
+        # calls the refinement passes used to make.
+        _stats_block = tuple(kwargs.get('stats_block_shape', (128, 128, 128)))
+        _stats = accumulate_label_statistics(
+            ret, intensity_volume, block_shape=_stats_block
+        )
+
         # [PROFILE|CONSERVE] Post-stitch, pre-refinement inventory.
-        _fg_stitch = int(np.count_nonzero(ret))
-        _nobj_stitch = int(np.unique(ret[ret > 0]).size)
+        _fg_stitch = int(_stats.label_count.sum())
+        _nobj_stitch = int(_stats.labels.size)
         flush_print(
             f"  [PROFILE|CONSERVE] POST-STITCH (pre-island): foreground_voxels={_fg_stitch} "
             f"| objects={_nobj_stitch} | delta_vs_input={_fg_stitch - _fg_in}"
         )
 
+        # ---- Merge tests, once, on the assembled volume ----------------------
+        # The worker no longer scores an interface unless both basins own a soma in
+        # its own chunk. It cannot: a chunk that only inherited its markers puts the
+        # boundary between two marker regions rather than at a valley, the tests
+        # correctly call that a bright cut, and because merging unions the seed sets
+        # one wrong verdict fuses two cells across the whole volume.
+        #
+        # Here every interface between two final labels is visible exactly once,
+        # with both cells whole, which is the only place `ref_intensity` and the
+        # interface-vs-cell-mean comparison mean what they were designed to mean.
+        # It is also what rejoins two spurious seeds on one real cell when their
+        # somata happened to land in different chunks -- the over-seeding rescue the
+        # per-chunk tests could never perform.
+        #
+        # Runs BEFORE the island pass on purpose: an over-split leaves seedless
+        # fragments that the island pass would otherwise hand out on contact area
+        # alone, cementing a split that should not have existed.
+        _merge_params = {
+            k: kwargs[k] for k in (
+                'local_analysis_radius',
+                'min_local_intensity_difference',
+                'min_path_intensity_ratio',
+                'max_interface_to_cell_mean_ratio',
+            ) if k in kwargs
+        }
+        _merged = global_merge_pass(
+            ret, intensity_volume, soma_mask, spacing,
+            _calculate_interface_metrics,
+            stats=_stats,
+            global_soma_intensities=kwargs.get('global_soma_intensities', {}),
+            block_shape=_stats_block,
+            log=flush_print,
+            **_merge_params
+        )
+        if _merged:
+            _fg_merge = int(np.count_nonzero(ret))
+            flush_print(
+                f"  [PROFILE|CONSERVE] POST-GLOBALMERGE: foreground_voxels={_fg_merge} "
+                f"| objects={int(np.unique(ret[ret > 0]).size)} "
+                f"| delta_vs_stitch={_fg_merge - _fg_stitch}"
+            )
+
         ret = _reassign_disconnected_islands(ret, soma_mask)
 
+        # Fresh aggregates: the island pass moved voxels between labels.
+        _stats_island = accumulate_label_statistics(ret, None, block_shape=_stats_block)
+
         # [PROFILE|CONSERVE] Post-island inventory.
-        _fg_island = int(np.count_nonzero(ret))
-        _nobj_island = int(np.unique(ret[ret > 0]).size)
+        _fg_island = int(_stats_island.label_count.sum())
+        _nobj_island = int(_stats_island.labels.size)
         flush_print(
             f"  [PROFILE|CONSERVE] POST-ISLAND: foreground_voxels={_fg_island} "
             f"| objects={_nobj_island} | delta_vs_stitch={_fg_island - _fg_stitch}"
@@ -1358,13 +1728,32 @@ def separate_multi_soma_cells(
         # (a chunk-clipped basin looks arbitrarily small inside the worker). Runs
         # AFTER the island pass so satellites have been reattached and the sizes
         # being judged are final. Merges only -- never deletes.
-        ret = _merge_undersized_cells(
-            ret, int(kwargs.get('min_size_threshold', 0) or 0)
+        #
+        # A label that owns a soma is protected. In the reported trace a 7,893-voxel
+        # cell with its own soma was merged into its neighbour purely for being
+        # small, which is the one outcome the size floor should never produce: the
+        # threshold exists to tidy debris, and a fragment with a soma is not debris.
+        # Set `protect_seeded_cells=False` for the old behaviour.
+        _protect = set()
+        if kwargs.get('protect_seeded_cells', True):
+            _protect = {
+                lbl for lbl, somas in accumulate_label_soma_map(
+                    ret, soma_mask, block_shape=_stats_block
+                ).items() if somas
+            }
+        merge_undersized_streaming(
+            ret, int(kwargs.get('min_size_threshold', 0) or 0),
+            stats=_stats_island,
+            protected=_protect,
+            block_shape=_stats_block,
+            log=flush_print,
         )
 
+        _stats_final = accumulate_label_statistics(ret, None, block_shape=_stats_block)
+
         # [PROFILE|CONSERVE] Post-undersize inventory.
-        _fg_undersize = int(np.count_nonzero(ret))
-        _nobj_undersize = int(np.unique(ret[ret > 0]).size)
+        _fg_undersize = int(_stats_final.label_count.sum())
+        _nobj_undersize = int(_stats_final.labels.size)
         flush_print(
             f"  [PROFILE|CONSERVE] POST-UNDERSIZE: foreground_voxels={_fg_undersize} "
             f"| objects={_nobj_undersize} | delta_vs_island="
@@ -1372,11 +1761,20 @@ def separate_multi_soma_cells(
         )
 
         flush_print("  Refining (Filling voids + Relabeling)...")
-        ret, _, _ = relabel_sequential(ret)
+        # Same result as `relabel_sequential` -- ids 1..N in ascending order of the
+        # old id -- but built from the labels already inventoried and applied as one
+        # lookup table per block, instead of a whole-volume pass.
+        _seq = {
+            int(old): new
+            for new, old in enumerate(_stats_final.labels.tolist(), start=1)
+            if int(old) != new
+        }
+        if _seq:
+            apply_label_mapping(ret, _seq, block_shape=_stats_block)
 
         # [PROFILE|CONSERVE] Final inventory + end-to-end verdict.
-        _fg_out = int(np.count_nonzero(ret))
-        _nobj_out = int(np.unique(ret[ret > 0]).size)
+        _fg_out = int(_stats_final.label_count.sum())
+        _nobj_out = int(_stats_final.labels.size)
         flush_print(
             f"  [PROFILE|CONSERVE] OUTPUT: foreground_voxels={_fg_out} | objects={_nobj_out}"
         )
@@ -1394,4 +1792,7 @@ def separate_multi_soma_cells(
             if os.path.exists(chunk_data[i]['path']):
                 try: os.remove(chunk_data[i]['path'])
                 except: pass
+        if os.path.exists(prior_path):
+            try: os.remove(prior_path)
+            except OSError: pass
         gc.collect()
