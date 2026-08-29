@@ -764,21 +764,29 @@ class ProjectViewWindow(QMainWindow):
         as it finds any organized folder, so the dropped file was never
         considered.
         """
-        from .project_scaffolding import unorganized_sources
+        from .project_scaffolding import (
+            existing_image_folder_names, unorganized_sources,
+        )
         from .slide_reader import folder_name_for_source
 
-        base = os.path.basename(source_file)
-        stem = os.path.splitext(base)[0]
+        base = os.path.basename(str(source_file).rstrip("/\\"))
 
-        # Already part of the project? Its folder exists under the project root.
+        # Already part of the project?
+        #
+        # This used to compare os.path.splitext(base)[0] against the immediate
+        # subdirectories of the PROJECT ROOT. That is only where sample folders
+        # live in a single-channel project: a multi-channel project keeps them
+        # inside each Channel_* directory, so the check never matched and a
+        # correctly-organized image fell through to the "could not read it"
+        # branch below -- reporting an unreadable file immediately after
+        # successfully organizing it. existing_image_folder_names looks in both
+        # places, and folder_name_for_source is the same function that named the
+        # folder in the first place (splitext also mis-stems "x.ome.zarr").
         try:
-            organized = {
-                d for d in os.listdir(project_dir)
-                if os.path.isdir(os.path.join(project_dir, d))
-            }
-        except OSError:
+            organized = existing_image_folder_names(project_dir)
+        except Exception:
             organized = set()
-        if stem in organized:
+        if folder_name_for_source(base) in organized:
             return  # visible as a row already; nothing to explain
 
         try:
@@ -799,13 +807,19 @@ class ProjectViewWindow(QMainWindow):
                 QMessageBox.warning(self, "Unsupported file format",
                                     unsupported_format_message(source_file))
             else:
+                # The readable list is derived, not written out: the hardcoded
+                # copy here went stale the moment .lif and Zarr were added, so it
+                # told users a format was unreadable while the app was reading it.
+                try:
+                    from .slide_formats import image_extensions
+                    readable = ", ".join(image_extensions())
+                except Exception:
+                    readable = ".tif, .tiff, .czi"
                 QMessageBox.warning(
                     self, "File not added",
                     f"{base} is not part of this project and HIBACHI could not "
                     "read it as an image.\n\n"
-                    "Readable formats: TIFF (.tif/.tiff), Zeiss CZI (.czi), and "
-                    "whole-slide formats (.vsi, .svs, .ndpi, .scn, .afi, "
-                    ".qptiff, .zvi, .ome.tif, .dcm)."
+                    f"Readable formats: {readable}"
                 )
             return
 
