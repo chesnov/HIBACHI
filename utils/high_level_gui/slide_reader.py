@@ -20,6 +20,13 @@ FULL RESOLUTION WITHOUT LOADING IT
     image, versus 96 MB for the read-it-all approach). Nothing here downsamples
     by default -- ``level`` exists for callers who want a pyramid level, and
     defaults to full resolution.
+
+NOT EVERYTHING IS SLIDEIO
+    Leica .lif is served by lif_reader and Zarr / OME-Zarr by zarr_reader.
+    Dispatch happens once, in ``_backend``, so every caller -- the setup wizard,
+    unorganized_sources, the dimension probe, extraction -- gets each new format
+    without changing, because those source keys are shaped exactly like a
+    multi-scene slide key. Adding a backend means one entry in ``_BACKENDS``.
 """
 
 from __future__ import annotations
@@ -76,14 +83,37 @@ def is_slide_source(key: str) -> bool:
     return spec_for_path(filename) is not None
 
 
+#: Compound suffixes that splitext leaves behind. ``Image.ome.zarr`` splits to
+#: ``Image.ome``, and the extracted channel is then written as
+#: ``Image.ome.tif`` -- a name that spec_for_path classifies as an OME-TIFF and
+#: routes to slideio, even though the file is a plain ImageJ TIFF this code just
+#: wrote with tifffile. slideio then fails to read a scale from it, the failure
+#: is swallowed, and the sample records no pixel size at all despite the
+#: resolution tags being correct. Stripping the inner suffix keeps the extracted
+#: name unambiguous. Applies to .ome.tif sources too, which had the same latent
+#: problem.
+_INNER_SUFFIXES: Tuple[str, ...] = (".ome",)
+
+
+def _source_stem(filename: str) -> str:
+    """Basename with its extension, and any compound inner suffix, removed."""
+    stem = os.path.splitext(os.path.basename(str(filename).rstrip("/\\")))[0]
+    for suffix in _INNER_SUFFIXES:
+        if stem.lower().endswith(suffix):
+            return stem[: -len(suffix)].rstrip(".")
+    return stem
+
+
 def folder_name_for_source(key: str) -> str:
     """Filesystem-safe folder name for a source key.
 
     ``Image.vsi::20x_01`` becomes ``Image_20x_01`` so the six scenes of one slide
-    land in six sibling sample folders rather than colliding on one name.
+    land in six sibling sample folders rather than colliding on one name. A Zarr
+    array path is sanitised the same way, so ``store.zarr::volumes/raw`` becomes
+    ``store_volumes_raw`` rather than a nested directory.
     """
     filename, scene = parse_source_key(key)
-    stem = os.path.splitext(os.path.basename(filename))[0]
+    stem = _source_stem(filename)
     if not scene:
         return stem
     safe = "".join(c if (c.isalnum() or c in "-_") else "_" for c in scene)
@@ -93,25 +123,59 @@ def folder_name_for_source(key: str) -> str:
 # --------------------------------------------------------------------------- #
 # Backend dispatch
 # --------------------------------------------------------------------------- #
-# Everything below is slideio except Leica .lif, which slideio has no driver for.
-# Dispatching here rather than at each call site means every existing caller --
-# the setup wizard, unorganized_sources, the dimension probe, extraction -- gets
-# LIF support without changing, because a .lif source key is shaped exactly like
-# a multi-scene slide key.
-def _lif_backend(source_key: str):
-    """The lif_reader module if this source is a .lif, else None."""
+# Backend dispatch
+# --------------------------------------------------------------------------- #
+# Everything below is slideio except the formats listed here, which slideio has
+# no driver for. Dispatching once means every existing caller gets each format
+# without changing, because these source keys are shaped exactly like a
+# multi-scene slide key.
+#
+# Suffixes are matched longest-first so ".ome.zarr" cannot be shadowed by
+# ".zarr" -- both route to the same module today, but a table that depends on
+# dict ordering for correctness is a trap for whoever adds the next format.
+_BACKENDS: Tuple[Tuple[Tuple[str, ...], str], ...] = (
+    ((".lif",), "lif_reader"),
+    ((".ome.zarr", ".zarr"), "zarr_reader"),
+)
+
+
+def _backend(source_key: str):
+    """The reader module serving this source key, or None for slideio.
+
+    Returns None both for "this is a slideio format" and for "the backend module
+    could not be imported", which is deliberate: the slideio path then reports a
+    driver error naming the format, which is more useful than an ImportError
+    traceback from a module the user never asked for by name.
+    """
     filename, _ = parse_source_key(source_key)
-    if not str(filename).lower().endswith(".lif"):
-        return None
-    try:
-        from . import lif_reader
-        return lif_reader
-    except ImportError:
-        return None
+    name = str(filename).rstrip("/\\").lower()
+    for suffixes, module_name in _BACKENDS:
+        if not name.endswith(suffixes):
+            continue
+        try:
+            import importlib
+            return importlib.import_module(f".{module_name}", __package__)
+        except ImportError:
+            return None
+    return None
+
+
+def _lif_backend(source_key: str):
+    """Deprecated alias for :func:`_backend`, kept so nothing breaks silently.
+
+    Retained because this module's dispatch was LIF-only before Zarr was added;
+    any out-of-tree caller that reached for the private name still works, and
+    still gets the right backend rather than None for a .zarr key.
+    """
+    return _backend(source_key)
 
 
 def backend_name(source_key: str) -> Optional[str]:
-    """Which reader library serves a source key ('slideio' | 'readlif' | None)."""
+    """Which library serves a key ('slideio' | 'readlif' | 'zarr' | None).
+
+    None means HIBACHI has no format registered for that path at all, which is
+    different from "slideio cannot open it".
+    """
     filename, _ = parse_source_key(source_key)
     return backend_for_path(filename)
 
@@ -123,9 +187,9 @@ def list_sources(path: str) -> List[str]:
     so it behaves exactly like the existing formats. Returns [] if the file can't
     be read, leaving the caller to report the reason from ``inspect_slide``.
     """
-    _lif = _lif_backend(path)
-    if _lif is not None:
-        return _lif.list_sources(path)
+    backend = _backend(path)
+    if backend is not None:
+        return backend.list_sources(path)
 
     info = inspect_slide(path)
     if info.error:
@@ -198,9 +262,9 @@ def open_scene(source_key: str, root: str = "") -> _SceneHandle:
 # --------------------------------------------------------------------------- #
 def scene_channel_count(source_key: str, root: str = "") -> int:
     """Channels in the scene a source key names, or 1 if it can't be read."""
-    _lif = _lif_backend(source_key)
-    if _lif is not None:
-        return _lif.scene_channel_count(source_key, root)
+    backend = _backend(source_key)
+    if backend is not None:
+        return backend.scene_channel_count(source_key, root)
     try:
         with open_scene(source_key, root) as scene:
             return int(scene.num_channels)
@@ -217,9 +281,9 @@ def scene_metadata(source_key: str, root: str = "") -> Dict[str, Any]:
     1e6 conversion. A slide with no Z calibration reports z=0, which would become
     a zero voxel dimension downstream, so it falls back to 1.0 and says so.
     """
-    _lif = _lif_backend(source_key)
-    if _lif is not None:
-        return _lif.scene_metadata(source_key, root)
+    backend = _backend(source_key)
+    if backend is not None:
+        return backend.scene_metadata(source_key, root)
 
     meta: Dict[str, Any] = {"x": 1.0, "y": 1.0, "z": 1.0, "found": False}
     try:
@@ -246,9 +310,9 @@ def scene_metadata(source_key: str, root: str = "") -> Dict[str, Any]:
 
 def scene_shape(source_key: str, root: str = "") -> Optional[Tuple[int, ...]]:
     """(Z, Y, X) or (Y, X) pixel shape of a scene, without reading pixels."""
-    _lif = _lif_backend(source_key)
-    if _lif is not None:
-        return _lif.scene_shape(source_key, root)
+    backend = _backend(source_key)
+    if backend is not None:
+        return backend.scene_shape(source_key, root)
     try:
         with open_scene(source_key, root) as scene:
             w, h = (int(v) for v in scene.size)
@@ -260,9 +324,9 @@ def scene_shape(source_key: str, root: str = "") -> Optional[Tuple[int, ...]]:
 
 def scene_channel_names(source_key: str, root: str = "") -> List[str]:
     """Channel names as the scanner recorded them, e.g. ['DAPI','FITC','Cy5']."""
-    _lif = _lif_backend(source_key)
-    if _lif is not None:
-        return _lif.scene_channel_names(source_key, root)
+    backend = _backend(source_key)
+    if backend is not None:
+        return backend.scene_channel_names(source_key, root)
     try:
         with open_scene(source_key, root) as scene:
             out = []
@@ -311,9 +375,9 @@ def extract_scene_channel(
     be broken into.
     Returns True only if a non-empty file was produced.
     """
-    _lif = _lif_backend(source_key)
-    if _lif is not None:
-        return _lif.extract_scene_channel(
+    backend = _backend(source_key)
+    if backend is not None:
+        return backend.extract_scene_channel(
             source_key, dest_path, channel_idx, root=root, tile=tile,
             level=level, progress=progress, should_cancel=should_cancel)
 

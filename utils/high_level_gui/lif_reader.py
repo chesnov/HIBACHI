@@ -439,11 +439,12 @@ def extract_scene_channel(
                     1.0 / meta["y"] if meta["y"] > 0 else 1.0),
         metadata={"unit": "micron", "spacing": meta["z"]},
     )
+    from .slide_reader import SetupCancelled
+
     try:
         total = max(1, im.z_slices)
         for z in range(total):
             if should_cancel is not None and should_cancel():
-                from .slide_reader import SetupCancelled
                 raise SetupCancelled("cancelled during .lif extraction")
 
             frame = np.asarray(image.get_frame(z=z, t=0, c=channel_idx, m=0))
@@ -458,7 +459,27 @@ def extract_scene_channel(
             if progress is not None:
                 progress(z + 1, total)
         mm.flush()
-    finally:
+    except SetupCancelled:
+        # A half-written channel would pass an existence check and be organized
+        # as if complete, so remove it. The slideio path in
+        # slide_reader.extract_scene_channel has always done this; this path did
+        # not, so a cancelled .lif setup left a folder holding a TIFF and no
+        # config -- which fails the one-tif-one-yaml check and makes the whole
+        # project read as empty, with a truncated image sitting inside it.
         del mm
+        try:
+            if os.path.isfile(dest_path):
+                os.remove(dest_path)
+        except OSError:
+            pass
+        raise
+    finally:
+        try:
+            del mm
+        except Exception:
+            pass
 
-    return os.path.isfile(dest_path) and os.path.getsize(dest_path) > 0
+    ok = os.path.isfile(dest_path) and os.path.getsize(dest_path) > 0
+    if not ok:
+        print(f"    Extraction produced no data at {dest_path}")
+    return ok

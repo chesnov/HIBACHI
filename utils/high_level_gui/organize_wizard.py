@@ -31,14 +31,36 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 _RAW_EXTS = (".tif", ".tiff", ".czi")
 
-# Whole-slide formats read through slideio. Declared separately because one such
-# file expands into several samples, one per scanned scene.
+# Multi-image formats: whole-slide files read through slideio, Leica .lif, and
+# Zarr / OME-Zarr stores. Declared separately because one such "file" expands
+# into several samples -- one per scanned scene, or per array in a store.
+#
+# Zarr is a DIRECTORY, so every walk below tests `os.path.isfile(...) or
+# _is_store(...)`. An isfile test alone silently yields zero sources for a
+# folder made of stores, which looks identical to an empty folder.
 try:
-    from .slide_formats import supported_extensions as _slide_exts
+    from .slide_formats import (
+        supported_extensions as _slide_exts,
+        is_directory_store as _is_store,
+    )
     _SLIDE_EXTS = tuple(_slide_exts())
 except Exception:
     _SLIDE_EXTS = ()
+
+    def _is_store(_path):  # type: ignore[misc]
+        return False
 _RAW_EXTS = _RAW_EXTS + _SLIDE_EXTS
+
+
+def _is_source_entry(full_path: str, name: str, exts) -> bool:
+    """True if a directory entry is a readable source of one of `exts`.
+
+    One predicate for both files and directory stores, so the isfile/isdir
+    distinction lives here rather than at each walk.
+    """
+    if not name.lower().endswith(tuple(exts)):
+        return False
+    return os.path.isfile(full_path) or bool(_is_store(full_path))
 
 # Sidecar filtering lives in gui_text_utils so every path that enumerates raw
 # images agrees on what counts as an image (see is_os_sidecar for why this
@@ -62,8 +84,7 @@ def detect_raw(raw_dir: str) -> Dict[str, object]:
     skipped: List[str] = []
     try:
         for f in sorted(os.listdir(raw_dir)):
-            if not (f.lower().endswith(_RAW_EXTS)
-                    and os.path.isfile(os.path.join(raw_dir, f))):
+            if not _is_source_entry(os.path.join(raw_dir, f), f, _RAW_EXTS):
                 continue
             # macOS AppleDouble sidecars share the real file's extension and sort
             # first, so they must be dropped before anything inspects "the first
@@ -273,8 +294,8 @@ def detect_default_mode(raw_dir: str) -> Optional[str]:
 
     try:
         files = [f for f in sorted(os.listdir(raw_dir))
-                 if f.lower().endswith((".tif", ".tiff") + _SLIDE_EXTS)
-                 and os.path.isfile(os.path.join(raw_dir, f))
+                 if _is_source_entry(os.path.join(raw_dir, f), f,
+                                     (".tif", ".tiff") + _SLIDE_EXTS)
                  and not is_os_sidecar(f)]
     except OSError:
         return None
@@ -285,6 +306,10 @@ def detect_default_mode(raw_dir: str) -> Optional[str]:
     # collapse the whole guess to None, which silently unfiltered the preset list
     # and offered 3D configs for a 2D dataset.
     shape = None
+    # Whether `shape` came from a backend's scene_shape (already canonical) or
+    # from a raw TIFF series (ambiguous). This distinction decides whether the
+    # channel heuristic below may be applied at all -- see the ndim == 3 branch.
+    shape_is_canonical = False
     for name in files:
         try:
             if name.lower().endswith(_SLIDE_EXTS):
@@ -293,6 +318,7 @@ def detect_default_mode(raw_dir: str) -> Optional[str]:
                 shape = scene_shape(keys[0], raw_dir) if keys else None
                 if shape is None:
                     continue
+                shape_is_canonical = True
                 break
             with tiff.TiffFile(os.path.join(raw_dir, name)) as tf:
                 shape = tf.series[0].shape
@@ -308,9 +334,19 @@ def detect_default_mode(raw_dir: str) -> Optional[str]:
     if ndim >= 4:
         return "fluorescence"                          # has Z and channel axes
     if ndim == 3:
-        # (Z, Y, X) stack vs (C, Y, X) multi-channel plane. Mirror the channel
-        # heuristic used elsewhere: a small leading axis (< 10 and < the next)
-        # reads as channels -> a 2D image; otherwise it's a Z stack -> 3D.
+        # A backend's scene_shape is ALREADY canonical: slide_reader and
+        # zarr_reader both return (Z, Y, X) only when Z > 1 and (Y, X)
+        # otherwise, having resolved the channel axis themselves. Applying the
+        # TIFF channel heuristic to it re-introduces an ambiguity that no
+        # longer exists, and reported any slide, .lif or Zarr stack with fewer
+        # than 10 slices as 2D -- so a plainly-3D dataset was offered 2D
+        # presets, the exact outcome this function exists to prevent.
+        if shape_is_canonical:
+            return "fluorescence"
+        # A raw TIFF series shape is genuinely ambiguous: (Z, Y, X) stack vs
+        # (C, Y, X) multi-channel plane. Mirror the channel heuristic used
+        # elsewhere -- a small leading axis (< 10 and < the next) reads as
+        # channels -> a 2D image; otherwise it's a Z stack -> 3D.
         if shape[0] < 10 and shape[0] < shape[1]:
             return "fluorescence_2d"
         return "fluorescence"

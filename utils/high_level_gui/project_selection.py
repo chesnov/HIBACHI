@@ -30,12 +30,47 @@ from typing import Callable, List, Optional
 from .gui_text_utils import is_os_sidecar
 
 # Image extensions HIBACHI understands as raw input.
+#
+# slide_formats owns this list: it knows the base formats (TIFF, CZI), the
+# whole-slide formats, and the DIRECTORY formats (Zarr). Keeping a second copy
+# here is what would let a format be added to one list and not the other.
 _RAW_IMAGE_EXTS = (".tif", ".tiff", ".czi")
-try:  # whole-slide formats count as raw images for folder classification
-    from .slide_formats import supported_extensions as _slide_exts
-    _RAW_IMAGE_EXTS = _RAW_IMAGE_EXTS + tuple(_slide_exts())
+_is_image_path = None
+_is_directory_store = None
+try:  # whole-slide and Zarr formats count as raw images for classification
+    from .slide_formats import (
+        image_extensions as _image_exts,
+        is_image_path as _is_image_path,
+        is_directory_store as _is_directory_store,
+    )
+    _RAW_IMAGE_EXTS = tuple(_image_exts())
 except Exception:
     pass
+
+
+def _looks_like_image(full_path: str, name: str) -> bool:
+    """True if a directory entry is a raw image HIBACHI can read.
+
+    Split out because a Zarr store is a DIRECTORY: the previous
+    ``os.path.isfile(full) and name.endswith(exts)`` test answered False for
+    every store, so a folder containing one classified as EMPTY and reported
+    "No images or projects found" with the data in plain sight. Falls back to
+    the old file-only behaviour when slide_formats cannot be imported, so this
+    module still works standalone.
+    """
+    if _is_image_path is not None:
+        return bool(_is_image_path(full_path))
+    return os.path.isfile(full_path) and name.lower().endswith(_RAW_IMAGE_EXTS)
+
+
+def _is_store_path(path: str) -> bool:
+    """True if `path` is a directory-tree image format (a Zarr store)."""
+    if _is_directory_store is None:
+        return False
+    try:
+        return bool(_is_directory_store(path))
+    except Exception:
+        return False
 
 
 def _unsupported_label(path: str) -> Optional[str]:
@@ -55,8 +90,15 @@ def is_readable_image(path: str) -> bool:
     previously accepted ANY local path, so dropping a .lif highlighted the target
     and reported "you selected an image file", both of which were untrue.
     """
-    name = os.path.basename(str(path)).lower()
-    return bool(name) and name.endswith(_RAW_IMAGE_EXTS)
+    # A trailing separator on a dropped directory makes basename return "" and
+    # match nothing, so it is stripped before the name test.
+    text = str(path).rstrip("/\\")
+    name = os.path.basename(text).lower()
+    if not name:
+        return False
+    if _is_image_path is not None:
+        return bool(_is_image_path(text))
+    return name.endswith(_RAW_IMAGE_EXTS)
 
 
 # --------------------------------------------------------------------------- #
@@ -141,7 +183,7 @@ def _loose_images(directory: str) -> List[str]:
         # otherwise-empty folder classifies as RAW_IMAGES and offers to be set up.
         if is_os_sidecar(f):
             continue
-        if os.path.isfile(full) and f.lower().endswith(_RAW_IMAGE_EXTS):
+        if _looks_like_image(full, f):
             out.append(full)
     return out
 
@@ -512,7 +554,12 @@ def classify_path(path: Optional[str]) -> Classification:
     redirected = False
     source_file = None
     unsupported = None
-    if os.path.isfile(path):
+    # A directory store (Zarr) is redirected exactly like a dropped file: the
+    # store IS the image, so the folder to classify is its parent. Without this
+    # the store was classified as the folder, held no loose images of its own,
+    # and reported EMPTY -- the same silent failure the extension work fixes,
+    # reached by a different route.
+    if os.path.isfile(path) or _is_store_path(path):
         redirected = True
         source_file = path
         unsupported = _unsupported_label(path)

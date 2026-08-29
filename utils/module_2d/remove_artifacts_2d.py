@@ -148,14 +148,14 @@ def generate_tight_hull_2d(
     """
     print(f"  [HullGen] Generating Concave Hull (Radius {hull_closing_radius}, DS {downsample_factor}x)...")
     
-    # 1. Robust Global Threshold Calculation (Log-Space Otsu)
-    valid = image[image > 0]
-    if valid.size > 0:
-        # Sample if huge
-        if valid.size > 200000:
-            valid = np.random.choice(valid, 200000, replace=False)
-            
-        log_pixels = np.log1p(valid.astype(np.float32))
+        # 1. Robust Global Threshold Calculation (Log-Space Otsu)
+    # Deterministic strided sampling, mirroring the 3D hull generator. 
+    sample_stride = max(1, int(np.ceil(np.sqrt(image.size / 200000.0))))
+    pixels = image[::sample_stride, ::sample_stride].ravel()
+    valid_pixels = pixels[pixels > 0]
+
+    if valid_pixels.size > 0:
+        log_pixels = np.log1p(valid_pixels.astype(np.float32))
         try:
             log_thresh = threshold_otsu(log_pixels)
         except:
@@ -369,14 +369,11 @@ def apply_hull_trimming_2d(
 
             # C. Recalculate Threshold
             print("  [Filter] Checking reference intensity...")
-            valid = original_image[original_image > 0]
-            if valid.size > 0:
-                sub = np.random.choice(valid, min(valid.size, 100000))
-                raw_otsu = threshold_otsu(sub)
-                vol_max = np.max(sub)
-            else:
-                raw_otsu = 0
-                vol_max = 0
+            ref_stride = max(1, int(np.ceil(np.sqrt(original_image.size / 100000.0))))
+            raw_pixels = original_image[::ref_stride, ::ref_stride].ravel()
+            valid = raw_pixels[raw_pixels > 0]
+            raw_otsu = threshold_otsu(valid) if valid.size > 0 else 0
+            vol_max = np.max(raw_pixels) if raw_pixels.size > 0 else 0
             
             ref_thresh = raw_otsu if (vol_max > 5 and segmentation_threshold < 2.0) else segmentation_threshold
             global_brightness_cutoff = ref_thresh * brightness_cutoff_factor

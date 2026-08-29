@@ -22,6 +22,14 @@ rather than from documentation:
 Because of (2), formats are declared individually rather than "whatever slideio
 opens". Anything not verified against real data is marked EXPERIMENTAL, reports
 why, and is expected to be surfaced to the user as such.
+
+3. NOT EVERY FORMAT IS A FILE, AND NOT EVERY FORMAT IS SLIDEIO. Leica .lif is
+   read by readlif and Zarr / OME-Zarr by the zarr package, so `backend` names
+   the library per format rather than assuming slideio. Zarr goes further: a
+   store is a DIRECTORY, not a file, so `directory_store` marks the formats that
+   every path-walking caller must test with os.path.isdir instead of isfile.
+   Without that flag a perfectly readable store is invisible to discovery, which
+   is a silent failure rather than a reported one.
 """
 
 from __future__ import annotations
@@ -59,10 +67,15 @@ class FormatSpec:
     # the header alone leaves a readable file with no image data.
     sidecar_dir: bool = False
     # Which library reads this format. Everything here is slideio except Leica
-    # .lif, which slideio has no driver for and which is read by readlif instead.
-    # Declared per format rather than inferred so a format cannot silently be
-    # routed to a library that cannot open it.
+    # .lif, which slideio has no driver for and which is read by readlif instead,
+    # and Zarr, which is read by the zarr package. Declared per format rather
+    # than inferred so a format cannot silently be routed to a library that
+    # cannot open it.
     backend: str = "slideio"
+    # True if this "file" is really a directory tree (Zarr). Callers that walk a
+    # folder must test these with os.path.isdir; an isfile test skips them
+    # entirely and reports the containing folder as holding no images.
+    directory_store: bool = False
 
 
 # Ordered most-specific-extension first; .ome.tif must beat .tif.
@@ -125,11 +138,37 @@ FORMATS: Tuple[FormatSpec, ...] = (
              "and time-series acquisitions are skipped with a reason rather "
              "than partially imported. " + _SUPPORT_UNKNOWN_NOTE,
     ),
+    # ---- Zarr ------------------------------------------------------------- #
+    # .ome.zarr must be declared BEFORE .zarr so the more specific suffix wins,
+    # matching the .ome.tif / .tif ordering above. Both route to the same
+    # backend; the distinction is only which metadata it expects to find.
+    FormatSpec(
+        driver="OMEZARR", label="OME-Zarr / NGFF",
+        extensions=(".ome.zarr",), support=EXPERIMENTAL, scenes=ALL_TISSUE,
+        backend="zarr", directory_store=True,
+        note="a directory, not a file. Axis order, pixel size and channel "
+             "names are read from the store's own NGFF metadata rather than "
+             "guessed. Only the full-resolution level of each multiscale image "
+             "becomes a sample; lower pyramid levels and anything under "
+             "labels/ are reported and skipped. " + _SUPPORT_UNKNOWN_NOTE,
+    ),
+    FormatSpec(
+        driver="ZARR", label="Zarr", extensions=(".zarr",),
+        support=EXPERIMENTAL, scenes=ALL_TISSUE,
+        backend="zarr", directory_store=True,
+        note="a directory, not a file. One store holds many arrays, each "
+             "becoming its own sample. A plain store declares no axis order, so "
+             "it is GUESSED by an explicit rule and the assumption is reported "
+             "-- check it before processing. Arrays whose name marks them as "
+             "labels or ground truth are skipped with a reason. "
+             + _SUPPORT_UNKNOWN_NOTE,
+    ),
 )
 
 #: Backends other than slideio, so callers can dispatch without hardcoding.
 BACKEND_SLIDEIO = "slideio"
 BACKEND_READLIF = "readlif"
+BACKEND_ZARR = "zarr"
 
 
 def backend_for_path(path: str) -> Optional[str]:
@@ -137,12 +176,78 @@ def backend_for_path(path: str) -> Optional[str]:
     spec = spec_for_path(path)
     return spec.backend if spec else None
 
+
+# --------------------------------------------------------------------------- #
+# Directory-tree formats
+# --------------------------------------------------------------------------- #
+# Every format above except Zarr is a single file, which is why the discovery
+# layer historically tested os.path.isfile. These three helpers exist so that
+# test can be widened once, here, rather than by scattering ".zarr" literals
+# through the callers -- and so that adding another directory format later needs
+# no further change outside this module.
+def directory_store_extensions() -> Tuple[str, ...]:
+    """Extensions whose "file" is really a directory."""
+    out: List[str] = []
+    for spec in FORMATS:
+        if spec.directory_store:
+            out.extend(spec.extensions)
+    return tuple(out)
+
+
+def is_directory_store(path: str) -> bool:
+    """True if `path` is an existing directory in a directory-tree format.
+
+    Name AND type are both checked: a directory merely named ``x.zarr`` that
+    holds no store is still a directory, and the backend refuses it with a
+    reason. This function only answers "should discovery treat this as an
+    image candidate rather than as a subfolder".
+    """
+    p = str(path).rstrip("/\\")
+    if not p.lower().endswith(directory_store_extensions()):
+        return False
+    return os.path.isdir(p)
+
+
+def image_extensions() -> Tuple[str, ...]:
+    """Every extension HIBACHI reads, files and directory stores together."""
+    return BASE_IMAGE_EXTENSIONS + supported_extensions()
+
+
+def is_image_path(path: str) -> bool:
+    """True if `path` is a readable image, whether it is a file or a store.
+
+    The single predicate a folder walk should use. Replaces
+    ``os.path.isfile(p) and p.endswith(exts)``, which silently skipped every
+    Zarr store because a store is a directory. Covers TIFF and CZI as well as
+    the declared formats, so a caller never needs a second extension list.
+    """
+    p = str(path)
+    if is_directory_store(p):
+        return True
+    if not os.path.isfile(p):
+        return False
+    name = str(os.path.basename(p)).lower()
+    # A directory-store extension on an actual FILE is not readable -- a file
+    # called "x.zarr" is not a store. Excluding those here keeps discovery from
+    # offering something the backend would then refuse.
+    file_exts = BASE_IMAGE_EXTENSIONS + tuple(
+        e for e in supported_extensions()
+        if e not in directory_store_extensions())
+    return name.endswith(file_exts)
+
 # Deliberately NOT routed through slideio:
 #   .czi          -- already handled by aicspylibczi; rerouting risks a working path
 #   .tif / .tiff  -- already handled by tifffile
 # slideio's CZI and GDAL drivers could serve both, but replacing a working reader
 # is a separate decision from adding new formats.
 EXCLUDED_EXTENSIONS = (".czi", ".tif", ".tiff")
+
+#: Formats read by their own libraries rather than declared in FORMATS above:
+#: TIFF via tifffile, CZI via aicspylibczi. They are listed here so that
+#: `is_image_path` can be the ONE predicate a folder walk needs. Without them it
+#: would silently answer False for a plain TIFF -- which is the format almost
+#: every HIBACHI project is actually made of.
+BASE_IMAGE_EXTENSIONS: Tuple[str, ...] = (".tif", ".tiff", ".czi")
 
 # Fraction of the largest scene's area below which a scene is treated as a
 # thumbnail / label rather than tissue, under BY_SIZE. The tested VSI slide's six
@@ -207,14 +312,20 @@ def unsupported_format_message(path: str) -> str:
         "(one file per image), then set the project up from those files. "
         "Multi-channel exports are supported: HIBACHI extracts each channel "
         "itself.\n\n"
-        "Readable formats: TIFF (.tif/.tiff), Zeiss CZI (.czi), and whole-slide "
+        "Readable formats: TIFF (.tif/.tiff), Zeiss CZI (.czi), Leica LIF "
+        "(.lif), Zarr and OME-Zarr stores (.zarr/.ome.zarr), and whole-slide "
         "formats (.vsi, .svs, .ndpi, .scn, .afi, .qptiff, .zvi, .ome.tif, .dcm)."
     )
 
 
 def spec_for_path(path: str) -> Optional[FormatSpec]:
-    """FormatSpec for a path, or None if HIBACHI shouldn't route it via slideio."""
-    name = os.path.basename(str(path)).lower()
+    """FormatSpec for a path, or None if HIBACHI has no format for it.
+
+    A directory store may arrive with a trailing separator (``a/b.zarr/``),
+    which would make os.path.basename return "" and match nothing, so the
+    separator is stripped first.
+    """
+    name = os.path.basename(str(path).rstrip("/\\")).lower()
     if name.endswith(EXCLUDED_EXTENSIONS) and not name.endswith((".ome.tif", ".ome.tiff")):
         return None
     for spec in FORMATS:
@@ -394,7 +505,8 @@ def inspect_slide(path: str) -> SlideInfo:
             path=path, driver=spec.driver, label=spec.label,
             support=spec.support,
             error=f"{spec.label} is read by '{spec.backend}', not slideio; "
-                  "use that backend's inspector instead",
+                  "use that backend's inspector instead "
+                  "(lif_reader.inspect_lif / zarr_reader.inspect_store)",
         )
 
     info = SlideInfo(path=path, driver=spec.driver, label=spec.label,
