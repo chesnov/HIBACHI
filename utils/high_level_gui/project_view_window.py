@@ -827,8 +827,28 @@ class ProjectViewWindow(QMainWindow):
         extended afterwards, rather than committing to the whole folder up front or
         re-setting the project up from scratch.
         """
-        from .project_scaffolding import add_sources_to_project, unorganized_sources
+        from .project_scaffolding import (
+            add_sources_to_project, existing_image_folder_names,
+            unorganized_sources,
+        )
         from .slide_reader import folder_name_for_source
+
+        # Setup that never completed leaves a folder full of readable images and
+        # NO organized image folders. add_sources_to_project then has no existing
+        # config to copy and reports "set the project up from scratch", which is
+        # true but reads like a failure of the add rather than of the setup that
+        # preceded it -- and gives no route out. Say what actually happened.
+        if not existing_image_folder_names(project_dir):
+            QMessageBox.information(
+                self, "Project setup did not complete",
+                "This folder has no organized images yet, so there is no "
+                "existing configuration to copy for a new one.\n\n"
+                "That normally means project setup was cancelled or dismissed "
+                "before it finished -- if the images carry no pixel size, setup "
+                "asks for the physical dimensions first, and closing that "
+                "prompt stops the run.\n\n"
+                "Open this folder again to restart setup.")
+            return
 
         pending = unorganized_sources(project_dir)
         if not pending:
