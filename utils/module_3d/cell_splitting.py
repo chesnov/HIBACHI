@@ -690,7 +690,7 @@ def _separate_multi_soma_cells_chunk(
         # 5. Final Landscape
         # speed_power = 1.5 slightly increases the penalty of thin necks to prevent Voronoi cuts.
         speed_power = kwargs.get('speed_power', 1.5)
-        if prior_tags and kwargs.get('propagated_pure_cost', True):
+        if kwargs.get('pure_cost_always', False) or (prior_tags and kwargs.get('propagated_pure_cost', True)):
             # Chunks with an inherited marker only. `d_seeds` measures straight-line
             # distance from the nearest marker, which is a reasonable proxy while
             # every marker is a point-like soma. An inherited marker is a whole
