@@ -690,7 +690,19 @@ def _separate_multi_soma_cells_chunk(
         # 5. Final Landscape
         # speed_power = 1.5 slightly increases the penalty of thin necks to prevent Voronoi cuts.
         speed_power = kwargs.get('speed_power', 1.5)
-        if kwargs.get('pure_cost_always', False) or (prior_tags and kwargs.get('propagated_pure_cost', True)):
+        # DEFAULT CHANGED TO FALSE. Measured on a single object with one seed in a
+        # bright, thick lobe and another in a dim, thin tail -- the geometry that
+        # produces the tiny-sliver artefact -- priority flooding the pure cost field
+        # lets the bright region flood cheaply across the whole object and stop dead
+        # at the dim seed: basins 13670/842, boundary at 84% of the length instead of
+        # the middle. The `d_seeds` term is what holds the cut near the geometric
+        # middle (10194/4318, boundary at 51%). The comment block above claims the
+        # opposite; the code is right and the comment is wrong.
+        if kwargs.get('pure_cost_always', False) or (prior_tags and kwargs.get('propagated_pure_cost', False)):
+            flush_print(
+                f"  [PROFILE|LANDSCAPE] cell={cell_label}: pure cost field "
+                f"(1/speed^{kwargs.get('speed_power', 1.5)}) -- watch for lopsided basins"
+            )
             # Chunks with an inherited marker only. `d_seeds` measures straight-line
             # distance from the nearest marker, which is a reasonable proxy while
             # every marker is a point-like soma. An inherited marker is a whole
@@ -708,6 +720,11 @@ def _separate_multi_soma_cells_chunk(
             # Set `propagated_pure_cost=False` to fall back.
             landscape = 1.0 / (speed ** speed_power)
         else:
+            if prior_tags:
+                flush_print(
+                    f"  [PROFILE|LANDSCAPE] cell={cell_label}: d_seeds/speed^p with "
+                    f"{len(prior_tags)} inherited marker(s)"
+                )
             landscape = d_seeds / (speed ** speed_power)
 
         ws_local = _watershed_with_simpleitk(landscape, markers)
