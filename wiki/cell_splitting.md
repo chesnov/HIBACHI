@@ -13,7 +13,7 @@ order:
 
 1.  **Splits** the cell into one region per seed (a marker-controlled watershed).
 2.  **Re-merges** any split that does not look like a real boundary between two
-    cells, using two intensity-based tests.
+    cells, using intensity-based tests.
 
 That split-then-merge order is the whole basis for tuning this step: every cell
 is first cut apart at its seeds, and then the merge tests decide which cuts to
@@ -21,14 +21,19 @@ keep. So you tune by first guaranteeing full separation, then relaxing the merge
 tests to rejoin only the cells that were split by mistake (the over-seeded cells
 from Step 3).
 
+Not every cut reaches the merge tests. Each boundary is either **scored** by the
+tests, or **kept without being scored** because one of two preconditions says the
+tests cannot give a meaningful answer there (see *When a cut is not scored at
+all*, below). A kept-unscored boundary always survives, whatever the levers say.
+
 > **Under the hood.** The watershed floods from the seed markers over a landscape
-> built from the distance transform (optionally modulated by intensity). Adjacent
-> basins are then assembled into a graph, and each shared interface is scored by
-> two independent metrics; a basin pair is merged back together if either metric
-> says the boundary is not a genuine valley between two cells. Two clean-up passes
-> then run on the whole image: seedless fragments are handed back to a touching
-> neighbour, and any resulting cell below **Min Final Cell Size** is merged into
-> its most-contacted neighbour. Neither pass ever deletes anything.
+> built from the distance transform (modulated by intensity). Adjacent basins are
+> then assembled into a graph, and each shared interface is scored by intensity
+> metrics; a basin pair is merged back together if the boundary is judged not to be
+> a genuine valley between two cells. Two clean-up passes then run on the whole
+> image: seedless fragments are handed back to a touching neighbour, and any
+> resulting cell below **Min Final Cell Size** is merged into its most-contacted
+> neighbour. Neither pass ever deletes anything.
 
 ---
 
@@ -61,11 +66,58 @@ together. They are largely orthogonal — valley-depth looks at interface-vs-som
 local-contrast looks at basin-vs-basin — which is what lets you fix most cases
 with two dials.
 
-A third mechanism can also undo a cut, after both levers have had their say:
-**Min Final Cell Size** merges any resulting cell that is too small to be a cell
-at all (see *Other controls* below). It has the last word, so if a split you
-expected to survive keeps disappearing, check that floor before re-tuning the
-levers.
+### The bright-cut check
+
+A third, internal test sits alongside them: it compares the interface intensity to
+the **whole cell's mean** and flags the boundary when the interface is not
+appreciably darker than the cell body as a whole (the threshold is `0.85`, not
+user-exposed). That pattern means the watershed made a geometric cut straight
+through bright tissue rather than finding a valley — typical when two dim or tiny
+seeds sit close together in the same lobe.
+
+On its own it never merges anything. It can only turn a *keep* into a *merge* when
+the valley-depth test passed but only barely — specifically when the valley ratio
+is above **70% of your Min Path Intensity Ratio**. That band matters in practice:
+at a Min Path Intensity Ratio of `6` the band starts at `4.2`, which real
+interfaces never reach, so the bright-cut check cannot fire and the "set it to 6 to
+guarantee separation" recipe below is safe. At the shipped `0.6` / `0.5` it can and
+does fire. When it does, the interface log line carries `*** BRIGHT CUT ***`.
+
+---
+
+## When a cut is not scored at all
+
+Two preconditions are checked before any intensity is measured. If either applies,
+the boundary is recorded as **KEEP** and the levers never see it. Both appear in
+the log with a reason, so you are never left guessing why a lever had no effect.
+
+**Max Seed Merge Distance** (`max_seed_centroid_dist`) — an upper bound in µm on
+how far apart two somata can be and still be considered for merging. Two cell
+bodies further apart than this cannot be one cell however unconvincing the
+boundary between them looks, so the tests are skipped and the cut stands. This is
+a safety rail on the levers rather than a lever itself: it bounds how much damage
+a permissive Min Path Intensity Ratio can do. Distances are measured between soma
+centroids across the whole image, so a soma in a different part of the image is
+still measured correctly, and the smallest soma-to-soma distance across the
+interface is the one used. Set it to `0` to remove the bound entirely.
+→ log: `KEEP: (a,b) (seeds_beyond_max_merge_distance)`.
+
+**Propagated interfaces** — the image is processed in overlapping chunks, and a
+chunk can inherit a partly-resolved cell from a neighbour it has already finished.
+A boundary where *neither* side has a soma inside the current chunk is not
+judgeable there: it sits between two inherited regions and lands at their midpoint,
+usually in bright tissue rather than at the true contact. Scoring it would reliably
+flag a bright cut and merge, and because merging pools the two cells' seeds, that
+one verdict would spread through the stitcher and fuse two genuinely separate cells
+across the whole image. Such boundaries are therefore kept unscored, so merge
+decisions only happen next to the somata that can justify them.
+→ log: `KEEP: (a,b) (propagated_interface_not_scored)`.
+
+The practical consequence is worth knowing: **if one real cell is over-seeded and
+its two somata land in different chunks, the levers cannot rejoin it.** That case
+has to be fixed in Step 3 by not producing the second seed. It is rare — it needs
+the two spurious seeds to straddle a chunk boundary — but it is a real limit, and
+it is one more reason to get seeding right before tuning here.
 
 ---
 
@@ -99,6 +151,12 @@ Intensity Diff for the remainder. Watch the **Final segmentation** layer: the go
 is that truly distinct cells stay separated while the mistakenly split ones merge
 back into single cells.
 
+If a cell refuses to rejoin no matter how far you move the levers, check the log
+for that pair before moving them further — a `KEEP` with a reason attached means
+one of the two preconditions above is holding the cut, and no lever setting will
+override it. If the reason is `seeds_beyond_max_merge_distance`, raise **Max Seed
+Merge Distance**.
+
 ### Other controls
 
 *   **Watershed Intensity Weight** — `0` cuts on geometry alone (distance
@@ -106,12 +164,16 @@ back into single cells.
     the dividing line toward dark pixels so the cut snaps to a visible intensity
     valley rather than a straight geometric midline. Raise it if cuts land across
     bright tissue instead of at the dark gap. (Shipped default: `0` in 3D, `0.5`
-    in 2D.)
-*   **Max Seed Merge Distance** — an upper bound (µm) on how far apart two seeds
-    can be and still be considered for merging. Lower it to stop distant seeds from
-    being combined.
-*   **Local Analysis Radius** — the neighbourhood size (µm) used by the local-
-    contrast test around an interface.
+    in 2D.) Brightness is normalised against the cell's own soma intensities across
+    the whole image rather than against each chunk's local maximum, so the same
+    value behaves consistently from chunk to chunk.
+*   **Max Seed Merge Distance** — described above; the µm bound beyond which two
+    somata are never merged.
+*   **Local Analysis Radius** — the neighbourhood size used by the local-contrast
+    test around an interface. Note that despite the "(um)" in its label this is
+    applied as a radius in **voxels (3D) / pixels (2D)**, with no conversion for
+    voxel size — so the physical size of the neighbourhood changes with your image
+    resolution.
 *   **Min Final Cell Size** — the size floor for a finished cell. After splitting
     and merging, any cell smaller than this is **merged into its most-contacted
     neighbouring cell**. This applies whether or not the fragment contains a seed:
@@ -127,16 +189,37 @@ back into single cells.
     remains, and that label is then kept whole.
 
     Because the floor is applied after the merge tests, **it overrides them**: a
-    boundary the two levers above deliberately kept is still merged if the
-    resulting cell is undersized. Raise this value to suppress small spurious
-    cells; lower it (or set it to `0`, which disables the pass entirely) if real
-    small cells are being absorbed into their neighbours. Every merge is named in
-    the process log as a `[PROFILE|UNDERSIZE]` line, so you can see exactly which
-    cells were combined and why.
+    boundary the two levers above deliberately kept — including one kept unscored —
+    is still merged if the resulting cell is undersized. Raise this value to
+    suppress small spurious cells; lower it (or set it to `0`, which disables the
+    pass entirely) if real small cells are being absorbed into their neighbours.
+    Every merge is named in the process log as a `[PROFILE|UNDERSIZE]` line. The
+    pass runs smallest-first and repeats until nothing more changes, up to 20
+    rounds; hitting that cap prints a warning and usually means the floor is very
+    large relative to your cells.
 
 If no setting of the two levers gets the count right, the seeds are the problem —
 return to [Step 3](soma_extraction.md) and re-check the **Cell bodies** layer,
 remembering that a *missing* seed can only be fixed there, never here.
+
+---
+
+## Reading the log
+
+Step 4 is as diagnostics-driven as Step 3, but its evidence is in the process log
+rather than in a summary table. When a result is not what you expected, read these
+before changing a parameter. They appear in the order the step runs:
+
+| Line | Tells you |
+| :--- | :--- |
+| `[PROFILE|SEED]` | Per-seed intensity and size relative to its peers, flagging `DIM` or `TINY` seeds. Seeds are never dropped for this, but a bad cut next to a flagged seed usually points back to Step 3. |
+| `[PROFILE|WS]` | The basins the watershed produced: label, size, mean intensity. |
+| `[PROFILE|WS|BOUNDARY]` | Per basin, the mean intensity along its boundary with a verdict of *dark valley* (the cut is where it should be) or *bright cut* (the cut is through tissue). |
+| `[PROFILE|INTERFACE]` | Every scored interface with all three test values and the resulting merge decision. This is the line that tells you which lever to move. |
+| `[PROFILE|GRAPH]` | A `MERGE` or `KEEP` verdict per boundary. A `KEEP` with a reason in brackets was never scored. |
+| `[PROFILE|STITCH]`, `[PROFILE|STITCH|GEO]` | How overlapping chunks were reconciled, including whether a contested region had a real intensity valley. |
+| `[PROFILE|ISLAND]`, `[PROFILE|UNDERSIZE]` | The two clean-up passes: which fragments were handed to a neighbour, and which cells were merged for being under the size floor. |
+| `[PROFILE|CONSERVE]` | Foreground totals at five points from input to output. The end-to-end delta should be zero; a loss is a bug worth reporting. |
 
 ---
 
@@ -146,15 +229,36 @@ remembering that a *missing* seed can only be fixed there, never here.
 | :--- | :--- | :--- | :--- | :--- |
 | **Min Path Intensity Ratio** (`min_path_intensity_ratio`) | float | `0.6` | `0.5` | Valley-depth merge test. High = keep separate; low = merge. |
 | **Min Local Intensity Diff** (`min_local_intensity_difference`) | float | `0.01` | `0.01` | Local-contrast merge test. `0` = never merge; raise = merge more. |
-| **Watershed Intensity Weight** (`intensity_weight`) | float | `0.0` | `0.5` | `0` = geometry-only cuts; higher biases cuts toward dark pixels. |
-| **Max Seed Merge Distance** (`max_seed_centroid_dist`) | float µm | `20.0` | `20.0` | Upper bound on seed separation considered for merging. |
-| **Local Analysis Radius** (`local_analysis_radius`) | int µm | `10` | `10` | Neighbourhood for the local-contrast test. |
-| **Min Final Cell Size** (`min_size_threshold`) | number | `20000` **voxels** | `400` **pixels** | Size floor for a finished cell. A smaller cell is **merged** into its most-contacted neighbour (seeded or not); one with no neighbour is kept whole. Never deletes. `0` disables. Overrides the two merge levers. |
+| **Watershed Intensity Weight** (`intensity_weight`) | float | `0.0` | `0.5` | `0` = geometry-only cuts; higher biases cuts toward dark pixels. Distinct from Step 3's parameter of the same name. |
+| **Max Seed Merge Distance** (`max_seed_centroid_dist`) | float µm | `20.0` | `20.0` | Somata further apart than this are never merged; the interface is kept unscored. `0` removes the bound. |
+| **Local Analysis Radius** (`local_analysis_radius`) | int | `10` | `10` | Neighbourhood for the local-contrast test. Applied in voxels/pixels despite the "(um)" label. |
+| **Min Final Cell Size** (`min_size_threshold`) | number | `20000` **voxels** | `400` **pixels** | Size floor for a finished cell. A smaller cell is **merged** into its most-contacted neighbour (seeded or not); one with no neighbour is kept whole. Never deletes. `0` disables. Overrides every merge decision above. |
 
-> **Under the hood.** A small third signal (a cell-mean intensity ratio) acts only
-> as a tiebreaker when a cut is borderline on the valley-depth test; it is not a
-> user parameter. Chunked processing for large volumes is controlled by an
-> internal `memmap_voxel_threshold` that only affects tiling, not the result.
+### Internal parameters
+
+Not exposed in the interface, listed so the behaviour above is reproducible. Change
+these only in code.
+
+| Name | Value | Effect |
+| :--- | :--- | :--- |
+| `max_interface_to_cell_mean_ratio` | `0.85` | Bright-cut threshold: interface intensity relative to the cell mean. |
+| (borderline band) | `0.7 ×` Min Path Intensity Ratio | How close the valley-depth test must be to its threshold before the bright-cut check may override a keep. |
+| `speed_power` | `1.5` | Exponent on the flooding speed; raises the cost of thin necks so cuts prefer them. |
+| `chunk_shape` / `overlap` | `(128, 512, 512)` / `32` | Processing tile size. Unlike most tiling, these affect the result — see below. |
+
+> **Under the hood: chunking is part of the algorithm, not just memory management.**
+> The image is always processed in overlapping chunks. Chunks holding two or more
+> of a cell's somata are visited first and the sweep radiates outward from them, so
+> boundaries are decided where the evidence is. Each chunk is given the labels its
+> already-finished neighbours wrote, together with the seeds those labels belong to,
+> and uses them as additional watershed markers — this is how a cut computed near
+> the somata continues into chunks that hold none. First writer wins. The stitcher
+> then joins labels across chunk seams, refusing to join two groups whose seed sets
+> are disjoint, and resolves any contested overlap with a small local watershed
+> using the same intensity-guided landscape (or, when the contested region is not
+> actually darker than either side, by giving it to the larger claimant rather than
+> inventing a cut through bright tissue). Because chunk placement determines which
+> boundaries are judgeable, changing the chunk size can change the result.
 
 ---
 

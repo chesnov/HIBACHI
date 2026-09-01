@@ -81,7 +81,50 @@ that essentially every real cell centre produces a core:
     central cores. Listing several ratios lets the step try each and keep the
     best-separated result.
 
-### Step B — open the gates wide, then tighten one at a time
+### Step B — if percentile cores come out fragmented, add smoothing
+
+**Intensity Smoothing (µm)** (`intensity_smooth_um`, default `0.0`) blurs the
+intensity image before the percentile threshold is applied. It exists because a
+percentile threshold follows whatever texture is in the image: inside a bright cell
+body, speckle means the surviving core is a thin web tracing the brightest specks
+rather than a solid blob. Such a core is small, oddly shaped, and often broken into
+many disconnected pieces, so it dies on **Min Seed Size** and the cell comes out
+unseeded — with a large *Too Small* count and nothing obviously wrong with your
+percentile.
+
+Reach for it when the *Too Small* count is high and lowering the percentile does
+not fix it. Raise it in small steps (0.25–1.0 µm is a sensible range) until cores
+are solid. The sigma is specified in **microns and converted per axis**, so
+anisotropic Z is handled correctly and the same value means the same physical blur
+on any image. `0.0` applies no smoothing.
+
+This only affects percentile mode. It has no effect in ratio mode, where the
+threshold is on the distance transform rather than on intensity.
+
+### Step C — if two touching cells share one core, add seed-split weight
+
+**Seed Split Intensity Weight** (`intensity_weight`, default `0.0`) controls how
+much intensity guides the splitting of a single fused core into separate
+candidates, as `field = dt × (1 + w × normalised_intensity)`.
+
+It matters when two touching cells produce one elongated core spanning both. The
+core is split by finding peaks in its distance transform, and an elongated blob
+that is thick along its whole length has only **one** distance-transform maximum —
+so geometry alone finds one peak, emits one candidate, and the pair is never
+separated. No amount of adjusting the percentile fixes this, because the problem is
+in the splitting, not the thresholding. Raising the weight lets the two bright
+centres show up as two peaks.
+
+The response is a broad plateau: anything from `0.25` to `5.0` behaves much the
+same, so the exact value is not critical. `0.0` is distance-transform only.
+
+> **Not the same parameter as Step 4's.** Step 4 has a **Watershed Intensity
+> Weight** with the identical name in code, the identical formula and the identical
+> range. They are separate settings on separate steps: this one splits *seed cores*
+> in Step 3, that one places the *cut between cells* in Step 4. Setting one does
+> nothing to the other.
+
+### Step D — open the gates wide, then tighten one at a time
 
 Every candidate core must pass a chain of gates. Start permissive so real somata
 are not dropped, then tighten using the printed diagnostics. Each gate has a
@@ -113,11 +156,14 @@ clears; if it cannot clear without falling apart, the seed is dropped.
 sitting within **Min Peak Separation** of each other — lower that value if they
 are being lost.
 
-### Step C — leave erosion off
-
-**Soma Erosion Iterations** should be **0** almost always. It erodes every core
-before island detection — a blunt, whole-image operation that helps only in rare
-cases and otherwise shrinks or destroys good seeds.
+> **Min Peak Separation does two jobs.** As well as being the seed-to-seed
+> placement gate above, it is the minimum distance used when splitting one core
+> into several candidates (Step C). So lowering it does not only permit two seeds
+> to sit closer together — it also makes the step more willing to split a core into
+> two candidates in the first place. Raising it does both in reverse. It is
+> converted to pixels using the **smallest in-plane (YX) spacing only**, with a
+> floor of 3 px, so on anisotropic data the same µm value spans many more pixels
+> laterally than the Z step would suggest.
 
 ### Reading the result
 
@@ -146,10 +192,12 @@ resolves as one core — or leave it, since Step 4 can re-merge a modest over-sp
 | **Ratios to Process** (`ratios_to_process`) | list of float | `0.3, 0.4, 0.5, 0.6` | `0.3, 0.4, 0.5, 0.6` | DT-peeling thresholds. Lower = larger core. Leave empty to use percentiles only. |
 | **Intensity Percentiles** (`intensity_percentiles_to_process`) | list of int | `99 … 1` (21 values) | `99 … 1` (21 values) | Brightness thresholds. Higher = smaller core. Override ratios where they compete. |
 | **Min Seed Size** (`min_fragment_size`) | int | `2500` **voxels** | `500` **pixels** | Smallest core kept. Labelled "Min Seed Size" (3D) / "Min Fragment Size" (2D). |
-| **Min Absolute Thickness** (`absolute_min_thickness_um`) | float µm | `1.5` | `1.5` | Lower bound of the thickness window (hard reject). |
+| **Intensity Smoothing** (`intensity_smooth_um`) | float µm | `0.0` | `0.0` | Blur before percentile thresholding. Range 0–10. Percentile mode only; `0` = off. |
+| **Seed Split Intensity Weight** (`intensity_weight`) | float | `0.0` | `0.0` | Intensity guidance when splitting a fused core. Range 0–10; `0` = geometry only. Distinct from Step 4's parameter of the same name. |
+| **Min Absolute Thickness** (`absolute_min_thickness_um`) | float µm | `1.5` | `1.5` | Lower bound of the thickness window (hard reject). Labelled "Soma Min Thickness" in 2D. |
 | **Max Absolute Thickness** (`absolute_max_thickness_um`) | float µm | `10.0` | `10.0` | Upper bound; recovers the inner sub-core rather than discarding. |
 | **Max Aspect Ratio** (`max_allowed_core_aspect_ratio`) | float | `10.0` | `5.0` | Elongation limit; tries tail-shaving recovery before rejecting. |
-| **Min Peak Separation** (`min_physical_peak_separation`) | float µm | `7.0` | `20.0` | Minimum distance between two seeds. |
+| **Min Peak Separation** (`min_physical_peak_separation`) | float µm | `7.0` | `20.0` | Minimum distance between two seeds, and the split distance for fused cores. |
 
 ---
 

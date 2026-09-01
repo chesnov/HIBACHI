@@ -35,6 +35,13 @@ recombine over-split pieces. Both steps affect how many objects you end up with:
     cell: a fragment with no seed, and any cell that ends up below **Min Final
     Cell Size**. Step 4 **never deletes anything** — a small cell with no
     neighbour to merge into is kept as it is.
+*   Step 4's rescue is **not unconditional**. Two preconditions can hold a cut
+    open regardless of the merge levers: somata further apart than **Max Seed
+    Merge Distance**, and boundaries the step cannot fairly judge because neither
+    side has a soma in the same processing chunk. The second means an over-seeded
+    cell whose two somata land in different chunks **cannot be rejoined in Step
+    4 at all** — it has to be fixed by not producing the second seed. Both cases
+    are named in the process log.
 
 So when a cell count looks wrong, the cause can be in either step, and the two
 interact. The practical consequence is the tuning order below: get the seeds
@@ -50,6 +57,15 @@ splitting and merging on good input rather than compensating for bad seeds.
 > the merge and size passes downstream can still change the final count relative
 > to the number of seeds — always downward, and always by combining, never by
 > discarding.
+>
+> Step 4 works in overlapping chunks, and this is part of the algorithm rather
+> than a memory detail. Chunks containing a cell's somata are solved first and
+> hand their labels — plus the seeds those labels belong to — to their neighbours
+> as extra markers, so a cut decided next to the somata carries on across the rest
+> of the cell. A stitcher then joins labels across seams, refusing to join two
+> groups whose seed sets are disjoint. Merge decisions are confined to the chunks
+> that hold the somata, which is why the chunk-straddling case above cannot be
+> rescued.
 
 ---
 
@@ -299,6 +315,27 @@ both lists, which means percentiles are doing the work by default.
     centre resolves into its own small bright core; to stop a single cell
     fragmenting, you go lower so its core stays whole.
 
+### Fix core quality before touching the gates
+
+Two settings shape the *cores themselves*, and reaching for a gate when one of
+these is the real problem is the most common way to get stuck here. Both default
+to `0` (off) and both are described in full on the Step 3 page.
+
+*   **Intensity Smoothing (µm)** — blurs the intensity image before the percentile
+    threshold. Percentile thresholding follows image texture, so speckle inside a
+    bright cell body yields a thin, broken web instead of a solid core, which then
+    dies on Min Seed Size. Reach for this when the *Too Small* count is high and
+    lowering the percentile does not help. Percentile mode only.
+*   **Seed Split Intensity Weight** — lets intensity, not just geometry, split one
+    fused core into separate candidates. Two touching cells often produce a single
+    elongated core with only one distance-transform maximum, so geometry alone
+    emits one candidate and the pair is never separated no matter what percentile
+    you choose. Response is a broad plateau, so any value in `0.25`–`5.0` behaves
+    much the same.
+
+Note that Step 4 has a **Watershed Intensity Weight** with the same name in code,
+the same formula and the same range. They are separate settings on separate steps.
+
 ### Then narrow with the gates — permissive first
 
 Every candidate core, from whichever mode, must pass a series of gates before it
@@ -322,11 +359,9 @@ a time, using the printed rejection counts to see which gate to touch.
     one cell keeps getting several seeds, raise this to merge the duplicates; if
     two genuinely close cells collapse into one seed, lower it. Watched by the
     *Spatial Overlap* count, and by the `[TRAP]` log line that fires whenever one
-    mask receives multiple somas.
-
-*   **Soma Erosion Iterations** — leave this at **0** almost always. It erodes
-    every core before detection, which is a blunt, whole-image sledgehammer; it
-    helps only in rare cases and otherwise just shrinks or destroys good seeds.
+    mask receives multiple somas. Note it does double duty: it is also the minimum
+    distance used when splitting one core into several candidates, so lowering it
+    makes the step more willing to split a core in the first place.
 
 ### Reading the result
 
@@ -413,7 +448,13 @@ which is what lets you fix most cases:
     depth lever misses — use it as the second lever when lowering Min Path
     Intensity Ratio alone over- or under-merges.
 
-The two are additive in effect: a split is undone if **either** lever judges the
+A third, internal check compares the interface to the whole cell's mean and
+catches cuts driven straight through bright tissue. It never merges on its own —
+it can only tip a borderline valley-depth verdict, and only when that verdict is
+within 70% of your Min Path Intensity Ratio. At a ratio of `6` that band is out of
+reach, so the permissive setting above really is permissive.
+
+The two levers are additive in effect: a split is undone if **either** judges the
 boundary unreal, so tune them together — Min Path Intensity Ratio first to do the
 bulk of the rescuing, then Min Local Intensity Diff to catch the cases it leaves
 behind. Watch the **Final segmentation** layer: the goal is that the truly
@@ -426,9 +467,12 @@ over-seeded cells) merge back into single cells.
     `0` biases cuts toward dark pixels so the dividing line snaps to a visible
     intensity valley rather than a straight geometric midline. Raise it if splits
     land in the wrong place (across bright tissue) rather than at the dark gap.
-*   **Max Seed Merge Distance** — an upper bound on how far apart two seeds can be
-    and still be considered for merging; lower it to stop distant seeds being
-    combined.
+*   **Max Seed Merge Distance** — an upper bound (µm) on how far apart two somata
+    can be and still be considered for merging. Beyond it the merge tests are not
+    consulted at all and the cut stands, so it is a safety rail bounding how much
+    a permissive Min Path Intensity Ratio can over-merge rather than a dial you
+    sweep. Lower it to stop distant cells being combined; raise it if a cell you
+    expected to rejoin is being held apart. `0` removes the bound.
 *   **Min Final Cell Size** — the size floor for a finished cell. Any cell below
     it is merged into its most-contacted neighbour, whether or not it holds a seed.
     Nothing is deleted: a small cell with no neighbouring cell to merge into is
@@ -436,6 +480,22 @@ over-seeded cells) merge back into single cells.
     one Step 3 never seeded). Because it runs after the two levers above, it
     overrides them — so check this value before re-tuning the levers if splits you
     expected keep vanishing. `0` disables it. Unit is voxels (3D) / pixels (2D).
+
+### When the levers do nothing
+
+Some boundaries are kept without ever being scored, so no lever setting will
+undo them. There are two reasons, and both are named in the process log as a
+`[PROFILE|GRAPH] KEEP:` line with the reason in brackets:
+
+*   `seeds_beyond_max_merge_distance` — the two somata are further apart than
+    **Max Seed Merge Distance**. Raise that value if the merge was wanted.
+*   `propagated_interface_not_scored` — neither side of the boundary has a soma in
+    the same processing chunk, so the step cannot judge it fairly and keeps the
+    cut. This one cannot be tuned around; the fix is in Step 3, by not creating the
+    second seed.
+
+Check the log for the pair in question before pushing a lever further than it
+wants to go.
 
 If no setting of these levers gets the count right, the seeds themselves are the
 problem — return to Step 3 and re-check the **Cell bodies** layer, remembering
