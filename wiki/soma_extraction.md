@@ -150,7 +150,6 @@ resolves as one core — or leave it, since Step 4 can re-merge a modest over-sp
 | **Max Absolute Thickness** (`absolute_max_thickness_um`) | float µm | `10.0` | `10.0` | Upper bound; recovers the inner sub-core rather than discarding. |
 | **Max Aspect Ratio** (`max_allowed_core_aspect_ratio`) | float | `10.0` | `5.0` | Elongation limit; tries tail-shaving recovery before rejecting. |
 | **Min Peak Separation** (`min_physical_peak_separation`) | float µm | `7.0` | `20.0` | Minimum distance between two seeds. |
-| **Soma Erosion Iterations** (`erosion_iterations`) | int | `0` | `0` | Leave at 0 in almost all cases. |
 
 ---
 

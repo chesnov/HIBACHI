@@ -141,13 +141,27 @@ execute_soma_extraction_fluorescence:
       min: 1
       max: 1000000
       step: 1
-    erosion_iterations:
-      label: Soma Erosion Iterations
-      type: int
-      value: 0
-      min: 0
-      max: 5
-      step: 1
+    intensity_smooth_um:
+      label: Intensity Smoothing (um)
+      hint: Gaussian blur applied to the intensity image before percentile
+        thresholding, in microns (converted per axis, so anisotropic z is handled).
+      type: float
+      value: 0.0
+      min: 0.0
+      max: 10.0
+      step: 0.05
+    intensity_weight:
+      label: Seed Split Intensity Weight
+      hint: How much intensity guides the splitting of a fused seed core, as
+        dt * (1 + w * normalised_intensity). Same meaning and range as the Watershed
+        Intensity Weight in Cell Separation, but applied when splitting seed cores.
+        Two touching nuclei give one distance-transform maximum and are never split
+        on geometry alone. 0 = distance transform only.
+      type: float
+      value: 0.0
+      min: 0.0
+      max: 10.0
+      step: 0.05
     min_physical_peak_separation:
       label: Min Peak Separation (um)
       type: float

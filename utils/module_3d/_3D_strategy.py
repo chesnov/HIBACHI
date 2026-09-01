@@ -351,7 +351,8 @@ class FluorescenceStrategy(ProcessingStrategy):
 
             soma_extraction_params = {
                 "min_fragment_size": int(params.get("min_fragment_size", 100)),
-                "erosion_iterations": int(params.get("erosion_iterations", 0)),
+                "intensity_smooth_um": float(params.get("intensity_smooth_um", 0.0)),
+                "intensity_weight": float(params.get("intensity_weight", 0.0)),
                 "ratios_to_process": params.get(
                     "ratios_to_process", [0.1, 0.2, 0.3, 0.4, 0.5, 0.6]
                 ),
