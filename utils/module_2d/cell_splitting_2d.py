@@ -52,9 +52,14 @@ except ImportError:
 
     from scipy.ndimage import distance_transform_edt
 
+# Shared with the 3D module; single copy lives beside segmentation_helpers.py.
 try:
-    from .interface_metrics import InterfaceStats, decide_merge, format_decision
-    from .deferred_resolution import DeferredInterface, resolve_deferred_interfaces
+    from ..module_3d.interface_metrics import (
+        InterfaceStats, decide_merge, format_decision,
+    )
+    from ..module_3d.deferred_resolution import (
+        DeferredInterface, resolve_deferred_interfaces,
+    )
 except ImportError:
     from interface_metrics import InterfaceStats, decide_merge, format_decision
     from deferred_resolution import DeferredInterface, resolve_deferred_interfaces
