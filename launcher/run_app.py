@@ -4,14 +4,17 @@ run_app.py -- the double-click entry point for HIBACHI.
 Order of operations on every launch:
 
     1. Show a small splash so the user gets immediate feedback.
-    2. Check for a newer version (safe + offline-tolerant; see updater.py).
-    3. If one is available, ASK the user whether to install it. Install only on
+    2. Apply a dependency update left pending by a previous session (e.g. a
+       channel switch made from inside the app, which cannot rebuild its own
+       environment), then re-exec.
+    3. Check for a newer version (safe + offline-tolerant; see updater.py).
+    4. If one is available, ASK the user whether to install it. Install only on
        consent. If the dependency spec changed, update the conda env and
        re-exec this launcher once (so the app runs under the new packages).
-    4. Refresh the desktop launcher so a changed icon / launch command / moved
+    5. Refresh the desktop launcher so a changed icon / launch command / moved
        checkout self-heals (best-effort; skipped on macOS).
-    5. Launch the real application (segment.py) as a subprocess and wait.
-    6. If it exits with an error, offer to roll back to a previous version.
+    6. Launch the real application (segment.py) as a subprocess and wait.
+    7. If it exits with an error, offer to roll back to a previous version.
 
 Everything is defensive: if updating fails for any reason, we still launch the
 version already on disk. The heavy GUI stack (PyQt/napari) is only touched by
@@ -245,6 +248,10 @@ def _apply_env_change(repo_root: str, splash, already_reexeced: bool) -> None:
         _msg(splash, "Dependencies already updated this session; not re-running.")
         return
     _update_environment(repo_root, splash)
+    # Cleared only after the attempt returns, never before. A solve killed
+    # halfway therefore leaves the flag set and is retried on the next launch,
+    # rather than being recorded as done on a half-built environment.
+    updater.set_pending_env_update(False)
     _msg(splash, "Restarting with updated dependencies...")
     if splash is not None:
         splash.close()
@@ -337,6 +344,7 @@ def _run_rollback(repo_root: str) -> None:
         if res.env_changed:
             log("Dependency list differs on this channel; updating now.")
             _update_environment(repo_root, None)
+            updater.set_pending_env_update(False)
             notes.append("Dependencies were updated to match this channel.")
 
     # --- 3. pin / unpin -------------------------------------------------- #
@@ -783,7 +791,16 @@ def main() -> int:
 
     splash = get_splash(enabled=not no_splash)
     try:
-        # Channel switch first: it may replace the working tree and re-exec, and
+        # A previous session left the checkout on code whose dependency spec
+        # has not been applied -- typically a channel switch made from inside
+        # the running app, which cannot rebuild its own environment. Settle that
+        # before the update check or the launch, so the app never starts against
+        # the wrong packages. Re-execs on success and does not return.
+        if updater.get_pending_env_update() and not no_update:
+            _msg(splash, "Finishing a dependency update from the last session...")
+            _apply_env_change(repo_root, splash, already_reexeced)
+
+        # Channel switch next: it may replace the working tree and re-exec, and
         # the update check below must run against the channel we end up on, not
         # the one we started from.
         if want_channel:
