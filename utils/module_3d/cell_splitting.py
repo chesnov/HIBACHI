@@ -137,9 +137,15 @@ def _get_chunk_slices(
     Yields:
         Tuple of slices defining the chunk coordinates.
     """
-    for z in range(0, volume_shape[0], chunk_shape[0] - overlap):
-        for y in range(0, volume_shape[1], chunk_shape[1] - overlap):
-            for x in range(0, volume_shape[2], chunk_shape[2] - overlap):
+    # Stride is floored at 1. Without this, an overlap equal to a chunk dimension
+    # raises (`range` step of zero) and an overlap larger than one silently yields
+    # NO chunks at all, so the whole volume comes back empty with only the
+    # foreground-conservation line to show for it. A thin z-stack with the default
+    # overlap is enough to hit this.
+    strides = tuple(max(1, chunk_shape[k] - overlap) for k in range(3))
+    for z in range(0, volume_shape[0], strides[0]):
+        for y in range(0, volume_shape[1], strides[1]):
+            for x in range(0, volume_shape[2], strides[2]):
                 yield (
                     slice(z, min(z + chunk_shape[0], volume_shape[0])),
                     slice(y, min(y + chunk_shape[1], volume_shape[1])),
@@ -624,6 +630,20 @@ def _separate_multi_soma_cells_chunk(
 
         n_identities = len(identity_seeds)
 
+        # Does every identity have a soma physically inside this crop?
+        #
+        # This decides whether the inherited markers are used at all. Priors exist
+        # to carry a decision INTO a chunk that cannot make it itself. Where all the
+        # somata are present, the priors add nothing and actively harm: an inherited
+        # marker is a region whose extent is bounded by the chunk seam, and using it
+        # as a watershed marker pre-claims that territory, so the basin boundary
+        # hugs a straight, axis-aligned plane instead of the intensity trough.
+        # Measured: a cell with both somata in-crop and one inherited marker split
+        # 5535/717 with both boundaries flagged `WRONG (bright cut)`, the cut lying
+        # along the chunk face.
+        _local_identity_ids = {_identity_of(int(_s)) for _s in seeds_in_crop}
+        _all_identities_local = (len(_local_identity_ids) == n_identities)
+
         # Case: fewer than 2 cells to tell apart here? Treat as single object.
         # Unchanged, except that the label now inherits the seed tags of whatever
         # reached it, so the stitcher can still tell whose piece this is.
@@ -689,8 +709,10 @@ def _separate_multi_soma_cells_chunk(
         # Inherited regions go down first so that a soma always outranks them where
         # they overlap. With no priors this is the original two-line loop.
         markers = np.zeros_like(local_mask, dtype=np.int32)
-        for p, tag in prior_tags.items():
-            markers[(local_prior == p) & local_mask] = _identity_of(sorted(tag)[0])
+        if not _all_identities_local:
+            # Only then are the neighbours' labels needed as markers.
+            for p, tag in prior_tags.items():
+                markers[(local_prior == p) & local_mask] = _identity_of(sorted(tag)[0])
         for s_id in seeds_in_crop:
             markers[local_soma == s_id] = _identity_of(int(s_id))
 
@@ -752,16 +774,19 @@ def _separate_multi_soma_cells_chunk(
         # the Voronoi bias on every propagated chunk, and the failure is invisible
         # except as misassigned branches in the viewer. Which landscape ran is
         # printed every time so it can never be in doubt again.
-        if prior_tags:
+        if not _all_identities_local:
             flush_print(
                 f"  [PROFILE|LANDSCAPE] cell={cell_label}: PURE COST "
-                f"(1/speed^{speed_power}) -- {len(prior_tags)} inherited marker(s)"
+                f"(1/speed^{speed_power}) -- {len(prior_tags)} inherited marker(s) "
+                f"in play; an inherited marker is a region, so d_seeds measured "
+                f"from it would land the cut at the chunk seam"
             )
             landscape = 1.0 / (speed ** speed_power)
         else:
             flush_print(
                 f"  [PROFILE|LANDSCAPE] cell={cell_label}: "
-                f"d_seeds/speed^{speed_power} (all markers are somata)"
+                f"d_seeds/speed^{speed_power} (every identity has a local soma; "
+                f"priors not used as markers)"
             )
             landscape = d_seeds / (speed ** speed_power)
 
@@ -1139,9 +1164,23 @@ def separate_multi_soma_cells(
     if not os.path.exists(memmap_dir):
         os.makedirs(memmap_dir, exist_ok=True)
 
+    # Overlap must leave a positive stride on every axis, or chunking degenerates.
+    _max_ov = max(0, min(chunk_shape) - 1)
+    if overlap > _max_ov:
+        flush_print(
+            f"  [SepMultiSoma] overlap={overlap} is not smaller than the smallest "
+            f"chunk dimension {min(chunk_shape)}; clamping to {_max_ov}. "
+            f"Reduce `overlap` or increase `chunk_shape` to silence this."
+        )
+        overlap = _max_ov
+
     chunk_slices = list(
         _get_chunk_slices(segmentation_mask.shape, chunk_shape, overlap)
     )
+    if not chunk_slices:
+        flush_print("  [SepMultiSoma] *** no chunks generated; returning input "
+                    "unchanged ***")
+        return segmentation_mask.copy()
     chunk_data = {}  # Stores (path, shape, seed_map)
 
     chunk_grid = (
@@ -1235,10 +1274,12 @@ def separate_multi_soma_cells(
 
         group_seeds_cache = {}
 
+        # Same stride floor as `_get_chunk_slices`, so the stitcher's grid matches
+        # the one the chunks were actually generated on.
         shape_in_chunks = [
-            len(range(0, segmentation_mask.shape[0], chunk_shape[0] - overlap)),
-            len(range(0, segmentation_mask.shape[1], chunk_shape[1] - overlap)),
-            len(range(0, segmentation_mask.shape[2], chunk_shape[2] - overlap))
+            len(range(0, segmentation_mask.shape[0], max(1, chunk_shape[0] - overlap))),
+            len(range(0, segmentation_mask.shape[1], max(1, chunk_shape[1] - overlap))),
+            len(range(0, segmentation_mask.shape[2], max(1, chunk_shape[2] - overlap)))
         ]
 
         for i, chunk_slice1 in enumerate(tqdm(chunk_slices, desc="Stitching Analysis")):
