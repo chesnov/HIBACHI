@@ -271,9 +271,22 @@ def _msg(splash, text: str) -> None:
         print(f"[startup] {text}")
 
 
-def _refresh_shortcut(splash) -> None:
-    """Regenerate the desktop launcher (best-effort) so shortcut changes apply."""
+def _refresh_shortcut(splash, repo_root: str) -> None:
+    """
+    Regenerate the desktop launcher (best-effort) so shortcut changes apply.
+
+    Skipped when this checkout is not the recorded install. The shortcut is
+    machine-wide, but `make_shortcuts` targets whichever checkout it was
+    imported from (it derives the path from its own `__file__`), so a developer
+    running a second clone from the same environment would silently repoint the
+    user's desktop icon at their working tree -- and back again on the next
+    launch of the real install. `updater.is_install_dir` returns True when no
+    install was ever recorded, so single-checkout machines are unaffected.
+    """
     try:
+        if not updater.is_install_dir(repo_root):
+            _msg(splash, "Not the installed copy; leaving the desktop shortcut alone.")
+            return
         import make_shortcuts  # sibling module in launcher/
 
         make_shortcuts.make_shortcut()
@@ -855,10 +868,11 @@ def main() -> int:
         # Keep the desktop launcher in sync on every start so a changed icon, a
         # moved checkout, or an updated launch command self-heals. Guarded:
         # make_shortcuts refuses to run from an env that can't launch the app,
-        # and _refresh_shortcut swallows errors so it never blocks startup.
+        # _refresh_shortcut skips checkouts that are not the recorded install,
+        # and it swallows errors so it never blocks startup.
         # macOS is skipped -- its .app bundle owns the launch.
         if not sys.platform.startswith("darwin"):
-            _refresh_shortcut(splash)
+            _refresh_shortcut(splash, repo_root)
 
         _msg(splash, "Launching HIBACHI...")
     finally:

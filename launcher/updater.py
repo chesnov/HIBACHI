@@ -935,6 +935,63 @@ def channel_branch(channel: Optional[str] = None) -> str:
     return CHANNELS.get(channel or get_channel(), STABLE_BRANCH)
 
 
+def _canonical_path(path: str) -> str:
+    """
+    A path in the form used to compare install locations.
+
+    `normcase` on top of `realpath` is what makes this correct on Windows: NTFS
+    is case-insensitive and accepts either separator, so C:\\Users\\K\\app and
+    c:/users/k/app are the same directory -- but `realpath` alone preserves
+    whatever case and slashes the caller supplied, and the two would compare
+    unequal. An install would then fail to recognise its own checkout. On POSIX
+    `normcase` is the identity, so nothing changes there.
+    """
+    return os.path.normcase(os.path.realpath(os.path.abspath(path)))
+
+
+def get_install_dir() -> Optional[str]:
+    """
+    The checkout the installer created, or None if it was never recorded.
+
+    Written once at install time. It exists because several launcher side
+    effects are global to the machine -- the desktop shortcut above all -- while
+    a developer may run a second checkout from the same environment. Without a
+    recorded answer, `_refresh_shortcut` repoints the user's desktop icon at
+    whichever checkout was launched most recently, because `make_shortcuts`
+    derives its target from its own `__file__`.
+    """
+    val = _read_state().get("install_dir")
+    return val if isinstance(val, str) and val else None
+
+
+def set_install_dir(path: str) -> bool:
+    """Record the managed checkout. Stored resolved, so comparisons are stable."""
+    data = _read_state()
+    data["install_dir"] = _canonical_path(path)
+    return _write_state(data)
+
+
+def is_install_dir(repo_root: str) -> bool:
+    """
+    Should machine-wide side effects be applied from `repo_root`?
+
+    True when it is the recorded install, and ALSO true when nothing was
+    recorded -- an install predating this key, or a manual clone, must keep
+    behaving exactly as before rather than silently losing its shortcut
+    refresh. Only a positive mismatch suppresses anything.
+    """
+    recorded = get_install_dir()
+    if not recorded:
+        return True
+    try:
+        # Compare canonically at BOTH ends: a value recorded by an older
+        # launcher was stored without normcase, so normalising only the
+        # argument would still mismatch on Windows.
+        return _canonical_path(repo_root) == _canonical_path(recorded)
+    except Exception:
+        return True
+
+
 def get_pending_env_update() -> bool:
     """
     True when the checkout moved to code whose dependency spec differs from

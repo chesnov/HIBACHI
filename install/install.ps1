@@ -650,6 +650,44 @@ try {
     }
 
     # ======================================================================== #
+    # 6b. Record this checkout as THE managed install
+    # ======================================================================== #
+    # The launcher keeps machine-wide state (notably the desktop shortcut) that
+    # must belong to one checkout. `updater.is_install_dir` compares against
+    # this value and treats an absent value as "yes", so writing it here is what
+    # stops a second clone -- a developer's working tree run from the same
+    # environment -- from repointing the user's Start Menu and Desktop shortcuts
+    # at itself on every launch.
+    #
+    # Written through the env's own Python so the merge with any existing state
+    # (channel, skipped revisions) is done by the same code that reads it. The
+    # path is passed as an argument, never interpolated into the source, so
+    # spaces and backslashes in $AppDir cannot corrupt the snippet.
+    #
+    # Deliberately NOT wrapped in Assert-Native: an unrecorded install behaves
+    # exactly as it did before this key existed, so a failure here must not fail
+    # an otherwise good installation.
+    Say "Registering the installation"
+    Write-ProgressFile 97 98 "Registering installation" ""
+    $registerPy = @'
+import os, sys
+app = sys.argv[1]
+sys.path.insert(0, os.path.join(app, "launcher"))
+import updater
+ok = updater.set_install_dir(app)
+print("  install dir recorded:", updater.get_install_dir())
+sys.exit(0 if ok else 1)
+'@
+    $registerFile = Join-Path $InstallDir ".register_install.py"
+    Set-Content -LiteralPath $registerFile -Value $registerPy -Encoding UTF8 -Force
+    & $EnvPy $registerFile $AppDir
+    $rc = $LASTEXITCODE
+    Remove-Item -LiteralPath $registerFile -Force -ErrorAction SilentlyContinue
+    if ($rc -ne 0) {
+        Warn "Could not record the install directory; continuing (shortcut refresh stays unguarded)."
+    }
+
+    # ======================================================================== #
     # 7. Desktop launcher
     # ======================================================================== #
     Say "Creating desktop launcher"

@@ -666,6 +666,33 @@ else
 fi
 
 # ============================================================================ #
+# 6b. Record this checkout as THE managed install
+# ============================================================================ #
+# The launcher keeps machine-wide state (notably the desktop shortcut) that must
+# belong to one checkout. `updater.is_install_dir` compares against this value
+# and treats an absent value as "yes", so writing it here is what stops a second
+# clone -- a developer's working tree run from the same environment -- from
+# repointing the user's desktop icon at itself on every launch.
+#
+# Written through the env's own Python so the merge with any existing state
+# (channel, skipped revisions) is done by the same code that reads it, rather
+# than by hand-rolled JSON editing in shell.
+progress 97 98 "Registering installation" ""
+if ! "${ENV_PY}" -c '
+import os, sys
+app = sys.argv[1]
+sys.path.insert(0, os.path.join(app, "launcher"))
+import updater
+ok = updater.set_install_dir(app)
+print("  install dir recorded:", updater.get_install_dir())
+sys.exit(0 if ok else 1)
+' "${APP_DIR}"; then
+  # Not fatal: an unrecorded install behaves exactly as it did before this key
+  # existed. Say so rather than failing an otherwise good installation.
+  say "Could not record the install directory; continuing (shortcut refresh stays unguarded)."
+fi
+
+# ============================================================================ #
 # 7. Create the double-click launcher
 # ============================================================================ #
 # Publish the install dir so make_shortcuts.py targets THIS location.
