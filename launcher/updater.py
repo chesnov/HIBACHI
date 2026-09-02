@@ -512,6 +512,7 @@ def apply_update(
     result.message = f"Updated {(result.old_rev or '')[:8]} -> {(result.new_rev or '')[:8]}."
     log(result.message)
     if result.env_changed:
+        set_pending_env_update(True)
         log("Dependency list changed; the environment will be updated.")
     return result
 
@@ -851,6 +852,10 @@ def switch_channel(
     )
     log(result.message)
     if result.env_changed:
+        # Set only now, after the checkout has actually moved. Recording it
+        # earlier would leave a flag demanding an environment rebuild for code
+        # that was never installed.
+        set_pending_env_update(True)
         log("Dependency list differs on this channel; the environment will be updated.")
     return result
 
@@ -928,6 +933,35 @@ def set_channel(channel: str) -> bool:
 def channel_branch(channel: Optional[str] = None) -> str:
     """Branch name for `channel` (default: the tracked one)."""
     return CHANNELS.get(channel or get_channel(), STABLE_BRANCH)
+
+
+def get_pending_env_update() -> bool:
+    """
+    True when the checkout moved to code whose dependency spec differs from
+    what is installed, and that spec has not been applied yet.
+
+    Set by `apply_update` and `switch_channel`; cleared by the launcher once it
+    has attempted the update. It exists because the two are separate processes
+    and separate moments: the code changes now, but only a launcher start can
+    rebuild the environment and re-exec into it. Without the flag, a switch made
+    from inside the running app -- which cannot rebuild its own environment --
+    would leave the next launch seeing an up-to-date checkout, `env_changed`
+    False, and no reason to update anything. The result is one channel's code
+    running against the other's pinned numerics, silently.
+
+    It also survives a kill: a solve interrupted halfway leaves the flag set, so
+    the next launch tries again instead of proceeding on a half-built env.
+    """
+    return bool(_read_state().get("pending_env_update"))
+
+
+def set_pending_env_update(value: bool) -> None:
+    data = _read_state()
+    if value:
+        data["pending_env_update"] = True
+    else:
+        data.pop("pending_env_update", None)
+    _write_state(data)
 
 
 def get_skipped_rev(channel: Optional[str] = None) -> Optional[str]:
