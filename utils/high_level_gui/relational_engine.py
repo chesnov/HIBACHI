@@ -7,9 +7,12 @@ from scipy import ndimage
 from typing import List, Dict, Tuple, Any, Optional
 import shutil
 
-# Correct relative imports
-from ..module_3d.interaction_analysis import calculate_interaction_metrics
-from ..module_2d.interaction_analysis_2d import calculate_interaction_metrics_2d
+# Both entry points now live in one merged module. They are still two
+# functions, and the `is_2d` dispatch below is kept: it is driven by the
+# image's own rank (`len(shape) == 2`), never by the mode string, so it stays
+# correct with a single mode.
+from ..fluorescence_module.interaction_analysis import (
+    calculate_interaction_metrics, calculate_interaction_metrics_2d)
 
 class RelationalEngine:
     """
@@ -185,9 +188,11 @@ class RelationalEngine:
         mask_path, shape, spacing, mask_name, id_mapping, out_dir, sample_name, is_2d
     ):
         if is_2d:
-            from ..module_2d.calculate_features_2d import analyze_segmentation_2d
+            from ..fluorescence_module.calculate_features import (
+                analyze_segmentation_2d)
         else:
-            from ..module_3d.calculate_features_3d import analyze_segmentation
+            from ..fluorescence_module.calculate_features import (
+                analyze_segmentation)
 
         mask = np.memmap(mask_path, dtype=np.int32, mode='r', shape=shape)
 

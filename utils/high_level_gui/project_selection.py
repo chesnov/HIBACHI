@@ -386,7 +386,11 @@ def sample_status(sample_folder: str) -> str:
         pass
 
     basename = os.path.splitext(tif)[0]
-    processed_dir = os.path.join(sample_folder, f"{basename}_processed_{mode}")
+    # Prefers the unified directory name and honours an existing legacy one, so
+    # a project processed before the modes merged still reports as processed
+    # rather than as unprocessed with its results sitting right there.
+    from ..fluorescence_module.config_migration import find_processed_dir
+    processed_dir = find_processed_dir(sample_folder, basename)
     if not os.path.isdir(processed_dir):
         return STATUS_UNPROCESSED
     try:
@@ -502,19 +506,21 @@ def partial_step_label(sample_folder: str) -> str:
             cfg = yaml.safe_load(fh) or {}
         mode = cfg.get("mode", "unknown")
 
-        from ..module_3d._3D_strategy import FluorescenceStrategy  # type: ignore
-        from ..module_2d._2D_strategy import Fluorescence2DStrategy  # type: ignore
-        strat_cls = {
-            "fluorescence": FluorescenceStrategy,
-            "fluorescence_2d": Fluorescence2DStrategy,
-        }.get(mode)
+        from ..fluorescence_module.fluorescence_strategy import (  # type: ignore
+            FluorescenceStrategy)
+        from ..fluorescence_module.config_migration import (  # type: ignore
+            UNIFIED_MODE, find_processed_dir, normalise_mode)
+        # One entry, and the lookup normalises: a saved project still carrying
+        # 'fluorescence_2d' resolves to the same class rather than returning ""
+        # and losing its step label.
+        strat_cls = {UNIFIED_MODE: FluorescenceStrategy}.get(normalise_mode(mode))
         if strat_cls is None:
             return ""
 
         with _tiff.TiffFile(_os.path.join(sample_folder, tif)) as tf:
             shape = tf.series[0].shape if tf.series else (1,)
         basename = _os.path.splitext(tif)[0]
-        processed_dir = _os.path.join(sample_folder, f"{basename}_processed_{mode}")
+        processed_dir = find_processed_dir(sample_folder, basename)
 
         # Spacing/scale don't affect on-disk checkpoint detection, so pass
         # neutral values — we only read get_last_completed_step() + step names.
