@@ -48,8 +48,20 @@ from .project_selection import _default_state_dir
 # --------------------------------------------------------------------------- #
 # Constants
 # --------------------------------------------------------------------------- #
-MODE_3D = "fluorescence"
-MODE_2D = "fluorescence_2d"
+from ..fluorescence_module.config_migration import (  # noqa: E402
+    LEGACY_MODES, UNIFIED_MODE, normalise_config, normalise_mode,
+)
+
+#: The one processing mode. Rank comes from the image, so a config no longer
+#: declares it.
+MODE = UNIFIED_MODE
+
+#: Retained so existing importers keep working while they are updated, and so a
+#: legacy string read off disk still compares equal to something. Both now name
+#: the same mode -- anything branching on the difference between them is a bug
+#: of the shape described in the handoff's §5.5.
+MODE_3D = UNIFIED_MODE
+MODE_2D = UNIFIED_MODE
 
 # The canonical reference file per mode (see module docstring).
 REFERENCE_FILENAME = "default.yaml"
@@ -61,6 +73,12 @@ REFERENCE_FILENAME = "default.yaml"
 # and dimensions) is handled separately via the run-config export helpers below.
 _IMAGE_SPECIFIC_KEYS = (
     "saved_state",
+    # The unified key first; the two legacy ones are still stripped because a
+    # preset may have been saved from a config that predates the merge. Omitting
+    # 'dimensions' meant every preset saved by this build carried the source
+    # image's physical extent into the library, and applying it would overwrite
+    # the target image's own calibration.
+    "dimensions",
     "voxel_dimensions",
     "pixel_dimensions",
     # Provenance of THIS image's dimensions. Travels with the dimensions, so it
@@ -74,8 +92,12 @@ _SOURCE_BUILTIN = "builtin"
 _SOURCE_LIBRARY = "library"
 
 _SOURCE_LABEL = {_SOURCE_BUILTIN: "Built-in", _SOURCE_LIBRARY: "My Library"}
-_MODE_LABEL = {MODE_3D: "3D", MODE_2D: "2D"}
-_MODE_SUBDIR = {MODE_3D: "3d", MODE_2D: "2d"}
+#: Subdirectory of the library root new presets are written to. The two legacy
+#: names below are still DISCOVERED and still written back to when an existing
+#: preset is overwritten, so no user file is moved or renamed -- a saved preset
+#: keeps working and keeps its path.
+_LIBRARY_SUBDIR = "fluorescence"
+_LEGACY_SUBDIRS = ("3d", "2d")
 
 
 # --------------------------------------------------------------------------- #
@@ -101,7 +123,7 @@ class LibraryEntry:
     """A single discoverable config (built-in or user library)."""
     name: str          # human-facing base name, e.g. "iMG"
     path: str          # absolute path to the .yaml
-    mode: str          # MODE_3D or MODE_2D
+    mode: str          # always MODE; kept so callers' shape is unchanged
     source: str        # _SOURCE_BUILTIN or _SOURCE_LIBRARY
 
     @property
@@ -110,9 +132,12 @@ class LibraryEntry:
 
     @property
     def label(self) -> str:
+        # No rank in the label any more: one config now applies to 2D and 3D
+        # data alike, so a "(3D)" suffix would be a claim about the preset that
+        # is not true -- and with one mode string every preset would have got
+        # the same suffix regardless.
         src = _SOURCE_LABEL.get(self.source, self.source)
-        md = _MODE_LABEL.get(self.mode, "?")
-        return f"{self.name} \u2014 {src} ({md})"
+        return f"{self.name} \u2014 {src}"
 
 
 @dataclass
@@ -184,12 +209,17 @@ def mode_of(config: Union[str, Dict[str, Any]]) -> str:
         src = "<in-memory config>"
         data = config or {}
 
+    # Normalised, not compared raw: a saved project or an exported preset still
+    # carries 'fluorescence_2d' (or the retired 'ramified' names), and those are
+    # this same pipeline under an old name. Comparing the raw string would raise
+    # on every one of them and make the file unopenable.
     declared = data.get("mode")
-    if declared in (MODE_2D, MODE_3D):
-        return declared
+    if normalise_mode(declared) == MODE:
+        return MODE
     raise ConfigModeError(
         f"Config has no valid 'mode' (found {declared!r}) in {src}. "
-        f"Expected '{MODE_3D}' (3D) or '{MODE_2D}' (2D)."
+        f"Expected '{MODE}' (or the legacy "
+        f"{', '.join(repr(m) for m in LEGACY_MODES)})."
     )
 
 
@@ -212,14 +242,37 @@ def desktop_dir() -> str:
     return desktop if os.path.isdir(desktop) else home
 
 
-def _mode_dir(mode: str) -> str:
-    return os.path.join(library_root(), _MODE_SUBDIR.get(mode, "3d"))
+def _mode_dir(mode: Any = None) -> str:
+    """Directory NEW presets are written to. `mode` is accepted and ignored.
+
+    It used to select a per-rank subdirectory from the mode string, which cannot
+    work with one mode: every preset would have landed in ``3d/`` regardless of
+    what it was for.
+    """
+    return os.path.join(library_root(), _LIBRARY_SUBDIR)
+
+
+def _library_dirs() -> List[str]:
+    """Every directory user presets are read from, write target first.
+
+    The legacy per-rank folders are included whenever they exist. Users have
+    presets in them and those files are not moved: relocating a preset changes
+    its path, and the project view records the config a channel was set up with
+    by name, so a moved file reads as a missing one.
+    """
+    root = library_root()
+    dirs = [os.path.join(root, _LIBRARY_SUBDIR)]
+    dirs.extend(os.path.join(root, sub) for sub in _LEGACY_SUBDIRS)
+    return [d for i, d in enumerate(dirs) if i == 0 or os.path.isdir(d)]
 
 
 def ensure_library() -> str:
-    """Create the library folder tree if missing; return the root."""
-    for mode in (MODE_2D, MODE_3D):
-        os.makedirs(_mode_dir(mode), exist_ok=True)
+    """Create the library folder if missing; return the root.
+
+    Only the write target is created. The legacy folders are read when present
+    but never conjured, so a fresh install gets one clean directory.
+    """
+    os.makedirs(_mode_dir(), exist_ok=True)
     return library_root()
 
 
@@ -246,11 +299,14 @@ def _display_name_from_file(filename: str) -> str:
 # Built-in discovery
 # --------------------------------------------------------------------------- #
 def _builtin_dirs() -> List[Tuple[str, str]]:
-    """(config_dir, mode) for the two in-repo module config folders."""
+    """(config_dir, mode) for the in-repo built-in config folder.
+
+    One folder now, in the merged package. The pair shape is kept because
+    ``reference_config`` and ``_scan_dir`` iterate it.
+    """
     here = os.path.dirname(os.path.abspath(__file__))
     return [
-        (os.path.join(here, "..", "module_3d", "configs"), MODE_3D),
-        (os.path.join(here, "..", "module_2d", "configs"), MODE_2D),
+        (os.path.join(here, "..", "fluorescence_module", "configs"), MODE),
     ]
 
 
@@ -292,8 +348,8 @@ def list_builtins() -> List[LibraryEntry]:
 
 def list_library() -> List[LibraryEntry]:
     entries: List[LibraryEntry] = []
-    for mode in (MODE_3D, MODE_2D):
-        entries.extend(_scan_dir(_mode_dir(mode), _SOURCE_LIBRARY)[0])
+    for config_dir in _library_dirs():
+        entries.extend(_scan_dir(config_dir, _SOURCE_LIBRARY)[0])
     return entries
 
 
@@ -304,8 +360,8 @@ def scan_problems() -> List[Tuple[str, str]]:
     problems: List[Tuple[str, str]] = []
     for config_dir, _mode in _builtin_dirs():
         problems.extend(_scan_dir(config_dir, _SOURCE_BUILTIN)[1])
-    for mode in (MODE_3D, MODE_2D):
-        problems.extend(_scan_dir(_mode_dir(mode), _SOURCE_LIBRARY)[1])
+    for config_dir in _library_dirs():
+        problems.extend(_scan_dir(config_dir, _SOURCE_LIBRARY)[1])
     return problems
 
 
@@ -347,6 +403,10 @@ def scan_available_presets() -> Dict[str, Dict[str, str]]:
 def sanitize_for_library(config: Union[str, Dict[str, Any]]) -> Dict[str, Any]:
     """Return a copy with image/run-specific keys removed and ``mode`` preserved."""
     data = _load_yaml(config) if isinstance(config, str) else copy.deepcopy(config)
+    # Normalised on the way in, so a preset saved from an old project is stored
+    # in the current schema rather than freezing the legacy spelling into a new
+    # file that will need migrating again every time it is read.
+    data = normalise_config(data, log=lambda _m: None)
     clean: Dict[str, Any] = {}
     resolved_mode = mode_of(data)
     for key, val in data.items():
@@ -360,8 +420,21 @@ def sanitize_for_library(config: Union[str, Dict[str, Any]]) -> Dict[str, Any]:
 # --------------------------------------------------------------------------- #
 # Library CRUD
 # --------------------------------------------------------------------------- #
-def _target_path(name: str, mode: str) -> str:
-    return os.path.join(_mode_dir(mode), f"{sanitize_name(name)}.yaml")
+def _target_path(name: str, mode: Any = None) -> str:
+    """Path a preset called `name` should be written to.
+
+    An EXISTING file of that name wins, wherever it lives, so saving over a
+    preset the user already has updates that file instead of creating a second
+    one with the same display name in the new directory -- which would make the
+    library show two identical rows and leave whichever the scan reached first
+    in charge. Only a genuinely new name goes to the write target.
+    """
+    filename = f"{sanitize_name(name)}.yaml"
+    for config_dir in _library_dirs():
+        candidate = os.path.join(config_dir, filename)
+        if os.path.isfile(candidate):
+            return candidate
+    return os.path.join(_mode_dir(), filename)
 
 
 def entry_exists(name: str, mode: str) -> bool:
@@ -380,7 +453,7 @@ def save_to_library(
     on collision unless ``overwrite`` is True, so the UI can decide.
     """
     clean = sanitize_for_library(config)
-    resolved_mode = mode or clean.get("mode") or MODE_3D
+    resolved_mode = normalise_mode(mode or clean.get("mode") or MODE)
     clean["mode"] = resolved_mode
 
     ensure_library()
@@ -423,7 +496,7 @@ def export_run_config(run_config_path: str, dst_path: str) -> str:
     """Export a processed run's config verbatim, for full reproducibility.
 
     Unlike saving to the library, nothing is stripped: ``saved_state`` (computed
-    thresholds), ``voxel/pixel_dimensions`` (calibration) and ``hibachi_version``
+    thresholds), ``dimensions`` (calibration) and ``hibachi_version``
     (the exact pipeline commit) are all preserved so a collaborator can reproduce
     the run — e.g. by checking out the recorded version. This is the intended way
     to share a non-stripped config.
@@ -447,21 +520,24 @@ def _lenient_mode(data: Dict[str, Any]) -> Optional[str]:
     rule), so nothing is ever *applied* on an inferred mode -- it's just shown.
     """
     declared = data.get("mode")
-    if declared in (MODE_2D, MODE_3D):
-        return declared
+    if normalise_mode(declared) == MODE:
+        return MODE
+    # The step-suffix fallback no longer distinguishes anything -- both
+    # `execute_x_fluorescence` and `execute_x_fluorescence_2d` are the same
+    # pipeline, and config_migration rewrites the latter on load. Any
+    # recognisable step structure means this mode.
     step_keys = [k for k in data if isinstance(k, str) and k.startswith("execute_")]
-    if step_keys:
-        return MODE_2D if any(k.endswith("_2d") for k in step_keys) else MODE_3D
-    return None
+    return MODE if step_keys else None
 
 
 def _has_dimensions(data: Dict[str, Any]) -> bool:
     """True if the config carries a non-empty physical-calibration block.
 
-    Accepts either ``voxel_dimensions`` (3D) or ``pixel_dimensions`` (2D). A key
-    that is present but empty/blank does not count as having dimensions.
+    Accepts the unified ``dimensions`` key and the two legacy per-rank keys that
+    saved projects still carry. A key that is present but empty/blank does not
+    count as having dimensions.
     """
-    for key in ("voxel_dimensions", "pixel_dimensions"):
+    for key in ("dimensions", "voxel_dimensions", "pixel_dimensions"):
         val = data.get(key)
         if isinstance(val, dict) and any(axis in val for axis in ("x", "y", "z")):
             return True
@@ -483,7 +559,7 @@ def read_provenance(path: str) -> Dict[str, Any]:
         threshold. Portable library presets are stripped of this; processed-run
         configs keep it.
       * ``has_dimensions`` -- whether the file carries physical calibration
-        (``voxel_dimensions`` / ``pixel_dimensions``). Also stripped from
+        (``dimensions``, or the legacy per-rank keys). Also stripped from
         portable presets (dimensions are per-image), kept by run configs.
       * ``is_full_run`` -- True when it carries run-specific state
         (``has_saved_state`` or ``has_dimensions``): a reproducibility record
@@ -546,7 +622,7 @@ def builtin_reference(mode: str) -> Dict[str, Any]:
         an arbitrary file.
     """
     for config_dir, dir_mode in _builtin_dirs():
-        if dir_mode != mode:
+        if dir_mode != normalise_mode(mode):
             continue
         ref = os.path.join(config_dir, REFERENCE_FILENAME)
         if os.path.isfile(ref):
@@ -611,6 +687,17 @@ def reconcile(
     dropped or added silently — the caller shows ``summary_lines()`` first.
     """
     src = _load_yaml(source) if isinstance(source, str) else copy.deepcopy(source)
+
+    # Migrate BEFORE any comparison. Steps are matched by exact key below, and a
+    # saved project still carries the old suffixed spelling
+    # (`execute_x_fluorescence`, or `..._fluorescence_2d`) while the reference is
+    # unsuffixed. Left unmigrated, the two sets would not intersect at all: all
+    # five steps would report as added AND removed, every tuned value would be
+    # dropped on the floor (values only carry across shared steps), and the GUI
+    # would invalidate the run's results from step 1 on the strength of it. The
+    # call is idempotent, so an already-current config passes through silently.
+    src = normalise_config(src, log=lambda _m: None)
+
     resolved_mode = mode or mode_of(src)
     # No silent passthrough: if the mode has no canonical reference this raises
     # ReferenceMissingError, which the caller surfaces to the user.

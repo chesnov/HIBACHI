@@ -18,9 +18,19 @@ Translations
     mode: fluorescence_2d           -> fluorescence
     voxel_dimensions / pixel_dimensions -> dimensions
     min_size_voxels / min_size_pixels   -> min_size
-    execute_*_fluorescence_2d       -> execute_*_fluorescence
+    execute_*_fluorescence_2d       -> execute_*
+    execute_*_fluorescence          -> execute_*
     scale profile rows              -> every row gains smooth_sigma and
                                        connect_max_gap_physical
+
+The step keys lose the mode suffix entirely rather than collapsing onto the 3D
+spelling. The suffix existed to keep two pipelines' blocks apart in one file;
+with one pipeline it is dead weight, and the canonical reference is unsuffixed.
+That makes this rewrite load-bearing: `config_library.reconcile` matches steps
+by exact key, so an unmigrated `execute_x_fluorescence` against an unsuffixed
+reference shares NO steps -- every step reads as both added and removed, every
+tuned value is dropped, and the GUI deletes the run's results from step 1. A
+config must therefore pass through here before it is reconciled.
 
 The last one is the awkward one. The 3D percentile table historically omitted
 those two keys, while its own absolute table and both 2D tables carried them.
@@ -54,6 +64,18 @@ _RETIRED_MODES = ("ramified", "ramified_2d")
 
 _SIZE_ALIASES = ("min_size_voxels", "min_size_pixels")
 _DIM_ALIASES = ("voxel_dimensions", "pixel_dimensions")
+
+#: Step-key suffixes earlier versions appended. Longest first, so
+#: `_fluorescence_2d` is matched before `_fluorescence` would strip half of it.
+_STEP_SUFFIXES = ("_fluorescence_2d", "_fluorescence", "_ramified_2d", "_ramified")
+
+
+def _base_step_key(key: str) -> str:
+    """`key` with any historical mode suffix removed."""
+    for suffix in _STEP_SUFFIXES:
+        if key.endswith(suffix):
+            return key[: -len(suffix)]
+    return key
 
 
 # --------------------------------------------------------------------------- #
@@ -170,14 +192,22 @@ def normalise_config(config: Dict[str, Any], log=print) -> Dict[str, Any]:
         if not (isinstance(block, dict) and key.startswith("execute_")):
             continue
 
-        # `execute_x_fluorescence_2d` -> `execute_x_fluorescence`
-        new_key = key
-        if key.endswith("_2d"):
-            new_key = key[:-3]
-            if new_key != key:
-                cfg[new_key] = cfg.pop(key)
-                block = cfg[new_key]
-                changes.append(f"{key} -> {new_key}")
+        # `execute_x_fluorescence_2d` / `execute_x_fluorescence` -> `execute_x`
+        new_key = _base_step_key(key)
+        if new_key != key:
+            if new_key in cfg:
+                # Both spellings present. `get_config_key` prefers the suffixed
+                # one, so THAT block is what the pipeline actually read and it
+                # wins; the bare one was inert. Said out loud rather than
+                # resolved silently, because the two can hold different values.
+                changes.append(
+                    f"{key} and {new_key} both present; kept {key}'s values "
+                    f"(the block the pipeline was reading) and discarded "
+                    f"{new_key}'s"
+                )
+            cfg[new_key] = cfg.pop(key)
+            block = cfg[new_key]
+            changes.append(f"{key} -> {new_key}")
 
         params = block.get("parameters") or {}
 
@@ -239,7 +269,7 @@ def is_legacy(config: Dict[str, Any]) -> bool:
         return True
     for key, block in config.items():
         if key.startswith("execute_") and isinstance(block, dict):
-            if key.endswith("_2d"):
+            if _base_step_key(key) != key:
                 return True
             if any(a in (block.get("parameters") or {}) for a in _SIZE_ALIASES):
                 return True
