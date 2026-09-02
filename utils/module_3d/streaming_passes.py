@@ -260,13 +260,20 @@ def merge_undersized_streaming(
                 guard.add(lbl)
                 continue
             best = max(sorted(nb), key=lambda k: nb[k])
+            # `lbl` is the undersized one; `best` is the neighbour absorbing it.
+            # The union keeps the smaller id, which has nothing to do with size, so
+            # report the merge in terms of what actually happened rather than in
+            # terms of which id survived -- otherwise a large neighbour gets logged
+            # as having been merged away for being small, and px_merged accumulates
+            # its voxels instead of the fragment's.
+            absorbed, absorbed_size = lbl, size[lbl]
             keep = uf.union(lbl, best)
-            gone = best if keep == lbl else lbl
-            log(f"    [PROFILE|UNDERSIZE] label={gone} size={size[gone]} "
-                f"< {min_size_threshold} -> MERGE into {keep} "
-                f"(contact={nb[best]} voxels)")
+            log(f"    [PROFILE|UNDERSIZE] label={absorbed} size={absorbed_size} "
+                f"< {min_size_threshold} -> MERGE into {best} "
+                f"(contact={nb[best]} voxels, surviving id={keep})")
             n_merged += 1
-            px_merged += size[gone]
+            px_merged += absorbed_size
+            gone = best if keep == lbl else lbl
             # Fold the absorbed label's size and contacts into the survivor.
             size[keep] = size.pop(lbl) + size.pop(best) if keep in (lbl, best) else size[keep]
             merged_contacts = contact.pop(gone, {})

@@ -35,13 +35,17 @@ recombine over-split pieces. Both steps affect how many objects you end up with:
     cell: a fragment with no seed, and any cell that ends up below **Min Final
     Cell Size**. Step 4 **never deletes anything** — a small cell with no
     neighbour to merge into is kept as it is.
-*   Step 4's rescue is **not unconditional**. Two preconditions can hold a cut
-    open regardless of the merge levers: somata further apart than **Max Seed
-    Merge Distance**, and boundaries the step cannot fairly judge because neither
-    side has a soma in the same processing chunk. The second means an over-seeded
-    cell whose two somata land in different chunks **cannot be rejoined in Step
-    4 at all** — it has to be fixed by not producing the second seed. Both cases
-    are named in the process log.
+*   Step 4's merge tests run **twice**: inside each chunk, for boundaries whose
+    two basins both own a soma in that chunk, and then **once globally after
+    stitching**, for every boundary between two finished cells. The global pass is
+    the authoritative one — it sees both cells whole, so the soma reference and
+    the cell mean mean what they were designed to mean. It is also what rejoins a
+    cell that picked up several erroneous somata when those somata landed in
+    different chunks, which no per-chunk test can see.
+*   One thing does hold a cut open regardless of the levers: **Max Seed Merge
+    Distance**. Somata further apart than that are never merged, in either pass.
+    Note that `0` disables the bound, while a small non-zero value gates every
+    candidate and turns merging off altogether — see *When the levers do nothing*.
 
 So when a cell count looks wrong, the cause can be in either step, and the two
 interact. The practical consequence is the tuning order below: get the seeds
@@ -59,13 +63,19 @@ splitting and merging on good input rather than compensating for bad seeds.
 > discarding.
 >
 > Step 4 works in overlapping chunks, and this is part of the algorithm rather
-> than a memory detail. Chunks containing a cell's somata are solved first and
-> hand their labels — plus the seeds those labels belong to — to their neighbours
-> as extra markers, so a cut decided next to the somata carries on across the rest
-> of the cell. A stitcher then joins labels across seams, refusing to join two
-> groups whose seed sets are disjoint. Merge decisions are confined to the chunks
-> that hold the somata, which is why the chunk-straddling case above cannot be
-> rescued.
+> than a memory detail. Chunks containing a cell's somata are solved first. A
+> chunk that cannot decide a boundary itself inherits its neighbours' labels, and
+> the seeds those labels belong to, as extra markers — and switches to a landscape
+> that does not measure straight-line distance from them, because an inherited
+> marker is a region rather than a point. Where all of a cell's somata are present
+> in one chunk, the inherited markers are not used at all; using them there
+> pre-claims chunk-shaped territory and produces cuts that run along the chunk face.
+>
+> After stitching, one bounded-memory sweep collects per-label and per-interface
+> aggregates, and three passes run on the assembled result: the global merge tests,
+> then seedless-fragment reassignment, then the size floor. Because the merge tests
+> get their final say there, the merge outcome does not depend on where the chunk
+> seams fell.
 
 ---
 
@@ -475,27 +485,52 @@ over-seeded cells) merge back into single cells.
     expected to rejoin is being held apart. `0` removes the bound.
 *   **Min Final Cell Size** — the size floor for a finished cell. Any cell below
     it is merged into its most-contacted neighbour, whether or not it holds a seed.
-    Nothing is deleted: a small cell with no neighbouring cell to merge into is
-    kept at full size, which is what preserves a genuinely small cell (including
-    one Step 3 never seeded). Because it runs after the two levers above, it
-    overrides them — so check this value before re-tuning the levers if splits you
-    expected keep vanishing. `0` disables it. Unit is voxels (3D) / pixels (2D).
+    This is the **third lever against over-splitting**, and it works on a
+    different signal from the two above: they ask whether a boundary looks real,
+    it asks whether the resulting piece is big enough to be a cell. It therefore
+    catches over-splits the intensity tests miss — a thin sliver cut off by a weak
+    spurious seed, for instance. It applies to basins whether or not they own a
+    soma, since every basin owns one.
+
+    An original mask that arrived with one soma or none is never affected: only
+    siblings from one split ever touch each other, so a whole object has no
+    neighbour to merge into and is kept at full size whatever its size. Nothing is
+    deleted. Where several basins of one cell are all undersized, the merges
+    cascade until one label remains.
+
+    Because it runs after the two levers above, it overrides them — so check this
+    value before re-tuning them if splits you expected keep vanishing. `0` disables
+    it. Unit is voxels (3D) / pixels (2D).
 
 ### When the levers do nothing
 
-Some boundaries are kept without ever being scored, so no lever setting will
-undo them. There are two reasons, and both are named in the process log as a
-`[PROFILE|GRAPH] KEEP:` line with the reason in brackets:
+Read the global merge summary before moving a lever further:
 
-*   `seeds_beyond_max_merge_distance` — the two somata are further apart than
-    **Max Seed Merge Distance**. Raise that value if the merge was wanted.
-*   `propagated_interface_not_scored` — neither side of the boundary has a soma in
-    the same processing chunk, so the step cannot judge it fairly and keeps the
-    cut. This one cannot be tuned around; the fix is in Step 3, by not creating the
-    second seed.
+```
+[PROFILE|GLOBALMERGE|SUMMARY] interfaces_tested=... | merged=... | beyond_max_merge_distance=...
+```
 
-Check the log for the pair in question before pushing a lever further than it
-wants to go.
+*   **`interfaces_tested=0`** with a large `beyond_max_merge_distance` — **Max Seed
+    Merge Distance** is gating every candidate, so no merge test ran anywhere in
+    the run and the over-seeding rescue did nothing. Set it to `0`, or to a value
+    comfortably above your real soma separations. Watch for a small non-zero value
+    here: `0` disables the bound, but something like `0.01` gates everything.
+*   **`interfaces_tested` high, `merged=0`** — the tests are running and rejecting.
+    That is a real lever question; lower Min Path Intensity Ratio.
+
+Inside the chunks you will also see `[PROFILE|GRAPH] KEEP:` lines carrying
+`propagated_interface_not_scored` or `seeds_beyond_max_merge_distance`. Those are
+not dead ends — the first means the chunk deferred the boundary to the global pass,
+which is where it gets decided.
+
+### If a cut looks straight or angular
+
+A dividing surface that is unnaturally flat and axis-aligned, especially with a
+very lopsided basin split on the `[PROFILE|WS]` line, means the cut is being
+shaped by chunk geometry rather than by the image. Check the `[PROFILE|LANDSCAPE]`
+line for that cell: it names which landscape ran and why. `PURE COST` alongside a
+badly unbalanced split is the signature. See the Step 4 page for what the two
+landscapes are and when each applies.
 
 If no setting of these levers gets the count right, the seeds themselves are the
 problem — return to Step 3 and re-check the **Cell bodies** layer, remembering

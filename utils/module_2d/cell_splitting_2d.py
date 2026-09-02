@@ -1856,11 +1856,24 @@ def separate_multi_soma_cells_2d(
         # AFTER the island pass so satellites have been reattached and the sizes
         # being judged are final. Merges only -- never deletes.
         #
-        # A label that owns a soma is protected: the threshold exists to tidy
-        # debris, and a fragment with a soma is not debris.
-        # Set `protect_seeded_cells=False` for the old behaviour.
+        # The size floor is a deliberate lever against over-splitting, so it must
+        # apply to watershed basins even though every basin owns a soma -- owning a
+        # soma is why the basin exists. Whether a label is a split basin or a whole
+        # original object is already decided by whether it has an adjacent label:
+        # distinct objects in the step 2 mask are separated by background, so only
+        # siblings from one split touch each other. A whole object therefore has no
+        # neighbour to merge into and is kept at full size whatever its size, which
+        # is exactly the rule wanted: an original mask with one soma or none becomes
+        # one cell, no questions.
+        #
+        # `protect_seeded_cells` exempts any soma-owning label from the floor. That
+        # exempts every basin, which disables the lever entirely -- symptom in the
+        # log is `[PROFILE|UNDERSIZE|SUMMARY] merged=0` on an image that visibly
+        # needs merging. Default OFF for that reason. Turn it on only to shield
+        # small-but-real cells from a threshold set too high for the data, and
+        # prefer fixing the threshold or the intensity levers instead.
         _protect = set()
-        if kwargs.get('protect_seeded_cells', True):
+        if kwargs.get('protect_seeded_cells', False):
             _protect = {
                 lbl for lbl, somas in accumulate_label_soma_map(
                     ret, soma_mask, block_shape=_stats_block
