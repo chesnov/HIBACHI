@@ -134,11 +134,18 @@ def _resolve_config(folder: str, mode: str) -> Tuple[Dict[str, Any], str, str]:
     template only when no processed run exists. ``source`` is "tuned" or
     "template".
     """
+    from ..fluorescence_module.config_migration import (
+        find_config_path, find_processed_dir)
+
     template_path, tif = _find_config_and_image(folder)
     basename = os.path.splitext(os.path.basename(tif))[0]
-    processed = os.path.join(
-        folder, f"{basename}_processed_{mode}", f"processing_config_{mode}.yaml")
-    if os.path.isfile(processed):
+    # Both the directory and the filename carried the mode, so both need the
+    # legacy fallback: a project tuned before the modes merged keeps its
+    # `..._processed_fluorescence_2d/processing_config_fluorescence_2d.yaml`,
+    # and building only the unified names would silently read the untouched
+    # template instead of the values the user actually tuned.
+    processed = find_config_path(find_processed_dir(folder, basename)) or ""
+    if processed and os.path.isfile(processed):
         return _load_yaml(processed), "tuned", tif
     return _load_yaml(template_path), "template", tif
 
@@ -165,7 +172,9 @@ def _raw_seg_step_key(config: Dict[str, Any]) -> str:
 def _spacing_from_config(config: Dict[str, Any], shape: Tuple[int, ...],
                          is_2d: bool) -> Tuple[float, ...]:
     """Per-pixel spacing = physical extent / shape (matches gui_manager)."""
-    dim = config.get("pixel_dimensions" if is_2d else "voxel_dimensions", {}) or {}
+    from .metadata import find_dimensions
+    _dim_key, dim = find_dimensions(config)
+    dim = dim or {}
     try:
         tx = float(dim.get("x", 1.0)); ty = float(dim.get("y", 1.0))
         tz = float(dim.get("z", 1.0))
@@ -280,36 +289,24 @@ def _segment_labels(image: np.ndarray, spacing: Tuple[float, ...],
     os.makedirs(run_tmp, exist_ok=True)
     labels_dir = None
     try:
-        if is_2d:
-            from ..module_2d.initial_2d_segmentation import (
-                segment_cells_first_pass_raw_2d as seg)
-            result = seg(
-                image=image, spacing=spacing,
-                tubular_scales=kw["tubular_scales"],
-                smooth_sigma=kw["smooth_sigma"],
-                connect_max_gap_physical=kw["connect_max_gap_physical"],
-                min_size_pixels=kw["min_size"],
-                low_threshold_percentile=kw["low_threshold_percentile"],
-                high_threshold_percentile=kw["high_threshold_percentile"],
-                threshold_mode=kw["threshold_mode"],
-                trace_max_gap=kw["trace_max_gap"],
-                temp_root_path=run_tmp,
-            )
-        else:
-            from ..module_3d.initial_3d_segmentation import (
-                segment_cells_first_pass_raw as seg)
-            result = seg(
-                volume=image, spacing=spacing,
-                tubular_scales=kw["tubular_scales"],
-                smooth_sigma=kw["smooth_sigma"],
-                connect_max_gap_physical=kw["connect_max_gap_physical"],
-                min_size_voxels=kw["min_size"],
-                low_threshold_percentile=kw["low_threshold_percentile"],
-                high_threshold_percentile=kw["high_threshold_percentile"],
-                threshold_mode=kw["threshold_mode"],
-                trace_max_gap=kw["trace_max_gap"],
-                temp_root_path=run_tmp,
-            )
+        # One segmenter for both ranks: it infers rank from `volume`. The two
+        # former branches differed only in argument spelling (image/volume,
+        # min_size_pixels/min_size_voxels) and converged on the same 4-tuple,
+        # so there is nothing left to dispatch on.
+        from ..fluorescence_module.initial_segmentation import (
+            segment_cells_first_pass_raw as seg)
+        result = seg(
+            volume=image, spacing=spacing,
+            tubular_scales=kw["tubular_scales"],
+            smooth_sigma=kw["smooth_sigma"],
+            connect_max_gap_physical=kw["connect_max_gap_physical"],
+            min_size=kw["min_size"],
+            low_threshold_percentile=kw["low_threshold_percentile"],
+            high_threshold_percentile=kw["high_threshold_percentile"],
+            threshold_mode=kw["threshold_mode"],
+            trace_max_gap=kw["trace_max_gap"],
+            temp_root_path=run_tmp,
+        )
         dat_path, labels_dir, _thr, _ = result
         if not dat_path or not os.path.exists(dat_path):
             raise OptimizationError("Segmentation produced no output.")
@@ -554,7 +551,12 @@ def optimize_initial_segmentation(
     if len(folders) < 2:
         raise OptimizationError("Select at least two images to optimize across.")
 
-    is_2d = mode.endswith("_2d")
+    # Rank is decided per image, from the image, once it is loaded. Deriving it
+    # from the mode string cannot work with a single mode -- the test would be
+    # False for every project, so a 2D image would get the 3D crop budget and a
+    # 3-axis spacing. `config_ndim` is used as a cross-check only: the array's
+    # own ndim is the authority here, since that is what the segmenter sees.
+    from .metadata import config_ndim
 
     # ---- Load every image, config, crop, and per-image optimum -------------- #
     _tick(0.0, "Loading images and configs…")
@@ -568,8 +570,11 @@ def optimize_initial_segmentation(
         step_key = _raw_seg_step_key(config)
         params = _flatten_params(config[step_key].get("parameters", config[step_key]))
         image = _load_image(tif_path)
-        if is_2d and image.ndim != 2:
+        # A 2D acquisition can arrive with singleton axes; squeeze first so the
+        # rank below is the real one.
+        if config_ndim(config) == 2 and image.ndim != 2:
             image = np.squeeze(image)
+        is_2d = (image.ndim == 2)
         crop = _pick_crop(image, is_2d)
         image = np.ascontiguousarray(image[crop])
         spacing = _spacing_from_config(config, image.shape, is_2d)
