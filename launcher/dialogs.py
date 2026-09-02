@@ -5,7 +5,6 @@ Uses ONLY tkinter/ttk (bundled with the conda Python); never imports the heavy
 GUI stack (PyQt/napari). Every function degrades safely with no display:
 
     * ask_update      -> "later"  (never update without explicit consent)
-    * choose_rollback -> None     (cancel)
     * choose_version  -> None     (cancel)
     * confirm_uninstall -> False  (never delete without explicit consent)
     * ask_yes_no      -> False
@@ -34,8 +33,9 @@ _ACCENT_ACTIVE = "#a94a2d"
 _BORDER = "#e2e4e8"
 _SEL = "#f3d9cf"         # list selection tint
 
-# Returned by choose_rollback() when the user picks Uninstall instead of a
-# version. A sentinel keeps the existing Optional[str] contract intact.
+# Returned by choose_version() when the user picks Uninstall instead of a
+# version, rather than a {channel, rev} selection. A sentinel keeps the
+# return type flat and avoids a second out-parameter.
 UNINSTALL = "__uninstall__"
 
 _ICON = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "hibachi.png")
@@ -212,79 +212,6 @@ def ask_update(current: str, latest: str, changelog: List[str], env_changed: boo
     root.protocol("WM_DELETE_WINDOW", lambda: choose("later"))
     _run(root)
     return result["choice"]
-
-
-def choose_rollback(versions: List[Dict[str, str]], current_rev: str) -> Optional[str]:
-    """Show recent versions; return the chosen full rev, or None if cancelled/no UI."""
-    tk, root, ui = _new_root()
-    if tk is None:
-        return None
-    from tkinter import ttk
-
-    result: Dict[str, Optional[str]] = {"rev": None}
-    _header(tk, root, ui, "Switch version")
-    body = _body(tk, root)
-
-    ttk.Label(body, text="Select a version to switch to:").pack(
-        anchor="w", padx=22, pady=(16, 8)
-    )
-
-    listwrap = tk.Frame(body, bg=_CARD)
-    listwrap.pack(fill="both", expand=True, padx=22)
-    sb = ttk.Scrollbar(listwrap, orient="vertical")
-    lb = tk.Listbox(listwrap, width=64, height=min(12, max(3, len(versions))),
-                    activestyle="none", font=ui["mono"], bd=0, relief="flat",
-                    highlightthickness=1, highlightbackground=_BORDER,
-                    selectbackground=_SEL, selectforeground=_TEXT,
-                    bg=_CARD, fg=_TEXT, yscrollcommand=sb.set)
-    sb.config(command=lb.yview)
-    sb.pack(side="right", fill="y")
-    lb.pack(side="left", fill="both", expand=True)
-
-    cur_index = 0
-    for i, v in enumerate(versions):
-        here = v["rev"].startswith(current_rev) or (current_rev and current_rev.startswith(v["rev"]))
-        if here:
-            cur_index = i
-        marker = "  \u25c0 current" if here else ""
-        lb.insert("end", f' {v["date"]}   {v["short"]}   {v["subject"]}{marker}')
-    if versions:
-        lb.selection_set(cur_index)
-        lb.see(cur_index)
-
-    hint = ttk.Label(body,
-                     text="Tip: you can also switch back later from the app's status bar.",
-                     style="Muted.TLabel")
-    hint.pack(anchor="w", padx=22, pady=(8, 0))
-
-    btns = ttk.Frame(body)
-    btns.pack(fill="x", padx=22, pady=(14, 18))
-
-    def do_switch() -> None:
-        sel = lb.curselection()
-        if sel:
-            result["rev"] = versions[sel[0]]["rev"]
-        _finish(root)
-
-    def cancel() -> None:
-        result["rev"] = None
-        _finish(root)
-
-    def uninstall() -> None:
-        result["rev"] = UNINSTALL
-        _finish(root)
-
-    ttk.Button(btns, text="Cancel", command=cancel).pack(side="left")
-    ttk.Button(btns, text="Uninstall HIBACHI...", command=uninstall).pack(
-        side="left", padx=(8, 0)
-    )
-    ttk.Button(btns, text="Switch to this version", style="Accent.TButton",
-               command=do_switch).pack(side="right")
-    lb.bind("<Double-Button-1>", lambda _e: do_switch())
-
-    root.protocol("WM_DELETE_WINDOW", cancel)
-    _run(root)
-    return result["rev"]
 
 
 CHANNEL_LABELS = {"stable": "Stable", "dev": "Development"}

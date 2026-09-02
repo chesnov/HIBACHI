@@ -1,7 +1,7 @@
 """Complete removal of a HIBACHI installation.
 
-Reached from the version menu (dialogs.choose_rollback -> "Uninstall..."), so the
-same entry point that rolls back also removes.
+Reached from the version menu (dialogs.choose_version -> "Uninstall..."), so the
+same entry point that switches channel or version also removes.
 
 Deletion runs in a DETACHED SHELL SCRIPT, not here: the targets include the
 interpreter executing this module (<install>/micromamba/envs/hibachi/bin/python)
