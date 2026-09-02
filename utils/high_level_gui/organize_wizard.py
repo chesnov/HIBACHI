@@ -875,13 +875,19 @@ if _HAVE_QT:
                 _match_dimension_override, load_dimension_overrides,
             )
 
-            # Mode comes from the chosen preset(s): it decides whether Z is even
-            # a question. If presets disagree (mixed 2D/3D channels), asking for
-            # the superset is right -- an unused Z is harmless, a missing one is not.
-            modes = set()
-            for _ch_idx, preset, _target in plan:
-                modes.add(str(preset.get('default_mode', '')))
-            mode = '' if any(not m.endswith('_2d') for m in modes) else 'fluorescence_2d'
+            # Which axes to ask about is decided PER IMAGE, from that image's own
+            # probed rank, inside plan_manual_entry. The presets' modes are no
+            # longer consulted: they all carry the single unified mode now, so
+            # the old superset heuristic below resolved to the 3D axes for every
+            # project and asked for a depth on 2D data.
+            #
+            #   modes = {preset['default_mode'] for ... in plan}
+            #   mode = '' if any(not m.endswith('_2d') for m in modes) else 'fluorescence_2d'
+            #
+            # `mode` is still passed through as the fallback for an image whose
+            # shape could not be probed at all.
+            from ..fluorescence_module.config_migration import UNIFIED_MODE
+            mode = UNIFIED_MODE
 
             csv_overrides = {}
             try:
@@ -934,6 +940,11 @@ if _HAVE_QT:
             ten typo.
             """
             from .metadata import MetadataExtractor
+            from .dimension_entry import NDIM_KEY
+            # The rank travels with the counts. It is recorded here because this
+            # is the only place the shape's LENGTH is seen: both branches report
+            # z=1 for a 2D image, so the counts alone cannot say whether a depth
+            # is a question -- and the mode string no longer can either.
             if MetadataExtractor._slide_source(name)[0] is not None:
                 # Slide scenes are sized via the slide reader rather than
                 # tifffile. Prefill is a convenience, so failing to get counts
@@ -943,9 +954,11 @@ if _HAVE_QT:
                     # Returns (Z, Y, X) or (Y, X), or None on any failure.
                     shape = scene_shape(name, self_root) or ()
                     if len(shape) == 3:
-                        return {'z': shape[0], 'y': shape[1], 'x': shape[2]}
+                        return {'z': shape[0], 'y': shape[1], 'x': shape[2],
+                                NDIM_KEY: 3}
                     if len(shape) == 2:
-                        return {'z': 1, 'y': shape[0], 'x': shape[1]}
+                        return {'z': 1, 'y': shape[0], 'x': shape[1],
+                                NDIM_KEY: 2}
                 except Exception:
                     pass
                 return {}
@@ -954,9 +967,10 @@ if _HAVE_QT:
                 series = handle.series[0]
                 shape = series.shape
             if len(shape) >= 3:
-                return {'z': shape[0], 'y': shape[-2], 'x': shape[-1]}
+                return {'z': shape[0], 'y': shape[-2], 'x': shape[-1],
+                        NDIM_KEY: 3}
             if len(shape) == 2:
-                return {'z': 1, 'y': shape[0], 'x': shape[1]}
+                return {'z': 1, 'y': shape[0], 'x': shape[1], NDIM_KEY: 2}
             return {}
 
         def _report_unscaled(self, summaries: List[dict]) -> None:

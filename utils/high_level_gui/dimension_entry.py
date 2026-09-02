@@ -119,8 +119,42 @@ def is_calibrated(config: Dict[str, Any]) -> bool:
 # --------------------------------------------------------------------------- #
 # Gap detection
 # --------------------------------------------------------------------------- #
-def axes_for_mode(mode) -> Tuple[str, ...]:
-    """Axes a mode needs: 2D has no Z."""
+#: Rank of the image a pixel-count dict was probed from, carried alongside the
+#: per-axis counts. The counts alone cannot answer it: a 2D probe reports
+#: ``z: 1`` and so does a single-slice z-stack, and the distinction decides
+#: whether the user is asked for a depth at all. Every consumer reads this dict
+#: with ``.get(axis)``, so the extra key is inert for them.
+NDIM_KEY = "ndim"
+
+
+def pixels_ndim(pixels: Optional[Dict[str, Any]]):
+    """Rank recorded by a pixel-count probe, or None if it did not record one."""
+    try:
+        value = (pixels or {}).get(NDIM_KEY)
+        return int(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def axes_for_mode(mode=None, ndim=None) -> Tuple[str, ...]:
+    """Axes an acquisition needs: a 2D image has no Z.
+
+    Rank comes from `ndim` -- the image's own dimensionality -- whenever the
+    caller can supply it. `mode` is honoured only as a fallback, for callers
+    with no image to consult yet, and is otherwise ignored.
+
+    The mode string can no longer answer this. With one mode,
+    ``mode.endswith('_2d')`` is always False, so this returned ('x','y','z')
+    for every image including 2D ones -- which asks the user for a depth that
+    does not exist, writes a z extent into a 2D config, and reports z as an
+    unscaled axis on every 2D organize. Same shape as the two guards in §5.5:
+    the test was only ever meaningful because two mode strings differed.
+    """
+    if ndim is not None:
+        try:
+            return ("x", "y", "z") if int(ndim) >= 3 else ("x", "y")
+        except (TypeError, ValueError):
+            pass
     return ("x", "y") if str(mode).endswith("_2d") else ("x", "y", "z")
 
 
@@ -191,26 +225,34 @@ def looks_like_pixel_count(total, pixels, rel_tol: float = UNIT_SCALE_REL_TOL) -
 def unit_scale_axes(
     totals: Optional[Dict[str, Any]],
     pixels: Optional[Dict[str, Any]],
-    mode,
+    mode=None,
     rel_tol: float = UNIT_SCALE_REL_TOL,
+    ndim=None,
 ) -> Tuple[str, ...]:
-    """Axes whose total extent is indistinguishable from their pixel count."""
+    """Axes whose total extent is indistinguishable from their pixel count.
+
+    Rank defaults to whatever the probe in `pixels` recorded, so a caller that
+    already has the counts does not have to supply it twice.
+    """
     if not totals or not pixels:
         return ()
+    if ndim is None:
+        ndim = pixels_ndim(pixels)
     return tuple(
-        a for a in axes_for_mode(mode)
+        a for a in axes_for_mode(mode, ndim)
         if looks_like_pixel_count(totals.get(a), pixels.get(a), rel_tol)
     )
 
 
-def scale_gaps(meta: Optional[Dict[str, Any]], mode) -> Tuple[str, ...]:
+def scale_gaps(meta: Optional[Dict[str, Any]], mode=None,
+               ndim=None) -> Tuple[str, ...]:
     """Axes for which `meta` provides no trustworthy scale.
 
     Per-axis on purpose. The previous check looked only at X and Y, so a 3D
     image with a genuine X/Y but no Z spacing passed as fully calibrated -- and
     Z is exactly the axis that is most often missing.
     """
-    axes = axes_for_mode(mode)
+    axes = axes_for_mode(mode, ndim)
     if not isinstance(meta, dict) or not meta.get("found"):
         return axes
     return tuple(a for a in axes if not _is_real_spacing(meta.get(a)))
@@ -219,8 +261,9 @@ def scale_gaps(meta: Optional[Dict[str, Any]], mode) -> Tuple[str, ...]:
 def resulting_totals(
     meta: Optional[Dict[str, Any]],
     pixels: Optional[Dict[str, Any]],
-    mode,
+    mode=None,
     csv_override: Optional[Dict[str, Optional[float]]] = None,
+    ndim=None,
 ) -> Dict[str, Optional[float]]:
     """The total extent each axis would end up with, before any manual entry.
 
@@ -230,7 +273,9 @@ def resulting_totals(
     """
     out: Dict[str, Optional[float]] = {}
     pixels = pixels or {}
-    for axis in axes_for_mode(mode):
+    if ndim is None:
+        ndim = pixels_ndim(pixels)
+    for axis in axes_for_mode(mode, ndim):
         if csv_override and csv_override.get(axis) is not None:
             out[axis] = float(csv_override[axis])
             continue
@@ -245,7 +290,7 @@ def resulting_totals(
 
 def plan_manual_entry(
     files_meta: Sequence[Tuple[str, Optional[Dict[str, Any]], Dict[str, int]]],
-    mode,
+    mode=None,
     csv_overrides: Optional[Dict[str, Dict[str, Optional[float]]]] = None,
     match_override=None,
     check_unit_scale: bool = True,
@@ -286,7 +331,12 @@ def plan_manual_entry(
             else:
                 override = csv_overrides.get(filename)
 
-        missing = set(scale_gaps(meta, mode))
+        # Rank per image, from that image's own probe -- not from the preset's
+        # mode, which is now the same string for 2D and 3D acquisitions. A
+        # mixed-rank batch therefore asks each file only about the axes it has.
+        ndim = pixels_ndim(pixels)
+
+        missing = set(scale_gaps(meta, mode, ndim))
         from_csv = set()
         if override:
             for axis in list(missing):
@@ -294,7 +344,7 @@ def plan_manual_entry(
                     missing.discard(axis)
                     from_csv.add(axis)
 
-        totals = resulting_totals(meta, pixels, mode, override)
+        totals = resulting_totals(meta, pixels, mode, override, ndim)
 
         # Suspicious totals only matter for axes we believe we HAVE a value for;
         # a missing axis is already being asked about, and its placeholder total
@@ -302,7 +352,7 @@ def plan_manual_entry(
         suspicious = set()
         if check_unit_scale:
             suspicious = {
-                a for a in unit_scale_axes(totals, pixels, mode)
+                a for a in unit_scale_axes(totals, pixels, mode, ndim=ndim)
                 if a not in missing
             }
 
@@ -312,7 +362,7 @@ def plan_manual_entry(
 
         reasons = {}
         current: Dict[str, Optional[float]] = {}
-        for axis in axes_for_mode(mode):
+        for axis in axes_for_mode(mode, ndim):
             if axis in missing:
                 reasons[axis] = REASON_MISSING
             elif axis in suspicious:
@@ -321,7 +371,7 @@ def plan_manual_entry(
 
         plan.append({
             "filename": filename,
-            "axes": tuple(a for a in axes_for_mode(mode) if a in ask),
+            "axes": tuple(a for a in axes_for_mode(mode, ndim) if a in ask),
             "pixels": dict(pixels or {}),
             "from_csv": tuple(sorted(from_csv)),
             "reasons": reasons,
@@ -335,12 +385,13 @@ def per_axis_sources(
     meta: Optional[Dict[str, Any]],
     csv_axes: Iterable[str] = (),
     manual_axes: Iterable[str] = (),
+    ndim=None,
 ) -> Dict[str, str]:
     """Provenance of each axis, for `combine_sources`."""
     csv_axes, manual_axes = set(csv_axes), set(manual_axes)
-    gaps = set(scale_gaps(meta, mode))
+    gaps = set(scale_gaps(meta, mode, ndim))
     out: Dict[str, str] = {}
-    for axis in axes_for_mode(mode):
+    for axis in axes_for_mode(mode, ndim):
         if axis in manual_axes:
             out[axis] = SOURCE_MANUAL
         elif axis in csv_axes:
@@ -401,7 +452,7 @@ def _build_dialog_classes():
         dialog cannot be used to accidentally overwrite a good value.
 
         Values are TOTAL microns per axis, matching the config's
-        ``voxel_dimensions`` / ``pixel_dimensions`` blocks and the CSV's
+        ``dimensions`` block and the CSV's
         'Width (um)' columns, rather than per-pixel spacing. Totals are what
         the rest of the pipeline stores, and asking for the same quantity the
         file format uses avoids a units conversion the user has to get right.

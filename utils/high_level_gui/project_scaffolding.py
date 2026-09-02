@@ -98,7 +98,12 @@ def _clear_processed_result_files(folder_path: str, details: Dict[str, Any]) -> 
         return 0
 
     basename = os.path.splitext(tif_file)[0]
-    proc_dir = os.path.join(folder_path, f"{basename}_processed_{mode}")
+    # Honours an existing legacy directory name rather than deriving one from
+    # the folder's mode: a project processed as 'fluorescence_2d' still has its
+    # results under that name, and deriving the unified name here would find
+    # nothing and silently skip the cleanup, leaving stale results in place.
+    from ..fluorescence_module.config_migration import find_processed_dir
+    proc_dir = find_processed_dir(folder_path, basename)
     if not os.path.isdir(proc_dir):
         return 0
 
@@ -109,14 +114,16 @@ def _clear_processed_result_files(folder_path: str, details: Dict[str, Any]) -> 
         cfg = {}
 
     try:
-        from ..module_3d._3D_strategy import FluorescenceStrategy  # type: ignore
-        from ..module_2d._2D_strategy import Fluorescence2DStrategy  # type: ignore
+        from ..fluorescence_module.fluorescence_strategy import (  # type: ignore
+            FluorescenceStrategy)
+        from ..fluorescence_module.config_migration import (  # type: ignore
+            UNIFIED_MODE, normalise_mode)
     except Exception:
         return 0
-    strat_cls = {
-        "fluorescence": FluorescenceStrategy,
-        "fluorescence_2d": Fluorescence2DStrategy,
-    }.get(mode)
+    # One entry, and the lookup normalises: a folder still carrying
+    # 'fluorescence_2d' resolves to the same class rather than returning None
+    # and skipping the cleanup it was called to do.
+    strat_cls = {UNIFIED_MODE: FluorescenceStrategy}.get(normalise_mode(mode))
     if strat_cls is None:
         return 0
 
@@ -154,8 +161,9 @@ def apply_template_config_to_project(
 
     Merges strategies:
     - All ``execute_*`` parameter blocks are taken wholesale from the template.
-    - ``voxel_dimensions`` / ``pixel_dimensions`` are preserved from each image's
-      own YAML so physical calibration is never overwritten.
+    - ``dimensions`` (and the legacy ``voxel_dimensions`` / ``pixel_dimensions``,
+      which saved projects still carry) are preserved from each image's own YAML
+      so physical calibration is never overwritten.
     - ``mode`` is preserved from each folder's existing value.
     - For folders that already have a processed config (Config 2), ``saved_state``
       (e.g. auto-detected thresholds) is also preserved so a partial run can still
@@ -251,8 +259,13 @@ def apply_template_config_to_project(
             if key.startswith('execute_'):
                 merged_main[key] = val
 
-        # Preserve per-image physical calibration (never overwrite with template values)
-        for dim_key in ('voxel_dimensions', 'pixel_dimensions'):
+        # Preserve per-image physical calibration (never overwrite with template
+        # values). The unified key is carried alongside the two legacy ones
+        # because merged_main is rebuilt from scratch: omitting 'dimensions'
+        # dropped the calibration of every image written by this build, which
+        # reads as an uncalibrated image the moment a config is applied to it.
+        from .metadata import DIMENSIONS_KEY, LEGACY_DIMENSION_KEYS
+        for dim_key in (DIMENSIONS_KEY,) + tuple(LEGACY_DIMENSION_KEYS):
             if dim_key in current_main:
                 merged_main[dim_key] = current_main[dim_key]
             elif dim_key in template:
@@ -288,13 +301,17 @@ def apply_template_config_to_project(
         tif_file = details.get('tif_file')
         if tif_file:
             basename = os.path.splitext(tif_file)[0]
-            effective_mode = merged_main['mode']
-            proc_dir = os.path.join(
-                folder_path, f"{basename}_processed_{effective_mode}"
-            )
-            proc_config_path = os.path.join(
-                proc_dir, f"processing_config_{effective_mode}.yaml"
-            )
+            # Both resolved rather than derived from the mode, for the same
+            # reason as the cleanup above: the existing results and their run
+            # config are under whatever name they were written with. Deriving
+            # the unified name would miss them, and the stale-results check
+            # below would then pass by default -- the folder would open showing
+            # data the new parameters did not produce.
+            from ..fluorescence_module.config_migration import (
+                config_basename, find_config_path, find_processed_dir)
+            proc_dir = find_processed_dir(folder_path, basename)
+            proc_config_path = (find_config_path(proc_dir)
+                                or os.path.join(proc_dir, config_basename()))
 
             if os.path.exists(proc_config_path):
                 try:
@@ -453,7 +470,7 @@ def _match_dimension_override(
     return None
 
 
-def _has_real_scale(meta: Dict[str, Any], mode: Any = "") -> bool:
+def _has_real_scale(meta: Dict[str, Any], mode: Any = "", ndim=None) -> bool:
     """True if `meta` carries a physical scale worth trusting on every axis.
 
     The ``found`` flag alone is not enough. Many writers (tifffile included)
@@ -464,12 +481,19 @@ def _has_real_scale(meta: Dict[str, Any], mode: Any = "") -> bool:
     producing dimensions that are really just pixel counts.
 
     Now delegates to ``dimension_entry.scale_gaps`` so the check is per-axis and
-    mode-aware. The old version tested only X and Y, so a 3D image with a genuine
+    rank-aware. The old version tested only X and Y, so a 3D image with a genuine
     X/Y but no Z spacing passed as fully calibrated -- and Z is the axis
     microscopes most often fail to record.
+
+    Pass `ndim` (the image's own rank) whenever it is known: without it, and with
+    one mode string for both ranks, this asks about Z for 2D images too.
+
+    NOTE: no live callers -- both organize paths now call ``scale_gaps``
+    directly, per axis. Kept only because it is importable from outside; a
+    candidate for deletion alongside the §6 cleanups.
     """
     from .dimension_entry import scale_gaps
-    return not scale_gaps(meta, mode)
+    return not scale_gaps(meta, mode, ndim)
 
 def organize_channel_project(
     source_files: List[str],
@@ -509,8 +533,21 @@ def organize_channel_project(
         template_data = yaml.safe_load(f) or {}
     
     mode = template_data.get('mode', fallback_mode)
-    is_2d_mode = mode.endswith('_2d')
-    dimension_key = 'pixel_dimensions' if is_2d_mode else 'voxel_dimensions'
+    # Rank is NOT taken from the mode here. This function writes the dimension
+    # block for a newly organized channel, and the template's mode is the same
+    # string for 2D and 3D data now, so `mode.endswith('_2d')` was False for
+    # every project: a 2D image would have been given a 'z' extent computed
+    # from a z_slices of 1 and whatever spurious z spacing its header carried.
+    #
+    # Every image in the loop below is read anyway, a few lines after
+    # extraction, to get its pixel counts (`mem.ndim`). That array is the
+    # authority on rank, so the per-image `img_ndim` derived there is what
+    # decides the axes. `template_ndim` is the fallback for an image whose
+    # array could not be read at all, in which case the totals are neutral
+    # placeholders regardless.
+    from .metadata import DIMENSIONS_KEY, LEGACY_DIMENSION_KEYS, config_ndim
+    dimension_key = DIMENSIONS_KEY
+    template_ndim = config_ndim(template_data)
 
     # A metadata CSV next to the raw images overrides what the files claim.
     csv_path = _find_dimension_csv(source_root)
@@ -621,11 +658,15 @@ def organize_channel_project(
             meta = MetadataExtractor.read_tiff_metadata(src_path)
 
         # Get pixel counts from the extracted file
+        img_ndim = template_ndim
         try:
             mem = tiff.imread(target_tif_path)
             shape = mem.shape
             z_slices = shape[0] if mem.ndim == 3 else 1
             height, width = shape[-2], shape[-1]
+            # The extracted array's own rank, which is what the dimension block
+            # and every axis check below are keyed on.
+            img_ndim = 3 if mem.ndim >= 3 else 2
             del mem
             gc.collect() # Force immediate release during heavy batch organization
         except Exception:
@@ -648,12 +689,13 @@ def organize_channel_project(
         # suppressed the unscaled report for the axes it did NOT supply, so a CSV
         # with only 'Width (um)' silently left Y and Z as pixel counts.
         from .dimension_entry import (
-            SOURCE_PIXELS_ASSUMED, combine_sources, per_axis_sources,
-            scale_gaps, stamp_dimensions_source, unit_scale_axes,
+            SOURCE_PIXELS_ASSUMED, axes_for_mode, combine_sources,
+            per_axis_sources, scale_gaps, stamp_dimensions_source,
+            unit_scale_axes,
         )
 
         totals = {'x': total_w, 'y': total_h, 'z': total_d}
-        gaps = set(scale_gaps(meta, mode))
+        gaps = set(scale_gaps(meta, mode, img_ndim))
         csv_axes, manual_axes = set(), set()
 
         override = _match_dimension_override(overrides, src_file)
@@ -684,7 +726,8 @@ def organize_channel_project(
 
         total_w, total_h, total_d = totals['x'], totals['y'], totals['z']
 
-        axis_sources = per_axis_sources(mode, meta, csv_axes, manual_axes)
+        axis_sources = per_axis_sources(mode, meta, csv_axes, manual_axes,
+                                        ndim=img_ndim)
         dim_source = combine_sources(axis_sources)
 
         still_missing = sorted(
@@ -698,7 +741,8 @@ def organize_channel_project(
         # 1 um/pixel is correct for that axis.
         suspect = [
             a for a in unit_scale_axes(
-                totals, {'x': width, 'y': height, 'z': z_slices}, mode)
+                totals, {'x': width, 'y': height, 'z': z_slices}, mode,
+                ndim=img_ndim)
             if a not in manual_axes and a not in still_missing
         ]
 
@@ -731,13 +775,25 @@ def organize_channel_project(
         if not os.path.exists(new_config_path):
             shutil.copy2(config_template_path, new_config_path)
 
+        axes_written = axes_for_mode(mode, img_ndim)
         try:
             with open(new_config_path, 'r') as f: cfg = yaml.safe_load(f) or {}
+            # Written under the unified key, and the legacy blocks the template
+            # may have carried are dropped: leaving one behind would make
+            # find_dimensions see two blocks describing different acquisitions
+            # and refuse to choose, which is a hard error on open.
+            for _legacy in LEGACY_DIMENSION_KEYS:
+                cfg.pop(_legacy, None)
             if dimension_key not in cfg: cfg[dimension_key] = {}
             cfg[dimension_key]['x'] = total_w
             cfg[dimension_key]['y'] = total_h
-            if not is_2d_mode:
+            # 'z' only for an image that actually has one. Its presence is what
+            # config_ndim reads rank off, so writing it on 2D data would make
+            # every later rank check say 3D.
+            if 'z' in axes_written:
                 cfg[dimension_key]['z'] = total_d
+            else:
+                cfg[dimension_key].pop('z', None)
             cfg['mode'] = mode
             cfg['synthetic'] = False  # real extracted channel
             # Provenance of the numbers above. Legacy configs lack this key and
@@ -918,16 +974,24 @@ def _probe_pixel_counts_quiet(path: str) -> Dict[str, int]:
 
     Used to test whether a recorded total is really a pixel count, so it must
     never raise: a probe failure just means that check is skipped for the image.
+
+    Also carries the image's RANK under ``NDIM_KEY``, because this is the only
+    place the shape's length is seen: both branches below report ``z: 1`` for a
+    2D image, so the counts alone cannot say whether a depth exists -- and the
+    mode string cannot say either now that there is one mode. Consumers read
+    this dict with ``.get(axis)``, so the extra key is inert for them.
     """
+    from .dimension_entry import NDIM_KEY
     try:
         with tiff.TiffFile(path) as handle:
             shape = handle.series[0].shape
     except Exception:
         return {}
     if len(shape) >= 3:
-        return {'z': int(shape[0]), 'y': int(shape[-2]), 'x': int(shape[-1])}
+        return {'z': int(shape[0]), 'y': int(shape[-2]), 'x': int(shape[-1]),
+                NDIM_KEY: 3}
     if len(shape) == 2:
-        return {'z': 1, 'y': int(shape[0]), 'x': int(shape[1])}
+        return {'z': 1, 'y': int(shape[0]), 'x': int(shape[1]), NDIM_KEY: 2}
     return {}
 
 
@@ -1069,14 +1133,26 @@ def organize_processing_dir(
         template_data = yaml.safe_load(f) or {}
     
     mode = template_data.get('mode', fallback_mode)
-    is_2d_mode = mode.endswith('_2d')
-    dimension_key = 'pixel_dimensions' if is_2d_mode else 'voxel_dimensions'
+    # As in organize_channel_project: rank comes from each image, never from the
+    # template's mode. This function has TWO paths that need it -- the
+    # auto-generate loop, which reads every array anyway, and the write loop
+    # below, which only ever has the moved file on disk. The latter probes the
+    # shape (headers only) rather than assuming, because assuming here writes a
+    # wrong dimension block, and a wrong dimension block silently rescales every
+    # physical measurement the pipeline goes on to produce.
+    from .metadata import DIMENSIONS_KEY, LEGACY_DIMENSION_KEYS, config_ndim
+    dimension_key = DIMENSIONS_KEY
+    template_ndim = config_ndim(template_data)
 
     from .dimension_entry import (
         SOURCE_CSV, SOURCE_MANUAL, SOURCE_PIXELS_ASSUMED, SOURCE_UNKNOWN,
-        combine_sources, per_axis_sources, scale_gaps, stamp_dimensions_source,
-        unit_scale_axes,
+        axes_for_mode, combine_sources, per_axis_sources, pixels_ndim,
+        scale_gaps, stamp_dimensions_source, unit_scale_axes,
     )
+
+    #: image filename -> rank, filled by the auto-generate loop so the write
+    #: loop can reuse a reading rather than re-opening the file.
+    probed_ndim: Dict[str, Optional[int]] = {}
 
     generated_rows = []
 
@@ -1124,10 +1200,12 @@ def organize_processing_dir(
             # project -- dropping every image is what produced an empty frame and
             # the loop above.
             width = height = z_slices = 1
+            img_ndim = template_ndim
             try:
                 mem = tiff.imread(full_path)
                 z_slices = mem.shape[0] if mem.ndim == 3 else 1
                 height, width = mem.shape[-2], mem.shape[-1]
+                img_ndim = 3 if mem.ndim >= 3 else 2
                 del mem
                 gc.collect()  # release promptly during heavy batch organization
             except Exception as exc:
@@ -1139,7 +1217,7 @@ def organize_processing_dir(
             # resolves to exactly 1.0 um/px -- i.e. an uncalibrated image that
             # previously sailed through as calibrated, making its dimensions its
             # pixel counts with no warning anywhere.
-            gaps = set(scale_gaps(meta, mode))
+            gaps = set(scale_gaps(meta, mode, img_ndim))
             spacing_x = float(meta.get('x', 1.0)) if 'x' not in gaps else 1.0
             spacing_y = float(meta.get('y', 1.0)) if 'y' not in gaps else 1.0
             spacing_z = float(meta.get('z', 1.0)) if 'z' not in gaps else 1.0
@@ -1166,7 +1244,8 @@ def organize_processing_dir(
                     print(f"    Dimensions ({', '.join(sorted(manual_axes))}) "
                           "entered or confirmed manually.")
 
-            per_axis = per_axis_sources(mode, meta, (), manual_axes)
+            per_axis = per_axis_sources(mode, meta, (), manual_axes,
+                                        ndim=img_ndim)
 
             still_missing = sorted(a for a in gaps if a not in manual_axes)
 
@@ -1175,12 +1254,16 @@ def organize_processing_dir(
             # often an uncalibrated image than a real one.
             suspect = [
                 a for a in unit_scale_axes(
-                    totals, {'x': width, 'y': height, 'z': z_slices}, mode)
+                    totals, {'x': width, 'y': height, 'z': z_slices}, mode,
+                    ndim=img_ndim)
                 if a not in manual_axes and a not in still_missing
             ]
             for _axis in suspect:
                 per_axis[_axis] = SOURCE_PIXELS_ASSUMED
             axis_sources[img_file] = per_axis
+            # Remembered so the write loop below does not have to re-open a file
+            # this loop has already read.
+            probed_ndim[img_file] = img_ndim
 
             if still_missing or suspect:
                 summary['unscaled'].append(img_file)
@@ -1290,6 +1373,17 @@ def organize_processing_dir(
         tracked = axis_sources.get(matched_file)
         row_manual_axes = set()
 
+        # Rank for this row. Reuse the auto-generate loop's reading when it ran;
+        # otherwise probe the moved file's header. Only if BOTH are unavailable
+        # does the template's rank apply, and then the extents are placeholders
+        # anyway.
+        row_pixels = _probe_pixel_counts_quiet(dst)
+        row_ndim = probed_ndim.get(matched_file)
+        if row_ndim is None:
+            row_ndim = pixels_ndim(row_pixels)
+        if row_ndim is None:
+            row_ndim = template_ndim
+
         if tracked is None:
             # Came from a user-supplied CSV.
             manual_row = _match_dimension_override(
@@ -1303,14 +1397,14 @@ def organize_processing_dir(
                     print(f"  Dimensions ({', '.join(sorted(row_manual_axes))}) "
                           f"of {matched_file} entered or confirmed manually.")
 
-            row_pixels = _probe_pixel_counts_quiet(dst)
             row_suspect = [
-                a for a in unit_scale_axes(row_totals, row_pixels, mode)
+                a for a in unit_scale_axes(row_totals, row_pixels, mode,
+                                           ndim=row_ndim)
                 if a not in row_manual_axes
             ]
             per_axis_row = {
                 a: (SOURCE_MANUAL if a in row_manual_axes else SOURCE_CSV)
-                for a in ('x', 'y') + (() if is_2d_mode else ('z',))
+                for a in axes_for_mode(mode, row_ndim)
             }
             if row_suspect:
                 for a in row_suspect:
@@ -1324,11 +1418,20 @@ def organize_processing_dir(
 
         try:
             with open(new_config_path, 'r') as f: cfg = yaml.safe_load(f) or {}
+            # Unified key, and any legacy block the template carried is
+            # dropped: two blocks describing different acquisitions is a hard
+            # error in find_dimensions, not a fallback.
+            for _legacy in LEGACY_DIMENSION_KEYS:
+                cfg.pop(_legacy, None)
             if dimension_key not in cfg: cfg[dimension_key] = {}
             cfg[dimension_key]['x'] = row_totals['x']
             cfg[dimension_key]['y'] = row_totals['y']
-            if not is_2d_mode:
+            # 'z' only for an image that has one -- its presence is what
+            # config_ndim reads rank off downstream.
+            if 'z' in axes_for_mode(mode, row_ndim):
                 cfg[dimension_key]['z'] = row_totals['z']
+            else:
+                cfg[dimension_key].pop('z', None)
             cfg['mode'] = mode
             cfg['synthetic'] = False  # real image (not procedurally generated)
             # Provenance, per axis, collapsed to one value for the config.
