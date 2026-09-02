@@ -285,33 +285,84 @@ def _ask_update(check) -> str:
 
 
 def _run_rollback(repo_root: str) -> None:
-    """Let the user pick a previous version and switch the checkout to it."""
+    """
+    Let the user pick a channel and a version, then apply it.
+
+    `dialogs.choose_version` returns intent, not git commands, so the mapping
+    lives here. Three things can be needed, in this order:
+
+        1. a channel switch, if a different channel was chosen
+        2. a dependency update, if that switch changed environment.yml
+        3. a pin (a specific commit) or an unpin (the "Latest" row)
+
+    Order matters: the pin target only exists locally after the switch has
+    fetched it, and the environment must match the code before either is used.
+
+    Unlike the launch path, this does not re-exec after updating dependencies --
+    we are about to exit and ask the user to restart, and silently relaunching
+    the app after they pressed a version button would be a surprise.
+    """
     import dialogs
 
-    versions = updater.list_versions(repo_root, limit=15)
-    if not versions:
-        dialogs.notify("HIBACHI", "No version history is available to roll back to.")
+    log = lambda m: print(f"[startup] {m}")  # noqa: E731
+    # A short fetch timeout: this runs in the crash-recovery path too, where an
+    # offline machine must not sit through two long fetches before showing the
+    # dialog.
+    overview = updater.channel_overview(repo_root, limit=15, fetch_timeout=15)
+    if not any(c.get("available") for c in overview["channels"].values()):
+        dialogs.notify("HIBACHI", "No version history is available to switch to.")
         return
 
-    current = updater.current_rev(repo_root) or ""
-    chosen = dialogs.choose_rollback(versions, current)
+    chosen = dialogs.choose_version(overview)
     if chosen == dialogs.UNINSTALL:
         import uninstall
 
         uninstall.run(repo_root)
         return
-    if not chosen:
-        return
+    if not isinstance(chosen, dict):
+        return  # cancelled, or no display
 
-    ok, msg = updater.pin_to(repo_root, chosen, logger=lambda m: print(f"[startup] {m}"))
-    if ok:
-        # No skip marker is needed any more. `pin_to` detaches HEAD, so
-        # check_for_update reports PINNED and offers nothing until the pin is
-        # released -- the old `set_skipped_rev(remote_tip)` call existed only to
-        # suppress the re-offer caused by rewinding the branch pointer.
-        dialogs.notify("HIBACHI", f"{msg}\n\nPlease start HIBACHI again to use this version.")
+    target = chosen.get("channel") or overview["current"]
+    rev = chosen.get("rev")
+    notes = []
+
+    # --- 1. channel ------------------------------------------------------ #
+    if target != overview["current"]:
+        res = updater.switch_channel(repo_root, target, logger=log)
+        if res.status != updater.UPDATED:
+            dialogs.notify("HIBACHI", f"Could not switch channel:\n{res.message}")
+            return
+        notes.append(res.message)
+        # --- 2. dependencies --------------------------------------------- #
+        if res.env_changed:
+            log("Dependency list differs on this channel; updating now.")
+            _update_environment(repo_root, None)
+            notes.append("Dependencies were updated to match this channel.")
+
+    # --- 3. pin / unpin -------------------------------------------------- #
+    if rev:
+        ok, msg = updater.pin_to(repo_root, rev, logger=log)
+    elif updater.is_pinned(repo_root):
+        # "Latest" on the channel we are already following: release the pin.
+        ok, msg = updater.unpin(repo_root, target, logger=log)
+    elif target == overview["current"]:
+        dialogs.notify("HIBACHI", "Already following the latest version of the "
+                                  f"{target} channel. Nothing to change.")
+        return
     else:
-        dialogs.notify("HIBACHI", f"Rollback failed:\n{msg}")
+        ok, msg = True, ""   # the switch already landed on the channel tip
+
+    if not ok:
+        dialogs.notify("HIBACHI", f"Could not switch version:\n{msg}")
+        return
+    if msg:
+        notes.append(msg)
+    # No skip marker is needed any more. `pin_to` detaches HEAD, so
+    # check_for_update reports PINNED and offers nothing until the pin is
+    # released -- the old `set_skipped_rev(remote_tip)` call existed only to
+    # suppress the re-offer caused by rewinding the branch pointer.
+    dialogs.notify("HIBACHI", "\n".join(notes)
+                   + "\n\nPlease start HIBACHI again to use this version.")
 
 
 def _tail(path: str, max_lines: int, max_chars: int = 20000) -> str:
@@ -468,10 +519,17 @@ def _offer_rollback_after_crash(repo_root: str, code: int) -> None:
     import dialogs
 
     try:
-        versions = updater.list_versions(repo_root, limit=15)
+        # Local only (fetch=False): this runs before the crash window appears,
+        # so it must not wait on the network. The offer is worth making if the
+        # user could pick ANYTHING different -- either an earlier version on
+        # this channel, or another channel entirely. That second case is the
+        # main recovery route after a bad development build, and the old
+        # `len(versions) >= 2` gate missed it.
+        ov = updater.channel_overview(repo_root, limit=15, fetch=False)
+        avail = [c for c in ov["channels"].values() if c.get("available")]
+        can_rollback = len(avail) > 1 or any(len(c["versions"]) >= 2 for c in avail)
     except Exception:
-        versions = []
-    can_rollback = len(versions) >= 2
+        can_rollback = False
 
     details, report_path = _collect_crash_report(code)
     summary = f"HIBACHI stopped unexpectedly \u2014 {_describe_exit(code)} (raw exit code {code})."
