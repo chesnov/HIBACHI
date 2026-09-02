@@ -32,45 +32,126 @@ class MissingDimensionsError(ValueError):
     """
 
 
-def dimension_key_for_mode(mode) -> str:
-    """Config key holding the physical extent for a processing mode."""
-    return 'pixel_dimensions' if str(mode).endswith('_2d') else 'voxel_dimensions'
+#: Key holding physical extent in the unified schema. The two legacy keys below
+#: are still read, because saved projects carry them; `config_migration.
+#: normalise_config` rewrites them to this one when a config is loaded.
+DIMENSIONS_KEY = 'dimensions'
+LEGACY_DIMENSION_KEYS = ('voxel_dimensions', 'pixel_dimensions')
 
 
-def require_dimensions(config: Dict[str, Any], mode: str,
-                       source: str = "") -> Dict[str, float]:
+def dimension_key_for_mode(mode=None) -> str:
+    """
+    Config key to WRITE physical extent under.
+
+    Always the unified key now. `mode` is accepted and ignored so existing
+    callers keep working; it used to select between the two per-rank keys, which
+    cannot work once there is a single mode -- it would have answered
+    'voxel_dimensions' for every project, including 2D ones.
+
+    Readers should not use this. Use `find_dimensions` or `require_dimensions`,
+    which accept the legacy keys as well.
+    """
+    return DIMENSIONS_KEY
+
+
+def find_dimensions(config: Dict[str, Any]):
+    """
+    Locate the physical-extent block: (key, block), or (None, None).
+
+    Prefers the unified key, then the legacy ones. Raises if BOTH legacy keys
+    are present, because there is no honest way to choose: they describe
+    different acquisitions, and picking one silently would reintroduce exactly
+    the "3D template applied to a 2D image" failure this module exists to stop.
+    """
+    block = config.get(DIMENSIONS_KEY)
+    if isinstance(block, dict) and block:
+        return DIMENSIONS_KEY, block
+
+    found = [k for k in LEGACY_DIMENSION_KEYS
+             if isinstance(config.get(k), dict) and config.get(k)]
+    if len(found) > 1:
+        raise MissingDimensionsError(
+            f"This config carries both {' and '.join(repr(k) for k in found)}. "
+            "They describe different acquisitions and there is no way to tell "
+            "which applies. Delete the one that does not belong to this image, "
+            "or set its dimensions again."
+        )
+    if found:
+        return found[0], config[found[0]]
+    return None, None
+
+
+def config_ndim(config: Dict[str, Any]):
+    """
+    Rank implied by the config's dimension block: 3, 2, or None if absent.
+
+    Advisory only. The authority on rank is the image itself -- this exists for
+    UI decisions made before an image is loaded, and as a cross-check against
+    the data. It replaces testing `mode.endswith('_2d')`, which says nothing
+    once there is one mode.
+    """
+    try:
+        _key, block = find_dimensions(config)
+    except MissingDimensionsError:
+        return None
+    if not block:
+        return None
+    return 3 if block.get('z') is not None else 2
+
+
+def require_dimensions(config: Dict[str, Any], mode=None,
+                       source: str = "", ndim=None) -> Dict[str, float]:
     """Total physical extent (microns) from a config, or raise.
 
-    Requires the key matching `mode` -- a 2D config needs 'pixel_dimensions' and a
-    3D config 'voxel_dimensions'. That distinction matters: a 3D config carries
-    dimensions under the 3D key, so reading it as 2D finds nothing, and the old
-    fallback then invented sub-micron totals. Applying a 3D template to a 2D image
-    is exactly how that happens.
+    Reads the unified 'dimensions' key, falling back to the legacy per-rank
+    keys so saved projects keep opening.
+
+    Rank comes from `ndim` -- the loaded image's own dimensionality -- whenever
+    the caller can supply it, and is otherwise inferred from the block. That
+    replaces the old rule, which took rank from the mode string and refused to
+    read the other rank's key. With one mode that rule cannot work, but the
+    protection it provided still must: applying a 3D template to a 2D image
+    used to invent sub-micron totals, silently rescaling every physical
+    parameter. So a block that disagrees with the image raises instead.
 
     Every axis must be a finite positive number. Zero or negative extents are as
     unusable as a missing block.
     """
-    key = dimension_key_for_mode(mode)
     where = f" in {source}" if source else ""
-    section = config.get(key)
+    key, section = find_dimensions(config)
 
-    if not isinstance(section, dict) or not section:
-        other = ('voxel_dimensions' if key == 'pixel_dimensions'
-                 else 'pixel_dimensions')
-        hint = ""
-        if isinstance(config.get(other), dict) and config.get(other):
-            hint = (f"\n\nIt has '{other}' instead, which belongs to the other "
-                    f"dimensionality. This config is set to mode '{mode}'; the two "
-                    "must agree. A config or template from a "
-                    f"{'3D' if other == 'voxel_dimensions' else '2D'} project "
-                    "cannot supply dimensions for this one.")
+    if not section:
         raise MissingDimensionsError(
-            f"No '{key}' found{where}.{hint}\n\nSet this image's physical "
+            f"No '{DIMENSIONS_KEY}' found{where}.\n\nSet this image's physical "
             "dimensions before processing. Processing cannot continue without "
             "them: every size, distance and density would be wrong."
         )
 
-    axes = ('x', 'y') if key == 'pixel_dimensions' else ('x', 'y', 'z')
+    have_z = section.get('z') is not None
+    if ndim is None:
+        # No image to consult (e.g. a UI reading a config before loading one):
+        # trust the block's own shape. `mode` is honoured only as a last resort,
+        # for callers not yet passing ndim.
+        want_z = have_z and not str(mode or "").endswith('_2d')
+    else:
+        want_z = int(ndim) >= 3
+        if want_z and not have_z:
+            raise MissingDimensionsError(
+                f"'{key}'{where} has no 'z' extent, but this image is "
+                f"{int(ndim)}D. A 2D config cannot supply the z extent a 3D "
+                "image needs. Set this image's physical dimensions before "
+                "processing."
+            )
+        if not want_z and have_z:
+            raise MissingDimensionsError(
+                f"'{key}'{where} carries a 'z' extent, but this image is "
+                f"{int(ndim)}D. This looks like a config from a 3D project; "
+                "its x and y extents describe a different acquisition and "
+                "would rescale every measurement. Set this image's own "
+                "dimensions before processing."
+            )
+
+    axes = ('x', 'y', 'z') if want_z else ('x', 'y')
     out: Dict[str, float] = {}
     for axis in axes:
         raw = section.get(axis)

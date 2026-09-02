@@ -1057,16 +1057,22 @@ def build_roi_config(
     """
     import copy as _copy
 
-    from .metadata import dimension_key_for_mode, require_dimensions
+    from .metadata import (DIMENSIONS_KEY, LEGACY_DIMENSION_KEYS, config_ndim,
+                           require_dimensions)
 
     roi_config = _copy.deepcopy(base_config)
-    is_2d_mode = str(mode).endswith('_2d')
-    dim_key = dimension_key_for_mode(mode)
+
+    # Rank comes from the config's own dimension block, not from the mode string
+    # (which is now the same for every project) and not from `full_shape`, whose
+    # length is not a reliable rank signal -- a 2D image with a channel axis is
+    # also three-dimensional. The block either declares a z extent or it does
+    # not, and that is the acquisition's own statement about its rank.
+    ndim = config_ndim(base_config)
 
     # No fallback. A region derives its extent by scaling the full image's, so an
     # absent or mismatched dimension block cannot be substituted for -- doing so
     # produced sub-micron totals and silently rescaled every physical parameter.
-    orig_dims = require_dimensions(base_config, mode,
+    orig_dims = require_dimensions(base_config,
                                    source="the full image's config")
     orig_x = orig_dims['x']
     orig_y = orig_dims['y']
@@ -1075,18 +1081,25 @@ def build_roi_config(
     full_w = int(full_shape[-1])
 
     # Built from the validated axes only, so a stray 'z' cannot leak into a 2D
-    # config -- a pixel_dimensions block carrying z is a sign of the old fallback.
+    # config -- a dimension block carrying an unexpected z is a sign of the old
+    # fallback.
     new_dims = {}
     new_dims['x'] = orig_x * ((x1 - x0) / full_w)
     new_dims['y'] = orig_y * ((y1 - y0) / full_h)
 
-    if not is_2d_mode and 'z' in orig_dims and len(full_shape) == 3:
+    if ndim == 3 and 'z' in orig_dims and len(full_shape) == 3:
         orig_z = orig_dims['z']
         full_z = int(full_shape[0])
         effective_z1 = z1 if z1 is not None else full_z
         new_dims['z'] = orig_z * ((effective_z1 - z0) / full_z)
 
-    roi_config[dim_key] = new_dims
+    roi_config[DIMENSIONS_KEY] = new_dims
+    # Drop any legacy block copied from the base config. Leaving one behind
+    # would keep the FULL image's extent in the ROI's config: harmless while the
+    # unified key is preferred, but a trap for anything that reads the legacy key
+    # directly, and misleading to a human reading the file.
+    for _legacy in LEGACY_DIMENSION_KEYS:
+        roi_config.pop(_legacy, None)
     return roi_config
 
 
@@ -1306,7 +1319,8 @@ def apply_template_to_regions(
     import copy as _copy
     import yaml as _yaml
 
-    from .metadata import dimension_key_for_mode, require_dimensions
+    from .metadata import (DIMENSIONS_KEY, LEGACY_DIMENSION_KEYS, config_ndim,
+                           require_dimensions)
 
     updated: List[str] = []
     skipped: List[Dict[str, Any]] = []
@@ -1327,18 +1341,6 @@ def apply_template_to_regions(
         if info is None:
             continue
         mode = info["mode"]
-        dim_key = dimension_key_for_mode(mode)
-
-        # The template's parameter blocks belong to a specific pipeline, so a
-        # template from a differently-shaped project must not be applied.
-        tmpl_mode = template.get("mode")
-        if tmpl_mode and str(tmpl_mode) != str(mode):
-            errors.append({
-                "roi_dir": sample_dir,
-                "error": (f"template is for mode '{tmpl_mode}' but this channel is "
-                          f"'{mode}'; the parameters are not interchangeable"),
-            })
-            continue
 
         # Extents come from the channel, so an ROI-derived template works too.
         channel_cfg_path = _channel_config_path(info)
@@ -1346,16 +1348,35 @@ def apply_template_to_regions(
             with open(channel_cfg_path, "r") as fh:
                 channel_cfg = _yaml.safe_load(fh) or {}
             full_dims = require_dimensions(
-                channel_cfg, mode,
+                channel_cfg,
                 source=f"{os.path.basename(sample_dir)} (full image)")
         except Exception as exc:
             errors.append({"roi_dir": sample_dir, "error": str(exc)})
             continue
 
+        # The template's parameter blocks belong to a specific pipeline, so a
+        # template from a differently-shaped project must not be applied. This
+        # used to compare mode strings; with a single mode that comparison is
+        # always satisfied and the protection would have disappeared silently.
+        # Rank is the property that actually made the parameters
+        # non-interchangeable, so it is what gets compared -- a 2D template's
+        # sizes and distances mean something different in a z-stack.
+        tmpl_ndim = config_ndim(template)
+        chan_ndim = config_ndim(channel_cfg)
+        if tmpl_ndim and chan_ndim and tmpl_ndim != chan_ndim:
+            errors.append({
+                "roi_dir": sample_dir,
+                "error": (f"template is for a {tmpl_ndim}D acquisition but this "
+                          f"channel is {chan_ndim}D; the parameters are not "
+                          f"interchangeable"),
+            })
+            continue
+
         base = _copy.deepcopy(template)
-        base[dim_key] = dict(full_dims)
+        base[DIMENSIONS_KEY] = dict(full_dims)
         base["mode"] = mode          # follows the channel, never the template
-        base.pop(_other_dim_key(dim_key), None)   # no stale block from a template
+        for _legacy in LEGACY_DIMENSION_KEYS:
+            base.pop(_legacy, None)  # no stale block from a template
         if config_name:
             # Recorded so the project view's Config column names the config that
             # was applied. Without it the column showed the fixed on-disk filename
@@ -1412,12 +1433,6 @@ def apply_template_to_regions(
 
     return {"updated": updated, "skipped": skipped, "errors": errors,
             "cleared": cleared}
-
-
-def _other_dim_key(dim_key: str) -> str:
-    """The dimension key belonging to the other dimensionality."""
-    return ('voxel_dimensions' if dim_key == 'pixel_dimensions'
-            else 'pixel_dimensions')
 
 
 def count_regions(sample_dirs: Sequence[str]) -> int:
@@ -1487,9 +1502,24 @@ def region_geometry(sample_dir: str, roi_name: str) -> Optional[Dict[str, Any]]:
         return None
     shape = tuple(int(v) for v in art["crop_shape"])
     config = art["config"] or {}
-    is_2d = str(art["mode"]).endswith("_2d")
-    dim_key = "pixel_dimensions" if is_2d else "voxel_dimensions"
-    dims = config.get(dim_key) or {}
+    # Whichever key the ROI config carries: unified for anything written since
+    # the modes merged, legacy for a project created before it. Derived from the
+    # config rather than from `art["mode"]`, which is the same string for every
+    # project now and so cannot select a key.
+    from .metadata import MissingDimensionsError, find_dimensions
+    try:
+        _dim_key, dims = find_dimensions(config)
+    except MissingDimensionsError:
+        # Ambiguous (both legacy blocks present). Handled below exactly as a
+        # missing block is, preserving this function's Optional contract.
+        dims = None
+    dims = dims or {}
+
+    # NOTE: `_per_px` substitutes 1.0 for a missing or unusable total, which
+    # invents a physical scale -- the pattern removed elsewhere in favour of
+    # raising. Left as-is here deliberately: this function returns None on
+    # failure rather than raising, and changing that is a behaviour change for
+    # relational analysis, not part of unifying the dimension keys.
 
     # The config stores TOTAL microns for the crop, so per-voxel spacing is that
     # divided by the crop's pixel count -- matching how the full-image path derives
