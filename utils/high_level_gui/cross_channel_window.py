@@ -653,7 +653,7 @@ class CrossChannelAnalyzerWindow(QMainWindow):
             # 3D rotation recorder (3D samples only), docked beneath the layer list.
             if shape and len(shape) == 3:
                 try:
-                    from ..module_3d.turntable import add_turntable_button
+                    from ..fluorescence_module.turntable import add_turntable_button
                     add_turntable_button(viewer)
                 except Exception as exc:
                     print(f"Could not add 3D rotation recorder: {exc}")
@@ -1002,7 +1002,7 @@ def open_sample_overlay(project_manager, sample_name, analysis_name=None, parent
         # 3D rotation recorder (3D samples only), docked beneath the layer list.
         if shape and len(shape) == 3:
             try:
-                from ..module_3d.turntable import add_turntable_button
+                from ..fluorescence_module.turntable import add_turntable_button
                 add_turntable_button(viewer)
             except Exception as exc:
                 print(f"Could not add 3D rotation recorder: {exc}")

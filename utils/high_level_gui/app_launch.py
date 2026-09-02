@@ -735,12 +735,20 @@ def interactive_segmentation_with_config(selected_folder: str = None,
         # the viewer, so it is best-effort.
         try:
             _shape = getattr(image_stack, "shape", None)
+            # Rank comes from the config's dimension block, not the mode string,
+            # which is now the same for every project. The shape alone is not
+            # enough: a 2D image with a channel axis is also three-dimensional,
+            # and the mode test is what used to exclude it. `config_ndim`
+            # returns None when a config declares nothing, in which case fall
+            # back to the shape rather than refusing outright.
+            from ..fluorescence_module.turntable import add_turntable_button
+            from .metadata import config_ndim
+            _declared = config_ndim(config)
             _is_3d = (
                 _shape is not None and len(_shape) >= 3
-                and not str(mode or "").endswith("_2d")
+                and (_declared == 3 if _declared is not None else True)
             )
             if _is_3d:
-                from ..module_3d.turntable import add_turntable_button
                 add_turntable_button(viewer)
         except Exception as exc:
             log.warning("Could not add 3D rotation recorder: %s", exc)
