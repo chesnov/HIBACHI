@@ -239,6 +239,24 @@ def current_branch(repo_root: str) -> str:
     return resolve_branch(repo_root)
 
 
+def _fetch_branch(repo_root: str, branch: str, timeout: int = 30) -> Tuple[int, str]:
+    """
+    Fetch one branch, creating/updating refs/remotes/origin/<branch>.
+
+    The refspec is explicit rather than a bare `git fetch origin <branch>`,
+    which only guarantees FETCH_HEAD: on a clone made with --single-branch (or
+    a shallow clone), remote.origin.fetch matches only the cloned branch, so no
+    remote-tracking ref is created for any other one and `rev-parse
+    origin/<branch>` fails -- making a channel that exists look nonexistent.
+    """
+    rc, _, err = _git(
+        ["fetch", "--quiet", "origin",
+         f"+refs/heads/{branch}:refs/remotes/origin/{branch}"],
+        repo_root, timeout=timeout,
+    )
+    return rc, err
+
+
 def _remote_reachable(repo_root: str, timeout: int = 15) -> bool:
     """
     Can we talk to origin at all?
@@ -366,14 +384,14 @@ def check_for_update(
             f"Pinned to version {(old_rev or '')[:8]}; not tracking "
             f"'{branch}'. Switch version to resume updates."
         )
-        rc, _, _ = _git(["fetch", "--quiet", "origin", branch], root, timeout=fetch_timeout)
+        rc, _ = _fetch_branch(root, branch, fetch_timeout)
         if rc == 0:
             result.new_rev = remote_tip(root, branch)
         log(result.message)
         return result
 
     log(f"Checking for updates on '{branch}' ({result.channel} channel)...")
-    rc, _, err = _git(["fetch", "--quiet", "origin", branch], root, timeout=fetch_timeout)
+    rc, err = _fetch_branch(root, branch, fetch_timeout)
     if rc != 0:
         if _remote_reachable(root):
             result.status = ERROR
@@ -520,26 +538,8 @@ def check_and_update(
 # --------------------------------------------------------------------------- #
 # Rollback
 # --------------------------------------------------------------------------- #
-def list_versions(
-    repo_root: Optional[str] = None,
-    limit: int = 15,
-    branch: Optional[str] = None,
-) -> List[dict]:
-    """
-    Recent versions (newest first) as dicts: {rev, short, date, subject}.
-
-    Listed along origin/<branch> when available (so you can also switch forward
-    to a fetched-but-not-installed version), otherwise along local HEAD.
-    """
-    root = repo_root or find_repo_root()
-    if not root:
-        return []
-    branch = branch or current_branch(root)
-    ref = f"origin/{branch}"
-    rc, _, _ = _git(["rev-parse", "--verify", "--quiet", ref], root)
-    if rc != 0:
-        ref = "HEAD"
-
+def _versions_along(root: str, ref: str, limit: int) -> List[dict]:
+    """Commits reachable from `ref`, newest first. Empty if `ref` is unknown."""
     rc, out, _ = _git(
         ["log", f"-n{int(limit)}", "--first-parent",
          "--format=%H%x1f%h%x1f%cs%x1f%s", ref],
@@ -555,6 +555,97 @@ def list_versions(
                 {"rev": parts[0], "short": parts[1], "date": parts[2], "subject": parts[3]}
             )
     return versions
+
+
+def list_versions(
+    repo_root: Optional[str] = None,
+    limit: int = 15,
+    branch: Optional[str] = None,
+) -> List[dict]:
+    """
+    Recent versions (newest first) as dicts: {rev, short, date, subject}.
+
+    Listed along origin/<branch> when available (so you can also switch forward
+    to a fetched-but-not-installed version), otherwise along local HEAD.
+
+    NOTE the HEAD fallback: this cannot distinguish "that branch has no commits"
+    from "that branch was never fetched", and answers the second case with the
+    CURRENT branch's history. That is fine for its one caller, which only ever
+    asks about the branch it is already on. Do not use it to populate a list for
+    some OTHER channel -- use `channel_overview`, which reports a channel as
+    unavailable rather than substituting the wrong commits.
+    """
+    root = repo_root or find_repo_root()
+    if not root:
+        return []
+    branch = branch or current_branch(root)
+    ref = f"origin/{branch}"
+    rc, _, _ = _git(["rev-parse", "--verify", "--quiet", ref], root)
+    if rc != 0:
+        ref = "HEAD"
+    return _versions_along(root, ref, limit)
+
+
+def channel_overview(
+    repo_root: Optional[str] = None,
+    limit: int = 15,
+    fetch: bool = True,
+    fetch_timeout: int = 30,
+) -> Dict:
+    """
+    Everything a channel-picking UI needs, in one call.
+
+    Returns:
+        {
+          "current":  "stable",              # the tracked channel
+          "pinned":   False,                 # HEAD detached?
+          "head":     "<sha>",               # what is checked out now
+          "channels": {
+             "stable": {"branch": "main", "available": True,
+                        "tip": "<sha>", "versions": [ {...}, ... ]},
+             "dev":    {"branch": "dev", "available": False, "tip": None,
+                        "versions": [], "reason": "never fetched"},
+          },
+        }
+
+    `available` is False when `origin/<branch>` cannot be resolved even after a
+    fetch attempt -- the channel does not exist on the server, or we are offline
+    and never fetched it. Such a channel gets an EMPTY version list and a reason,
+    never a borrowed one: showing the current channel's commits under the other
+    channel's name would invite picking a version that is not what it says.
+
+    Fetches each channel's branch (pass fetch=False to work purely offline).
+    Read-only otherwise: it never moves HEAD or writes state.
+    """
+    root = repo_root or find_repo_root()
+    out: Dict = {"current": get_channel(), "pinned": False, "head": None,
+                 "channels": {}}
+    if not root or not os.path.isdir(os.path.join(root, ".git")):
+        for name, branch in CHANNELS.items():
+            out["channels"][name] = {"branch": branch, "available": False,
+                                     "tip": None, "versions": [],
+                                     "reason": "not a git checkout"}
+        return out
+
+    out["pinned"] = is_pinned(root)
+    out["head"] = current_rev(root)
+
+    for name, branch in CHANNELS.items():
+        entry: Dict = {"branch": branch, "available": False, "tip": None,
+                       "versions": []}
+        if fetch:
+            _fetch_branch(root, branch, fetch_timeout)
+        ref = f"origin/{branch}"
+        rc, tip, _ = _git(["rev-parse", "--verify", "--quiet", ref], root)
+        if rc != 0 or not tip:
+            entry["reason"] = ("not on the server, or never fetched"
+                               if fetch else "never fetched (offline mode)")
+        else:
+            entry["available"] = True
+            entry["tip"] = tip
+            entry["versions"] = _versions_along(root, ref, limit)
+        out["channels"][name] = entry
+    return out
 
 
 def _stash_guard(root: str, tag: str, log: Callable[[str], None]) -> bool:
@@ -638,7 +729,7 @@ def unpin(
     branch = channel_branch(channel)
     _stash_guard(root, "unpin-backup", log)
 
-    _git(["fetch", "--quiet", "origin", branch], root, timeout=fetch_timeout)
+    _fetch_branch(root, branch, fetch_timeout)
     rc, _, _ = _git(["rev-parse", "--verify", "--quiet", f"origin/{branch}"], root)
     if rc == 0:
         rc, _, err = _git(["checkout", "-B", branch, f"origin/{branch}", "--quiet"], root)
@@ -697,7 +788,7 @@ def switch_channel(
     result.old_rev = current_rev(root)
 
     log(f"Switching to the {channel} channel ('{branch}')...")
-    rc, _, err = _git(["fetch", "--quiet", "origin", branch], root, timeout=fetch_timeout)
+    rc, err = _fetch_branch(root, branch, fetch_timeout)
     if rc != 0:
         if _remote_reachable(root):
             result.message = (
