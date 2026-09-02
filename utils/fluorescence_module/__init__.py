@@ -6,7 +6,8 @@ Why this package exists
 The pipeline used to live as two parallel trees, ``utils/module_3d`` and
 ``utils/module_2d``, meant to be kept at parity by hand. That did not work. A fix
 would land in one and be forgotten in the other, and the drift was invisible
-until a result looked wrong. Measured across the seven paired modules before the
+until a result looked wrong. Both trees were deleted once nothing imported them;
+this package is the whole pipeline. Measured across the seven paired modules before the
 merge: 61% of lines were shared, but of the divergence only about a fifth was
 ever about dimensionality -- the rest was accumulated drift, including 15 paired
 functions whose bodies had fallen below 60% similar and 13 functions that existed
@@ -55,9 +56,15 @@ Conventions for anything added here
     microns per voxel. "In-plane" means the LAST TWO entries at either rank --
     ``spacing[-2:]``, never ``spacing[1:]``, which silently drops Y in 2D.
 
-5.  **Imports inside this package are relative and stay inside it.** No
-    ``from ..module_3d import ...``. Two of this session's failures were missing
-    or cross-package imports; a self-contained package cannot have them.
+5.  **Imports inside this package are relative and stay inside it.** Nothing
+    reaches into a sibling package -- not ``high_level_gui``, and not the old
+    ``module_3d`` / ``module_2d`` trees, which is what this rule was originally
+    written against and which no longer exist to import from. Two of the merge
+    session's failures were missing or cross-package imports; a self-contained
+    package cannot have them. The constraint runs the other way too: the GUI
+    imports this package, so this package importing the GUI would make the two
+    impossible to reason about separately (``turntable._locate_layer_list_dock``
+    is deliberately hand-rolled for exactly this reason).
 
 6.  **Old entry-point names are kept as thin translating wrappers.** Existing
     callers, saved projects and batch workflows keep working, and the wrapper is

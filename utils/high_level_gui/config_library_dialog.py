@@ -36,8 +36,14 @@ except Exception:  # pragma: no cover - headless / no Qt
     _HAVE_QT = False
 
 
-# Order the two mode groups deterministically (3D first, then 2D).
-_MODE_ORDER = [(cl.MODE_3D, "3D"), (cl.MODE_2D, "2D")]
+# Source is now the only grouping. There used to be a mode level above it:
+#
+#   _MODE_ORDER = [(cl.MODE_3D, "3D"), (cl.MODE_2D, "2D")]
+#
+# With one mode those two constants are the same string, so the tree loop looked
+# up the same bucket twice and rendered every config under a "3D" heading and
+# again under a "2D" one. Grouping by rank is also no longer meaningful: a config
+# applies to 2D and 3D data alike, and rank comes from the image.
 _SOURCE_ORDER = [("builtin", "Built-in"), ("library", "My Library")]
 
 
@@ -159,7 +165,7 @@ if _HAVE_QT:
                 self._problem_box.setVisible(False)
 
         def _refresh(self, select_path: Optional[str] = None) -> None:
-            """Rebuild the tree grouped Mode -> Source, and restore selection."""
+            """Rebuild the tree grouped by Source, and restore selection."""
             self._show_problems()
             self.tree.clear()
 
@@ -169,40 +175,31 @@ if _HAVE_QT:
                 QMessageBox.critical(self, "Config error", str(exc))
                 entries = []
 
-            by_mode: Dict[str, Dict[str, list]] = {}
+            by_source: Dict[str, list] = {}
             for e in entries:
-                by_mode.setdefault(e.mode, {}).setdefault(e.source, []).append(e)
+                by_source.setdefault(e.source, []).append(e)
 
             target_item = None
-            for mode, mode_label in _MODE_ORDER:
-                sources = by_mode.get(mode)
-                if not sources:
+            for source, source_label in _SOURCE_ORDER:
+                items = by_source.get(source)
+                if not items:
                     continue
-                mode_node = QTreeWidgetItem([mode_label])
-                f = mode_node.font(0)
+                src_node = QTreeWidgetItem([source_label])
+                f = src_node.font(0)
                 f.setBold(True)
-                mode_node.setFont(0, f)
-                mode_node.setFlags(Qt.ItemIsEnabled)
-                self.tree.addTopLevelItem(mode_node)
-                for source, source_label in _SOURCE_ORDER:
-                    items = sources.get(source)
-                    if not items:
-                        continue
-                    src_node = QTreeWidgetItem([source_label])
-                    src_node.setFlags(Qt.ItemIsEnabled)
-                    mode_node.addChild(src_node)
-                    for entry in sorted(items, key=lambda x: x.name.lower()):
-                        # Leaf shows the bare name; mode + source are already the
-                        # parent groups, so the full entry.label would be redundant
-                        # here. The LibraryEntry itself is carried in item data.
-                        leaf = QTreeWidgetItem([entry.name])
-                        leaf.setData(0, Qt.UserRole, entry)
-                        src_node.addChild(leaf)
-                        if select_path and os.path.abspath(entry.path) == os.path.abspath(select_path):
-                            target_item = leaf
-                mode_node.setExpanded(True)
-                for i in range(mode_node.childCount()):
-                    mode_node.child(i).setExpanded(True)
+                src_node.setFont(0, f)
+                src_node.setFlags(Qt.ItemIsEnabled)  # group header: not selectable
+                self.tree.addTopLevelItem(src_node)
+                for entry in sorted(items, key=lambda x: x.name.lower()):
+                    # Leaf shows the bare name; source is already the parent
+                    # group, so the full entry.label would be redundant here.
+                    # The LibraryEntry itself is carried in item data.
+                    leaf = QTreeWidgetItem([entry.name])
+                    leaf.setData(0, Qt.UserRole, entry)
+                    src_node.addChild(leaf)
+                    if select_path and os.path.abspath(entry.path) == os.path.abspath(select_path):
+                        target_item = leaf
+                src_node.setExpanded(True)
 
             if target_item is not None:
                 self.tree.setCurrentItem(target_item)
@@ -226,11 +223,13 @@ if _HAVE_QT:
                 return
 
             src_label = "Built-in (read-only)" if not entry.editable else "My Library"
-            mode_label = dict(_MODE_ORDER).get(entry.mode, entry.mode)
             self._name_lbl.setText(entry.name)
-            self._meta_lbl.setText(
-                f"Mode: {mode_label}    Source: {src_label}\n{entry.path}"
-            )
+            # No "Mode:" line. It read a rank label out of _MODE_ORDER, which
+            # cannot say anything now: there is one mode and it applies to both
+            # ranks. The mode string itself is still shown in the provenance
+            # pane below, where it is a fact about the file rather than a claim
+            # about what the config is for.
+            self._meta_lbl.setText(f"Source: {src_label}\n{entry.path}")
 
             # Provenance preview (read-only; never raises on a bad mode).
             try:

@@ -671,7 +671,13 @@ def _write_gif(out_path: str, frames: List[np.ndarray], fps: int) -> None:
 def _locate_layer_list_dock(viewer):
     """Find napari's layer-list dock across versions so the button can sit
     directly beneath it. Kept self-contained (no import from the GUI package)
-    so this module can live in module_3d/ without an upward dependency."""
+    so this module has no upward dependency on it.
+
+    The constraint outlives the reason given here originally, which was that the
+    module lived in module_3d/. It now lives in fluorescence_module/, but the
+    rule is the same: the pipeline package must not import from the GUI package,
+    or the two cannot be reasoned about separately (see convention 5 in
+    fluorescence_module/__init__.py)."""
     for accessor in (lambda: viewer.window._qt_viewer.dockLayerList,
                      lambda: viewer.window.qt_viewer.dockLayerList):
         try:

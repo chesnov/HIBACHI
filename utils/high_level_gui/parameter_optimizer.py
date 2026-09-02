@@ -169,9 +169,14 @@ def _raw_seg_step_key(config: Dict[str, Any]) -> str:
     )
 
 
-def _spacing_from_config(config: Dict[str, Any], shape: Tuple[int, ...],
-                         is_2d: bool) -> Tuple[float, ...]:
-    """Per-pixel spacing = physical extent / shape (matches gui_manager)."""
+def _spacing_from_config(config: Dict[str, Any],
+                         shape: Tuple[int, ...]) -> Tuple[float, ...]:
+    """Per-pixel spacing = physical extent / shape (matches gui_manager).
+
+    Rank comes from `shape`. There was an `is_2d` parameter here that the body
+    never read -- it branched on `len(shape)` throughout -- so the flag could
+    disagree with the array and nothing would notice.
+    """
     from .metadata import find_dimensions
     _dim_key, dim = find_dimensions(config)
     dim = dim or {}
@@ -253,7 +258,7 @@ def _write_leaf_into_config(rich_params: Dict[str, Any], leaf: Tuple[Any, str],
 
 
 def _params_to_kwargs(params: Dict[str, Any]) -> Dict[str, Any]:
-    """Mirror _2D_strategy.execute_raw_segmentation's parameter parsing."""
+    """Mirror FluorescenceStrategy.execute_raw_segmentation's parameter parsing."""
     _tbl, profiles = _active_profiles(params)
     is_absolute = bool(params.get("use_absolute_thresholds", False))
     base_smooth = float(params.get("smooth_sigma", 0.1))
@@ -275,9 +280,14 @@ def _params_to_kwargs(params: Dict[str, Any]) -> Dict[str, Any]:
 # Segmentation adapter (mode-dispatched, at parity)
 # --------------------------------------------------------------------------- #
 def _segment_labels(image: np.ndarray, spacing: Tuple[float, ...],
-                    params: Dict[str, Any], is_2d: bool, temp_root: str) -> np.ndarray:
+                    params: Dict[str, Any], temp_root: str) -> np.ndarray:
     """Run raw segmentation on `image` with `params`; return the int32 LABEL
     image (object identities preserved, not just a binary mask).
+
+    Took an `is_2d` flag until the two segmenter branches collapsed into one
+    call that infers rank from `volume`; nothing has read it since, so it is
+    gone rather than left as an argument the call sites have to invent a value
+    for.
 
     Reads the label memmap into RAM (the run region is bounded) and removes all
     temp output so repeated probing does not accumulate on disk. `temp_root` is
@@ -577,7 +587,7 @@ def optimize_initial_segmentation(
         is_2d = (image.ndim == 2)
         crop = _pick_crop(image, is_2d)
         image = np.ascontiguousarray(image[crop])
-        spacing = _spacing_from_config(config, image.shape, is_2d)
+        spacing = _spacing_from_config(config, image.shape)
         images.append(image); spacings.append(spacing)
         params_list.append(copy.deepcopy(params)); step_keys.append(step_key)
         base_configs.append(config)
@@ -611,7 +621,7 @@ def optimize_initial_segmentation(
         name = os.path.basename(folders[i])
         _tick(0.05 + 0.10 * (i + 1) / len(images),
               f"[{name}] reference segmentation…")
-        ref = _segment_labels(image, spacing, params, is_2d, folders[i])
+        ref = _segment_labels(image, spacing, params, folders[i])
         if int((ref > 0).sum()) < _MIN_REF_PIXELS:
             empty_refs.append(name)
             print(f"[optimize] {name}: reference nearly empty "
@@ -643,7 +653,7 @@ def optimize_initial_segmentation(
         trial = copy.deepcopy(params_list[i])
         _set_leaf(trial, leaf, x)
         try:
-            lab = _segment_labels(images[i], spacings[i], trial, is_2d, folders[i])
+            lab = _segment_labels(images[i], spacings[i], trial, folders[i])
         except OptimizationCancelled:
             raise
         except Exception as exc:
