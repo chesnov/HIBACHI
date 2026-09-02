@@ -935,6 +935,20 @@ def channel_branch(channel: Optional[str] = None) -> str:
     return CHANNELS.get(channel or get_channel(), STABLE_BRANCH)
 
 
+def _canonical_path(path: str) -> str:
+    """
+    A path in the form used to compare install locations.
+
+    `normcase` on top of `realpath` is what makes this correct on Windows: NTFS
+    is case-insensitive and accepts either separator, so C:\\Users\\K\\app and
+    c:/users/k/app are the same directory -- but `realpath` alone preserves
+    whatever case and slashes the caller supplied, and the two would compare
+    unequal. An install would then fail to recognise its own checkout. On POSIX
+    `normcase` is the identity, so nothing changes there.
+    """
+    return os.path.normcase(os.path.realpath(os.path.abspath(path)))
+
+
 def get_install_dir() -> Optional[str]:
     """
     The checkout the installer created, or None if it was never recorded.
@@ -953,7 +967,7 @@ def get_install_dir() -> Optional[str]:
 def set_install_dir(path: str) -> bool:
     """Record the managed checkout. Stored resolved, so comparisons are stable."""
     data = _read_state()
-    data["install_dir"] = os.path.realpath(os.path.abspath(path))
+    data["install_dir"] = _canonical_path(path)
     return _write_state(data)
 
 
@@ -970,7 +984,10 @@ def is_install_dir(repo_root: str) -> bool:
     if not recorded:
         return True
     try:
-        return os.path.realpath(os.path.abspath(repo_root)) == recorded
+        # Compare canonically at BOTH ends: a value recorded by an older
+        # launcher was stored without normcase, so normalising only the
+        # argument would still mismatch on Windows.
+        return _canonical_path(repo_root) == _canonical_path(recorded)
     except Exception:
         return True
 
