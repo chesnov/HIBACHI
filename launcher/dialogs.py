@@ -6,6 +6,7 @@ GUI stack (PyQt/napari). Every function degrades safely with no display:
 
     * ask_update      -> "later"  (never update without explicit consent)
     * choose_rollback -> None     (cancel)
+    * choose_version  -> None     (cancel)
     * confirm_uninstall -> False  (never delete without explicit consent)
     * ask_yes_no      -> False
     * notify          -> prints to the console
@@ -284,6 +285,188 @@ def choose_rollback(versions: List[Dict[str, str]], current_rev: str) -> Optiona
     root.protocol("WM_DELETE_WINDOW", cancel)
     _run(root)
     return result["rev"]
+
+
+CHANNEL_LABELS = {"stable": "Stable", "dev": "Development"}
+
+# Shown when the Development channel is selected. Not a scare message -- the
+# point is that the choice is reversible from this same dialog.
+_DEV_WARNING = ("Development builds are unreleased and may be broken. "
+                "You can switch back to Stable here at any time.")
+
+# The synthetic first row. Selecting it means "follow this channel's tip and
+# keep auto-updating"; selecting any real commit below means "pin to exactly
+# this version and stop updating".
+_LATEST_ROW = " Latest  --  follow this channel (auto-update)"
+
+
+def choose_version(overview: Dict, current_rev: str = "") -> Optional[object]:
+    """
+    Pick a channel and a version in one dialog.
+
+    `overview` is exactly what `updater.channel_overview()` returns; this
+    function does no git work of its own, matching the rest of this module.
+
+    Returns:
+        None                                cancelled, or no display
+        UNINSTALL                           the uninstall button
+        {"channel": <name>, "rev": None}    track that channel's tip
+        {"channel": <name>, "rev": <sha>}   pin to that exact commit
+
+    The caller decides what those mean in git terms (switch / unpin / pin) --
+    see run_app._run_rollback. Switching the radio only re-renders the list;
+    nothing is applied until the primary button is pressed, so a mis-click
+    while recovering from a crash costs nothing.
+    """
+    tk, root, ui = _new_root()
+    if tk is None:
+        return None
+    from tkinter import ttk
+
+    # `clam` renders radiobuttons on its own grey; restyle them onto the card.
+    # Done here rather than in _new_root so no other dialog is affected.
+    try:
+        _st = ttk.Style(root)
+        _st.configure("Chan.TRadiobutton", background=_CARD, foreground=_TEXT,
+                      font=ui["font"])
+        _st.map("Chan.TRadiobutton",
+                background=[("active", _CARD)],
+                foreground=[("disabled", _MUTED)])
+        _RB = "Chan.TRadiobutton"
+    except Exception:
+        _RB = "TRadiobutton"
+
+    channels: Dict = overview.get("channels") or {}
+    order = [c for c in ("stable", "dev") if c in channels] or sorted(channels)
+    if not order:
+        _finish(root)
+        return None
+    current_channel = overview.get("current") or order[0]
+    if current_channel not in order:
+        current_channel = order[0]
+    head = overview.get("head") or current_rev or ""
+    pinned = bool(overview.get("pinned"))
+
+    result: Dict[str, Optional[object]] = {"value": None}
+    _header(tk, root, ui, "Switch version")
+    body = _body(tk, root)
+
+    # --- channel toggle -------------------------------------------------- #
+    chan_var = tk.StringVar(value=current_channel)
+    chan_row = ttk.Frame(body)
+    chan_row.pack(anchor="w", fill="x", padx=22, pady=(16, 0))
+    ttk.Label(chan_row, text="Channel:", font=ui["font_bold"]).pack(side="left")
+    for name in order:
+        entry = channels.get(name) or {}
+        rb = ttk.Radiobutton(chan_row, text=CHANNEL_LABELS.get(name, name.title()),
+                             value=name, variable=chan_var, style=_RB)
+        rb.pack(side="left", padx=(10, 0))
+        if not entry.get("available"):
+            # Unreachable channels are disabled rather than hidden, so the
+            # option is visibly there and the reason is stated.
+            rb.state(["disabled"])
+
+    note = ttk.Label(body, text="", style="Muted.TLabel", wraplength=430,
+                     justify="left")
+    note.pack(anchor="w", fill="x", padx=22, pady=(6, 8))
+
+    listwrap = tk.Frame(body, bg=_CARD)
+    listwrap.pack(fill="both", expand=True, padx=22)
+    sb = ttk.Scrollbar(listwrap, orient="vertical")
+    # Wide enough that the longest row -- a subject plus a trailing marker --
+    # is not clipped; the earlier 64 cut "<- current" to "<- curren".
+    lb = tk.Listbox(listwrap, width=78, height=12,
+                    activestyle="none", font=ui["mono"], bd=0, relief="flat",
+                    highlightthickness=1, highlightbackground=_BORDER,
+                    selectbackground=_SEL, selectforeground=_TEXT,
+                    bg=_CARD, fg=_TEXT, yscrollcommand=sb.set)
+    sb.config(command=lb.yview)
+    sb.pack(side="right", fill="y")
+    lb.pack(side="left", fill="both", expand=True)
+
+    btns = ttk.Frame(body)
+    btns.pack(fill="x", padx=22, pady=(14, 18))
+    go = ttk.Button(btns, text="Switch to this version", style="Accent.TButton")
+
+    # `rows` maps a listbox index to the rev it means (None = the Latest row).
+    rows: List[Optional[str]] = []
+
+    def render(*_args) -> None:
+        name = chan_var.get()
+        entry = channels.get(name) or {}
+        lb.delete(0, "end")
+        rows.clear()
+
+        if not entry.get("available"):
+            reason = entry.get("reason") or "unavailable"
+            note.config(text=f"The {CHANNEL_LABELS.get(name, name)} channel is "
+                             f"not available: {reason}.")
+            go.state(["disabled"])
+            return
+        go.state(["!disabled"])
+
+        msgs = []
+        if name != current_channel:
+            msgs.append(f"You are currently on "
+                        f"{CHANNEL_LABELS.get(current_channel, current_channel)}. "
+                        f"Switching replaces the application files and may "
+                        f"update dependencies.")
+        if name == "dev":
+            msgs.append(_DEV_WARNING)
+        if pinned and name == current_channel:
+            msgs.append("This version is pinned, so updates are paused. "
+                        "Choose Latest to resume them.")
+        note.config(text=" ".join(msgs))
+
+        is_here = (name == current_channel)
+        # When following a channel, its tip IS the Latest row -- so only that
+        # row gets the marker. Marking the tip commit too (as an earlier version
+        # did) labelled two rows "current" and implied that selecting the commit
+        # was a no-op, when it would in fact pin and stop updates.
+        tracking_tip = is_here and not pinned
+        lb.insert("end", _LATEST_ROW + ("   <- current" if tracking_tip else ""))
+        rows.append(None)
+
+        select_at = 0   # Latest: correct default whenever nothing is pinned
+        for v in entry.get("versions") or []:
+            here = is_here and bool(head) and v["rev"] == head
+            tag = "   <- pinned here" if (here and pinned) else ""
+            lb.insert("end", f' {v["date"]}   {v["short"]}   {v["subject"]}{tag}')
+            rows.append(v["rev"])
+            if here and pinned:
+                select_at = len(rows) - 1
+        lb.selection_clear(0, "end")
+        lb.selection_set(select_at)
+        lb.see(select_at)
+
+    chan_var.trace_add("write", render)
+    render()
+
+    def do_switch() -> None:
+        sel = lb.curselection()
+        if sel and sel[0] < len(rows):
+            result["value"] = {"channel": chan_var.get(), "rev": rows[sel[0]]}
+        _finish(root)
+
+    def cancel() -> None:
+        result["value"] = None
+        _finish(root)
+
+    def uninstall() -> None:
+        result["value"] = UNINSTALL
+        _finish(root)
+
+    go.config(command=do_switch)
+    ttk.Button(btns, text="Cancel", command=cancel).pack(side="left")
+    ttk.Button(btns, text="Uninstall HIBACHI...", command=uninstall).pack(
+        side="left", padx=(8, 0)
+    )
+    go.pack(side="right")
+    lb.bind("<Double-Button-1>", lambda _e: do_switch())
+
+    root.protocol("WM_DELETE_WINDOW", cancel)
+    _run(root)
+    return result["value"]
 
 
 def ask_yes_no(title: str, message: str) -> bool:

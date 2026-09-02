@@ -4,21 +4,27 @@ run_app.py -- the double-click entry point for HIBACHI.
 Order of operations on every launch:
 
     1. Show a small splash so the user gets immediate feedback.
-    2. Check for a newer version (safe + offline-tolerant; see updater.py).
-    3. If one is available, ASK the user whether to install it. Install only on
+    2. Apply a dependency update left pending by a previous session (e.g. a
+       channel switch made from inside the app, which cannot rebuild its own
+       environment), then re-exec.
+    3. Check for a newer version (safe + offline-tolerant; see updater.py).
+    4. If one is available, ASK the user whether to install it. Install only on
        consent. If the dependency spec changed, update the conda env and
        re-exec this launcher once (so the app runs under the new packages).
-    4. Refresh the desktop launcher so a changed icon / launch command / moved
+    5. Refresh the desktop launcher so a changed icon / launch command / moved
        checkout self-heals (best-effort; skipped on macOS).
-    5. Launch the real application (segment.py) as a subprocess and wait.
-    6. If it exits with an error, offer to roll back to a previous version.
+    6. Launch the real application (segment.py) as a subprocess and wait.
+    7. If it exits with an error, offer to roll back to a previous version.
 
 Everything is defensive: if updating fails for any reason, we still launch the
 version already on disk. The heavy GUI stack (PyQt/napari) is only touched by
 the child process, never here -- so a mid-update package change is safe.
 
 Environment knobs (all optional):
-    HIBACHI_BRANCH        branch to track (default: current branch, else 'main')
+    HIBACHI_BRANCH        branch to track, overriding the channel entirely
+                          (see updater.resolve_branch for the precedence)
+    HIBACHI_CHANNEL       'stable' or 'dev' -- switch channel on this launch,
+                          then carry on. Equivalent to --channel.
     HIBACHI_NO_UPDATE     '1' to skip the update check entirely (offline/dev use)
     HIBACHI_AUTO_UPDATE   '1' to install updates without asking (headless/kiosk)
     HIBACHI_NO_SPLASH     '1' to disable the splash window
@@ -33,6 +39,8 @@ Environment knobs (all optional):
 
 Command line:
     --rollback            open the rollback chooser instead of launching
+    --channel             print the tracked channel and exit
+    --channel stable|dev  switch to that channel, then launch normally
 """
 
 from __future__ import annotations
@@ -223,6 +231,39 @@ def _update_environment(repo_root: str, splash) -> bool:
     return did_something
 
 
+def _apply_env_change(repo_root: str, splash, already_reexeced: bool) -> None:
+    """
+    Bring dependencies in line with the checkout, then re-exec so the app runs
+    under them. Does NOT return when the re-exec succeeds.
+
+    Extracted so both callers use the identical sequence: an accepted update,
+    and a channel switch. A channel switch needs this just as much -- the two
+    channels pin different numerics, and switching BACK to stable has to rebuild
+    the environment too or stable code runs against dev's pins.
+
+    `already_reexeced` guards against a loop: the child inherits the guard
+    variable, so the env update is attempted at most once per launch chain.
+    """
+    if already_reexeced:
+        _msg(splash, "Dependencies already updated this session; not re-running.")
+        return
+    _update_environment(repo_root, splash)
+    # Cleared only after the attempt returns, never before. A solve killed
+    # halfway therefore leaves the flag set and is retried on the next launch,
+    # rather than being recorded as done on a half-built environment.
+    updater.set_pending_env_update(False)
+    _msg(splash, "Restarting with updated dependencies...")
+    if splash is not None:
+        splash.close()
+    new_env = dict(os.environ)
+    new_env[_REEXEC_GUARD] = "1"
+    # sys.argv is deliberately dropped: re-running with the original flags would
+    # re-open the rollback chooser or re-apply --channel, both of which have
+    # already happened by this point.
+    os.execve(sys.executable, [sys.executable, __file__], new_env)
+    # os.execve does not return on success.
+
+
 def _msg(splash, text: str) -> None:
     if splash is not None:
         splash.set_status(text)
@@ -251,35 +292,85 @@ def _ask_update(check) -> str:
 
 
 def _run_rollback(repo_root: str) -> None:
-    """Let the user pick a previous version and switch the checkout to it."""
+    """
+    Let the user pick a channel and a version, then apply it.
+
+    `dialogs.choose_version` returns intent, not git commands, so the mapping
+    lives here. Three things can be needed, in this order:
+
+        1. a channel switch, if a different channel was chosen
+        2. a dependency update, if that switch changed environment.yml
+        3. a pin (a specific commit) or an unpin (the "Latest" row)
+
+    Order matters: the pin target only exists locally after the switch has
+    fetched it, and the environment must match the code before either is used.
+
+    Unlike the launch path, this does not re-exec after updating dependencies --
+    we are about to exit and ask the user to restart, and silently relaunching
+    the app after they pressed a version button would be a surprise.
+    """
     import dialogs
 
-    versions = updater.list_versions(repo_root, limit=15)
-    if not versions:
-        dialogs.notify("HIBACHI", "No version history is available to roll back to.")
+    log = lambda m: print(f"[startup] {m}")  # noqa: E731
+    # A short fetch timeout: this runs in the crash-recovery path too, where an
+    # offline machine must not sit through two long fetches before showing the
+    # dialog.
+    overview = updater.channel_overview(repo_root, limit=15, fetch_timeout=15)
+    if not any(c.get("available") for c in overview["channels"].values()):
+        dialogs.notify("HIBACHI", "No version history is available to switch to.")
         return
 
-    current = updater.current_rev(repo_root) or ""
-    chosen = dialogs.choose_rollback(versions, current)
+    chosen = dialogs.choose_version(overview)
     if chosen == dialogs.UNINSTALL:
         import uninstall
 
         uninstall.run(repo_root)
         return
-    if not chosen:
-        return
+    if not isinstance(chosen, dict):
+        return  # cancelled, or no display
 
-    ok, msg = updater.rollback_to(repo_root, chosen, logger=lambda m: print(f"[startup] {m}"))
-    if ok:
-        # Don't immediately re-prompt to update back up to the tip: remember the
-        # current remote tip as "skipped" so the next launch stays put unless
-        # the user opts in.
-        tip = updater.remote_tip(repo_root)
-        if tip:
-            updater.set_skipped_rev(tip)
-        dialogs.notify("HIBACHI", f"{msg}\n\nPlease start HIBACHI again to use this version.")
+    target = chosen.get("channel") or overview["current"]
+    rev = chosen.get("rev")
+    notes = []
+
+    # --- 1. channel ------------------------------------------------------ #
+    if target != overview["current"]:
+        res = updater.switch_channel(repo_root, target, logger=log)
+        if res.status != updater.UPDATED:
+            dialogs.notify("HIBACHI", f"Could not switch channel:\n{res.message}")
+            return
+        notes.append(res.message)
+        # --- 2. dependencies --------------------------------------------- #
+        if res.env_changed:
+            log("Dependency list differs on this channel; updating now.")
+            _update_environment(repo_root, None)
+            updater.set_pending_env_update(False)
+            notes.append("Dependencies were updated to match this channel.")
+
+    # --- 3. pin / unpin -------------------------------------------------- #
+    if rev:
+        ok, msg = updater.pin_to(repo_root, rev, logger=log)
+    elif updater.is_pinned(repo_root):
+        # "Latest" on the channel we are already following: release the pin.
+        ok, msg = updater.unpin(repo_root, target, logger=log)
+    elif target == overview["current"]:
+        dialogs.notify("HIBACHI", "Already following the latest version of the "
+                                  f"{target} channel. Nothing to change.")
+        return
     else:
-        dialogs.notify("HIBACHI", f"Rollback failed:\n{msg}")
+        ok, msg = True, ""   # the switch already landed on the channel tip
+
+    if not ok:
+        dialogs.notify("HIBACHI", f"Could not switch version:\n{msg}")
+        return
+    if msg:
+        notes.append(msg)
+    # No skip marker is needed any more. `pin_to` detaches HEAD, so
+    # check_for_update reports PINNED and offers nothing until the pin is
+    # released -- the old `set_skipped_rev(remote_tip)` call existed only to
+    # suppress the re-offer caused by rewinding the branch pointer.
+    dialogs.notify("HIBACHI", "\n".join(notes)
+                   + "\n\nPlease start HIBACHI again to use this version.")
 
 
 def _tail(path: str, max_lines: int, max_chars: int = 20000) -> str:
@@ -436,10 +527,17 @@ def _offer_rollback_after_crash(repo_root: str, code: int) -> None:
     import dialogs
 
     try:
-        versions = updater.list_versions(repo_root, limit=15)
+        # Local only (fetch=False): this runs before the crash window appears,
+        # so it must not wait on the network. The offer is worth making if the
+        # user could pick ANYTHING different -- either an earlier version on
+        # this channel, or another channel entirely. That second case is the
+        # main recovery route after a bad development build, and the old
+        # `len(versions) >= 2` gate missed it.
+        ov = updater.channel_overview(repo_root, limit=15, fetch=False)
+        avail = [c for c in ov["channels"].values() if c.get("available")]
+        can_rollback = len(avail) > 1 or any(len(c["versions"]) >= 2 for c in avail)
     except Exception:
-        versions = []
-    can_rollback = len(versions) >= 2
+        can_rollback = False
 
     details, report_path = _collect_crash_report(code)
     summary = f"HIBACHI stopped unexpectedly \u2014 {_describe_exit(code)} (raw exit code {code})."
@@ -589,12 +687,69 @@ def _activate_env_path() -> None:
         os.environ["PATH"] = os.pathsep.join(new + ([current] if current else []))
 
 
+def _parse_channel_arg(argv: list[str]) -> tuple[bool, str | None]:
+    """
+    Read `--channel [name]` / $HIBACHI_CHANNEL.
+
+    Returns (requested, name). `requested` with a None name means "report the
+    current channel and exit"; a name means "switch to it".
+    """
+    env = os.environ.get("HIBACHI_CHANNEL")
+    if "--channel" in argv:
+        i = argv.index("--channel")
+        nxt = argv[i + 1] if i + 1 < len(argv) else None
+        if nxt and not nxt.startswith("-"):
+            return True, nxt
+        return True, None
+    if env:
+        return True, env
+    return False, None
+
+
+def _run_channel_switch(repo_root: str, channel: str | None,
+                        splash, already_reexeced: bool) -> int | None:
+    """
+    Handle --channel. Returns an exit code to stop, or None to keep launching.
+
+    A switch that changes the dependency spec goes through the same
+    _apply_env_change path an accepted update uses, so the app is never left
+    running one channel's code against the other's packages.
+    """
+    if channel is None:
+        cur = updater.get_channel()
+        print(f"[startup] tracking the {cur} channel "
+              f"(branch '{updater.channel_branch(cur)}')")
+        if updater.is_pinned(repo_root):
+            print(f"[startup] pinned to {(updater.current_rev(repo_root) or '')[:8]}; "
+                  f"updates are paused")
+        return 0
+
+    if channel not in updater.CHANNELS:
+        print(f"[startup] unknown channel {channel!r}; "
+              f"expected one of {sorted(updater.CHANNELS)}")
+        return 2
+
+    res = updater.switch_channel(repo_root, channel,
+                                 logger=lambda m: _msg(splash, m))
+    if res.status != updater.UPDATED:
+        # Nothing was changed (offline, missing branch, dirty checkout that
+        # could not be stashed). Say so and launch what is on disk rather than
+        # failing the launch outright.
+        _msg(splash, res.message or f"Could not switch to {channel}.")
+        return None
+
+    if res.env_changed:
+        _apply_env_change(repo_root, splash, already_reexeced)
+    return None
+
+
 def main() -> int:
     no_update = os.environ.get("HIBACHI_NO_UPDATE") == "1"
     no_splash = os.environ.get("HIBACHI_NO_SPLASH") == "1"
     auto_update = os.environ.get("HIBACHI_AUTO_UPDATE") == "1"
     already_reexeced = os.environ.get(_REEXEC_GUARD) == "1"
     want_rollback = ("--rollback" in sys.argv[1:]) or os.environ.get("HIBACHI_ROLLBACK") == "1"
+    want_channel, channel_name = _parse_channel_arg(sys.argv[1:])
 
     repo_root = updater.find_repo_root(_HERE) or os.path.dirname(_HERE)
 
@@ -636,6 +791,26 @@ def main() -> int:
 
     splash = get_splash(enabled=not no_splash)
     try:
+        # A previous session left the checkout on code whose dependency spec
+        # has not been applied -- typically a channel switch made from inside
+        # the running app, which cannot rebuild its own environment. Settle that
+        # before the update check or the launch, so the app never starts against
+        # the wrong packages. Re-execs on success and does not return.
+        if updater.get_pending_env_update() and not no_update:
+            _msg(splash, "Finishing a dependency update from the last session...")
+            _apply_env_change(repo_root, splash, already_reexeced)
+
+        # Channel switch next: it may replace the working tree and re-exec, and
+        # the update check below must run against the channel we end up on, not
+        # the one we started from.
+        if want_channel:
+            rc = _run_channel_switch(repo_root, channel_name, splash,
+                                     already_reexeced)
+            if rc is not None:
+                if splash is not None:
+                    splash.close()
+                return rc
+
         if no_update:
             _msg(splash, "Update check skipped.")
         else:
@@ -663,20 +838,9 @@ def main() -> int:
 
                     # Apply a dependency update once, then re-exec so the app
                     # sees it -- only if the update actually landed.
-                    if (
-                        applied.status == updater.UPDATED
-                        and applied.env_changed
-                        and not already_reexeced
-                    ):
-                        _update_environment(repo_root, splash)
-                        _msg(splash, "Restarting with updated dependencies...")
-                        if splash is not None:
-                            splash.close()
-                            splash = None
-                        new_env = dict(os.environ)
-                        new_env[_REEXEC_GUARD] = "1"
-                        os.execve(sys.executable, [sys.executable, __file__], new_env)
-                        # os.execve does not return on success.
+                    if applied.status == updater.UPDATED and applied.env_changed:
+                        _apply_env_change(repo_root, splash, already_reexeced)
+                        splash = None
                 elif decision == "skip":
                     updater.set_skipped_rev(check.new_rev)
                     _msg(splash, "Skipping this version.")
