@@ -44,10 +44,27 @@ UPDATED = "updated"
 OFFLINE = "offline"
 SKIPPED = "skipped"
 LOCAL_AHEAD = "local_ahead"   # checkout has un-pushed / diverged commits; left untouched
+PINNED = "pinned"             # HEAD is detached at a user-chosen rev; tracking nothing
 ERROR = "error"
 
 # Path (relative to repo root) whose change triggers a dependency-env update.
 ENV_FILE_REL = os.path.join("install", "environment.yml")
+
+# --------------------------------------------------------------------------- #
+# Release channels
+# --------------------------------------------------------------------------- #
+# A channel is a user-facing name for a branch. `stable` is what every install
+# tracks unless the user opts in; `dev` carries work that may break. The
+# mapping exists so the UI and the persisted state talk about channels while
+# git only ever sees branch names -- renaming a branch is then a one-line
+# change here rather than a search across the launcher and both installers.
+#
+# NOTE: install.sh and install.ps1 default BRANCH/-Branch to "main"
+# independently. If STABLE_BRANCH ever changes, those two must change with it.
+STABLE_BRANCH = "main"
+DEV_BRANCH = "dev"
+CHANNELS: Dict[str, str] = {"stable": STABLE_BRANCH, "dev": DEV_BRANCH}
+DEFAULT_CHANNEL = "stable"
 
 
 @dataclass
@@ -58,6 +75,8 @@ class UpdateResult:
     env_changed: bool = False
     update_available: bool = False
     branch: Optional[str] = None
+    channel: Optional[str] = None
+    pinned: bool = False
     message: str = ""
     stashed: bool = False
     changelog: List[str] = field(default_factory=list)
@@ -166,11 +185,72 @@ def _git(
 # --------------------------------------------------------------------------- #
 # Small query helpers (used by the launcher's rollback UI)
 # --------------------------------------------------------------------------- #
-def current_branch(repo_root: str) -> str:
+def head_branch(repo_root: str) -> Optional[str]:
+    """
+    The branch HEAD is on, or None when HEAD is detached.
+
+    Returns the truth and nothing else. The old `current_branch` answered this
+    question with the literal string "main" when HEAD was detached, and
+    `describe_version` stamped that answer into every processed dataset -- an
+    invented value presented as provenance. Callers that need *something* to
+    track should use `resolve_branch`; callers recording what happened must use
+    this and accept None.
+    """
     rc, cur, _ = _git(["rev-parse", "--abbrev-ref", "HEAD"], repo_root)
     if rc == 0 and cur and cur != "HEAD":
         return cur
-    return os.environ.get("HIBACHI_BRANCH") or "main"
+    return None
+
+
+def is_pinned(repo_root: str) -> bool:
+    """True when HEAD is detached -- i.e. the user pinned a specific version."""
+    return head_branch(repo_root) is None
+
+
+def resolve_branch(repo_root: str, branch: Optional[str] = None) -> str:
+    """
+    Which branch this install should track, in order of precedence:
+
+        1. an explicit `branch` argument            (caller knows best)
+        2. $HIBACHI_BRANCH                          (operator override)
+        3. HEAD's branch, if it is NOT a channel    (a dev's feature branch:
+           branch and not detached                   respect where they are)
+        4. the persisted channel                    (the normal case)
+        5. STABLE_BRANCH                            (never-configured install)
+
+    Rule 3 keeps a developer working on `feature/x` from being told about
+    updates to `main`; rule 4 is what makes the channel choice sticky across
+    launches, including while pinned (HEAD detached), where there is no branch
+    to infer from.
+    """
+    if branch:
+        return branch
+    env = os.environ.get("HIBACHI_BRANCH")
+    if env:
+        return env
+    head = head_branch(repo_root)
+    if head and head not in CHANNELS.values():
+        return head
+    return channel_branch()
+
+
+def current_branch(repo_root: str) -> str:
+    """Deprecated alias for `resolve_branch`, kept for external callers."""
+    return resolve_branch(repo_root)
+
+
+def _remote_reachable(repo_root: str, timeout: int = 15) -> bool:
+    """
+    Can we talk to origin at all?
+
+    Only called when a fetch has already failed, to tell "no network" apart
+    from "that branch does not exist on the server". Both make `git fetch`
+    exit non-zero, and reporting the second as "working offline" sends the user
+    to check their wifi over a branch-name problem.
+    """
+    rc, _, _ = _git(["ls-remote", "--exit-code", "--heads", "origin"], repo_root,
+                    timeout=timeout)
+    return rc == 0
 
 
 def current_rev(repo_root: str) -> Optional[str]:
@@ -195,10 +275,17 @@ def describe_version(repo_root: Optional[str] = None) -> Dict[str, Optional[str]
     uncommitted changes at processing time -- important, because a dirty tree
     means the commit alone does NOT fully reproduce the code). Never raises; any
     field it can't determine is None (e.g. not a git checkout -> commit is None).
+
+    Two fields describe *where the code came from* rather than which commit it
+    is: `channel` (the release channel the install tracks) and `branch` (the
+    branch HEAD is actually on, or None when the version is pinned). They can
+    legitimately disagree -- a pinned dev install reports channel 'dev' and
+    branch None -- and that disagreement is the useful signal, so neither is
+    inferred from the other.
     """
     info: Dict[str, Optional[str]] = {
         "commit": None, "short": None, "date": None, "branch": None,
-        "tag": None, "dirty": None,
+        "channel": None, "pinned": None, "tag": None, "dirty": None,
     }
     try:
         if not repo_root:
@@ -211,7 +298,12 @@ def describe_version(repo_root: Optional[str] = None) -> Dict[str, Optional[str]
             info["commit"] = parts[0] or None
             info["short"] = parts[1] or None
             info["date"] = parts[2] or None
-        info["branch"] = current_branch(repo_root)
+        # `head_branch`, not `resolve_branch`: this field records what the
+        # checkout WAS, so a detached (pinned) HEAD must report None rather
+        # than the branch it would track if it were following one.
+        info["branch"] = head_branch(repo_root)
+        info["channel"] = get_channel()
+        info["pinned"] = info["branch"] is None
         # Nearest semantic tag, e.g. 'v1.2.0' (exact) or 'v1.2.0-3-gabc123' (3
         # commits after the tag). Empty/None if the repo has no tags. This is the
         # human-facing version to cite when reproducing an analysis.
@@ -256,20 +348,43 @@ def check_for_update(
         log(result.message)
         return result
 
-    if not branch:
-        branch = os.environ.get("HIBACHI_BRANCH")
-    if not branch:
-        branch = current_branch(root)
+    branch = resolve_branch(root, branch)
     result.branch = branch
+    result.channel = get_channel()
 
     rc, old_rev, _ = _git(["rev-parse", "HEAD"], root)
     result.old_rev = old_rev or None
 
-    log(f"Checking for updates on '{branch}'...")
+    # A pinned install (detached HEAD) tracks nothing by definition. Report
+    # what is available so the UI can offer to unpin, but never present it as
+    # an applicable update: `update_available` stays False, and the status is
+    # one no caller treats as actionable.
+    if is_pinned(root):
+        result.status = PINNED
+        result.pinned = True
+        result.message = (
+            f"Pinned to version {(old_rev or '')[:8]}; not tracking "
+            f"'{branch}'. Switch version to resume updates."
+        )
+        rc, _, _ = _git(["fetch", "--quiet", "origin", branch], root, timeout=fetch_timeout)
+        if rc == 0:
+            result.new_rev = remote_tip(root, branch)
+        log(result.message)
+        return result
+
+    log(f"Checking for updates on '{branch}' ({result.channel} channel)...")
     rc, _, err = _git(["fetch", "--quiet", "origin", branch], root, timeout=fetch_timeout)
     if rc != 0:
-        result.status = OFFLINE
-        result.message = f"Could not reach the update server (working offline). {err}".strip()
+        if _remote_reachable(root):
+            result.status = ERROR
+            result.message = (
+                f"The update server has no branch '{branch}'. If this install "
+                f"tracks a channel that has been retired, switch channel to "
+                f"resume updates."
+            )
+        else:
+            result.status = OFFLINE
+            result.message = f"Could not reach the update server (working offline). {err}".strip()
         log(result.message)
         return result
 
@@ -442,43 +557,222 @@ def list_versions(
     return versions
 
 
-def rollback_to(
+def _stash_guard(root: str, tag: str, log: Callable[[str], None]) -> bool:
+    """Stash uncommitted changes before a destructive checkout. Never raises."""
+    rc, dirty, _ = _git(["status", "--porcelain"], root)
+    if rc != 0 or not dirty:
+        return False
+    stamp = time.strftime("%Y-%m-%d_%H-%M-%S")
+    rc_s, _, err_s = _git(
+        ["stash", "push", "--include-untracked", "-m", f"hibachi-{tag}-{stamp}"], root
+    )
+    if rc_s == 0:
+        log(f"Local changes detected; backed them up to a git stash ({stamp}).")
+        return True
+    log(f"Warning: could not stash local changes: {err_s}")
+    return False
+
+
+def pin_to(
     repo_root: Optional[str],
     rev: str,
     logger: Optional[Callable[[str], None]] = None,
 ) -> Tuple[bool, str]:
     """
-    Switch the checkout to `rev` (a guarded `git reset --hard`).
+    Pin the checkout to `rev` by detaching HEAD there.
 
-    Uncommitted changes are stashed first, so nothing is silently lost. Returns
-    (ok, message).
+    Detaching, rather than `reset --hard` on the current branch, is deliberate.
+    A reset rewrites the local branch pointer, so `main` stops meaning what
+    `origin/main` means: the next launch sees a clean fast-forward and offers to
+    pull the user straight back to the tip they just left. (That is what the
+    old `set_skipped_rev(remote_tip)` call in the launcher existed to suppress.)
+    A detached HEAD instead says exactly what the user asked for -- this commit,
+    tracking nothing -- so `check_for_update` reports PINNED and nothing is
+    offered until the pin is released. The tracked channel is left alone, so
+    unpinning returns to whichever channel the user was on.
+
+    Uncommitted changes are stashed first. Returns (ok, message).
     """
     log = logger or _default_logger
     root = repo_root or find_repo_root()
     if not root or not os.path.isdir(os.path.join(root, ".git")):
         return False, "Not a git checkout."
 
-    rc, _, _ = _git(["rev-parse", "--verify", "--quiet", f"{rev}^{{commit}}"], root)
+    rc, full, _ = _git(["rev-parse", "--verify", "--quiet", f"{rev}^{{commit}}"], root)
     if rc != 0:
         return False, f"Unknown version: {rev}"
+    rev = full or rev
 
-    rc, dirty, _ = _git(["status", "--porcelain"], root)
-    if rc == 0 and dirty:
-        stamp = time.strftime("%Y-%m-%d_%H-%M-%S")
-        _git(["stash", "push", "--include-untracked", "-m", f"hibachi-rollback-backup-{stamp}"], root)
-        log(f"Backed up local changes to a git stash ({stamp}).")
+    _stash_guard(root, "pin-backup", log)
 
-    rc, _, err = _git(["reset", "--hard", rev], root)
+    rc, _, err = _git(["checkout", "--detach", "--quiet", rev], root)
     if rc != 0:
-        return False, f"Rollback failed: {err}"
+        return False, f"Could not switch to that version: {err}"
 
-    log(f"Switched to {rev[:8]}.")
-    return True, f"Switched to version {rev[:8]}."
+    log(f"Pinned to {rev[:8]} (updates paused until you switch back).")
+    return True, f"Pinned to version {rev[:8]}. Updates are paused."
+
+
+# Kept so existing callers keep working; the behaviour is now a pin, not a
+# branch-rewinding reset. Prefer `pin_to` in new code.
+rollback_to = pin_to
+
+
+def unpin(
+    repo_root: Optional[str] = None,
+    channel: Optional[str] = None,
+    fetch_timeout: int = 30,
+    logger: Optional[Callable[[str], None]] = None,
+) -> Tuple[bool, str]:
+    """
+    Release a pin and resume tracking `channel` (default: the tracked one).
+
+    Works offline: if origin cannot be reached, HEAD is attached to the local
+    branch and the next launch fast-forwards normally.
+    """
+    log = logger or _default_logger
+    root = repo_root or find_repo_root()
+    if not root or not os.path.isdir(os.path.join(root, ".git")):
+        return False, "Not a git checkout."
+
+    branch = channel_branch(channel)
+    _stash_guard(root, "unpin-backup", log)
+
+    _git(["fetch", "--quiet", "origin", branch], root, timeout=fetch_timeout)
+    rc, _, _ = _git(["rev-parse", "--verify", "--quiet", f"origin/{branch}"], root)
+    if rc == 0:
+        rc, _, err = _git(["checkout", "-B", branch, f"origin/{branch}", "--quiet"], root)
+    else:
+        rc, _, err = _git(["checkout", "--quiet", branch], root)
+    if rc != 0:
+        return False, f"Could not resume updates on '{branch}': {err}"
+
+    log(f"Resumed tracking '{branch}'.")
+    return True, f"Resumed tracking the {channel or get_channel()} channel."
+
+
+def switch_channel(
+    repo_root: Optional[str] = None,
+    channel: str = DEFAULT_CHANNEL,
+    fetch_timeout: int = 30,
+    logger: Optional[Callable[[str], None]] = None,
+) -> UpdateResult:
+    """
+    Move the checkout onto `channel` and persist the choice.
+
+    This cannot reuse apply_update: that path is `merge --ff-only` gated on
+    HEAD being an ancestor of the remote tip, and two channels diverge by
+    construction, so it would report LOCAL_AHEAD and refuse. A switch is a
+    deliberate, guarded replacement of the working tree instead --
+    `checkout -B <branch> origin/<branch>` -- which also re-attaches HEAD, so
+    switching channels releases a pin as a side effect.
+
+    Order matters: the channel is persisted only AFTER the checkout succeeds.
+    Recording the intent first would leave an install claiming to be on dev
+    while running stable code, which is worse than not switching at all.
+
+    `env_changed` is computed by diffing the two trees directly rather than
+    over a commit range, because the channels are not ancestors of one another.
+    It is set in BOTH directions: returning to stable also needs the dependency
+    environment rebuilt, or stable code runs against dev's pinned numerics.
+    """
+    log = logger or _default_logger
+    result = UpdateResult(status=ERROR)
+
+    if channel not in CHANNELS:
+        result.message = f"Unknown channel {channel!r}."
+        log(result.message)
+        return result
+
+    root = repo_root or find_repo_root()
+    if not root or not os.path.isdir(os.path.join(root, ".git")):
+        result.status = SKIPPED
+        result.message = "Not a git checkout; cannot switch channel."
+        log(result.message)
+        return result
+
+    branch = CHANNELS[channel]
+    result.branch = branch
+    result.channel = channel
+    result.old_rev = current_rev(root)
+
+    log(f"Switching to the {channel} channel ('{branch}')...")
+    rc, _, err = _git(["fetch", "--quiet", "origin", branch], root, timeout=fetch_timeout)
+    if rc != 0:
+        if _remote_reachable(root):
+            result.message = (
+                f"The {channel} channel does not exist on the server "
+                f"(no branch '{branch}'). Nothing was changed."
+            )
+        else:
+            result.status = OFFLINE
+            result.message = (
+                f"Could not reach the update server, so the {channel} channel "
+                f"was not installed. Nothing was changed. {err}".strip()
+            )
+        log(result.message)
+        return result
+
+    rc, remote_rev, _ = _git(["rev-parse", f"origin/{branch}"], root)
+    if rc != 0 or not remote_rev:
+        result.message = (
+            f"The {channel} channel does not exist on the server "
+            f"(no branch '{branch}'). Nothing was changed."
+        )
+        log(result.message)
+        return result
+    result.new_rev = remote_rev
+
+    rc, changed, _ = _git(["diff", "--name-only", "HEAD", remote_rev], root)
+    if rc == 0:
+        norm = {os.path.normpath(f.strip()) for f in changed.splitlines() if f.strip()}
+        result.env_changed = os.path.normpath(ENV_FILE_REL) in norm
+
+    rc, subjects, _ = _git(
+        ["log", "--no-merges", "--format=%s", f"{result.old_rev}..{remote_rev}"], root
+    )
+    if rc == 0 and subjects:
+        result.changelog = [s.strip() for s in subjects.splitlines() if s.strip()][:20]
+
+    result.stashed = _stash_guard(root, f"channel-{channel}-backup", log)
+
+    # Check out the exact rev that was diffed above, not `origin/<branch>`, so a
+    # push landing mid-switch cannot leave the tree at a commit we never
+    # inspected. Upstream is then set separately, best-effort, so a power user's
+    # manual `git pull` still works.
+    rc, _, err = _git(["checkout", "-B", branch, remote_rev, "--quiet"], root)
+    if rc != 0:
+        result.message = f"Could not switch to the {channel} channel: {err}"
+        log(result.message)
+        return result
+    _git(["branch", f"--set-upstream-to=origin/{branch}", branch], root)
+
+    if not set_channel(channel):
+        # The checkout moved but the choice could not be saved, so the next
+        # launch would resolve the channel from HEAD's branch and appear to
+        # stick anyway -- until the user pins. Say so rather than imply it took.
+        log(f"Warning: switched to {channel}, but the choice could not be saved "
+            f"to {_state_path()}; it may not persist.")
+
+    result.status = UPDATED
+    result.message = (
+        f"Now on the {channel} channel ({(remote_rev or '')[:8]})."
+    )
+    log(result.message)
+    if result.env_changed:
+        log("Dependency list differs on this channel; the environment will be updated.")
+    return result
 
 
 # --------------------------------------------------------------------------- #
-# Tiny persisted state (only: which update version the user chose to skip)
+# Tiny persisted state: the tracked channel, and per-channel skipped revs
 # --------------------------------------------------------------------------- #
+# Kept in $HIBACHI_STATE_DIR/state.json (default ~/.hibachi/state.json), which
+# lives OUTSIDE the repository -- so it survives every reset/fast-forward the
+# updater performs, which is exactly why the channel choice can be sticky.
+#
+# Writes are atomic (temp file + os.replace): a half-written state.json would
+# lose the channel and silently drop a dev install back to stable.
 def _state_path() -> str:
     base = os.environ.get("HIBACHI_STATE_DIR") or os.path.join(os.path.expanduser("~"), ".hibachi")
     try:
@@ -488,28 +782,96 @@ def _state_path() -> str:
     return os.path.join(base, "state.json")
 
 
-def get_skipped_rev() -> Optional[str]:
+def _read_state() -> Dict:
     import json
     try:
         with open(_state_path()) as fh:
-            return json.load(fh).get("skip_rev")
+            data = json.load(fh)
+        return data if isinstance(data, dict) else {}
     except Exception:
-        return None
+        return {}
 
 
-def set_skipped_rev(rev: Optional[str]) -> None:
+def _write_state(data: Dict) -> bool:
+    """Best-effort atomic write. Returns True on success; never raises."""
     import json
     path = _state_path()
-    data = {}
+    tmp = f"{path}.tmp"
     try:
-        if os.path.isfile(path):
-            with open(path) as fh:
-                data = json.load(fh)
+        with open(tmp, "w") as fh:
+            json.dump(data, fh, indent=1, sort_keys=True)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+        return True
     except Exception:
-        data = {}
-    data["skip_rev"] = rev
-    try:
-        with open(path, "w") as fh:
-            json.dump(data, fh)
-    except Exception:
-        pass
+        try:
+            if os.path.isfile(tmp):
+                os.remove(tmp)
+        except Exception:
+            pass
+        return False
+
+
+def get_channel() -> str:
+    """
+    The channel this install tracks. Unknown/absent values fall back to stable.
+
+    An install that has never made a choice reads as `stable`, which is why no
+    migration was needed when the dev channel was introduced: every existing
+    install keeps tracking the same branch it always did.
+    """
+    ch = _read_state().get("channel")
+    return ch if ch in CHANNELS else DEFAULT_CHANNEL
+
+
+def set_channel(channel: str) -> bool:
+    """Persist the tracked channel. Returns False if it could not be saved."""
+    if channel not in CHANNELS:
+        raise ValueError(f"unknown channel {channel!r}; expected one of {sorted(CHANNELS)}")
+    data = _read_state()
+    data["channel"] = channel
+    return _write_state(data)
+
+
+def channel_branch(channel: Optional[str] = None) -> str:
+    """Branch name for `channel` (default: the tracked one)."""
+    return CHANNELS.get(channel or get_channel(), STABLE_BRANCH)
+
+
+def get_skipped_rev(channel: Optional[str] = None) -> Optional[str]:
+    """
+    The rev the user chose to skip on `channel` (default: the tracked one).
+
+    Skips are per-channel: a version dismissed on dev must not suppress the
+    update prompt on stable, which is what a single shared value did.
+    """
+    data = _read_state()
+    skip = data.get("skip_rev")
+    ch = channel or get_channel()
+    if isinstance(skip, dict):
+        val = skip.get(ch)
+        return val if isinstance(val, str) else None
+    # Legacy scalar, written before channels existed. Such an install was on
+    # stable by definition, so honour it there and nowhere else.
+    if isinstance(skip, str):
+        return skip if ch == DEFAULT_CHANNEL else None
+    return None
+
+
+def set_skipped_rev(rev: Optional[str], channel: Optional[str] = None) -> None:
+    data = _read_state()
+    ch = channel or get_channel()
+    skip = data.get("skip_rev")
+    if isinstance(skip, dict):
+        table = dict(skip)
+    elif isinstance(skip, str):
+        table = {DEFAULT_CHANNEL: skip}   # migrate the legacy scalar in place
+    else:
+        table = {}
+    if rev is None:
+        table.pop(ch, None)
+    else:
+        table[ch] = rev
+    data["skip_rev"] = table
+    _write_state(data)

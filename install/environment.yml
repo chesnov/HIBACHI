@@ -22,20 +22,67 @@ dependencies:
   - git                 # needed for git clone + self-update on clean machines
   - pip
   - pip:
+      # ---------------------------------------------------------------------
+      # CORE NUMERICS -- pinned to a captured, working set.
+      #
+      # These were previously UNPINNED and arrived transitively via napari, skan
+      # and dask-image, so a fresh install resolved whatever was current that
+      # day. That is how one machine and another produced different behaviour
+      # from the same commit. Versions below are from a machine where results
+      # are known good (python 3.11.15, Linux); re-capture with
+      # `capture_versions.py` if that reference machine changes.
+      #
+      # Two constraints here are load-bearing, not cosmetic:
+      #
+      #   numpy < 2.4      At numpy 2.4 a `numpy.bool` scalar stopped satisfying
+      #                    `operator.index()`, which made
+      #                    `scipy.ndimage.find_objects` reject a boolean array
+      #                    ("'numpy.bool' object cannot be interpreted as an
+      #                    integer"). Verified as a NUMPY boundary, not a scipy
+      #                    one: the failure and non-failure were observed with
+      #                    identical scipy (1.17.1) and scikit-image (0.26.0),
+      #                    differing only in numpy (2.4.4 vs 2.2.6). The code no
+      #                    longer passes a bool, so this is now a
+      #                    reproducibility pin rather than a workaround.
+      #
+      #   scikit-image     `footprint_rectangle` requires >= 0.25, while
+      #   >=0.25,<0.28     `binary_closing`, `binary_dilation` and the
+      #                    `remove_small_objects(min_size=...)` signature are
+      #                    deprecated at 0.26 and REMOVED at 0.28. 0.28 will
+      #                    break the pipeline outright. Migrating to
+      #                    `morphology.dilation` / `closing` would lift the upper
+      #                    bound and is behaviour-preserving here (every
+      #                    footprint used is symmetric), but has not been done.
+      # ---------------------------------------------------------------------
+      - numpy==2.2.6
+      - scipy==1.17.1
+      - scikit-image==0.26.0
+      - pandas==3.0.3
+      - dask==2026.7.1
+      - dask-image==2024.5.3
+      - zarr==3.0.10
+      - scikit-learn==1.6.1
+      - simpleitk==2.5.5
+      - skan==0.12.3
+      - networkx==3.6.1
+      - numba==0.61.2
+      - tifffile==2026.3.3
+      - fcswrite==0.6.4
+      - psutil==7.2.2
+      - tqdm==4.68.4
+
       - google-crc32c>=1.7.1
       - napari[all]~=0.5.6
       - napari-animation~=0.0.9   # 3D rotation / turntable movies
       - imageio-ffmpeg>=0.5.1     # bundled ffmpeg binary (Win/Linux/macOS incl. Apple Silicon) for MP4 export
       - napari-plugin-manager~=0.1.4
       - nbformat~=5.10.4
-      - numba~=0.61.0
       - PartSegCore_compiled_backend~=0.15.9
       - pipdeptree~=2.25.1
       - plotly~=6.0.0
       - pooch~=1.8.2
       - pyconify~=0.2.1
       - PyQt5~=5.15.11
-      - scikit-learn~=1.6.1
       # Whole-slide formats (Olympus .vsi, Aperio, Hamamatsu, Leica and others).
       # pip rather than conda: wheels exist for macOS arm64 + x86_64, Linux and
       # Windows, and unlike the Bio-Formats route it needs no JVM.
@@ -44,10 +91,4 @@ dependencies:
       # than a redundant one. Pure Python, no JVM, same constraint as above.
       - readlif>=0.6.5
       - seaborn~=0.13.2
-      - tifffile>=2023.1.1
-      - zarr~=3.0.2
-      - dask-image~=2024.5.3
-      - simpleitk~=2.5.2
-      - skan~=0.12.2
       - aicspylibczi~=3.3.1
-      - fcswrite~=0.6.4
