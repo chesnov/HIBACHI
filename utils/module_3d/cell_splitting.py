@@ -1,5 +1,6 @@
 import os
 import gc
+import shutil
 from typing import List, Dict, Optional, Tuple, Set, Iterator, Any
 
 import numpy as np
@@ -9,6 +10,23 @@ from skimage.segmentation import relabel_sequential  # type: ignore
 from tqdm import tqdm
 
 # Import shared helpers
+try:
+    from .streaming_stats import accumulate_label_statistics
+    from .streaming_passes import (
+        accumulate_label_soma_map,
+        apply_label_mapping,
+        global_merge_pass,
+        merge_undersized_streaming,
+    )
+except ImportError:  # pragma: no cover - direct script execution
+    from streaming_stats import accumulate_label_statistics
+    from streaming_passes import (
+        accumulate_label_soma_map,
+        apply_label_mapping,
+        global_merge_pass,
+        merge_undersized_streaming,
+    )
+
 try:
     from .segmentation_helpers import (
         flush_print,
@@ -22,13 +40,6 @@ except ImportError:
         _watershed_with_simpleitk,
         distance_transform_edt
     )
-
-try:
-    from .interface_metrics import InterfaceStats, decide_merge, format_decision
-    from .deferred_resolution import DeferredInterface, resolve_deferred_interfaces
-except ImportError:
-    from interface_metrics import InterfaceStats, decide_merge, format_decision
-    from deferred_resolution import DeferredInterface, resolve_deferred_interfaces
 
 
 def _soma_first_chunk_order(
@@ -140,6 +151,56 @@ def _get_chunk_slices(
 # Graph & Metric Functions
 # =============================================================================
 
+def _analyze_local_intensity_difference_optimized(
+    interface_mask: np.ndarray,
+    region1_mask: np.ndarray,
+    region2_mask: np.ndarray,
+    intensity_vol_local: np.ndarray,
+    local_analysis_radius: int,
+    min_local_intensity_difference_threshold: float
+) -> bool:
+    """
+    Analyzes relative intensity difference between two regions at their interface.
+
+    Args:
+        interface_mask: Mask of the interface boundary.
+        region1_mask: Mask of object A.
+        region2_mask: Mask of object B.
+        intensity_vol_local: Local intensity volume.
+        local_analysis_radius: Radius for dilation to find local neighborhood.
+        min_local_intensity_difference_threshold: Threshold for relative difference.
+
+    Returns:
+        bool: True if the regions are distinct enough, False if they should merge.
+    """
+    footprint_elem = (
+        ball(local_analysis_radius) if local_analysis_radius > 1
+        else footprint_rectangle((3, 3, 3))
+    )
+
+    # Define local analysis zone around the interface
+    analysis_zone = binary_dilation(interface_mask, footprint=footprint_elem)
+
+    # Extract pixels belonging to R1 and R2 within that zone
+    la_r1 = analysis_zone & region1_mask
+    la_r2 = analysis_zone & region2_mask
+
+    # If regions are too small locally, assume they are distinct (safe default)
+    if np.sum(la_r1) < 20 or np.sum(la_r2) < 20:
+        return True
+
+    m1 = np.mean(intensity_vol_local[la_r1])
+    m2 = np.mean(intensity_vol_local[la_r2])
+
+    ref_i = max(m1, m2)
+    if ref_i < 1e-6:
+        return True
+
+    # Calculate relative difference
+    rel_diff = abs(m1 - m2) / ref_i
+    return rel_diff >= min_local_intensity_difference_threshold
+
+
 def _min_soma_separation(
     somas_A: List[int],
     somas_B: List[int],
@@ -148,10 +209,14 @@ def _min_soma_separation(
     """
     Smallest physical distance between a soma on side A and a soma on side B.
 
-    Centroids come from the whole-image table the coordinator builds, so a soma
-    that sits outside the current crop is still measured correctly. Returns 0.0
-    when the distance cannot be established -- no table, or neither side has a
-    soma present in it -- so that an interface is never gated on missing data.
+    Centroids are whole-image and in physical units, so a soma outside the current
+    crop is still measured correctly. Returns 0.0 when the distance cannot be
+    established -- no table, or neither side has a soma in it -- so an interface is
+    never gated on missing data.
+
+    The MINIMUM across the two sides, not the maximum: after an earlier merge a node
+    can own several somata, and the question being asked is whether ANY pair across
+    this boundary is close enough to plausibly be one cell.
     """
     if not soma_centroids or not somas_A or not somas_B:
         return 0.0
@@ -164,65 +229,96 @@ def _min_soma_separation(
     )
 
 
-def _interface_stats(
-    mask_A_local, mask_B_local, parent_mask_local, intensity_local,
-    local_analysis_radius, footprint_adj, footprint_zone,
-):
-    """
-    Accumulate the three voxel sets the merge tests read, over a whole crop.
-
-    This is the single-pass counterpart of the tiled accumulation in
-    `deferred_resolution`; both feed the same `InterfaceStats`, so the in-chunk
-    and post-stitch paths cannot drift apart.
-    """
-    dilated_A = binary_dilation(mask_A_local, footprint=footprint_adj)
-    iface = dilated_A & mask_B_local & parent_mask_local
-    st = InterfaceStats()
-    if not np.any(iface):
-        return st
-    zone = binary_dilation(iface, footprint=footprint_zone)
-    st.add(intensity_local, iface, zone & mask_A_local, zone & mask_B_local)
-    return st
-
-
 def _calculate_interface_metrics(
     mask_A_local: np.ndarray,
     mask_B_local: np.ndarray,
     parent_mask_local: np.ndarray,
     intensity_local: np.ndarray,
     avg_soma_intensity_for_interface: float,
+    cell_mean_intensity: float,
+    spacing_tuple: Optional[Tuple[float, float, float]],
     local_analysis_radius: int,
     min_local_intensity_difference: float,
     min_path_intensity_ratio_heuristic: float,
     max_interface_to_cell_mean_ratio: float = 0.85,
 ) -> Dict[str, Any]:
     """
-    Decide whether two watershed basins should be merged.
+    Calculates metrics to decide if two watershed basins should be merged.
+    Three independent criteria are evaluated — ALL must pass to keep basins separate:
 
-    The arithmetic lives in `interface_metrics.decide_merge`, shared with the
-    post-stitch pass so both apply identical thresholds to identically-defined
-    quantities. See that module for what the three tests are.
+    1. Valley-depth check (soma-relative ratio): interface / avg_soma < threshold.
+       Catches interfaces that are bright relative to the soma peaks.
 
-    Note the bright-cut reference is the mean of the interface neighbourhood, not
-    the mean of the whole parent object. A parent object here can be anything from
-    a doublet to the entire volume, and in the latter case its mean describes the
-    image rather than the boundary under test.
+    2. Bright-cut check (cell-mean-relative ratio): interface / cell_mean < max_ratio.
+       Catches Voronoi-style cuts between dim/adjacent seeds where the interface sits
+       at or above the overall cell body mean — indicating no real intensity valley.
+       This is the critical check for dim/tiny seeds close together in the same lobe.
+
+    3. Local contrast check: the two basins must look sufficiently different near the
+       interface. Catches spurious splits where both sides have similar intensities.
     """
-    fp_adj = footprint_rectangle((3, 3, 3))
-    fp_zone = ball(local_analysis_radius) if local_analysis_radius > 1 else fp_adj
-    st = _interface_stats(
-        mask_A_local, mask_B_local, parent_mask_local, intensity_local,
-        local_analysis_radius, fp_adj, fp_zone,
+    metrics = {'should_merge_decision': False}
+    footprint_dilation = footprint_rectangle((3, 3, 3))
+
+    # Identify interface pixels
+    dilated_A = binary_dilation(mask_A_local, footprint=footprint_dilation)
+    interface_mask = dilated_A & mask_B_local & parent_mask_local
+
+    if not np.any(interface_mask):
+        return metrics
+
+    mean_interface_intensity = float(np.mean(intensity_local[interface_mask]))
+
+    # 1. Valley Depth Check — soma-relative
+    ratio_soma = mean_interface_intensity / max(avg_soma_intensity_for_interface, 1e-6)
+    # LOW ratio = deep dark valley relative to soma peaks -> keep separate
+    soma_ratio_passed = ratio_soma < min_path_intensity_ratio_heuristic
+
+    # 2. Bright-Cut Check — cell-mean-relative
+    # If the interface sits at or above cell_mean * threshold, there is no valley:
+    # the watershed made a Voronoi-style geometric cut through bright tissue.
+    # This fires when dim/tiny seeds are adjacent within the same cell lobe.
+    ratio_cell_mean = mean_interface_intensity / max(cell_mean_intensity, 1e-6)
+    cell_mean_ratio_passed = ratio_cell_mean < max_interface_to_cell_mean_ratio
+
+    # 3. Local Contrast Check
+    lid_passed = _analyze_local_intensity_difference_optimized(
+        interface_mask, mask_A_local, mask_B_local, intensity_local,
+        local_analysis_radius, min_local_intensity_difference
     )
-    m = decide_merge(
-        st, avg_soma_intensity_for_interface,
-        min_local_intensity_difference,
-        min_path_intensity_ratio_heuristic,
-        max_interface_to_cell_mean_ratio,
+
+    # Merge decision logic:
+    #
+    # - lid_passed=False alone is sufficient to merge (regions are locally indistinguishable).
+    # - soma_ratio_passed=False alone is sufficient to merge (no deep valley vs soma peaks).
+    # - cell_mean_ratio_passed=False alone is NOT sufficient to merge. It only acts as a
+    #   tiebreaker when soma_ratio_passed=True but is borderline: if the interface is near
+    #   the cell body mean AND the soma-ratio valley is not clearly deep, merge.
+    #   Specifically: it can only upgrade a "keep" to a "merge" when soma_ratio is within
+    #   a tolerance band of the threshold (ratio > threshold * 0.7). This prevents the
+    #   bright-cut check from overriding a confirmed strong dark valley.
+    soma_ratio_is_borderline = (
+        soma_ratio_passed and
+        ratio_soma > min_path_intensity_ratio_heuristic * 0.7
     )
-    flush_print("  [PROFILE|INTERFACE] " + format_decision(
-        m, min_path_intensity_ratio_heuristic, max_interface_to_cell_mean_ratio))
-    return m
+    if not soma_ratio_passed or not lid_passed:
+        metrics['should_merge_decision'] = True
+    elif not cell_mean_ratio_passed and soma_ratio_is_borderline:
+        metrics['should_merge_decision'] = True
+
+    # [PROFILING] Log all three checks and their raw values.
+    bright_cut_warn = " *** BRIGHT CUT ***" if not cell_mean_ratio_passed else ""
+    flush_print(f"  [PROFILE|INTERFACE] "
+                f"mean_interface={mean_interface_intensity:.1f} | "
+                f"soma_ref={avg_soma_intensity_for_interface:.1f} | "
+                f"soma_ratio={ratio_soma:.4f} (thr={min_path_intensity_ratio_heuristic}, "
+                f"passed={soma_ratio_passed}) | "
+                f"cell_mean_ratio={ratio_cell_mean:.4f} (thr={max_interface_to_cell_mean_ratio}, "
+                f"passed={cell_mean_ratio_passed}){bright_cut_warn} | "
+                f"lid_passed={lid_passed} | "
+                f"=> should_merge={metrics['should_merge_decision']}")
+
+    return metrics
 
 
 def _build_adjacency_graph_for_cell(
@@ -231,10 +327,12 @@ def _build_adjacency_graph_for_cell(
     soma_mask_local: np.ndarray,
     soma_props_for_cell: Dict[int, Dict[str, Any]],
     intensity_local: np.ndarray,
+    cell_mean_intensity: float,
+    spacing_tuple: Optional[Tuple[float, float, float]],
     local_analysis_radius: int,
     min_local_intensity_difference: float,
     min_path_intensity_ratio_heuristic: float,
-    max_interface_to_zone_ratio: float = 0.85,
+    max_interface_to_cell_mean_ratio: float = 0.85,
     node_seed_tags: Optional[Dict[int, Set[int]]] = None,
     require_local_somas: bool = False,
     soma_centroids: Optional[Dict[int, np.ndarray]] = None,
@@ -244,30 +342,6 @@ def _build_adjacency_graph_for_cell(
     Builds a Region Adjacency Graph (RAG) for segments within a single cell.
     Returns nodes and edges with merge metrics.
 
-    An interface is either SCORED by the three intensity tests in
-    ``_calculate_interface_metrics``, or recorded as KEEP without being scored. Two
-    gates produce the unscored KEEP, and both are checked before any intensity is
-    measured:
-
-    ``require_local_somas`` -- KEEP when either side has no soma in this crop. A
-    chunk holding only inherited markers can produce a boundary in the middle of
-    bright tissue, because the landscape uses ``d_seeds`` and so places it midway
-    between the marker regions rather than at a valley. The intensity tests then
-    correctly report *** BRIGHT CUT *** and merge; because merging unions the seed
-    sets, that single verdict propagates through the stitcher and fuses two
-    genuinely separate cells across the whole image. Merge decisions therefore
-    belong only to the chunks that sit next to the somata and can actually judge
-    them.
-
-    ``max_seed_centroid_dist`` (um, 0 disables) -- KEEP when the two sides' somata
-    are further apart than this. Two somata that far apart cannot belong to one
-    cell however unconvincing the boundary between them looks, so the intensity
-    tests are not consulted. This bounds how much a permissive Min Path Intensity
-    Ratio can over-merge. Distances are the smallest soma-to-soma distance across
-    the interface, taken from ``soma_centroids`` (physical units, whole-image, so
-    a soma outside this crop is still measured correctly). A node whose somata are
-    absent from the table is not gated.
-
     ``node_seed_tags`` is a fallback for ``orig_somas``: {segment label -> set of
     seed ids}. A segment grown from a marker inherited from a neighbouring chunk
     belongs to a real cell whose soma may sit in a different chunk entirely, so
@@ -275,11 +349,39 @@ def _build_adjacency_graph_for_cell(
     would report no somas, ``ref_intensity`` would collapse to the 1.0 default, and
     both merge tests would be evaluated against a meaningless reference. The tag
     restores the intended semantics -- interface brightness measured against the
-    somata of the two cells involved.
+    somata of the two cells involved -- for interfaces the worker could not
+    previously produce at all.
+
+    ``require_local_somas`` records an interface as KEEP without scoring it when
+    either side has no soma in this crop. Measured reason: a chunk that only inherited
+    markers can produce a boundary in the middle of bright tissue (the landscape uses
+    `d_seeds`, which places it midway between the marker regions rather than at a
+    valley). The interface tests then correctly report *** BRIGHT CUT *** and merge --
+    and because merging unions the seed sets, that one verdict propagates over the
+    whole volume and fuses two genuinely separate cells. On a control scene where the
+    split is unambiguous this happened in 3 of 5 tilings.
+
+    So merge decisions are confined to the chunks that can actually judge them, next
+    to the somata. The cost is that two spurious seeds on one real cell whose somata
+    land in different chunks are no longer rejoined by the levers; that case wants a
+    single global pass over the assembled volume, which is what the streaming
+    aggregates in `streaming_stats.py` are for.
+
+    ``max_seed_centroid_dist`` (um, 0 disables) records an interface as KEEP without
+    scoring it when the two sides' somata are further apart than that. Two cell bodies
+    that far apart cannot belong to one cell however unconvincing the boundary looks,
+    so the intensity tests are not consulted. It bounds how much a permissive
+    ``min_path_intensity_ratio`` can over-merge. Distances come from
+    ``soma_centroids``, which is whole-image and in physical units, so a soma outside
+    this crop is still measured correctly. NOTE that with ``require_local_somas``
+    active most long-range pairs never reach the worker at all -- the same bound is
+    applied in ``global_merge_pass``, which is where those decisions now happen.
+
+    Leaving all of the above at their defaults reproduces the previous behaviour exactly.
     """
     nodes = {}
     edges = {}
-    
+
     seg_lbls = np.unique(
         current_cell_segments_mask_local[current_cell_segments_mask_local > 0]
     )
@@ -306,7 +408,7 @@ def _build_adjacency_graph_for_cell(
         lbl_A = seg_lbls[i]
         mask_A = (current_cell_segments_mask_local == lbl_A)
         dil_A = binary_dilation(mask_A, footprint=footprint_d)
-        
+
         # Find neighbors intersecting with dilation
         candidate_mask = (
             dil_A &
@@ -318,13 +420,13 @@ def _build_adjacency_graph_for_cell(
         for lbl_B in np.unique(candidates):
             if lbl_B <= lbl_A:
                 continue  # Avoid duplicate checks
-            
+
             edge_key = (lbl_A, lbl_B)
             if edge_key in edges:
                 continue
 
             mask_B = (current_cell_segments_mask_local == lbl_B)
-            
+
             # Reference intensity: mean of somas involved
             somas_A = nodes[lbl_A]['orig_somas']
             somas_B = nodes[lbl_B]['orig_somas']
@@ -333,25 +435,16 @@ def _build_adjacency_graph_for_cell(
                 np.any(soma_mask_local[mask_A] > 0)
                 and np.any(soma_mask_local[mask_B] > 0)
             ):
-                # Propagated interface: not judgeable here. Keep the cut, and
-                # record where it is so the post-stitch pass can revisit it once
-                # the labels are whole. Without this record a cell that received
-                # two seeds either side of a chunk seam could never be rejoined.
-                _if = dil_A & mask_B & original_cell_mask_local
-                _bb = None
-                if np.any(_if):
-                    _nz = np.nonzero(_if)
-                    _bb = tuple((int(c.min()), int(c.max()) + 1) for c in _nz)
+                # Propagated interface: not judgeable here. Keep the cut.
                 edges[edge_key] = {
                     'should_merge_decision': False,
                     'reason': 'propagated_interface_not_scored',
-                    'deferred_bbox_local': _bb,
                 }
                 continue
 
             sep = _min_soma_separation(somas_A, somas_B, soma_centroids)
             if max_seed_centroid_dist > 0 and sep > max_seed_centroid_dist:
-                # Somata too far apart to be one cell. Not scored.
+                # Somata too far apart to be one cell. Not scored; cut stands.
                 edges[edge_key] = {
                     'should_merge_decision': False,
                     'reason': 'seeds_beyond_max_merge_distance',
@@ -359,8 +452,8 @@ def _build_adjacency_graph_for_cell(
                 }
                 flush_print(
                     f"  [PROFILE|INTERFACE] pair=({lbl_A},{lbl_B}) | "
-                    f"soma_separation={sep:.1f} um > max_seed_centroid_dist="
-                    f"{max_seed_centroid_dist:.1f} um => KEEP (not scored)"
+                    f"soma_separation={sep:.1f}um > max_seed_centroid_dist="
+                    f"{max_seed_centroid_dist:.1f}um => KEEP (not scored)"
                 )
                 continue
 
@@ -373,11 +466,11 @@ def _build_adjacency_graph_for_cell(
 
             edges[edge_key] = _calculate_interface_metrics(
                 mask_A, mask_B, original_cell_mask_local, intensity_local,
-                ref_intensity,
+                ref_intensity, cell_mean_intensity, spacing_tuple,
                 local_analysis_radius, min_local_intensity_difference,
-                min_path_intensity_ratio_heuristic, max_interface_to_zone_ratio
+                min_path_intensity_ratio_heuristic, max_interface_to_cell_mean_ratio
             )
-            
+
     return nodes, edges
 
 
@@ -425,13 +518,6 @@ def _separate_multi_soma_cells_chunk(
     chunk_result = np.zeros_like(segmentation_mask, dtype=np.int32)
     label_to_seeds_map = {}
 
-    # Interfaces this worker declined to score, in whole-image coordinates, for
-    # the post-stitch pass to revisit. Returned in place of the unused second
-    # element of the result tuple.
-    _NDIM = 3
-    _goff = tuple(kwargs.get('global_offset', (0,) * _NDIM))
-    deferred_records: List[DeferredInterface] = []
-
     unique_labels = np.unique(segmentation_mask[segmentation_mask > 0])
 
     # 1. Copy Single Cells (Pass-through)
@@ -448,14 +534,14 @@ def _separate_multi_soma_cells_chunk(
     ]
 
     if not present_multi_soma:
-        return chunk_result, deferred_records, label_to_seeds_map
+        return chunk_result, {}, label_to_seeds_map
 
     next_local_label = label_offset
     # NOTE: `min_size_threshold` is deliberately NOT read here. The worker sees one
     # chunk, so a basin straddling a chunk boundary has an arbitrarily truncated
     # size and would be judged undersized purely because it was clipped. The size
     # rule is applied once, globally, after stitching -- see
-    # `_merge_undersized_cells` in `separate_multi_soma_cells`.
+    # `merge_undersized_streaming` in `separate_multi_soma_cells`.
 
     # 2. Process Multi-Soma Objects
     for cell_label in present_multi_soma:
@@ -463,7 +549,7 @@ def _separate_multi_soma_cells_chunk(
         slices = ndimage.find_objects(cell_mask_full)
         if not slices:
             continue
-        
+
         bbox = slices[0]
         # Pad bounding box to avoid boundary artifacts during watershed
         bbox_padded = tuple(
@@ -598,7 +684,7 @@ def _separate_multi_soma_cells_chunk(
 
         # A. Seeded Watershed
         # Use SimpleITK helper for speed/memory efficiency
-        
+
         # First, generate the markers (seeds)
         # Inherited regions go down first so that a soma always outranks them where
         # they overlap. With no priors this is the original two-line loop.
@@ -609,23 +695,29 @@ def _separate_multi_soma_cells_chunk(
             markers[local_soma == s_id] = _identity_of(int(s_id))
 
         # ---- LANDSCAPE GENERATION ----
-        # landscape = d_seeds / speed**speed_power
+        # TWO landscapes, chosen by what the markers are. Read this before changing
+        # the branch below, because the two cases are not interchangeable.
         #
-        # `speed` carries the image evidence: thick, bright regions flood cheaply and
-        # dark thin necks act as barriers, so the boundary is drawn toward the valley.
-        # `d_seeds` is the Euclidean distance from the nearest marker, and it holds the
-        # cut near the geometric middle of the object.
+        #   markers are all somata      ->  d_seeds / speed**p
+        #       d_seeds is straight-line distance from the nearest marker. With
+        #       point-like somata that is a fair proxy, and it holds the cut near
+        #       the geometric middle so one bright lobe cannot flood the whole
+        #       object and strand the other seed in a sliver.
         #
-        # The d_seeds term is load-bearing, not a leftover. Measured on a single object
-        # with one seed in a bright, thick lobe and another in a dim, thin tail -- the
-        # geometry that produces the tiny-sliver artefact -- the pure cost field
-        # 1/speed**p lets the bright region flood across the whole object and stop dead
-        # at the dim seed: basins of 13670 and 842 voxels, boundary at 84% of the
-        # object's length. With d_seeds the same object gives 10194 and 4318, boundary
-        # at 51%.
+        #   any marker is inherited     ->  1 / speed**p   (pure cost)
+        #       An inherited marker is a whole REGION handed over by a neighbouring
+        #       chunk, not a point. d_seeds measured from a region puts the boundary
+        #       at the Euclidean midpoint between the two regions, which is wherever
+        #       the chunk seams happen to fall -- typically mid-tissue rather than at
+        #       the dark contact. Symptom in the log: `WRONG (bright cut -- Voronoi
+        #       bias!)`, and in the viewer, a branch assigned to the wrong cell.
+        #       The pure cost field has no distance term, so the boundary is set by
+        #       the speed field alone and lands at the dark neck.
+        #
+        # `d_seeds` IS used, in the first case. An earlier comment here said it was
+        # not; that was wrong, and acting on it removes the first case entirely.
 
-        # 1. Geometric thickness: large in cell centres, dropping at boundaries and
-        #    thin necks.
+        # 1. Geometric thickness: large in cell centres, dropping at thin necks.
         dt = distance_transform_edt(local_mask, sampling=spacing)
 
         # 2. Euclidean distance from the markers.
@@ -633,42 +725,45 @@ def _separate_multi_soma_cells_chunk(
 
         # 3. Local expansion "speed"
         speed = dt + 1e-5
-        
+
         # 4. Modulate speed by intensity
         intensity_weight = kwargs.get('intensity_weight', 0.5)
         if intensity_weight > 0:
             # Fetch global data passed from the coordinator
             cell_global_seeds = list(kwargs.get('cell_to_somas', {}).get(cell_label, seeds_in_crop))
             global_intensities = kwargs.get('global_soma_intensities', {})
-            
+
             # FIX: Global Continuous Normalization
             # Instead of using local.max() (which varies wildly between chunks and causes jagged artifacts),
             # we normalize against the true global soma intensities.
             soma_ints = [global_intensities.get(s, 1.0) for s in cell_global_seeds]
             ref_int = np.mean(soma_ints) if soma_ints else (local_intensity.max() + 1e-6)
-            
+
             # This ignores bright noise outliers and restores the true 0.0 to 1.0 gradient!
             norm_int = np.clip(local_intensity / (ref_int + 1e-6), 0.0, 1.0)
-            
+
             # Restored your original, highly stable math
             speed = speed * (1.0 + intensity_weight * norm_int)
 
         # 5. Final Landscape
         # speed_power = 1.5 slightly increases the penalty of thin necks to prevent Voronoi cuts.
-        # speed_power = 1.5 slightly increases the penalty of thin necks, which keeps
-        # the cut off a plain Voronoi midplane.
         speed_power = kwargs.get('speed_power', 1.5)
+        # No flag on the branch below. A default of False here silently reintroduces
+        # the Voronoi bias on every propagated chunk, and the failure is invisible
+        # except as misassigned branches in the viewer. Which landscape ran is
+        # printed every time so it can never be in doubt again.
         if prior_tags:
-            # An inherited marker is a whole region rather than a point-like soma, so
-            # between two of them d_seeds puts the boundary at the Euclidean midpoint
-            # -- usually in bright tissue rather than at the dark contact. Such
-            # interfaces are recorded as KEEP without being scored (see
-            # `require_local_somas`), so the misplaced boundary is not acted upon.
             flush_print(
-                f"  [PROFILE|LANDSCAPE] cell={cell_label}: d_seeds/speed^p with "
-                f"{len(prior_tags)} inherited marker(s)"
+                f"  [PROFILE|LANDSCAPE] cell={cell_label}: PURE COST "
+                f"(1/speed^{speed_power}) -- {len(prior_tags)} inherited marker(s)"
             )
-        landscape = d_seeds / (speed ** speed_power)
+            landscape = 1.0 / (speed ** speed_power)
+        else:
+            flush_print(
+                f"  [PROFILE|LANDSCAPE] cell={cell_label}: "
+                f"d_seeds/speed^{speed_power} (all markers are somata)"
+            )
+            landscape = d_seeds / (speed ** speed_power)
 
         ws_local = _watershed_with_simpleitk(landscape, markers)
         ws_local[~local_mask] = 0
@@ -708,16 +803,14 @@ def _separate_multi_soma_cells_chunk(
                 flush_print(f"    boundary of ws_label={ws_id}: mean_intensity={bnd_mean:.1f} | "
                             f"frac_below_cell_mean={bnd_frac_below_mean:.2f} | => {verdict}")
 
-
-        _deferred_local: List[Dict[str, Any]] = []
-
         # B. Graph-Based Merging
         nodes, edges = _build_adjacency_graph_for_cell(
             ws_local, local_mask, local_soma, soma_props, local_intensity,
+            cell_mean_int, spacing,
             kwargs.get('local_analysis_radius', 10),
             kwargs.get('min_local_intensity_difference', 0.0),
             kwargs.get('min_path_intensity_ratio', 1.0),
-            kwargs.get('max_interface_to_zone_ratio', 0.85),
+            kwargs.get('max_interface_to_cell_mean_ratio', 0.85),
             node_seed_tags={i + 1: s for i, s in enumerate(identity_seeds)},
             require_local_somas=True,
             soma_centroids=kwargs.get('global_soma_centroids', {}),
@@ -737,25 +830,6 @@ def _separate_multi_soma_cells_chunk(
                 f"    [PROFILE|GRAPH] KEEP:  {edge_key}"
                 + (f" ({_why})" if _why else "")
             )
-
-        # Deferred interfaces: remember where they are, in whole-image
-        # coordinates, and which ws basins they joined. The basin ids are mapped
-        # to the labels this worker finally emits further down, once merging and
-        # relabelling have happened.
-        for _ek, _ev in edges.items():
-            if _ev.get('reason') != 'propagated_interface_not_scored':
-                continue
-            _bb = _ev.get('deferred_bbox_local')
-            if _bb is None:
-                continue
-            _base = [bbox_padded[_d].start + _goff[_d] for _d in range(_NDIM)]
-            _deferred_local.append({
-                'ws_pair': _ek,
-                'bbox': tuple((_base[_d] + _bb[_d][0], _base[_d] + _bb[_d][1])
-                              for _d in range(_NDIM)),
-                'seeds': (set(identity_seeds[_ek[0] - 1]),
-                          set(identity_seeds[_ek[1] - 1])),
-            })
 
         merge_map = {i: i for i in range(n_identities + 2)}
         for (id_a, id_b), metrics in edges.items():
@@ -818,7 +892,7 @@ def _separate_multi_soma_cells_chunk(
                         # `min_size_threshold`, which was the only place step 4 ever
                         # destroyed signal -- and it destroyed exactly the case that
                         # must be preserved. Size-based handling now happens globally,
-                        # post-stitch, in `_merge_undersized_cells`, where it MERGES
+                        # post-stitch, in `merge_undersized_streaming`, where it MERGES
                         # rather than deletes and where fragment sizes are true (a
                         # chunk-clipped fragment looks arbitrarily small here).
                         flush_print(
@@ -830,12 +904,12 @@ def _separate_multi_soma_cells_chunk(
         # D. Map to Global IDs
         # Relabel locally to be sequential (1..N) before assigning global IDs
         final_local_mask_clean, _, _ = relabel_sequential(final_local_mask)
-        
+
         chunk_result_view = chunk_result[bbox_padded]
 
         for local_id in np.unique(final_local_mask_clean[final_local_mask_clean > 0]):
             mask_l = (final_local_mask_clean == local_id)
-            
+
             seeds_in_segment = np.unique(local_soma[mask_l])
             seeds_in_segment_set = set(
                 int(s) for s in seeds_in_segment[seeds_in_segment > 0]
@@ -846,37 +920,16 @@ def _separate_multi_soma_cells_chunk(
             for _mid in np.unique(markers[mask_l]):
                 if _mid > 0 and (_mid - 1) < len(identity_seeds):
                     seeds_in_segment_set |= identity_seeds[_mid - 1]
-            
+
             global_lbl = next_local_label
             chunk_result_view[mask_l] = global_lbl
-            
+
             label_to_seeds_map[global_lbl] = seeds_in_segment_set
             next_local_label += 1
 
-        # Translate each deferred interface from watershed-basin ids to the
-        # labels this worker actually emitted, so the post-stitch pass can find
-        # them. A pair whose basins ended up merged here needs no revisiting.
-        if _deferred_local:
-            _ws_to_global = {}
-            for _ws in np.unique(ws_local[ws_local > 0]):
-                _m = (ws_local == _ws)
-                _vals = np.unique(chunk_result_view[_m])
-                _vals = _vals[_vals > 0]
-                if _vals.size:
-                    _ws_to_global[int(_ws)] = int(_vals[np.argmax(
-                        [int(np.sum(chunk_result_view[_m] == _v)) for _v in _vals])])
-            for _rec in _deferred_local:
-                _a = _ws_to_global.get(int(_rec['ws_pair'][0]))
-                _b = _ws_to_global.get(int(_rec['ws_pair'][1]))
-                if _a is None or _b is None or _a == _b:
-                    continue
-                deferred_records.append(DeferredInterface(
-                    _a, _b, _rec['seeds'][0], _rec['seeds'][1], _rec['bbox']))
-
         chunk_result[bbox_padded] = chunk_result_view
 
-    return chunk_result, deferred_records, label_to_seeds_map
-
+    return chunk_result, {}, label_to_seeds_map
 
 
 def _reassign_disconnected_islands(
@@ -895,7 +948,7 @@ def _reassign_disconnected_islands(
     foreground-conserving.
 
     Size-based handling is NOT done here and is no longer done in the worker
-    either: it runs immediately after this pass, in ``_merge_undersized_cells``,
+    either: it runs immediately after this pass, in ``merge_undersized_streaming``,
     which MERGES an undersized cell into a neighbour instead of deleting it.
     Outright removal of small objects belongs to the step 1 / step 2 size filters.
 
@@ -997,170 +1050,6 @@ def _reassign_disconnected_islands(
     return segmentation
 
 
-def _merge_undersized_cells(
-    segmentation: np.ndarray,
-    min_size_threshold: int,
-    max_rounds: int = 20,
-) -> np.ndarray:
-    """
-    Merge any final cell smaller than ``min_size_threshold`` into its most-contacted
-    neighbouring cell. Never deletes anything.
-
-    Why this exists
-    ---------------
-    The watershed in the worker splits a multi-soma cell into one basin per seed.
-    A basin can come out genuinely too small to be a cell -- but it is real signal
-    belonging to the cell it was cut from, so the right response is to give it back
-    to a sibling basin, not to delete it. Before this pass, ``min_size_threshold``
-    only ever applied to *seedless* fragments, and only to delete them; a small
-    basin that happened to contain a seed was never size-tested at all.
-
-    Why here and not in the worker
-    ------------------------------
-    The worker sees a single chunk, so a basin straddling a chunk boundary has an
-    arbitrarily truncated size there and would be merged purely because it was
-    clipped. Run after stitching, every label's size is its true, whole size.
-
-    Guarantees
-    ----------
-    * **Nothing is ever deleted.** A label below the threshold with no
-      differently-labelled neighbour is KEPT at full size. That is what preserves
-      a genuinely small cell -- whether or not soma extraction gave it a seed, and
-      including the degenerate case where every basin of one cell is undersized
-      (merging then cascades until a single label remains, which has no sibling
-      left and is kept whole). Foreground is exactly conserved.
-    * **Smallest-first, and iterated.** Absorbing a fragment grows the recipient,
-      which can lift it over the threshold, so the set is re-evaluated between
-      rounds rather than judged once against stale sizes.
-    * This rule OVERRIDES the graph merge decisions: a boundary the intensity
-      heuristics deliberately kept is still merged if the basin is undersized.
-      That is intentional -- the size floor is the final word on what counts as a
-      cell -- and every such merge is logged.
-
-    Only labels that touch another label can be merged, and basins only ever touch
-    siblings cut from the same original object, so a cell that was never split
-    cannot be affected by this pass.
-    """
-    if min_size_threshold is None or min_size_threshold <= 0:
-        flush_print("  [Refine] Undersized-cell merge skipped (threshold <= 0).")
-        return segmentation
-
-    flush_print(
-        f"  [Refine] Merging cells below {min_size_threshold} voxels into their "
-        "largest-contact neighbour (nothing is deleted)..."
-    )
-
-    fg_before = int(np.count_nonzero(segmentation))
-    dilate_struct = ndimage.generate_binary_structure(3, 3)
-
-    n_merged = n_kept = 0
-    px_merged = px_kept = 0
-    detail_cap = 80
-    detail_shown = 0
-    kept_isolated: Set[int] = set()   # below threshold, no neighbour -> stop retrying
-
-    round_idx = 0                     # defined even if max_rounds <= 0
-    for round_idx in range(max_rounds):
-        counts = np.bincount(segmentation.ravel())
-        if counts.size <= 1:
-            break
-        # Candidate labels: present, below threshold, not already settled.
-        candidates = [
-            int(lbl) for lbl in np.nonzero(counts)[0]
-            if lbl != 0
-            and counts[lbl] < min_size_threshold
-            and int(lbl) not in kept_isolated
-        ]
-        if not candidates:
-            break
-
-        # Smallest first: the least cell-like fragment is given away before it can
-        # act as a recipient for another.
-        candidates.sort(key=lambda l: counts[l])
-
-        objs = ndimage.find_objects(segmentation)
-        merged_this_round = 0
-
-        for label_id in candidates:
-            if label_id - 1 >= len(objs):
-                continue
-            sl = objs[label_id - 1]
-            if sl is None:
-                continue  # already absorbed earlier in this round
-
-            sl_pad = tuple(
-                slice(max(0, s.start - 1), min(d, s.stop + 1))
-                for s, d in zip(sl, segmentation.shape)
-            )
-            target_view = segmentation[sl_pad]
-            frag_mask = (target_view == label_id)
-            frag_size = int(np.sum(frag_mask))
-            if frag_size == 0:
-                continue
-            # Re-check against the live size: an earlier merge in this same round
-            # may have grown this label past the threshold.
-            if frag_size >= min_size_threshold:
-                continue
-
-            dilated = ndimage.binary_dilation(frag_mask, structure=dilate_struct)
-            raw_neighbors = target_view[dilated]
-            neighbor_ids = raw_neighbors[
-                (raw_neighbors != 0) & (raw_neighbors != label_id)
-            ]
-
-            if neighbor_ids.size > 0:
-                counts_n = np.bincount(neighbor_ids)
-                best_neighbor = int(np.argmax(counts_n))
-                target_view[frag_mask] = best_neighbor
-                segmentation[sl_pad] = target_view
-                n_merged += 1
-                px_merged += frag_size
-                merged_this_round += 1
-                if detail_shown < detail_cap:
-                    flush_print(
-                        f"    [PROFILE|UNDERSIZE] label={label_id} size={frag_size} "
-                        f"< {min_size_threshold} -> MERGE into {best_neighbor} "
-                        f"(contact={int(counts_n[best_neighbor])} voxels)"
-                    )
-                    detail_shown += 1
-            else:
-                # Isolated and undersized: a small cell in its own right. Keep it.
-                kept_isolated.add(label_id)
-                n_kept += 1
-                px_kept += frag_size
-                if detail_shown < detail_cap:
-                    flush_print(
-                        f"    [PROFILE|UNDERSIZE] label={label_id} size={frag_size} "
-                        f"< {min_size_threshold} -> KEEP (no neighbouring cell to "
-                        f"merge into; small cells are never deleted)"
-                    )
-                    detail_shown += 1
-
-        if merged_this_round == 0:
-            break
-    else:
-        flush_print(
-            f"  [PROFILE|UNDERSIZE] *** reached the {max_rounds}-round cap; some "
-            "undersized cells may remain. This is safe (nothing is deleted) but "
-            "suggests min_size_threshold is very large relative to your cells. ***"
-        )
-
-    fg_after = int(np.count_nonzero(segmentation))
-    flush_print(
-        f"  [PROFILE|UNDERSIZE|SUMMARY] merged={n_merged} (voxels={px_merged}) | "
-        f"kept_small_isolated={n_kept} (voxels={px_kept}) | rounds_used"
-        f"={round_idx + 1}"
-    )
-    flush_print(
-        f"  [PROFILE|UNDERSIZE|SUMMARY] foreground voxels before={fg_before} "
-        f"after={fg_after} delta={fg_after - fg_before}"
-        + ("  *** FOREGROUND LOST -- UNEXPECTED ***" if fg_after != fg_before
-           else "  (conserved)")
-    )
-
-    return segmentation
-
-
 # =============================================================================
 # Main Coordinator
 # =============================================================================
@@ -1201,7 +1090,7 @@ def separate_multi_soma_cells(
 
     # 1. Identify Multi-Soma Cells (Global Check)
     cell_to_somas: Dict[int, Set[int]] = {}
-    
+
     global_soma_centroids = {}
     global_soma_intensities = {}
 
@@ -1210,7 +1099,7 @@ def separate_multi_soma_cells(
         if s_slice is None:
             continue
         soma_id = s_idx + 1
-        
+
         # Calculate Global Centroid
         cz = (s_slice[0].start + s_slice[0].stop) / 2.0
         cy = (s_slice[1].start + s_slice[1].stop) / 2.0
@@ -1218,7 +1107,7 @@ def separate_multi_soma_cells(
         if spacing:
             cz *= spacing[0]; cy *= spacing[1]; cx *= spacing[2]
         global_soma_centroids[soma_id] = np.array([cz, cy, cx])
-        
+
         # Calculate Global Intensity Reference
         s_mask = soma_mask[s_slice] == soma_id
         mean_i = np.mean(intensity_volume[s_slice][s_mask]) if np.any(s_mask) else 1.0
@@ -1240,7 +1129,7 @@ def separate_multi_soma_cells(
     kwargs['global_soma_intensities'] = global_soma_intensities
 
     multi_soma_labels = [c for c, s in cell_to_somas.items() if len(s) > 1]
-    
+
     if not multi_soma_labels:
         flush_print("  No multi-soma cells found. Returning original.")
         return segmentation_mask.copy()
@@ -1253,8 +1142,7 @@ def separate_multi_soma_cells(
     chunk_slices = list(
         _get_chunk_slices(segmentation_mask.shape, chunk_shape, overlap)
     )
-    chunk_data = {}  # Stores (path, seed_map)
-    all_deferred: List[DeferredInterface] = []
+    chunk_data = {}  # Stores (path, shape, seed_map)
 
     chunk_grid = (
         len(range(0, segmentation_mask.shape[0], max(1, chunk_shape[0] - overlap))),
@@ -1296,12 +1184,12 @@ def separate_multi_soma_cells(
 
             prior_chunk = np.array(prior_mask[sl])
 
-            res, _deferred, seed_map = _separate_multi_soma_cells_chunk(
+            res, _, seed_map = _separate_multi_soma_cells_chunk(
                 seg_chunk, int_chunk, soma_chunk,
                 spacing, chunk_offset, multi_soma_labels,
                 prior_labels=prior_chunk,
                 prior_seed_map=prior_seed_map,
-                global_offset=(sl[0].start, sl[1].start, sl[2].start), # <--- NEW
+                global_offset=(sl[0].start, sl[1].start, sl[2].start),
                 **kwargs
             )
             del prior_chunk
@@ -1309,8 +1197,7 @@ def separate_multi_soma_cells(
             path = os.path.join(memmap_dir, f"chunk_{i}_{os.getpid()}.npy")
             np.save(path, res)
 
-            chunk_data[i] = {'path': path, 'seed_map': seed_map}
-            all_deferred.extend(_deferred)
+            chunk_data[i] = {'path': path, 'shape': res.shape, 'seed_map': seed_map}
             prior_seed_map.update(seed_map)
 
             # First writer wins, so a decision already taken stays put and the
@@ -1320,7 +1207,7 @@ def separate_multi_soma_cells(
             prior_view[_fill] = res[_fill]
             prior_mask[sl] = prior_view
 
-            del res, prior_view, _fill # Free RAM immediately
+            del res, prior_view, _fill  # Free RAM immediately
             gc.collect()
 
         del prior_mask
@@ -1330,7 +1217,7 @@ def separate_multi_soma_cells(
         # 3. Seed-Aware Stitching Logic
         flush_print("  Stitching with Transitive Seed Verification...")
         label_map: Dict[int, int] = {}
-        
+
         # Global registry of seeds for every label ID
         # We must aggregate this first to track seeds as they merge
         global_seed_lookup = {}
@@ -1373,7 +1260,7 @@ def separate_multi_soma_cells(
             for j in neighbors:
                 if j not in chunk_data:
                     continue
-                
+
                 chunk_slice2 = chunk_slices[j]
                 res2 = np.load(chunk_data[j]['path'])
 
@@ -1410,34 +1297,34 @@ def separate_multi_soma_cells(
                         continue
 
                     # We check the seeds of the *Roots*, not the fragments.
-                    # This catches the case where an "Empty" fragment has already 
+                    # This catches the case where an "Empty" fragment has already
                     # been merged into "Cell A", acquiring "Seed A".
                     s1_set = get_group_seeds(root1)
                     s2_set = get_group_seeds(root2)
 
                     # If both groups have known seeds, and they don't overlap -> CONFLICT.
                     if s1_set and s2_set and s1_set.isdisjoint(s2_set):
-                        continue # Do not merge Cell A and Cell B
+                        continue  # Do not merge Cell A and Cell B
 
                     # Otherwise, merge is safe (or involves an untagged bridge)
                     target = min(root1, root2)
                     source = max(root1, root2)
-                    
+
                     # Update Map
                     label_map[source] = target
                     label_map[root1] = target
                     label_map[root2] = target
-                    
+
                     # Update Cache: Union of seeds
                     new_seeds = s1_set.union(s2_set)
-                    # If we just merged a phantom fragment into a cell, 
+                    # If we just merged a phantom fragment into a cell,
                     # the phantom fragment effectively 'gains' that cell's seed.
                     group_seeds_cache[target] = new_seeds
-                    
+
                     # Redirect source's cache to target (cleanup)
                     if source in group_seeds_cache:
                         del group_seeds_cache[source]
-                    
+
                     # Path compression for existing mappings
                     # (Optional optimization, but good for deep chains)
                     keys_to_update = [k for k, v in label_map.items() if v == source]
@@ -1468,14 +1355,14 @@ def separate_multi_soma_cells(
 
             mask_nz = res > 0
             canvas_view = final_mask[sl]
-            
+
             # Identify conflict pixels where canvas already has a DIFFERENT label
             conflict_mask = mask_nz & (canvas_view > 0) & (canvas_view != res)
-            
+
             # Safely write non-conflicting pixels
             non_conflict = mask_nz & ~conflict_mask
             canvas_view[non_conflict] = res[non_conflict]
-            
+
             # [PROFILING] Log conflict stats for every chunk written.
             n_conflict = int(np.sum(conflict_mask))
             n_written  = int(np.sum(non_conflict))
@@ -1483,59 +1370,53 @@ def separate_multi_soma_cells(
                         f"conflicts={n_conflict} | "
                         f"conflict_labels_existing={np.unique(canvas_view[conflict_mask]).tolist()} | "
                         f"conflict_labels_incoming={np.unique(res[conflict_mask]).tolist()}")
-            
+
             if np.any(conflict_mask):
                 unique_pairs = np.unique(
                     np.vstack((canvas_view[conflict_mask], res[conflict_mask])), axis=1
                 ).T
-                
+
                 for e_lab, i_lab in unique_pairs:
                     pair_conflict = (canvas_view == e_lab) & (res == i_lab) & conflict_mask
                     if not np.any(pair_conflict):
                         continue
-                        
+
                     # 1. Get GLOBAL coordinates of the conflict pixels
                     cz, cy, cx = np.where(pair_conflict)
                     gz, gy, gx = cz + sl[0].start, cy + sl[1].start, cx + sl[2].start
-                    
+
                     # 2. Extract a padded block from the GLOBAL canvas so we can see both chunks
                     pad = overlap + 4
                     z_min, z_max = max(0, gz.min() - pad), min(final_mask.shape[0], gz.max() + pad + 1)
                     y_min, y_max = max(0, gy.min() - pad), min(final_mask.shape[1], gy.max() + pad + 1)
                     x_min, x_max = max(0, gx.min() - pad), min(final_mask.shape[2], gx.max() + pad + 1)
-                    
+
                     sub_slice = (slice(z_min, z_max), slice(y_min, y_max), slice(x_min, x_max))
                     cv_sub = final_mask[sub_slice].copy()
-                    
+
                     # 3. Project conflict pixels into local cv_sub coordinates
                     local_cz, local_cy, local_cx = gz - z_min, gy - y_min, gx - x_min
                     local_conflict = np.zeros(cv_sub.shape, dtype=bool)
                     local_conflict[local_cz, local_cy, local_cx] = True
-                    
+
                     # 4. Find safe zones globally
                     local_e_safe = (cv_sub == e_lab) & ~local_conflict
                     local_i_safe = (cv_sub == i_lab) & ~local_conflict
-                    
+
                     # Failsafe
                     if not np.any(local_e_safe) or not np.any(local_i_safe):
                         flush_print(f"  [STITCHER] Failsafe Triggered. e:{np.sum(local_e_safe)}, i:{np.sum(local_i_safe)}")
                         cv_sub[local_conflict] = i_lab
                         final_mask[sub_slice] = cv_sub
                         continue
-                        
+
                     # 5. Run Geodesic Micro-Watershed
                     local_domain = local_conflict | local_e_safe | local_i_safe
                     markers = np.zeros(local_domain.shape, dtype=np.int32)
                     markers[local_e_safe] = 1
                     markers[local_i_safe] = 2
-                    
-                    dt = distance_transform_edt(local_domain, sampling=spacing)
 
-                    # NOTE: d_seeds (Euclidean distance from markers) is intentionally
-                    # NOT computed here. See the per-cell watershed comment for rationale:
-                    # using d_seeds in the landscape introduces a Euclidean geometric bias
-                    # that overrides intensity guidance when safe zones are unequal in size.
-                    # The pure cost field 1/speed^p is the correct formulation.
+                    dt = distance_transform_edt(local_domain, sampling=spacing)
 
                     # FIX: Use intensity-modulated speed, identical to the per-cell watershed.
                     # Previously this was geometry-only (speed = dt + 1e-5), which caused
@@ -1553,7 +1434,6 @@ def separate_multi_soma_cells(
                         speed = dt + (norm_int_sub * max_dt_sub * stitch_intensity_weight) + 1e-5
 
                         # [PROFILING] Confirm intensity contribution relative to geometry.
-                        # Only alarm when intensity is genuinely absent (ratio < 0.1).
                         geom_c = dt[local_domain].mean()
                         int_c  = (norm_int_sub[local_domain] * max_dt_sub * stitch_intensity_weight).mean()
                         ratio_c = int_c / (geom_c + 1e-9)
@@ -1563,18 +1443,12 @@ def separate_multi_soma_cells(
                                     f"p1={p1_s:.1f} p99={p99_s:.1f}{contrib_warn}")
 
                         # [PROFILING] SAFE ZONE INTENSITY CHECK — the root cause test.
-                        # If e_safe and i_safe have SIMILAR mean intensity, the geodesic has
-                        # no signal to guide the cut and will default to a geometric midplane.
-                        # If the conflict zone is NOT the darkest region, the safe zones are
-                        # on the wrong side of the true cell boundary (upstream watershed error).
                         e_safe_mean = float(np.mean(local_int_sub[local_e_safe])) if np.any(local_e_safe) else float('nan')
                         i_safe_mean = float(np.mean(local_int_sub[local_i_safe])) if np.any(local_i_safe) else float('nan')
                         conflict_mean = float(np.percentile(local_int_sub[local_conflict], 5))
                         domain_mean = float(np.mean(local_int_sub[local_domain]))
                         is_valley = conflict_mean < min(e_safe_mean, i_safe_mean) * 0.85
                         safe_contrast = abs(e_safe_mean - i_safe_mean) / (max(e_safe_mean, i_safe_mean) + 1e-6)
-                        # Warn on safe-zone contrast only when it is genuinely negligible (< 5%).
-                        # 10-30% contrast IS meaningful signal; do not alarm on it.
                         contrast_warn = " *** LOW CONTRAST: geodesic cut may be geometric ***" if safe_contrast < 0.05 else ""
                         flush_print(f"    [PROFILE|STITCH|GEO] INTENSITY MAP: "
                                     f"e_safe_mean={e_safe_mean:.1f} | conflict_mean={conflict_mean:.1f} | "
@@ -1599,8 +1473,6 @@ def separate_multi_soma_cells(
                     # a bright point (WRONG), and the result depends on arbitrary safe-zone
                     # size asymmetry. Instead, directly assign all conflict voxels to
                     # whichever label has the larger safe zone (size-wins rule).
-                    # This avoids the expensive watershed and avoids introducing a spurious
-                    # bright-intensity cut boundary into the segmentation.
                     if local_int_sub is not None and not is_valley:
                         winner = e_lab if np.sum(local_e_safe) >= np.sum(local_i_safe) else i_lab
                         flush_print(f"    [PROFILE|STITCH|GEO] NO VALLEY: skipping geodesic — "
@@ -1614,11 +1486,13 @@ def separate_multi_soma_cells(
 
                     # d_seeds provides equal-start guarantee: all markers enter the priority
                     # queue at elevation 0 regardless of local intensity, so dim/tiny seeds
-                    # compete fairly. See per-cell watershed comment for full rationale.
+                    # compete fairly. Both safe zones here are real, already-committed
+                    # territory rather than inherited point markers, so the region-marker
+                    # problem that forces pure cost in the per-cell watershed does not arise.
                     d_seeds_stitch = distance_transform_edt(markers == 0, sampling=spacing)
                     landscape = d_seeds_stitch / (speed ** speed_power)
                     landscape[~local_domain] = 1e6
-                    
+
                     ws_local = _watershed_with_simpleitk(landscape, markers)
 
                     # [PROFILING] Log how many conflict voxels were assigned to each label.
@@ -1629,8 +1503,7 @@ def separate_multi_soma_cells(
                                 f"geodesic => e_lab={n_to_e} voxels, i_lab={n_to_i} voxels | "
                                 f"e_safe_size={int(np.sum(local_e_safe))} i_safe_size={int(np.sum(local_i_safe))}")
 
-                    # [PROFILING] RESOLVED BOUNDARY INTENSITY — checks if the geodesic placed
-                    # the final cut at a dark valley or at a bright midpoint.
+                    # [PROFILING] RESOLVED BOUNDARY INTENSITY
                     if local_int_sub is not None:
                         ws_e_mask = (ws_local == 1) & local_domain
                         ws_i_mask = (ws_local == 2) & local_domain
@@ -1645,7 +1518,7 @@ def separate_multi_soma_cells(
                                             f"vs domain_mean={domain_mean:.1f} | => {bnd_verdict}")
 
                     cv_sub[(ws_local == 2) & local_conflict] = i_lab
-                    
+
                     # Write safely back to the global memmap
                     final_mask[sub_slice] = cv_sub
 
@@ -1658,63 +1531,115 @@ def separate_multi_soma_cells(
         if os.path.exists(final_path):
             os.remove(final_path)
 
+        # Aggregates for every pass below: label sizes, intensity sums, and the
+        # adjacency graph with each interface's bounding box. One bounded-memory
+        # sweep replaces the whole-volume `np.unique` / `bincount` / `find_objects`
+        # calls the refinement passes used to make.
+        _stats_block = tuple(kwargs.get('stats_block_shape', (128, 128, 128)))
+        _stats = accumulate_label_statistics(
+            ret, intensity_volume, block_shape=_stats_block
+        )
+
         # [PROFILE|CONSERVE] Post-stitch, pre-refinement inventory.
-        _fg_stitch = int(np.count_nonzero(ret))
-        _nobj_stitch = int(np.unique(ret[ret > 0]).size)
+        _fg_stitch = int(_stats.label_count.sum())
+        _nobj_stitch = int(_stats.labels.size)
         flush_print(
             f"  [PROFILE|CONSERVE] POST-STITCH (pre-island): foreground_voxels={_fg_stitch} "
             f"| objects={_nobj_stitch} | delta_vs_input={_fg_stitch - _fg_in}"
         )
 
-        # Resolve the interfaces the workers deferred.
+        # ---- Merge tests, once, on the assembled volume ----------------------
+        # The worker no longer scores an interface unless both basins own a soma in
+        # its own chunk. It cannot: a chunk that only inherited its markers puts the
+        # boundary between two marker regions rather than at a valley, the tests
+        # correctly call that a bright cut, and because merging unions the seed sets
+        # one wrong verdict fuses two cells across the whole volume.
         #
-        # DEFAULT OFF, and it should stay off until chunked flooding is made
-        # convergent. This pass scores the boundary the watershed produced, and
-        # that boundary is only trustworthy where some chunk held two somata and
-        # actually ran a watershed. Where none did, the cut is placed by chunk
-        # geometry instead of by the image, and scoring it merges cells that are
-        # genuinely separate. Measured on a two-cell scene whose dividing valley
-        # lies 130 px from the nearest chunk that could see both somata: the cut
-        # landed in bright tissue, the tests read it as bright, and the pass
-        # merged the pair. Enabling it trades a missed rejoin for a wrong merge,
-        # which is the worse of the two.
-        if kwargs.get('resolve_deferred', False):
-            ret = resolve_deferred_interfaces(
-                ret, intensity_volume, all_deferred,
-                stitch_label_map=label_map,
-                soma_intensities=global_soma_intensities,
-                soma_centroids=global_soma_centroids,
-                local_analysis_radius=int(kwargs.get('local_analysis_radius', 10)),
-                min_local_intensity_difference=float(
-                    kwargs.get('min_local_intensity_difference', 0.0)),
-                min_path_intensity_ratio=float(
-                    kwargs.get('min_path_intensity_ratio', 1.0)),
-                max_interface_to_zone_ratio=float(
-                    kwargs.get('max_interface_to_zone_ratio', 0.85)),
-                max_seed_centroid_dist=float(
-                    kwargs.get('max_seed_centroid_dist', 0.0)),
-                search_margin=int(overlap),
-                log=flush_print,
+        # Here every interface between two final labels is visible exactly once,
+        # with both cells whole, which is the only place `ref_intensity` and the
+        # interface-vs-cell-mean comparison mean what they were designed to mean.
+        # It is also what rejoins two spurious seeds on one real cell when their
+        # somata happened to land in different chunks -- the over-seeding rescue the
+        # per-chunk tests could never perform.
+        #
+        # Runs BEFORE the island pass on purpose: an over-split leaves seedless
+        # fragments that the island pass would otherwise hand out on contact area
+        # alone, cementing a split that should not have existed.
+        #
+        # `max_seed_centroid_dist` is passed here as well as to the worker, and this
+        # is where it does the work: with `require_local_somas` active, a long-range
+        # pair is never scored inside a chunk at all, so the bound has to be applied
+        # at the point the decision is actually taken.
+        _merge_params = {
+            k: kwargs[k] for k in (
+                'local_analysis_radius',
+                'min_local_intensity_difference',
+                'min_path_intensity_ratio',
+                'max_interface_to_cell_mean_ratio',
+            ) if k in kwargs
+        }
+        _merged = global_merge_pass(
+            ret, intensity_volume, soma_mask, spacing,
+            _calculate_interface_metrics,
+            stats=_stats,
+            global_soma_intensities=kwargs.get('global_soma_intensities', {}),
+            global_soma_centroids=kwargs.get('global_soma_centroids', {}),
+            max_seed_centroid_dist=float(kwargs.get('max_seed_centroid_dist', 0.0)),
+            block_shape=_stats_block,
+            log=flush_print,
+            **_merge_params
+        )
+        if _merged:
+            _fg_merge = int(np.count_nonzero(ret))
+            flush_print(
+                f"  [PROFILE|CONSERVE] POST-GLOBALMERGE: foreground_voxels={_fg_merge} "
+                f"| objects={int(np.unique(ret[ret > 0]).size)} "
+                f"| delta_vs_stitch={_fg_merge - _fg_stitch}"
             )
 
         ret = _reassign_disconnected_islands(ret, soma_mask)
 
+        # Fresh aggregates: the island pass moved voxels between labels.
+        _stats_island = accumulate_label_statistics(ret, None, block_shape=_stats_block)
+
         # [PROFILE|CONSERVE] Post-island inventory.
-        _fg_island = int(np.count_nonzero(ret))
-        _nobj_island = int(np.unique(ret[ret > 0]).size)
+        _fg_island = int(_stats_island.label_count.sum())
+        _nobj_island = int(_stats_island.labels.size)
         flush_print(
             f"  [PROFILE|CONSERVE] POST-ISLAND: foreground_voxels={_fg_island} "
             f"| objects={_nobj_island} | delta_vs_stitch={_fg_island - _fg_stitch}"
         )
 
-        # Size floor, unchanged from the original module.
-        ret = _merge_undersized_cells(
-            ret, int(kwargs.get('min_size_threshold', 0) or 0)
+        # Size floor, applied globally so every label's size is its true whole size
+        # (a chunk-clipped basin looks arbitrarily small inside the worker). Runs
+        # AFTER the island pass so satellites have been reattached and the sizes
+        # being judged are final. Merges only -- never deletes.
+        #
+        # A label that owns a soma is protected. In the reported trace a 7,893-voxel
+        # cell with its own soma was merged into its neighbour purely for being
+        # small, which is the one outcome the size floor should never produce: the
+        # threshold exists to tidy debris, and a fragment with a soma is not debris.
+        # Set `protect_seeded_cells=False` for the old behaviour.
+        _protect = set()
+        if kwargs.get('protect_seeded_cells', True):
+            _protect = {
+                lbl for lbl, somas in accumulate_label_soma_map(
+                    ret, soma_mask, block_shape=_stats_block
+                ).items() if somas
+            }
+        merge_undersized_streaming(
+            ret, int(kwargs.get('min_size_threshold', 0) or 0),
+            stats=_stats_island,
+            protected=_protect,
+            block_shape=_stats_block,
+            log=flush_print,
         )
 
+        _stats_final = accumulate_label_statistics(ret, None, block_shape=_stats_block)
+
         # [PROFILE|CONSERVE] Post-undersize inventory.
-        _fg_undersize = int(np.count_nonzero(ret))
-        _nobj_undersize = int(np.unique(ret[ret > 0]).size)
+        _fg_undersize = int(_stats_final.label_count.sum())
+        _nobj_undersize = int(_stats_final.labels.size)
         flush_print(
             f"  [PROFILE|CONSERVE] POST-UNDERSIZE: foreground_voxels={_fg_undersize} "
             f"| objects={_nobj_undersize} | delta_vs_island="
@@ -1722,11 +1647,20 @@ def separate_multi_soma_cells(
         )
 
         flush_print("  Refining (Filling voids + Relabeling)...")
-        ret, _, _ = relabel_sequential(ret)
+        # Same result as `relabel_sequential` -- ids 1..N in ascending order of the
+        # old id -- but built from the labels already inventoried and applied as one
+        # lookup table per block, instead of a whole-volume pass.
+        _seq = {
+            int(old): new
+            for new, old in enumerate(_stats_final.labels.tolist(), start=1)
+            if int(old) != new
+        }
+        if _seq:
+            apply_label_mapping(ret, _seq, block_shape=_stats_block)
 
         # [PROFILE|CONSERVE] Final inventory + end-to-end verdict.
-        _fg_out = int(np.count_nonzero(ret))
-        _nobj_out = int(np.unique(ret[ret > 0]).size)
+        _fg_out = int(_stats_final.label_count.sum())
+        _nobj_out = int(_stats_final.labels.size)
         flush_print(
             f"  [PROFILE|CONSERVE] OUTPUT: foreground_voxels={_fg_out} | objects={_nobj_out}"
         )
@@ -1737,7 +1671,7 @@ def separate_multi_soma_cells(
         )
 
         return ret
-    
+
     finally:
         # Emergency cleanup: remove any remaining .npy files in case of crash
         for i in chunk_data:
