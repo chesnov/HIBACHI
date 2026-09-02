@@ -18,6 +18,44 @@ from .relational_engine import RelationalEngine
 from .metadata import get_sample_metadata
 
 
+def _spacing_from_extents(meta, shape, where=""):
+    """Per-axis spacing from total extents, or None if any axis is unusable.
+
+    Both viewer paths used to inline this as
+    ``meta.get('z', 1.0) / shape[0]``, so a config with no dimension block --
+    or, before `get_sample_metadata` stopped returning a placeholder, one that
+    merely looked like it had one -- produced a spacing of 1.0/N microns per
+    pixel. That is a fabricated physical scale: the layers render at the wrong
+    aspect and any measurement taken off them is wrong by that factor, with
+    nothing to indicate it. Returning None lets the caller keep its own
+    isotropic default and, crucially, PRINTS the reason -- so an unscaled
+    preview is visible in the log instead of looking like a calibrated one.
+
+    Only the display paths use this. The measurement paths (`_resolve_geometry`
+    and `roi_sharing.region_geometry`) refuse outright rather than fall back,
+    because a wrong spacing there corrupts reported distances.
+    """
+    if not meta:
+        if where:
+            print(f"[cross-channel] {where}: no dimension block in the config; "
+                  f"layers will not be physically scaled.")
+        return None
+    axes = ('z', 'y', 'x') if len(shape) == 3 else ('y', 'x')
+    out = []
+    for axis, count in zip(axes, shape):
+        try:
+            total = float(meta.get(axis))
+        except (TypeError, ValueError):
+            total = 0.0
+        if not (total > 0 and count):
+            if where:
+                print(f"[cross-channel] {where}: no usable {axis!r} extent; "
+                      f"layers will not be physically scaled.")
+            return None
+        out.append(total / count)
+    return tuple(out)
+
+
 
 def _safe_name(name: str) -> str:
     """Folder-safe form of a region name, e.g. 'ROI 2' -> 'ROI_2'.
@@ -284,12 +322,19 @@ class CrossChannelAnalyzerWindow(QMainWindow):
         self.recipe_list.addItem(step["name"])
 
     def project_is_2d(self):
-        """True when this project was processed by the 2D pipeline.
+        """True when this project's images are planes rather than stacks.
 
         Read from a sample's saved config rather than inferred from array shapes:
-        a 3-axis array can be (Z, Y, X) or (C, Y, X), so the recorded mode is the
-        only reliable discriminator. Cached, because it cannot change within a
-        project and the lookup touches the disk.
+        a 3-axis array can be (Z, Y, X) or (C, Y, X), so the array alone cannot
+        settle it. What settles it is the config's dimension block -- a 'z'
+        extent means a stack -- and NOT the mode string, which used to be the
+        discriminator here. With one mode `mode.endswith("_2d")` is always
+        False, so every project reported as 3D and every 2D project's object
+        sizes were labelled um3 and called "Volume".
+
+        Cached, because it cannot change within a project and the lookup touches
+        the disk. Defaults to 3D when no config carries dimensions, matching the
+        previous behaviour for an unreadable project.
         """
         if getattr(self, "_is_2d_cache", None) is not None:
             return self._is_2d_cache
@@ -297,11 +342,11 @@ class CrossChannelAnalyzerWindow(QMainWindow):
         for sample_data in self.pm.sample_registry.values():
             for ch_path in sample_data.values():
                 try:
-                    _, mode = get_sample_metadata(ch_path)
+                    dims, _mode = get_sample_metadata(ch_path)
                 except Exception:
                     continue
-                if mode:
-                    is_2d = str(mode).endswith("_2d")
+                if dims:
+                    is_2d = dims.get("z") is None
                     break
             if is_2d is not None:
                 break
@@ -507,27 +552,50 @@ class CrossChannelAnalyzerWindow(QMainWindow):
             return None, None
         with tiff.TiffFile(tif_path) as tif:
             shape = tuple(int(s) for s in tif.series[0].shape)
-        meta, mode = get_sample_metadata(first_ch)
-        meta = meta or {}
+        meta, _mode = get_sample_metadata(first_ch)
+        if not meta:
+            # No usable dimension block. Previously this fell through to a
+            # spacing of 1.0/N per axis, which is a physical scale nobody
+            # supplied; every distance the analysis then reported was wrong and
+            # still labelled microns. The caller documents (None, None) as
+            # "could not be determined" and handles it.
+            print(f"[cross-channel] {first_ch}: config has no usable "
+                  f"dimension block; geometry cannot be determined.")
+            return None, None
+
         # A (C, Z, Y, X) or (C, Y, X) file would otherwise hand back a shape the
-        # .dat memmaps do not have. The config's mode says how many trailing
-        # axes are spatial, which is the only reliable discriminator: a 3-axis
-        # array may be (Z, Y, X) or (C, Y, X). Keep exactly the `want` trailing
+        # .dat memmaps do not have. How many trailing axes are spatial comes from
+        # the dimension block's rank -- a 'z' extent means a stack -- because a
+        # 3-axis array may be (Z, Y, X) or (C, Y, X) and the array cannot say
+        # which. This used to read the mode string, which is now the same for
+        # both ranks, so `want` was always 3 and a 2D project's (C, Y, X) file
+        # kept its channel axis as if it were Z. Keep exactly the `want` trailing
         # spatial axes and drop any leading (channel) axes. Do NOT squeeze
         # singleton axes generally: a genuine thin-Z volume is (1, Y, X) and must
         # stay 3D, or the 3D viewport and turntable would be lost for
         # single-channel / few-slice samples.
-        want = 2 if str(mode or "").endswith("_2d") else 3
+        want = 3 if meta.get('z') is not None else 2
         if len(shape) > want:
             shape = shape[-want:]
-        if len(shape) == 3:
-            spacing = (meta.get('z', 1.0) / shape[0],
-                       meta.get('y', 1.0) / shape[1],
-                       meta.get('x', 1.0) / shape[2])
-        else:
-            spacing = (meta.get('y', 1.0) / shape[0],
-                       meta.get('x', 1.0) / shape[1])
-        return shape, spacing
+        if len(shape) < want:
+            print(f"[cross-channel] {first_ch}: config describes a {want}D "
+                  f"acquisition but the image has shape {shape}; geometry "
+                  f"cannot be determined.")
+            return None, None
+
+        axes = ('z', 'y', 'x') if want == 3 else ('y', 'x')
+        spacing = []
+        for axis, count in zip(axes, shape):
+            try:
+                total = float(meta.get(axis))
+            except (TypeError, ValueError):
+                total = 0.0
+            if not (total > 0 and count):
+                print(f"[cross-channel] {first_ch}: no usable {axis!r} extent "
+                      f"in the config; refusing to invent a spacing.")
+                return None, None
+            spacing.append(total / count)
+        return shape, tuple(spacing)
 
     def preview_recipe(self):
         if not self.recipe_steps:
@@ -596,12 +664,15 @@ class CrossChannelAnalyzerWindow(QMainWindow):
                 if shape is None and tif_file:
                     with tiff.TiffFile(tif_file) as tif:
                         shape = tif.series[0].shape
-                    # Try to get spacing from strategy config
+                    # Spacing from the config's dimension block: total_um per
+                    # axis divided by that axis's pixel count. Unusable extents
+                    # leave the isotropic default in place (this is the display
+                    # path; the measurement paths refuse instead), with the
+                    # helper printing why.
                     meta, _ = get_sample_metadata(ch_path)
-                    if meta:
-                        # Very simple spacing calc: total_um / pixels
-                        # (Note: In a production version, we use the exact strategy spacing)
-                        spacing = (meta.get('z', 1.0)/shape[0], meta.get('y', 1.0)/shape[1], meta.get('x', 1.0)/shape[2]) if len(shape)==3 else (meta.get('y', 1.0)/shape[0], meta.get('x', 1.0)/shape[1])
+                    _sp = _spacing_from_extents(meta, shape, ch_path)
+                    if _sp is not None:
+                        spacing = _sp
 
                 # Add Raw Intensity
                 if tif_file:
@@ -951,12 +1022,10 @@ def open_sample_overlay(project_manager, sample_name, analysis_name=None, parent
                 with tiff.TiffFile(tif_file) as tif:
                     shape = tif.series[0].shape
                 meta, _ = get_sample_metadata(ch_path)
-                if meta:
-                    spacing = (
-                        (meta.get('z', 1.0)/shape[0], meta.get('y', 1.0)/shape[1], meta.get('x', 1.0)/shape[2])
-                        if len(shape) == 3 else
-                        (meta.get('y', 1.0)/shape[0], meta.get('x', 1.0)/shape[1])
-                    )
+                # Unusable extents leave the isotropic default (display path).
+                _sp = _spacing_from_extents(meta, shape, ch_path)
+                if _sp is not None:
+                    spacing = _sp
 
             if tif_file:
                 raw_img = tiff.imread(tif_file)

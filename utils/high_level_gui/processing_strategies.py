@@ -310,13 +310,18 @@ class ProcessingStrategy(abc.ABC):
         Returns:
             str: The key used in the YAML config file.
         """
+        # The BARE name is the current spelling: the canonical reference and
+        # everything `config_migration.normalise_config` produces are unsuffixed,
+        # because one pipeline does not need the mode in its step keys. The
+        # suffixed form is checked first only so an un-migrated config on disk
+        # still resolves -- it is the legacy path now, not the primary one, which
+        # is the reverse of what this function's comment used to claim.
         mode_specific_key = f"{step_name}_{self.mode_name}"
         if mode_specific_key in self.config:
-            return mode_specific_key
+            return mode_specific_key    # legacy, un-migrated config
         elif step_name in self.config:
-            # Fallback for backward compatibility
-            return step_name
-        return mode_specific_key
+            return step_name            # current spelling
+        return step_name
 
     def get_checkpoint_files(self) -> Dict[str, str]:
         """
@@ -461,10 +466,26 @@ class ProcessingStrategy(abc.ABC):
             return
 
         config_to_save = {}
-        
-        # Copy relevant keys, filtering out internal UI state if any
+
+        # Copy relevant keys, filtering out internal UI state if any.
+        #
+        # This is a WHITELIST, so anything absent from it is silently dropped
+        # from the run config -- the file that records how a result was produced,
+        # that reconcile compares against, and that `require_dimensions` reads
+        # when the project is reopened. 'dimensions' was missing: every run made
+        # from a unified config wrote its record with the calibration stripped,
+        # and the project then reopened raising "No 'dimensions' found" despite
+        # having been calibrated correctly. The two legacy keys stay so a config
+        # that has not been migrated still round-trips.
+        #
+        # Add new top-level provenance keys HERE or they will not survive a save.
+        _PASSTHROUGH_KEYS = (
+            'dimensions', 'voxel_dimensions', 'pixel_dimensions',
+            'dimensions_source',   # provenance of the numbers above; travels with them
+            'mode', 'saved_state', 'config_name', 'synthetic',
+        )
         for step_key, step_data in current_config.items():
-            if step_key in ['voxel_dimensions', 'pixel_dimensions', 'mode', 'saved_state']:
+            if step_key in _PASSTHROUGH_KEYS:
                 config_to_save[step_key] = step_data
             elif step_key.startswith("execute_") and isinstance(step_data, dict):
                 config_to_save[step_key] = step_data

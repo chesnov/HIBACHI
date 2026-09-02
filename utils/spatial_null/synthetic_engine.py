@@ -171,16 +171,27 @@ def _mode_name(cfg):
 
 
 def _spatial_ndim(cfg, img_ndim):
-    """Number of spatial axes: authoritative from the config mode, else the image.
+    """Number of spatial axes: from the config's dimension block, else the image.
 
-    Using the mode disambiguates a 3-axis array that could be (Z, Y, X) or
-    (C, Y, X) -- part of bug 6.
+    A 3-axis array is ambiguous between (Z, Y, X) and (C, Y, X), so the array
+    alone cannot settle this -- the config has to. What settles it is the
+    dimension block: a 'z' extent means a stack.
+
+    It used to read the mode string:
+
+        if mode.endswith('_2d'): return 2
+        if mode: return 3
+
+    With one mode the first test is never true and the second always is, so
+    every project was declared 3D. A 2D sample's (C, Y, X) template then kept
+    its channel axis as a spatial one, pooling background statistics across
+    channels -- which is the same bug 6 this function was written to fix,
+    reintroduced by the merge.
     """
-    mode = _mode_name(cfg)
-    if mode.endswith('_2d'):
-        return 2
-    if mode:
-        return 3
+    from ..high_level_gui.metadata import config_ndim
+    ndim = config_ndim(cfg)
+    if ndim in (2, 3):
+        return ndim
     return 2 if img_ndim <= 2 else 3
 
 
@@ -208,29 +219,43 @@ def _reduce_to_spatial(img, ndim_spatial, sample_name):
 def _read_spacing(cfg, shape, sample_name):
     """Physical spacing per axis in microns, from total extent / voxel count.
 
-    Configs store `voxel_dimensions` (3D) / `pixel_dimensions` (2D) as TOTAL
-    physical extents, which is how `run_batch_analysis` derives spacing too.
+    Configs store the TOTAL physical extent under `dimensions` (or, in a project
+    predating the merge, `voxel_dimensions` / `pixel_dimensions`), which is how
+    `run_batch_analysis` derives spacing too.
+
+    Read through `find_dimensions` so the unified key is seen. Reading only the
+    two legacy keys meant a config written since the merge yielded {} and every
+    axis fell back to 1.0 um -- object geometry in voxel units, reported in
+    microns, with only the warning below to say so.
     """
     ndim = len(shape)
-    dims = cfg.get('voxel_dimensions') or cfg.get('pixel_dimensions') or {}
+    from ..high_level_gui.metadata import MissingDimensionsError, find_dimensions
+    try:
+        _dim_key, dims = find_dimensions(cfg)
+    except MissingDimensionsError:
+        dims = None
     if not isinstance(dims, dict):
         dims = {}
     keys = ('z', 'y', 'x') if ndim == 3 else ('y', 'x')
 
-    spacing, missing = [], False
+    spacing, missing = [], []
     for key, size in zip(keys, shape):
         extent = _safe_float(dims.get(key))
         if np.isfinite(extent) and extent > 0 and size > 0:
             spacing.append(extent / float(size))
         else:
-            spacing.append(1.0)
-            missing = True
+            missing.append(key)
 
     if missing:
-        print(f"  [{sample_name}] Warning: incomplete "
-              f"{'voxel' if ndim == 3 else 'pixel'}_dimensions in config; "
-              f"using 1.0 um for the missing axes. Object geometry will be "
-              f"in voxel units for those axes.")
+        # Returns None rather than substituting 1.0 um for the missing axes.
+        # This engine builds a synthetic null to compare real measurements
+        # against, so an invented spacing does not merely mislabel units -- it
+        # makes the comparison itself meaningless, in a number that still reads
+        # as microns. The caller skips the sample and says why.
+        print(f"  [{sample_name}] No usable "
+              f"{', '.join(repr(k) for k in missing)} extent in the config's "
+              f"'dimensions'; refusing to invent a spacing.")
+        return None
     return tuple(spacing)
 
 
@@ -584,6 +609,10 @@ def generate_synthetic_channel(pm, template_ch, rel_filter, out_dir,
 
         shape = real_img.shape
         spacing = _read_spacing(cfg, shape, sample_key)
+        if spacing is None:
+            print(f"  [{sample_key}] Skipped: the synthetic null needs a "
+                  f"physical spacing to be comparable with the real data.")
+            continue
 
         # Background model, computed on the spatial array only (bug 6).
         bg_mean = float(np.median(real_img))

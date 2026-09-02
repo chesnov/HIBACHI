@@ -251,20 +251,31 @@ class SpatialNullDialog(QDialog):
         return None
 
     def _size_unit(self) -> str:
-        """'um²' in 2D, 'um³' in 3D, from a sample's recorded pipeline mode.
+        """'um²' for planar data, 'um³' for a stack, from a sample's config.
 
-        Falls back to 3D wording only if no mode can be read; a 3-axis array is
-        ambiguous between (Z, Y, X) and (C, Y, X), so shape is not usable here.
+        Rank comes from the config's dimension block -- a 'z' extent means a
+        stack -- because a 3-axis array is ambiguous between (Z, Y, X) and
+        (C, Y, X) and so cannot answer this itself.
+
+        It used to read the recorded mode and test `endswith("_2d")`. With one
+        mode that is never true, so every 2D project's object sizes were
+        labelled um3. The label is cosmetic, but it is written into the recipe
+        step as `size_unit` and travels with the exported results, so a wrong
+        one mislabels the numbers a reader sees.
+
+        Falls back to 3D wording when no config carries dimensions, matching the
+        previous behaviour for an unreadable project.
         """
         try:
-            from .runner import _mode_of
+            from .runner import _read_config
+            from ..high_level_gui.metadata import config_ndim
         except ImportError:
             return "um\u00b3"
         for channels in self.pm.sample_registry.values():
             for path in channels.values():
-                mode = _mode_of(path)
-                if mode:
-                    return "um\u00b2" if str(mode).endswith("_2d") else "um\u00b3"
+                ndim = config_ndim(_read_config(path))
+                if ndim in (2, 3):
+                    return "um\u00b2" if ndim == 2 else "um\u00b3"
         return "um\u00b3"
 
     def _recipe_program(self):

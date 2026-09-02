@@ -530,16 +530,38 @@ class MetadataExtractor:
         }
 
 def get_sample_metadata(folder_path):
-    """Retrieves shape and spacing from the YAML in a project folder."""
+    """``(dimensions, mode)`` from the YAML in a project folder.
+
+    ``dimensions`` is the TOTAL physical extent per axis, read through
+    `find_dimensions` so the unified key and both legacy keys are all accepted.
+    A 'z' entry means the acquisition is a stack, which is also how
+    `config_ndim` determines rank -- so callers needing rank can test
+    ``dims.get('z') is not None`` rather than looking at the mode string.
+
+    Returns ``(None, mode)`` when the config carries no usable dimension block,
+    and ``(None, None)`` when there is no config at all.
+
+    Two things this used to do, both of which produced wrong numbers rather than
+    an error:
+
+    * It chose the dimension key with ``mode.endswith('_2d')``. With one mode
+      that is always False, so it read 'voxel_dimensions' for every project and
+      found nothing in any config written since the merge.
+    * On finding nothing it returned ``{'x': 1, 'y': 1, 'z': 1}`` -- a
+      placeholder indistinguishable from a real 1-micron image. Callers divide
+      those by pixel counts to get spacing, so a missing block silently became a
+      spacing of 1/N microns per pixel. It now returns None, and callers must
+      decide what to do about it.
+    """
     for f in os.listdir(folder_path):
         if f.endswith(('.yaml', '.yml')):
             with open(os.path.join(folder_path, f), 'r') as file:
-                cfg = yaml.safe_load(file)
-                mode = cfg.get('mode', '')
-                is_2d = mode.endswith('_2d')
-                dim_key = 'pixel_dimensions' if is_2d else 'voxel_dimensions'
-                dims = cfg.get(dim_key, {'x':1, 'y':1, 'z':1})
-                # Note: We'd need actual pixel counts to calculate spacing, 
-                # but for preview, we can often rely on the Strategy to provide this.
-                return dims, mode
+                cfg = yaml.safe_load(file) or {}
+            mode = cfg.get('mode', '')
+            try:
+                _dim_key, dims = find_dimensions(cfg)
+            except MissingDimensionsError:
+                # Both legacy blocks present: no honest way to choose.
+                dims = None
+            return (dims or None), mode
     return None, None

@@ -1515,31 +1515,38 @@ def region_geometry(sample_dir: str, roi_name: str) -> Optional[Dict[str, Any]]:
         dims = None
     dims = dims or {}
 
-    # NOTE: `_per_px` substitutes 1.0 for a missing or unusable total, which
-    # invents a physical scale -- the pattern removed elsewhere in favour of
-    # raising. Left as-is here deliberately: this function returns None on
-    # failure rather than raising, and changing that is a behaviour change for
-    # relational analysis, not part of unifying the dimension keys.
-
     # The config stores TOTAL microns for the crop, so per-voxel spacing is that
     # divided by the crop's pixel count -- matching how the full-image path derives
     # spacing from its own dimensions.
+    #
+    # `_per_px` returns None for a missing or unusable total instead of the 1.0
+    # it used to substitute. Inventing a scale here does not fail loudly: the
+    # region's masks memmap fine and relational analysis produces distances and
+    # densities that read as microns while actually being in voxels. Refusing
+    # costs nothing, because this function's contract is already Optional and
+    # both callers (cross_channel_window._resolve_geometry and
+    # spatial_null.runner._geometry_fallback) already treat None as "geometry
+    # unavailable" and say so.
     def _per_px(total, count):
         try:
             total = float(total)
         except (TypeError, ValueError):
-            return 1.0
-        return (total / count) if (count and total > 0) else 1.0
+            return None
+        if not (count and total > 0):
+            return None
+        return total / count
 
-    if len(shape) == 3:
-        spacing = (_per_px(dims.get("z", 1.0), shape[0]),
-                   _per_px(dims.get("y", 1.0), shape[1]),
-                   _per_px(dims.get("x", 1.0), shape[2]))
-    else:
-        spacing = (_per_px(dims.get("y", 1.0), shape[0]),
-                   _per_px(dims.get("x", 1.0), shape[1]))
+    axes = ("z", "y", "x") if len(shape) == 3 else ("y", "x")
+    spacing = []
+    for axis, count in zip(axes, shape):
+        per_px = _per_px(dims.get(axis), count)
+        if per_px is None:
+            print(f"[ROI] {roi_name!r} in {sample_dir}: no usable {axis!r} "
+                  f"extent in the region config; cannot derive a spacing.")
+            return None
+        spacing.append(per_px)
 
-    return {"shape": shape, "spacing": spacing, "roi_dir": art["roi_dir"],
+    return {"shape": shape, "spacing": tuple(spacing), "roi_dir": art["roi_dir"],
             "mode": art["mode"]}
 
 

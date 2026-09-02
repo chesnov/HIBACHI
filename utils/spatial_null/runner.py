@@ -1005,11 +1005,25 @@ def _mode_of(sample_dir: str) -> Optional[str]:
 
 
 def _full_shape(sample_dir: str) -> Optional[Tuple[int, ...]]:
-    """Spatial shape of the full image, disambiguated by the config mode."""
+    """Spatial shape of the full image, disambiguated by the config's rank.
+
+    Rank comes from the config's dimension block -- a 'z' extent means a stack --
+    and NOT from the mode string. `mode.endswith("_2d")` was always False once
+    the modes merged, so `want` was always 3: a 2D project's (C, Y, X) file kept
+    its channel axis as if it were Z, and the masks were memmapped against a
+    shape the .dat files do not have.
+
+    Returns None when rank cannot be established, rather than guessing 3D. A
+    wrong rank here silently mismatches every mask in the analysis.
+    """
     import tifffile
+    from ..high_level_gui.metadata import config_ndim
     cfg = _read_config(sample_dir)
-    is_2d = str(cfg.get("mode", "")).endswith("_2d")
-    want = 2 if is_2d else 3
+    want = config_ndim(cfg)
+    if want is None:
+        print(f"  [spatial_null] {sample_dir}: config has no usable dimension "
+              f"block, so the image's rank cannot be determined; skipping.")
+        return None
     try:
         tif = next(os.path.join(sample_dir, f) for f in sorted(os.listdir(sample_dir))
                    if f.lower().endswith((".tif", ".tiff")))
@@ -1041,7 +1055,18 @@ def _geometry_fallback(sample_dir: str,
     if shape is None:
         return None, None
     cfg = _read_config(sample_dir)
-    dims = cfg.get("voxel_dimensions") or cfg.get("pixel_dimensions") or {}
+    # Reads the unified key AND the legacy ones. It used to read only the two
+    # legacy keys, so a config written since the merge -- which carries
+    # 'dimensions' and nothing else -- yielded {} and every axis fell through to
+    # a spacing of 1.0. The analysis then reported distances in pixels while
+    # labelling them microns.
+    from ..high_level_gui.metadata import MissingDimensionsError, find_dimensions
+    try:
+        _dim_key, dims = find_dimensions(cfg)
+    except MissingDimensionsError:
+        dims = None
+    dims = dims or {}
+
     keys = ("z", "y", "x") if len(shape) == 3 else ("y", "x")
     spacing = []
     for k, n in zip(keys, shape):
@@ -1049,5 +1074,12 @@ def _geometry_fallback(sample_dir: str,
             total = float(dims.get(k, 0) or 0)
         except (TypeError, ValueError):
             total = 0.0
-        spacing.append(total / n if total > 0 and n else 1.0)
+        if not (total > 0 and n):
+            # No substituted 1.0. An invented spacing turns every distance this
+            # analysis produces into a wrong number that still reads as microns,
+            # which is worse than no result: the caller already handles None.
+            print(f"  [spatial_null] {sample_dir}: no usable '{k}' extent in the "
+                  f"config; refusing to invent a spacing.")
+            return None, None
+        spacing.append(total / n)
     return shape, tuple(spacing)
