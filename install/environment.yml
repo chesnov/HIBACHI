@@ -67,6 +67,24 @@ dependencies:
       - networkx==3.6.1
       - numba==0.61.2
       - tifffile==2026.3.3
+      # tifffile decodes only a few codecs itself and delegates the rest --
+      # JPEG, JPEG2000, WebP, LZMA, Zstd -- to imagecodecs, raising
+      # "<COMPRESSION.JPEG2000: 34712> requires the 'imagecodecs' package" when
+      # it is absent. Whole-slide exports and many camera/vendor TIFFs are
+      # JPEG2000, so this was not an exotic case: those files simply could not
+      # be opened. slideio covers the proprietary slide formats, but a plain
+      # .tif goes through tifffile, which is why slideio's presence did not
+      # already cover this.
+      #
+      # Pinned like the numerics above, captured on the reference machine
+      # (python 3.11, Linux). It requires only numpy>=2.0, so it does NOT
+      # disturb the numpy<2.4 bound that the find_objects pin depends on --
+      # verified with numpy 2.2.6 and tifffile 2026.3.3 in place, with
+      # imagecodecs.JPEG2K.available True. Re-check that when re-capturing.
+      #
+      # ~27 MB binary wheel (cp311-abi3), with wheels for Windows, Linux and
+      # both macOS architectures; no system libraries or JVM needed.
+      - imagecodecs==2026.3.6
       - fcswrite==0.6.4
       - psutil==7.2.2
       - tqdm==4.68.4
