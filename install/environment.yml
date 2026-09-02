@@ -45,6 +45,23 @@ dependencies:
       - readlif>=0.6.5
       - seaborn~=0.13.2
       - tifffile>=2023.1.1
+      # tifffile decodes only a few codecs itself and delegates the rest --
+      # JPEG, JPEG2000, WebP, LZMA, Zstd -- to imagecodecs, raising
+      # "<COMPRESSION.JPEG2000: 34712> requires the 'imagecodecs' package" when
+      # it is absent. Whole-slide exports and many camera/vendor TIFFs are
+      # JPEG2000, so those files simply could not be opened. slideio handles the
+      # proprietary slide formats, but a plain .tif goes through tifffile, which
+      # is why having slideio did not already cover this.
+      #
+      # Floor rather than a pin, matching the readers above. 2026.3.6 is the
+      # version this was verified with (python 3.11, Linux, numpy 2.2.6,
+      # tifffile 2026.3.3, imagecodecs.JPEG2K.available True); older releases
+      # very likely work but were not tested, so the floor claims only what was.
+      # It requires just numpy>=2.0, so it constrains nothing else here.
+      #
+      # ~27 MB binary wheel (cp311-abi3), with wheels for Windows, Linux and
+      # both macOS architectures; no system libraries or JVM needed.
+      - imagecodecs>=2026.3.6
       - zarr~=3.0.2
       - dask-image~=2024.5.3
       - simpleitk~=2.5.2
