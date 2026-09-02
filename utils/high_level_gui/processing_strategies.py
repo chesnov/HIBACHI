@@ -28,10 +28,16 @@ def _hibachi_version_stamp() -> Dict[str, Any]:
     Build the `hibachi_version` block written into each processed config.
 
     Records the git commit (so the exact code can be checked out to reproduce
-    the run), the branch, whether the working tree was dirty, and a UTC
+    the run), the branch and release channel, whether the version was pinned,
+    whether the working tree was dirty, and a UTC
     timestamp of when the config was saved. Reuses the launcher's stdlib-only
     `updater` module (no Qt import). Fully best-effort: on any failure it returns
     a minimal stamp rather than raising, so saving the config never breaks.
+
+    `branch` is None when the version is pinned (detached HEAD), which is why
+    `channel` is recorded separately: the channel says which line of releases
+    the install follows, and it survives a pin. The two disagreeing is the
+    informative case, so neither is derived from the other.
     """
     import datetime
 
@@ -41,6 +47,8 @@ def _hibachi_version_stamp() -> Dict[str, Any]:
         "tag": None,
         "date": None,
         "branch": None,
+        "channel": None,
+        "pinned": None,
         "dirty": None,
         "processed_at": datetime.datetime.now(datetime.timezone.utc)
         .replace(microsecond=0)
@@ -57,7 +65,8 @@ def _hibachi_version_stamp() -> Dict[str, Any]:
         import updater  # type: ignore
 
         info = updater.describe_version(repo_root)
-        for key in ("commit", "short", "tag", "date", "branch", "dirty"):
+        for key in ("commit", "short", "tag", "date", "branch", "channel",
+                    "pinned", "dirty"):
             if key in info:
                 stamp[key] = info[key]
     except Exception as exc:  # pragma: no cover - defensive
