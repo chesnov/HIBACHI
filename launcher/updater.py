@@ -935,6 +935,46 @@ def channel_branch(channel: Optional[str] = None) -> str:
     return CHANNELS.get(channel or get_channel(), STABLE_BRANCH)
 
 
+def get_install_dir() -> Optional[str]:
+    """
+    The checkout the installer created, or None if it was never recorded.
+
+    Written once at install time. It exists because several launcher side
+    effects are global to the machine -- the desktop shortcut above all -- while
+    a developer may run a second checkout from the same environment. Without a
+    recorded answer, `_refresh_shortcut` repoints the user's desktop icon at
+    whichever checkout was launched most recently, because `make_shortcuts`
+    derives its target from its own `__file__`.
+    """
+    val = _read_state().get("install_dir")
+    return val if isinstance(val, str) and val else None
+
+
+def set_install_dir(path: str) -> bool:
+    """Record the managed checkout. Stored resolved, so comparisons are stable."""
+    data = _read_state()
+    data["install_dir"] = os.path.realpath(os.path.abspath(path))
+    return _write_state(data)
+
+
+def is_install_dir(repo_root: str) -> bool:
+    """
+    Should machine-wide side effects be applied from `repo_root`?
+
+    True when it is the recorded install, and ALSO true when nothing was
+    recorded -- an install predating this key, or a manual clone, must keep
+    behaving exactly as before rather than silently losing its shortcut
+    refresh. Only a positive mismatch suppresses anything.
+    """
+    recorded = get_install_dir()
+    if not recorded:
+        return True
+    try:
+        return os.path.realpath(os.path.abspath(repo_root)) == recorded
+    except Exception:
+        return True
+
+
 def get_pending_env_update() -> bool:
     """
     True when the checkout moved to code whose dependency spec differs from
