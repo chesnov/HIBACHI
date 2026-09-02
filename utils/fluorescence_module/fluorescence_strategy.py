@@ -834,13 +834,3 @@ class FluorescenceStrategy(ProcessingStrategy):
             self._remove_file_safely(files.get("distances_matrix"))
             self._remove_file_safely(files.get("points_matrix"))
             self._remove_file_safely(files.get("metrics_fcs"))
-
-
-# --------------------------------------------------------------------------
-# Legacy aliases
-# --------------------------------------------------------------------------
-#: The former per-rank classes. `FluorescenceStrategy` now handles both, so both
-#: names resolve to it and the mode-keyed registries keep working while they are
-#: migrated to a single "fluorescence" entry.
-Fluorescence2DStrategy = FluorescenceStrategy
-
