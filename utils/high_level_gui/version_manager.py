@@ -103,13 +103,42 @@ class _CheckWorker(QThread):
             self.done.emit(exc)
 
 
+class _OverviewWorker(QThread):
+    """Refresh channel availability in the background. Fetch only.
+
+    Deliberately NOT `_CheckWorker`: that also runs `check_for_update`, whose
+    result drives the "Update available -- restart now?" prompt. This worker
+    runs unprompted when the dialog opens, so it must not be able to raise a
+    modal asking the user to quit.
+    """
+
+    done = pyqtSignal(object)
+
+    def __init__(self, updater, repo_root, parent=None):
+        super().__init__(parent)
+        self._u = updater
+        self._root = repo_root
+
+    def run(self):  # noqa: D401
+        try:
+            self.done.emit(self._u.channel_overview(self._root, limit=15,
+                                                    fetch=True))
+        except Exception as exc:  # pragma: no cover - defensive
+            self.done.emit(exc)
+
+
 class VersionDialog(QDialog):
     def __init__(self, updater, repo_root, parent=None):
         super().__init__(parent)
         self._u = updater
         self._root = repo_root
         self._worker = None
-        # Local refs only: opening the dialog must not wait on the network.
+        self._ov_worker = None
+        # Local refs only: opening the dialog must not wait on the network. The
+        # result can be WRONG about availability, though -- a channel created
+        # after this install was cloned has no origin/<branch> ref yet, so it
+        # reads as unavailable -- so `_start_overview_refresh` corrects it in the
+        # background once the window is up.
         self._overview = updater.channel_overview(repo_root, limit=15, fetch=False)
 
         self.setWindowTitle("HIBACHI versions")
@@ -158,6 +187,17 @@ class VersionDialog(QDialog):
         chan_row.addStretch(1)
         root.addLayout(chan_row)
 
+        # Reason an option is greyed out, stated where it can be READ. It used
+        # to live only in the radio's tooltip, plus a note in the list area that
+        # `_populate` writes when a channel is selected -- which a user can
+        # never see for a disabled radio, because a disabled radio cannot be
+        # selected. So a channel appeared broken with the explanation
+        # unreachable.
+        self._chan_note = QLabel("")
+        self._chan_note.setStyleSheet(_MUTED)
+        self._chan_note.setWordWrap(True)
+        root.addWidget(self._chan_note)
+
         self._note = QLabel("")
         self._note.setStyleSheet(_MUTED)
         self._note.setWordWrap(True)
@@ -183,6 +223,7 @@ class VersionDialog(QDialog):
         root.addLayout(footer)
 
         self._apply_overview()
+        self._start_overview_refresh()
 
     # ---------------------------------------------------------------- state #
     def _channel_order(self):
@@ -207,17 +248,34 @@ class VersionDialog(QDialog):
         self._title.setText("&nbsp;·&nbsp;".join(bits))
 
     def _apply_overview(self):
-        """Re-sync the radios and the list to `self._overview`."""
+        """Re-sync the radios and the list to `self._overview`.
+
+        Called both on open and after a background refresh, so it must not
+        stomp a choice the user has already made: the selection is preserved
+        when it is still available, and only falls back to the tracked channel
+        otherwise. Forcing `current` unconditionally would have snapped the
+        radio back to Stable the moment the refresh landed, which is precisely
+        when the user is reaching for Development.
+        """
         chans = self._overview.get("channels") or {}
         current = self._current_channel()
+
+        unavailable = []
         for name, rb in self._radios.items():
             entry = chans.get(name) or {}
-            rb.setEnabled(bool(entry.get("available")))
-            if not entry.get("available"):
-                rb.setToolTip(f"Unavailable: {entry.get('reason', 'unknown')}")
-            else:
-                rb.setToolTip("")
-        rb = self._radios.get(current)
+            ok = bool(entry.get("available"))
+            rb.setEnabled(ok)
+            rb.setToolTip("" if ok else
+                          f"Unavailable: {entry.get('reason', 'unknown')}")
+            if not ok:
+                unavailable.append(
+                    f"{_CHANNEL_LABELS.get(name, name)} is unavailable "
+                    f"({entry.get('reason', 'unknown')})")
+        self._chan_note.setText("; ".join(unavailable))
+
+        selected = self._selected_channel()
+        keep = selected if (chans.get(selected) or {}).get("available") else current
+        rb = self._radios.get(keep)
         if rb is not None:
             rb.blockSignals(True)
             rb.setChecked(True)
@@ -245,6 +303,9 @@ class VersionDialog(QDialog):
         head = self._overview.get("head") or ""
 
         if not entry.get("available"):
+            # Reachable only for a channel that WAS available when the radio
+            # was clicked and has since gone away; the usual case is covered by
+            # `_chan_note`, which renders next to the disabled radio itself.
             self._note.setText(
                 f"The {_CHANNEL_LABELS.get(name, name)} channel is not "
                 f"available: {entry.get('reason', 'unknown')}. "
@@ -285,6 +346,58 @@ class VersionDialog(QDialog):
             if here and pinned:
                 select = it
         self.list.setCurrentItem(select)
+
+    # -------------------------------------------------------- availability #
+    def _start_overview_refresh(self):
+        """Fetch each channel's ref in the background and re-judge availability.
+
+        Runs unprompted on open, because the alternative is what shipped: a
+        channel that exists on the server sits greyed out until the user happens
+        to press "Check for updates". Nothing told them to -- the text that says
+        so is in the list area, which only renders for a SELECTED channel, and a
+        disabled radio cannot be selected. An install predating a new channel
+        could therefore never reach that channel from this dialog at all.
+
+        Cheap (two ref fetches), off the UI thread, and side-effect free: it
+        cannot prompt, and it never moves HEAD.
+        """
+        missing = [n for n, e in (self._overview.get("channels") or {}).items()
+                   if not e.get("available")]
+        if not missing:
+            return          # nothing to correct; don't touch the network
+        self._chan_note.setText("Checking which channels are available…")
+        self._ov_worker = _OverviewWorker(self._u, self._root, self)
+        self._ov_worker.done.connect(self._on_overview_refresh)
+        self._ov_worker.start()
+
+    def _on_overview_refresh(self, payload):
+        # This handler can arrive after the dialog is gone: the refresh starts
+        # automatically on open, so "open it and close it again" now races a
+        # fetch that may take up to the fetch timeout. Touching a destroyed Qt
+        # widget raises RuntimeError from the sip wrapper, so every UI update
+        # below is guarded rather than assumed to be safe.
+        try:
+            self._apply_refresh(payload)
+        except RuntimeError:
+            pass    # dialog closed while the fetch was in flight; nothing to update
+
+    def _apply_refresh(self, payload):
+        if isinstance(payload, Exception):
+            # Keep the local verdict; say why it could not be improved.
+            self._chan_note.setText(
+                f"Could not reach the update server to check for other "
+                f"channels: {payload}")
+            return
+        was = {n for n, e in (self._overview.get("channels") or {}).items()
+               if e.get("available")}
+        self._overview = payload
+        self._apply_overview()
+        now = {n for n, e in (self._overview.get("channels") or {}).items()
+               if e.get("available")}
+        gained = sorted(now - was)
+        if gained:
+            names = ", ".join(_CHANNEL_LABELS.get(n, n) for n in gained)
+            self.check_status.setText(f"{names} channel is now available.")
 
     # ------------------------------------------------------------- checking #
     def _check(self):
