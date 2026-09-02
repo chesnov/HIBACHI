@@ -21,8 +21,10 @@ import napari  # type: ignore
 
 # --- Relative Imports ---
 try:
-    from ..module_3d._3D_strategy import FluorescenceStrategy
-    from ..module_2d._2D_strategy import Fluorescence2DStrategy
+    from ..fluorescence_module.fluorescence_strategy import FluorescenceStrategy
+    from ..fluorescence_module.config_migration import (
+        UNIFIED_MODE, config_basename, find_config_path, find_processed_dir,
+        normalise_mode)
     from .processing_strategies import ProcessingStrategy
     from .helper_funcs import create_parameter_widget
 except ImportError as e:
@@ -54,24 +56,36 @@ except Exception:  # pragma: no cover
 #: mode string -> strategy class. The one place this mapping is defined; both
 #: DynamicGUIManager and the pre-viewer validation in app_launch read it.
 STRATEGY_CLASSES: Dict[str, Any] = {
-    'fluorescence': FluorescenceStrategy,
-    'fluorescence_2d': Fluorescence2DStrategy,
+    UNIFIED_MODE: FluorescenceStrategy,
 }
 
 SUPPORTED_MODES: Tuple[str, ...] = tuple(STRATEGY_CLASSES)
 
 #: Modes that earlier versions wrote into configs and this build no longer has.
-#: Named explicitly so the user gets "this was removed, here's the fix" instead
-#: of a bare "Unsupported mode", which says nothing actionable.
+#: Both former ramified modes are the fluorescence pipeline under an old name,
+#: so both point at the single surviving mode.
 RETIRED_MODES: Dict[str, str] = {
-    'ramified': 'fluorescence',
-    'ramified_2d': 'fluorescence_2d',
+    'ramified': UNIFIED_MODE,
+    'ramified_2d': UNIFIED_MODE,
 }
+
+
+def strategy_for(mode: Any):
+    """
+    Strategy class for `mode`, or None if this build cannot open it.
+
+    Every lookup goes through `normalise_mode` because saved projects still
+    carry 'fluorescence_2d' (and older ones 'ramified'), and the registry now
+    has one entry. Looking up the raw string would return None for those
+    projects and report them as unsupported -- the strategy is the same class
+    either way, since rank comes from the data.
+    """
+    return STRATEGY_CLASSES.get(normalise_mode(mode))
 
 
 def is_supported_mode(mode: Any) -> bool:
     """True if this build can open a config with this mode."""
-    return str(mode) in STRATEGY_CLASSES
+    return strategy_for(mode) is not None
 
 
 def unsupported_mode_message(mode: Any, folder: str = "") -> str:
@@ -341,9 +355,13 @@ class DynamicGUIManager(QObject):
         self.inputdir = os.path.dirname(self.file_loc)
         basename = os.path.basename(self.file_loc)
         self.basename = os.path.splitext(basename)[0]
-        self.processed_dir = os.path.join(
-            self.inputdir, f"{self.basename}_processed_{self.processing_mode}"
-        )
+        # Prefers `<basename>_processed_fluorescence`, but uses an existing
+        # legacy directory when one is there: a project processed before the
+        # modes merged has its results under `..._fluorescence_2d`, and building
+        # only the new name would orphan them.
+        self.processed_dir = find_processed_dir(
+            self.inputdir, self.basename,
+            log=lambda m: print(m))
 
         # Spacing
         self.spacing: Union[Tuple[float, float, float], Tuple[float, float]] = (1.0, 1.0, 1.0)
@@ -352,7 +370,7 @@ class DynamicGUIManager(QObject):
 
         # Initialize Strategy
         try:
-            strategy_class = STRATEGY_CLASSES.get(self.processing_mode)
+            strategy_class = strategy_for(self.processing_mode)
 
             if not strategy_class:
                 # Callers should validate with is_supported_mode() *before*
@@ -411,7 +429,7 @@ class DynamicGUIManager(QObject):
 
     def _get_strategy_class(self):
         """Returns the strategy class for the current processing mode."""
-        return STRATEGY_CLASSES.get(self.processing_mode)
+        return strategy_for(self.processing_mode)
 
     def _rebuild_strategy(self) -> None:
         """
@@ -591,8 +609,10 @@ class DynamicGUIManager(QObject):
                     QApplication.restoreOverrideCursor()
 
             # Load persisted ROI config, or rebuild it fresh
-            roi_cfg_path = os.path.join(
-                roi_dir, f"processing_config_{self.processing_mode}.yaml"
+            # A legacy ROI keeps its own filename; anything new is written
+            # under the unified one.
+            roi_cfg_path = find_config_path(roi_dir) or os.path.join(
+                roi_dir, config_basename()
             )
             if os.path.exists(roi_cfg_path):
                 with open(roi_cfg_path, 'r') as fh:
@@ -1023,8 +1043,7 @@ class DynamicGUIManager(QObject):
         )
         roi_config = self._build_roi_config(
             y0, x0, y1, x1, self._full_config, z0=z0_crop, z1=z1_crop)
-        with open(os.path.join(
-                roi_dir, f"processing_config_{self.processing_mode}.yaml"), 'w') as fh:
+        with open(os.path.join(roi_dir, config_basename()), 'w') as fh:
             yaml.safe_dump(roi_config, fh, default_flow_style=False,
                            sort_keys=False)
         return roi_name, roi_dir, crop_mm, roi_config
@@ -1434,7 +1453,11 @@ class DynamicGUIManager(QObject):
         """Parses spacing from config or defaults to 1.0."""
         from .metadata import require_dimensions
 
-        is_2d_mode = self.processing_mode.endswith("_2d")
+        # Rank comes from the loaded image, not from the mode string, which is
+        # the same for every project now. Passing it also lets
+        # require_dimensions reject a config whose block disagrees with the
+        # image -- the protection the old mode-based key choice provided.
+        ndim = len(self.image_stack.shape)
         # No fallback. Defaulting a TOTAL extent to 1.0 made a whole 2916 px axis
         # one micron across, which silently rescaled every physical parameter --
         # a 0.7 um smoothing sigma became a 2084 px blur. An unset extent stops
@@ -1442,10 +1465,10 @@ class DynamicGUIManager(QObject):
         label = (self.active_roi_name
                  or os.path.basename(os.path.dirname(self.processed_dir))
                  or "this image")
-        dim = require_dimensions(self.config, self.processing_mode, source=label)
+        dim = require_dimensions(self.config, source=label, ndim=ndim)
         tx = dim['x']
         ty = dim['y']
-        tz = 1.0 if is_2d_mode else dim['z']
+        tz = dim['z'] if 'z' in dim else 1.0
 
         shape = self.image_stack.shape
         

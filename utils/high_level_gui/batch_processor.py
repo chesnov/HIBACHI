@@ -10,8 +10,9 @@ import tifffile as tiff  # type: ignore
 
 # Corrected relative imports
 try:
-    from ..module_3d._3D_strategy import FluorescenceStrategy
-    from ..module_2d._2D_strategy import Fluorescence2DStrategy
+    from ..fluorescence_module.fluorescence_strategy import FluorescenceStrategy
+    from ..fluorescence_module.config_migration import (
+        UNIFIED_MODE, find_processed_dir, normalise_mode)
     from .processing_strategies import ProcessingStrategy
 except ImportError as e:
     print(f"Error importing modules in batch_processor.py: {e}")
@@ -39,8 +40,7 @@ class BatchProcessor:
         """
         self.project_manager = project_manager
         self.supported_strategies = {
-            "fluorescence": FluorescenceStrategy,
-            "fluorescence_2d": Fluorescence2DStrategy,
+            UNIFIED_MODE: FluorescenceStrategy,
         }
         print(f"BatchProcessor initialized. Supported modes: {list(self.supported_strategies.keys())}")
 
@@ -64,19 +64,21 @@ class BatchProcessor:
         """
         from .metadata import require_dimensions
 
-        mode = config.get('mode', '')
-        is_2d_mode = str(mode).endswith("_2d")
+        num_dims = len(image_shape)
 
         # No fallback: raises MissingDimensionsError rather than defaulting a TOTAL
         # extent to 1.0. That default made a whole 2916 px axis one micron across,
         # which turned a 0.7 um smoothing sigma into a 2084 px blur and would have
         # made every measurement wrong by the same factor.
-        dimensions = require_dimensions(config, mode, source=label or "this image")
+        #
+        # Rank comes from the image, not the mode string: the mode is the same
+        # for every project now. Passing it also lets require_dimensions reject
+        # a config whose block disagrees with the image.
+        dimensions = require_dimensions(config, source=label or "this image",
+                                        ndim=num_dims)
         total_x_um = dimensions['x']
         total_y_um = dimensions['y']
-        total_z_um = 1.0 if is_2d_mode else dimensions['z']
-
-        num_dims = len(image_shape)
+        total_z_um = dimensions['z'] if 'z' in dimensions else 1.0
         spacing_val: Tuple[float, ...] = (1.0, 1.0, 1.0)
         z_scale_factor_val = 1.0
 
@@ -154,8 +156,8 @@ class BatchProcessor:
             with open(os.path.join(folder_path, details['yaml_file']), 'r') as fh:
                 config_params = yaml.safe_load(fh) or {}
             basename = os.path.splitext(details['tif_file'])[0]
-            processed_dir = os.path.join(folder_path,
-                                        f"{basename}_processed_{mode}")
+            processed_dir = find_processed_dir(folder_path, basename,
+                                               log=lambda m: print(m))
             if load_pixels:
                 image = tiff.memmap(tif_path, mode='r')
                 image_shape = image.shape
@@ -216,7 +218,7 @@ class BatchProcessor:
             mode: str = target['mode']
             result['mode'] = mode
 
-            StrategyClass = self.supported_strategies.get(mode)
+            StrategyClass = self.supported_strategies.get(normalise_mode(mode))
             if not StrategyClass:
                 result['status'] = 'unsupported'
                 return result
@@ -476,14 +478,12 @@ class BatchProcessor:
                 method_name = step_def['method']
                 step_num = step_idx + 1
 
-                # Handle 2D method naming convention if needed
+                # No rank suffix to resolve any more: there is one strategy
+                # with one method per step, and rank comes from the data. The
+                # old lookup for a `<method>_2d` variant would now never fire
+                # (mode_name is never rank-suffixed), so it is gone rather than
+                # left as dead code that looks load-bearing.
                 actual_method = method_name
-                if strategy_instance.mode_name.endswith("_2d") and not method_name.endswith("_2d"):
-                    # Check if the 2D strategy actually uses suffix or not.
-                    # Based on refactor, names in get_step_definitions match method names directly.
-                    # So strict mapping is preferred.
-                    if hasattr(strategy_instance, f"{method_name}_2d"):
-                        actual_method = f"{method_name}_2d"
 
                 print(f"  [Exec] Step {step_num}/{num_total_steps}: {method_name}...")
                 if progress_callback is not None:
@@ -620,7 +620,7 @@ class BatchProcessor:
             print(f"\nProcessing {i+1}/{total}: {name}")
             mode = self._leaf_mode(fp)
 
-            if mode not in self.supported_strategies:
+            if normalise_mode(mode) not in self.supported_strategies:
                 reason = "unsupported mode" if mode != 'error' else "invalid folder"
                 print(f"  [Skip] {name} — {reason} ({mode}).")
                 skipped += 1
@@ -747,7 +747,7 @@ class BatchProcessor:
 
             mode = self._leaf_mode(fp)
 
-            if mode not in self.supported_strategies:
+            if normalise_mode(mode) not in self.supported_strategies:
                 if mode != 'error':
                     print(f"  [Skip] {self._leaf_label(fp)} — unsupported mode: {mode}")
                 else:
