@@ -33,9 +33,12 @@ A config already carrying the keys is left alone.
 """
 
 import copy
-from typing import Any, Dict
+import os
+from typing import Any, Dict, Optional
 
-__all__ = ["normalise_config", "LEGACY_MODES", "UNIFIED_MODE"]
+__all__ = ["normalise_config", "normalise_mode", "LEGACY_MODES", "UNIFIED_MODE",
+           "processed_dir_name", "find_processed_dir",
+           "config_basename", "find_config_path"]
 
 UNIFIED_MODE = "fluorescence"
 LEGACY_MODES = ("fluorescence_2d",)
@@ -46,8 +49,95 @@ LEGACY_MODES = ("fluorescence_2d",)
 _LEGACY_SMOOTH_SIGMA = {"fluorescence": 1.3, "fluorescence_2d": 0.1}
 _LEGACY_CONNECT_GAP = {"fluorescence": 1.0, "fluorescence_2d": 0.0}
 
+#: Modes earlier versions wrote that are the same pipeline under another name.
+_RETIRED_MODES = ("ramified", "ramified_2d")
+
 _SIZE_ALIASES = ("min_size_voxels", "min_size_pixels")
 _DIM_ALIASES = ("voxel_dimensions", "pixel_dimensions")
+
+
+# --------------------------------------------------------------------------- #
+# Mode strings
+# --------------------------------------------------------------------------- #
+def normalise_mode(mode: Any) -> str:
+    """
+    The unified mode for any historical mode string.
+
+    Anything this build recognises as the fluorescence pipeline -- including the
+    retired `ramified` names -- maps to `UNIFIED_MODE`. Anything else is
+    returned unchanged, so an unknown mode still fails a registry lookup rather
+    than being silently accepted as fluorescence.
+    """
+    text = str(mode or "")
+    if text in (UNIFIED_MODE,) + LEGACY_MODES or text in _RETIRED_MODES:
+        return UNIFIED_MODE
+    return text
+
+
+# --------------------------------------------------------------------------- #
+# On-disk names
+# --------------------------------------------------------------------------- #
+# The mode string is embedded in the results directory (`<basename>_processed_
+# <mode>`) and the run config filename (`processing_config_<mode>.yaml`). Those
+# names exist on users' disks, so collapsing the mode cannot simply change them:
+# a project processed as `fluorescence_2d` would have its results orphaned --
+# still on disk, but invisible, and the project would report as unprocessed.
+#
+# So these resolvers prefer the unified name and fall back to a legacy one that
+# actually exists. New work gets clean names; old projects keep opening; nothing
+# is renamed or moved. The same shape as `metadata.find_dimensions`, on purpose.
+def processed_dir_name(basename: str, mode: Any = UNIFIED_MODE) -> str:
+    """The results directory name for `basename` under `mode`."""
+    return f"{basename}_processed_{normalise_mode(mode)}"
+
+
+def find_processed_dir(parent: str, basename: str, log=None) -> str:
+    """
+    Absolute results directory for `basename` in `parent`.
+
+    Returns the unified path when it exists, otherwise an existing legacy path,
+    otherwise the unified path (so callers creating a new one get the clean
+    name). A fallback is logged when `log` is given: silently reading a legacy
+    directory is fine, but it should be visible that it happened.
+    """
+    unified = os.path.join(parent, processed_dir_name(basename))
+    if os.path.isdir(unified):
+        return unified
+    for legacy_mode in LEGACY_MODES + _RETIRED_MODES:
+        candidate = os.path.join(parent,
+                                 f"{basename}_processed_{legacy_mode}")
+        if os.path.isdir(candidate):
+            if log:
+                log(f"  [ConfigMigration] using legacy results directory "
+                    f"{os.path.basename(candidate)} (not renamed)")
+            return candidate
+    return unified
+
+
+def config_basename(mode: Any = UNIFIED_MODE) -> str:
+    """The run-config filename for `mode`."""
+    return f"processing_config_{normalise_mode(mode)}.yaml"
+
+
+def find_config_path(directory: str, log=None) -> Optional[str]:
+    """
+    Absolute run-config path inside `directory`, or None if there is none.
+
+    Unified name first, then legacy. Returns None rather than a non-existent
+    path so callers can tell "no config here" from "config to be created".
+    """
+    unified = os.path.join(directory, config_basename())
+    if os.path.isfile(unified):
+        return unified
+    for legacy_mode in LEGACY_MODES + _RETIRED_MODES:
+        candidate = os.path.join(directory,
+                                 f"processing_config_{legacy_mode}.yaml")
+        if os.path.isfile(candidate):
+            if log:
+                log(f"  [ConfigMigration] using legacy run config "
+                    f"{os.path.basename(candidate)} (not renamed)")
+            return candidate
+    return None
 
 
 def normalise_config(config: Dict[str, Any], log=print) -> Dict[str, Any]:
