@@ -2220,17 +2220,45 @@ class DynamicGUIManager(QObject):
 
     # --- Widget Creation ---
 
-    def _param_applies(self, pconf: Any) -> bool:
+    def _reference_config(self) -> Dict[str, Any]:
+        """The built-in reference config, loaded once per session.
+
+        Cached because `_param_applies` is called for every parameter of every
+        step and this reads a file from disk.
+        """
+        if getattr(self, "_ref_cache", None) is None:
+            try:
+                from .config_library import MODE, builtin_reference
+                self._ref_cache = builtin_reference(MODE) or {}
+            except Exception as exc:
+                print(f"[gui] reference config unavailable: {exc}")
+                self._ref_cache = {}
+        return self._ref_cache
+
+    def _param_applies(self, config_key: str, pname: str, pconf: Any) -> bool:
         """Whether a parameter is meaningful at this image's rank.
 
         Rank comes from the ARRAY, not the config's mode or dimension block:
-        the array is what the step will actually be handed. A parameter with no
-        `ndim` key applies at every rank, so annotating is opt-in and an
-        un-annotated config behaves exactly as before.
+        the array is what the step will actually be handed.
+
+        The `ndim` annotation is looked up in the PROJECT's config first and
+        then in the built-in reference. The reference matters because that is
+        where the annotation lives: a saved project's config was written before
+        `ndim` existed, so consulting only `pconf` meant every existing project
+        still showed the control -- the annotation was on disk with nothing able
+        to see it. Definitions belong to the reference and values to the
+        project, and this is the one piece of definition read at render time.
+
+        A parameter annotated in neither applies at every rank, so this stays
+        opt-in and an un-annotated parameter behaves exactly as before.
         """
-        if not isinstance(pconf, dict):
-            return True
-        want = pconf.get("ndim")
+        want = pconf.get("ndim") if isinstance(pconf, dict) else None
+        if want is None:
+            ref = self._reference_config()
+            ref_block = (ref.get(config_key) or {}).get("parameters") or {}
+            ref_pconf = ref_block.get(pname)
+            if isinstance(ref_pconf, dict):
+                want = ref_pconf.get("ndim")
         if want is None:
             return True
         try:
@@ -2298,7 +2326,7 @@ class DynamicGUIManager(QObject):
                 # values, and convention 7 keeps rank-varying settings in the
                 # YAML where they are visible) but showing them invites tuning a
                 # control that cannot affect the result.
-                if not self._param_applies(pconf):
+                if not self._param_applies(config_key, pname, pconf):
                     continue
 
                 try:
