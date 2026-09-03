@@ -309,6 +309,14 @@ class DynamicGUIManager(QObject):
     ):
         super().__init__()
         self.viewer = viewer
+        # Migrated once, here, before anything reads it. The widgets are built
+        # from `self.config` by step key, and a saved project still carries
+        # `execute_<step>_fluorescence_2d`; `get_config_key` looks for the
+        # unified-suffixed then the bare spelling and finds neither, so the
+        # step rendered with NO parameter fields and could not be edited or
+        # re-processed. `initial_config` is migrated too, or the dirty check
+        # would compare two different schemas and read as permanently dirty.
+        config = self._migrate_config(config)
         self.initial_config = config.copy()
         self.config = config.copy()
         self.image_stack = image_stack
@@ -1293,7 +1301,9 @@ class DynamicGUIManager(QObject):
         self.active_roi_name = roi_name
         self.image_stack = cropped_image
         self.processed_dir = roi_processed_dir
-        self.config = roi_config
+        # Same migration as the full-image path: a region config saved before
+        # the modes merged carries the legacy step keys too.
+        self.config = self._migrate_config(roi_config)
         self.initial_config = copy.deepcopy(roi_config)
 
         self._rebuild_strategy()
@@ -1857,6 +1867,22 @@ class DynamicGUIManager(QObject):
 
         self.current_step["value"] -= 1
         self.create_step_widgets(self.processing_steps[self.current_step["value"]])
+
+    @staticmethod
+    def _migrate_config(config: Dict[str, Any]) -> Dict[str, Any]:
+        """Bring a config to the current schema, reporting what changed.
+
+        Logged (unlike the silent migration inside ProcessingStrategy) because
+        this runs once per opened image, so the report is useful rather than
+        noise -- and because a user who opens an old project should be able to
+        see in the log that its keys were translated.
+        """
+        try:
+            from ..fluorescence_module.config_migration import normalise_config
+            return normalise_config(config)
+        except Exception as exc:
+            print(f"[gui] config migration unavailable: {exc}")
+            return config
 
     def _ensure_config_canonical(self, step_index: int) -> bool:
         """Make the config match the current pipeline before (re)processing.

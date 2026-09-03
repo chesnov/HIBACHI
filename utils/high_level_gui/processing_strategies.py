@@ -115,7 +115,23 @@ class ProcessingStrategy(abc.ABC):
             spacing: Voxel/Pixel spacing (e.g., (1.0, 0.5, 0.5)).
             scale_factor: Z-scale factor for 3D visualization (anisotropy).
         """
-        self.config = config
+        # Migrated on the way in, so every strategy sees one schema regardless
+        # of how old the config on disk is. This is the choke point: a config
+        # reaches the pipeline only through here, and `get_config_key` matches
+        # step keys by name -- a legacy config still carrying
+        # `execute_raw_segmentation_fluorescence_2d` matched neither the
+        # unified-suffixed nor the bare spelling, so the step had no parameters
+        # at all. Silent because status probes construct a strategy per folder
+        # and would otherwise print a migration report for each one; the GUI
+        # logs it once when it loads.
+        try:
+            from ..fluorescence_module.config_migration import normalise_config
+            self.config = normalise_config(config, log=lambda _m: None)
+        except Exception as exc:
+            # Never block on migration: an unmigrated config is what we had
+            # before, so fall back to it rather than refusing to open.
+            print(f"[strategy] config migration unavailable: {exc}")
+            self.config = config
         self.processed_dir = processed_dir
         os.makedirs(self.processed_dir, exist_ok=True)
         self.temp_dir = os.path.join(self.processed_dir, "temp_artifacts")
