@@ -276,6 +276,72 @@ class ProcessingStrategy(abc.ABC):
               f"{n} object(s) -> {os.path.basename(path)}")
         return path
 
+    # ---------------------------------------------------------------- #
+    # Artifact naming
+    # ---------------------------------------------------------------- #
+    # Every checkpoint filename used to be built from `mode_name`, which was
+    # the third family of on-disk names carrying the mode string -- after
+    # `<basename>_processed_<mode>` and `processing_config_<mode>.yaml`, and
+    # unlike those two it was never given a legacy fallback. Collapsing the
+    # mode therefore made a legacy 2D project's artifacts invisible: they are
+    # all `*_fluorescence_2d.*`, the strategy looked for `*_fluorescence.*`,
+    # `get_last_completed_step` found nothing, and the project read as
+    # unprocessed while its results sat right there. Re-running then wrote a
+    # second, parallel set alongside the first, and `cleanup_step_artifacts`
+    # deleted neither -- so an edit silently left the old results in place.
+    #
+    # So an artifact is identified by a PATTERN rather than a name. Discovery
+    # matches whatever suffix is on disk, so legacy projects open and view;
+    # deletion removes every match, so an edit is destructive regardless of
+    # how the file was named. Nothing anywhere needs to know which mode
+    # strings ever existed.
+    #
+    # Patterns are explicit per artifact, not derived from the canonical name:
+    # `edge_mask` carries the mode as a PREFIX (`fluorescence_2d_edge_mask.dat`),
+    # so a stem-plus-suffix rule would have missed exactly one of the twelve.
+
+    def _artifact(self, canonical: str, pattern: str) -> str:
+        """Path to read/write an artifact: an existing match, else `canonical`.
+
+        Prefers `canonical` (this build's name) when it exists, then any file
+        matching `pattern`, then `canonical` so a fresh write gets the clean
+        name. Mirrors `config_migration.find_processed_dir`: read what is
+        there, write what is current, rename nothing.
+        """
+        exact = os.path.join(self.processed_dir, canonical)
+        if os.path.exists(exact):
+            return exact
+        found = self._artifact_matches(pattern)
+        return found[0] if found else exact
+
+    def _artifact_matches(self, pattern: str) -> List[str]:
+        """Every file in `processed_dir` matching `pattern`, sorted."""
+        import fnmatch
+        try:
+            names = sorted(os.listdir(self.processed_dir))
+        except OSError:
+            return []
+        return [os.path.join(self.processed_dir, n) for n in names
+                if fnmatch.fnmatch(n, pattern)]
+
+    def _purge_artifacts(self, *patterns: str) -> int:
+        """Delete EVERY file matching any pattern. Returns the count removed.
+
+        Used by `cleanup_step_artifacts`: an edit has to invalidate a legacy
+        project's results too, and those do not carry this build's names.
+        """
+        removed = 0
+        for pattern in patterns:
+            for path in self._artifact_matches(pattern):
+                try:
+                    os.remove(path)
+                    removed += 1
+                    print(f"  Removed {os.path.basename(path)}")
+                except OSError as exc:
+                    print(f"  Warning: could not remove "
+                          f"{os.path.basename(path)}: {exc}")
+        return removed
+
     @abc.abstractmethod
     def _get_mode_name(self) -> str:
         """
@@ -332,12 +398,16 @@ class ProcessingStrategy(abc.ABC):
             Dict[str, str]: Map of artifact keys to file paths.
         """
         return {
-            "config": os.path.join(
-                self.processed_dir, f"processing_config_{self.mode_name}.yaml"
-            ),
-            "metrics_df": os.path.join(
-                self.processed_dir, f"metrics_df_{self.mode_name}.csv"
-            ),
+            # Resolved, not derived: a legacy run's config is
+            # `processing_config_fluorescence_2d.yaml`, and deriving the unified
+            # name meant the tuned parameters and the saved segmentation
+            # threshold were both invisible -- the run read as having no config
+            # at all, and a second config file was written beside the first.
+            "config": self._artifact(
+                f"processing_config_{self.mode_name}.yaml",
+                "processing_config*.yaml"),
+            "metrics_df": self._artifact(
+                f"metrics_df_{self.mode_name}.csv", "metrics_df*.csv"),
         }
 
     def get_last_completed_step(self) -> int:

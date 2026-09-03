@@ -140,6 +140,49 @@ class FluorescenceStrategy(ProcessingStrategy):
             }
         ]
 
+    #: (key, canonical name, glob) for every artifact this strategy writes.
+    #: One table, read by BOTH `get_checkpoint_files` (which resolves to the
+    #: file that exists) and `cleanup_step_artifacts` (which deletes every
+    #: match), so discovery and invalidation can never disagree about what an
+    #: artifact is called -- the failure that let a legacy project be re-run
+    #: without its old results being removed.
+    #:
+    #: `{p}` is the mode name. `edge_mask` is the one artifact carrying it as a
+    #: PREFIX, which is why the globs are written out rather than derived.
+    ARTIFACT_PATTERNS = (
+        ("raw_segmentation", "raw_segmentation_{p}.dat", "raw_segmentation*.dat"),
+        ("edge_mask", "{p}_edge_mask.dat", "*edge_mask.dat"),
+        ("trimmed_segmentation", "trimmed_segmentation_{p}.dat",
+         "trimmed_segmentation*.dat"),
+        ("cell_bodies", "cell_bodies.dat", "cell_bodies*.dat"),
+        ("final_segmentation", "final_segmentation_{p}.dat",
+         "final_segmentation*.dat"),
+        ("skeleton_array", "skeleton_array_{p}.dat", "skeleton_array*.dat"),
+        ("distances_matrix", "distances_matrix_{p}.csv", "distances_matrix*.csv"),
+        ("points_matrix", "points_matrix_{p}.csv", "points_matrix*.csv"),
+        ("branch_data", "branch_data_{p}.csv", "branch_data*.csv"),
+        ("metrics_fcs", "metrics_{p}.fcs", "metrics*.fcs"),
+    )
+
+    #: Which artifacts each 1-based step owns, for invalidation.
+    STEP_ARTIFACTS = {
+        1: ("raw_segmentation",),
+        2: ("trimmed_segmentation", "edge_mask"),
+        3: ("cell_bodies",),
+        4: ("final_segmentation",),
+        5: ("skeleton_array", "metrics_df", "branch_data",
+            "distances_matrix", "points_matrix", "metrics_fcs"),
+    }
+
+    #: Layers each step adds, removed alongside its files.
+    STEP_LAYERS = {
+        1: ("Raw Intermediate Segmentation",),
+        2: ("Trimmed Intermediate Segmentation", "Edge Mask"),
+        3: ("Cell bodies",),
+        4: ("Final segmentation",),
+        5: ("Skeletons", "Neighbor Connections"),
+    }
+
     def get_checkpoint_files(self) -> Dict[str, str]:
         """
         Defines file paths for all intermediate and final outputs.
@@ -149,38 +192,12 @@ class FluorescenceStrategy(ProcessingStrategy):
         """
         files = super().get_checkpoint_files()
         p = self.mode_name
-        files.update({
-            "raw_segmentation": os.path.join(
-                self.processed_dir, f"raw_segmentation_{p}.dat"
-            ),
-            "edge_mask": os.path.join(
-                self.processed_dir, f"{p}_edge_mask.dat"
-            ),
-            "trimmed_segmentation": os.path.join(
-                self.processed_dir, f"trimmed_segmentation_{p}.dat"
-            ),
-            "cell_bodies": os.path.join(
-                self.processed_dir, "cell_bodies.dat"
-            ),
-            "final_segmentation": os.path.join(
-                self.processed_dir, f"final_segmentation_{p}.dat"
-            ),
-            "skeleton_array": os.path.join(
-                self.processed_dir, f"skeleton_array_{p}.dat"
-            ),
-            "distances_matrix": os.path.join(
-                self.processed_dir, f"distances_matrix_{p}.csv"
-            ),
-            "points_matrix": os.path.join(
-                self.processed_dir, f"points_matrix_{p}.csv"
-            ),
-            "branch_data": os.path.join(
-                self.processed_dir, f"branch_data_{p}.csv"
-            ),
-            "metrics_fcs": os.path.join(
-                self.processed_dir, f"metrics_{p}.fcs"
-            ),
-        })
+        # (canonical name for a fresh write, glob matching any historical name).
+        # See `ProcessingStrategy._artifact`: a legacy 2D run's files are all
+        # `*_fluorescence_2d.*`, so an exact name built from the collapsed mode
+        # found none of them and the run read as unprocessed.
+        for key, canonical, pattern in self.ARTIFACT_PATTERNS:
+            files[key] = self._artifact(canonical.format(p=p), pattern)
         return files
 
     def _close_memmap(self, memmap_obj: Any):
@@ -808,29 +825,24 @@ class FluorescenceStrategy(ProcessingStrategy):
 
     def cleanup_step_artifacts(self, viewer, step_number: int):
         """
-        Removes temporary files and layers for a specific step to allow restart.
+        Removes files and layers for one step, so it can be re-run.
+
+        Deletes EVERY file matching each artifact's glob, not one exact name.
+        An edit has to invalidate a legacy project's results too, and those are
+        named `*_fluorescence_2d.*`: deleting only this build's names left the
+        real results on disk while reporting success, so the folder kept showing
+        data the current parameters never produced. `metrics_df`'s pattern comes
+        from the base class, the rest from ARTIFACT_PATTERNS, so this can never
+        drift from what `get_checkpoint_files` looks for.
         """
-        files = self.get_checkpoint_files()
-        if step_number == 1:
-            self._remove_layer_safely(viewer, "Raw Intermediate Segmentation")
-            self._remove_file_safely(files.get("raw_segmentation"))
-        elif step_number == 2:
-            self._remove_layer_safely(viewer, "Trimmed Intermediate Segmentation")
-            self._remove_layer_safely(viewer, "Edge Mask")
-            self._remove_file_safely(files.get("trimmed_segmentation"))
-            self._remove_file_safely(files.get("edge_mask"))
-        elif step_number == 3:
-            self._remove_layer_safely(viewer, "Cell bodies")
-            self._remove_file_safely(files.get("cell_bodies"))
-        elif step_number == 4:
-            self._remove_layer_safely(viewer, "Final segmentation")
-            self._remove_file_safely(files.get("final_segmentation"))
-        elif step_number == 5:
-            self._remove_layer_safely(viewer, "Skeletons")
-            self._remove_layer_safely(viewer, "Neighbor Connections")
-            self._remove_file_safely(files.get("skeleton_array"))
-            self._remove_file_safely(files.get("metrics_df"))
-            self._remove_file_safely(files.get("branch_data"))
-            self._remove_file_safely(files.get("distances_matrix"))
-            self._remove_file_safely(files.get("points_matrix"))
-            self._remove_file_safely(files.get("metrics_fcs"))
+        for name in self.STEP_LAYERS.get(step_number, ()):
+            self._remove_layer_safely(viewer, name)
+
+        globs = dict((key, pattern)
+                     for key, _canonical, pattern in self.ARTIFACT_PATTERNS)
+        globs["metrics_df"] = "metrics_df*.csv"
+
+        patterns = [globs[key] for key in self.STEP_ARTIFACTS.get(step_number, ())
+                    if key in globs]
+        if patterns:
+            self._purge_artifacts(*patterns)
