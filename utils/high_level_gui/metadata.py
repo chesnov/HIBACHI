@@ -3,6 +3,7 @@
 
 import os
 import re
+import shutil
 import traceback
 import yaml  # type: ignore
 import numpy as np
@@ -418,6 +419,139 @@ class MetadataExtractor:
         return scales
 
     @staticmethod
+    def _stream_tiff_channel(src_path: str, dest_path: str, channel_idx: int,
+                             source_meta: Dict[str, Any],
+                             progress=None, should_cancel=None) -> None:
+        """Write one channel of a TIFF to `dest_path` a plane at a time.
+
+        Never holds the source volume. One plane is decoded at a time into a
+        single reused buffer and written sequentially, so peak usage is about
+        1.9 GB for the VS200 stacks this exists for -- (4, 13, 30402, 30527)
+        uint16, which is 96 GB as a single `imread`, which is what used to
+        happen and what used to exhaust the machine partway through decoding.
+
+        The output is uncompressed and contiguous by necessity, not by
+        preference: `app_launch` opens it with `tiff.memmap`, so a tiled or
+        compressed file would be far smaller on disk and unopenable by the
+        application that wrote it.
+
+        Raises ChannelExtractionError with a specific reason. SetupCancelled
+        propagates, so a cancelled setup is not reported as a failure.
+        """
+        from .slide_reader import SetupCancelled
+
+        info = probe_tiff_axes(src_path)
+        if not info:
+            raise ChannelExtractionError(
+                "the TIFF header could not be read, so its axes are unknown")
+        if info['reject']:
+            raise ChannelExtractionError(info['reject'])
+
+        axes, sizes = info['axes'], info['sizes']
+        n_channels = int(sizes.get('C', 1))
+        if channel_idx >= n_channels:
+            raise ChannelExtractionError(
+                f"channel {channel_idx} was requested but the image has "
+                f"{n_channels} (axes '{axes}')")
+
+        depth = int(sizes.get('Z', 1))
+        height, width = int(sizes['Y']), int(sizes['X'])
+        dtype = np.dtype(info['dtype'])
+        out_shape = (depth, height, width) if depth > 1 else (height, width)
+        out_axes = 'ZYX' if depth > 1 else 'YX'
+
+        # Refuse up front rather than halfway through. One channel of these
+        # stacks is 24 GB uncompressed from an 18 GB JPEG2000 source, and
+        # running out of room after twenty minutes of decoding is the worst
+        # possible time to find out.
+        needed = int(np.prod(out_shape)) * int(dtype.itemsize)
+        try:
+            free = shutil.disk_usage(os.path.dirname(dest_path) or '.').free
+        except OSError:
+            free = None
+        if free is not None and free < needed:
+            raise ChannelExtractionError(
+                f"this channel needs {needed / 1e9:.1f} GB uncompressed but "
+                f"only {free / 1e9:.1f} GB is free where the project is being "
+                "written")
+
+        # The page holding (channel, z) is found by raveling the series'
+        # LEADING AXES BY NAME. `page = channel_idx * depth + z` happens to be
+        # right for 'CZYX' and wrong for 'ZCYX', and guessing which one a file
+        # is was the original bug: index 0 is C here and Y in the sibling
+        # 'YXS' file from the same scanner.
+        leading = [a for a in axes if a not in 'YXS']
+        leading_shape = [int(sizes[a]) for a in leading]
+
+        res_x = MetadataExtractor._safe_resolution(source_meta.get('x'))
+        res_y = MetadataExtractor._safe_resolution(source_meta.get('y'))
+        spacing = MetadataExtractor._safe_spacing(source_meta.get('z'))
+
+        # A reused scratch plane, and the only large allocation this function
+        # makes: ~1.9 GB at 30402x30527 uint16, against 96 GB for the volume.
+        # `tifffile` consumes each yielded array before asking for the next, so
+        # one buffer serves every plane.
+        scratch = np.empty((height, width), dtype=dtype)
+
+        def planes():
+            with tiff.TiffFile(src_path) as handle:
+                series = handle.series[0]
+                for z_index in range(depth):
+                    if should_cancel is not None and should_cancel():
+                        raise SetupCancelled("setup cancelled by the user")
+                    position = {'C': channel_idx, 'Z': z_index}
+                    page_index = 0
+                    if leading:
+                        page_index = int(np.ravel_multi_index(
+                            [position[a] for a in leading], leading_shape))
+                    page = series.pages[page_index]
+                    try:
+                        page.asarray(out=scratch)
+                    except Exception:
+                        # Decoding into the scratch buffer keeps the allocation
+                        # count at one, but a reader that will not honour `out`
+                        # should still produce a correct file.
+                        scratch[:] = page.asarray()
+                    if progress is not None:
+                        progress(z_index + 1, depth)
+                    yield scratch
+
+        # Written under a temporary name and renamed on success, so a half
+        # finished file can never appear at `dest_path` -- not even if the
+        # process is killed outright, which no exception handler can cover. A
+        # partial file is worse than no file: it carries a valid header and a
+        # nonzero length, so every existence check downstream passes it and the
+        # project quietly contains a truncated image.
+        partial_path = dest_path + '.part'
+        try:
+            # Sequential buffered writes, deliberately not `tiff.memmap` and a
+            # filled array: the destination is routinely an external drive
+            # mounted through FUSE, where every page of a 24 GB mapping faults
+            # through userspace and the write takes hours. This also avoids
+            # reserving the full size up front on a filesystem without sparse
+            # files.
+            #
+            # 'axes' in the metadata is not cosmetic. Without it tifffile's
+            # ImageJ writer labels a 3D array's first axis as CHANNELS, so
+            # every stack this application has extracted so far declares 13
+            # channels on disk where it has 13 slices.
+            tiff.imwrite(
+                partial_path, planes(), shape=out_shape, dtype=dtype,
+                imagej=True, photometric='minisblack',
+                resolution=(res_x, res_y),
+                metadata={'axes': out_axes, 'unit': 'micron',
+                          'spacing': spacing},
+            )
+            os.replace(partial_path, dest_path)
+        except BaseException:
+            try:
+                if os.path.isfile(partial_path):
+                    os.remove(partial_path)
+            except OSError:
+                pass
+            raise
+
+    @staticmethod
     def extract_channel_to_tiff(src_path: str, dest_path: str, channel_idx: int,
                                 progress=None, should_cancel=None) -> bool:
         """Extracts a channel and preserves the spatial resolution tags.
@@ -476,28 +610,23 @@ class MetadataExtractor:
             elif ext in ['.tif', '.tiff']:
                 # 1. Get Metadata specifically for TIFF
                 source_meta = MetadataExtractor.read_tiff_metadata(src_path)
-                
-                # 2. Extract Data using tifffile
-                vol = tiff.imread(src_path)
-                
-                # Handle ImageJ Hyperstacks (Z vs C vs T)
-                if vol.ndim == 3:
-                    # Differentiate (C,Y,X) from (Z,Y,X)
-                    # Heuristic: Channels usually < 10, Z usually < Y/X
-                    if vol.shape[0] < 10 and vol.shape[0] < vol.shape[1]: 
-                        ch_data = vol[channel_idx]
-                    else: 
-                        # Assumes single channel Z-stack
-                        ch_data = vol
-                elif vol.ndim == 4:
-                    # Usually (C, Z, Y, X) or (Z, C, Y, X). 
-                    # Simplistic assumption: Smallest dim is C.
-                    if vol.shape[0] < vol.shape[1]: # (C, Z, Y, X)
-                        ch_data = vol[channel_idx]
-                    else: # (Z, C, Y, X)
-                        ch_data = vol[:, channel_idx, :, :]
-                else:
-                    ch_data = vol
+
+                # 2. Stream the channel to disk plane by plane. This writes the
+                # file itself, so there is no `ch_data` for the common write
+                # below to handle -- materialising one would defeat the point.
+                # The heuristics this replaces guessed C from Z by comparing
+                # shape[0] to 10 and to shape[1]; `_stream_tiff_channel` reads
+                # the axes by name instead.
+                MetadataExtractor._stream_tiff_channel(
+                    src_path, dest_path, channel_idx, source_meta,
+                    progress=progress, should_cancel=should_cancel)
+                if (not os.path.isfile(dest_path)
+                        or os.path.getsize(dest_path) == 0):
+                    raise ChannelExtractionError(
+                        "the write completed but produced no data on disk "
+                        "(is the volume full or read-only?)")
+                return True
+
             
             elif ext == '.czi' and not HAS_CZI:
                 # Called out separately from "unsupported": the format IS supported,
@@ -544,6 +673,13 @@ class MetadataExtractor:
         except ChannelExtractionError:
             raise  # already carries a precise reason
         except Exception as e:
+            # A cancelled setup is the user's own doing, not a failure to
+            # report. The slide branch above already re-raises it; the TIFF
+            # branch reaches this handler instead, because it can now be
+            # interrupted between planes.
+            from .slide_reader import SetupCancelled
+            if isinstance(e, SetupCancelled):
+                raise
             # Wrap anything unexpected so the caller still gets a usable reason
             # instead of the old silent None.
             print(f"Extraction failed for {os.path.basename(src_path)}: {e}")
