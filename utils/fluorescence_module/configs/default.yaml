@@ -9,44 +9,6 @@
 # `dimensions` is the TOTAL physical extent of the image in microns, not the
 # per-voxel size (spacing = extent / axis length). Omit `z` for 2D data; its
 # presence is what distinguishes a stack from a plane.
-#
-# Resolved divergences between the two former configs:
-#   max_seed_centroid_dist      0.1 / 50.0  -> 50.0
-#       0.1 gated every candidate merge, so no interface was ever scored and the
-#       over-seeding rescue silently did nothing. 0 disables the bound; a small
-#       non-zero value disables MERGING, which is not the same thing.
-#   absolute_min_thickness_um   0.0001 / 1.5 -> 0.01
-#       0.0001 effectively removed the thickness floor.
-#   scale_profiles_percentile   3 keys/row -> 5 keys/row
-#       The 3D table lacked `smooth_sigma` and `connect_max_gap_physical`, which
-#       its own absolute table already carried and which 2D had in both. Brought
-#       to parity with 2D; per-scale filters now apply in either threshold mode.
-#   min_size_voxels/min_size_pixels -> min_size
-#       One key; the unit follows the data's rank.
-#   z_erosion_iterations
-#       Retained and 3D-only. On 2D data the step logs that it skipped, rather
-#       than the parameter silently not existing.
-#
-#   brightness_cutoff_factor    100.0 / 1.5 -> 1.5
-#       The cutoff is `segmentation_threshold * factor`. At 100 essentially every
-#       labelled voxel counted as a protected bright core, so edge trimming
-#       deleted nothing at any distance up to 40 um.
-#   max_allowed_core_aspect_ratio  50.0 / 5.0 -> 5.0
-#       50 is this parameter's own maximum, i.e. the elongation gate was off.
-#   ratios_to_process           6 values / empty -> 6 values
-#       Empty means percentile-only seeding. Both lists are provided by default;
-#       where they compete the percentiles win, so ratios only place a seed in
-#       space no percentile claimed.
-#   calculate_solidity          false / true -> false
-#       The convex-hull ratio is markedly more expensive in 3D. Off by default;
-#       turn it on per project when the metric is wanted.
-#
-# Values below start from the 3D project config except where noted above, so
-# scale-dependent parameters (min_size, min_fragment_size,
-# min_physical_peak_separation, hull_closing_radius, intensity_weight,
-# min_size_threshold and the scale profiles) are 3D-flavoured and WILL need
-# retuning for 2D data. That is expected: these are starting points, and each
-# project saves its own tuned copy.
 # =============================================================================
 execute_raw_segmentation:
   name: Execute Raw Segmentation
@@ -130,15 +92,8 @@ execute_trim_edges:
       label: Z-Anisotropy Correction (Erosion)
       # Hidden by the GUI on a 2D image. `remove_artifacts` runs the erosion
       # only under `ndim == 3` and skips it on a plane, so on 2D data this knob
-      # looks live and does nothing. The hint below already said so; the GUI
-      # simply had no way to act on it. The value stays here because one config
+      # looks live and does nothing. The value stays here because one config
       # serves both ranks and the 3D path needs it.
-      #
-      # The ONLY rank-specific parameter in this file. `calculate_solidity`,
-      # `hull_closing_radius` and `otsu_scale_factor` read as 3D-only from
-      # their wording but are all consumed by the 2D path too
-      # (features_2d.calculate_morphology_2d, generate_tight_hull_2d), so none
-      # of them is annotated -- checked rather than assumed.
       ndim: 3
       type: int
       value: 0
@@ -320,7 +275,5 @@ mode: fluorescence
 # the canonical REFERENCE the reconcile machinery compares a run against, and
 # both of those keys are image-specific: a physical extent copied out of
 # whichever image the defaults were last tuned on, and a segmentation threshold
-# computed from that image's intensities. Shipping either would hand every new
-# project one image's calibration, and `config_library.sanitize_for_library`
-# strips both from user presets for the same reason. Dimensions are written per
+# computed from that image's intensities. Dimensions are written per
 # image when a project is organized; the threshold is recomputed per run.

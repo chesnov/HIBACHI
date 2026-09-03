@@ -1,12 +1,7 @@
 # =============================================================================
 # HIBACHI runtime environment  (install/environment.yml)
 # -----------------------------------------------------------------------------
-# This is the project's VALIDATED dependency set. Only two things were changed
-# from the original environment.yaml:
-#   1. Added `git` (conda-forge) -- required by the installer's clone step and
-#      the self-updater, so it works on machines with no system git.
-#   2. Dropped the Anaconda `defaults` channel (everything comes from pip or
-#      conda-forge anyway) to avoid Anaconda's commercial Terms of Service.
+# This is the project's dependency set. 
 #
 # The installer reads this file, and the launcher rebuilds the environment
 # automatically whenever this file changes upstream -- so this path
@@ -25,35 +20,6 @@ dependencies:
       # ---------------------------------------------------------------------
       # CORE NUMERICS -- pinned to a captured, working set.
       #
-      # These were previously UNPINNED and arrived transitively via napari, skan
-      # and dask-image, so a fresh install resolved whatever was current that
-      # day. That is how one machine and another produced different behaviour
-      # from the same commit. Versions below are from a machine where results
-      # are known good (python 3.11.15, Linux); re-capture with
-      # `capture_versions.py` if that reference machine changes.
-      #
-      # Two constraints here are load-bearing, not cosmetic:
-      #
-      #   numpy < 2.4      At numpy 2.4 a `numpy.bool` scalar stopped satisfying
-      #                    `operator.index()`, which made
-      #                    `scipy.ndimage.find_objects` reject a boolean array
-      #                    ("'numpy.bool' object cannot be interpreted as an
-      #                    integer"). Verified as a NUMPY boundary, not a scipy
-      #                    one: the failure and non-failure were observed with
-      #                    identical scipy (1.17.1) and scikit-image (0.26.0),
-      #                    differing only in numpy (2.4.4 vs 2.2.6). The code no
-      #                    longer passes a bool, so this is now a
-      #                    reproducibility pin rather than a workaround.
-      #
-      #   scikit-image     `footprint_rectangle` requires >= 0.25, while
-      #   >=0.25,<0.28     `binary_closing`, `binary_dilation` and the
-      #                    `remove_small_objects(min_size=...)` signature are
-      #                    deprecated at 0.26 and REMOVED at 0.28. 0.28 will
-      #                    break the pipeline outright. Migrating to
-      #                    `morphology.dilation` / `closing` would lift the upper
-      #                    bound and is behaviour-preserving here (every
-      #                    footprint used is symmetric), but has not been done.
-      # ---------------------------------------------------------------------
       - numpy==2.2.6
       - scipy==1.17.1
       - scikit-image==0.26.0
@@ -67,23 +33,6 @@ dependencies:
       - networkx==3.6.1
       - numba==0.61.2
       - tifffile==2026.3.3
-      # tifffile decodes only a few codecs itself and delegates the rest --
-      # JPEG, JPEG2000, WebP, LZMA, Zstd -- to imagecodecs, raising
-      # "<COMPRESSION.JPEG2000: 34712> requires the 'imagecodecs' package" when
-      # it is absent. Whole-slide exports and many camera/vendor TIFFs are
-      # JPEG2000, so this was not an exotic case: those files simply could not
-      # be opened. slideio covers the proprietary slide formats, but a plain
-      # .tif goes through tifffile, which is why slideio's presence did not
-      # already cover this.
-      #
-      # Pinned like the numerics above, captured on the reference machine
-      # (python 3.11, Linux). It requires only numpy>=2.0, so it does NOT
-      # disturb the numpy<2.4 bound that the find_objects pin depends on --
-      # verified with numpy 2.2.6 and tifffile 2026.3.3 in place, with
-      # imagecodecs.JPEG2K.available True. Re-check that when re-capturing.
-      #
-      # ~27 MB binary wheel (cp311-abi3), with wheels for Windows, Linux and
-      # both macOS architectures; no system libraries or JVM needed.
       - imagecodecs==2026.3.6
       - fcswrite==0.6.4
       - psutil==7.2.2
