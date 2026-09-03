@@ -139,7 +139,7 @@ _BACKENDS: Tuple[Tuple[Tuple[str, ...], str], ...] = (
 )
 
 
-def _backend(source_key: str):
+def _backend(source_key: str, root: str = ""):
     """The reader module serving this source key, or None for slideio.
 
     Returns None both for "this is a slideio format" and for "the backend module
@@ -157,17 +157,35 @@ def _backend(source_key: str):
             return importlib.import_module(f".{module_name}", __package__)
         except ImportError:
             return None
+
+    # Sidecar-TIFF slides cannot be dispatched by extension: a .vsi is served
+    # by slideio when its regions are ETS tile stacks and by vsi_sidecar when
+    # they are TIFF pyramids, and only the file on disk says which. The test is
+    # a filesystem one -- does this key's scene resolve to a readable TIFF under
+    # the sidecar directory -- so an ETS scene name resolves to nothing and
+    # falls through to the driver, and no name is pattern-matched.
+    #
+    # `root` matters here and nowhere above: extension dispatch reads the key
+    # alone, but resolving a path needs the same root the accessors were given.
+    # Without it a caller using `scene_shape(key, root=...)` rather than a
+    # joined path silently got the slideio path and a wrong answer.
+    try:
+        from . import vsi_sidecar
+    except ImportError:
+        return None
+    if vsi_sidecar.claims(source_key, root):
+        return vsi_sidecar
     return None
 
 
-def _lif_backend(source_key: str):
+def _lif_backend(source_key: str, root: str = ""):
     """Deprecated alias for :func:`_backend`, kept so nothing breaks silently.
 
     Retained because this module's dispatch was LIF-only before Zarr was added;
     any out-of-tree caller that reached for the private name still works, and
     still gets the right backend rather than None for a .zarr key.
     """
-    return _backend(source_key)
+    return _backend(source_key, root)
 
 
 def backend_name(source_key: str) -> Optional[str]:
@@ -185,16 +203,35 @@ def list_sources(path: str) -> List[str]:
 
     Returns one key per tissue scene. A single-scene slide yields a bare filename
     so it behaves exactly like the existing formats. Returns [] if the file can't
-    be read, leaving the caller to report the reason from ``inspect_slide``.
+    be read, and says why: the reason was previously computed by
+    ``inspect_slide`` and thrown away, so a caller could only report "no
+    readable scenes" for a file whose actual problem was already known.
     """
     backend = _backend(path)
     if backend is not None:
         return backend.list_sources(path)
 
     info = inspect_slide(path)
-    if info.error:
-        return []
     scenes = info.tissue_scenes
+    if info.error or not scenes:
+        # A VS-series slide whose regions were written as TIFF pyramids rather
+        # than ETS tile stacks: slideio's VSI driver opens it and reports no
+        # scenes at all, so the images are readable but invisible to the driver.
+        try:
+            from . import vsi_sidecar
+            fallback = vsi_sidecar.list_sources(path)
+        except ImportError:
+            fallback = []
+        if fallback:
+            print(f"  [slide] {os.path.basename(path)}: the "
+                  f"{info.driver or '?'} driver reported no usable scenes; "
+                  f"reading {len(fallback)} region(s) from its sidecar "
+                  "TIFF data instead")
+            return fallback
+        if info.error:
+            print(f"  [slide] {os.path.basename(path)}: {info.error}")
+        return []
+
     name = os.path.basename(path)
     if len(scenes) <= 1:
         return [name]
@@ -262,7 +299,7 @@ def open_scene(source_key: str, root: str = "") -> _SceneHandle:
 # --------------------------------------------------------------------------- #
 def scene_channel_count(source_key: str, root: str = "") -> int:
     """Channels in the scene a source key names, or 1 if it can't be read."""
-    backend = _backend(source_key)
+    backend = _backend(source_key, root)
     if backend is not None:
         return backend.scene_channel_count(source_key, root)
     try:
@@ -281,7 +318,7 @@ def scene_metadata(source_key: str, root: str = "") -> Dict[str, Any]:
     1e6 conversion. A slide with no Z calibration reports z=0, which would become
     a zero voxel dimension downstream, so it falls back to 1.0 and says so.
     """
-    backend = _backend(source_key)
+    backend = _backend(source_key, root)
     if backend is not None:
         return backend.scene_metadata(source_key, root)
 
@@ -310,7 +347,7 @@ def scene_metadata(source_key: str, root: str = "") -> Dict[str, Any]:
 
 def scene_shape(source_key: str, root: str = "") -> Optional[Tuple[int, ...]]:
     """(Z, Y, X) or (Y, X) pixel shape of a scene, without reading pixels."""
-    backend = _backend(source_key)
+    backend = _backend(source_key, root)
     if backend is not None:
         return backend.scene_shape(source_key, root)
     try:
@@ -324,7 +361,7 @@ def scene_shape(source_key: str, root: str = "") -> Optional[Tuple[int, ...]]:
 
 def scene_channel_names(source_key: str, root: str = "") -> List[str]:
     """Channel names as the scanner recorded them, e.g. ['DAPI','FITC','Cy5']."""
-    backend = _backend(source_key)
+    backend = _backend(source_key, root)
     if backend is not None:
         return backend.scene_channel_names(source_key, root)
     try:
@@ -375,7 +412,7 @@ def extract_scene_channel(
     be broken into.
     Returns True only if a non-empty file was produced.
     """
-    backend = _backend(source_key)
+    backend = _backend(source_key, root)
     if backend is not None:
         return backend.extract_scene_channel(
             source_key, dest_path, channel_idx, root=root, tile=tile,

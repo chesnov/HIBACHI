@@ -368,10 +368,16 @@ def sidecar_status(path: str, spec: Optional[FormatSpec] = None) -> Dict[str, An
         result["ok"] = False
         return result
 
+    # EXACTLY `_<stem>_`, not any directory containing the stem. `stem in item`
+    # made 20260901.vsi claim _20260901_01_ and _20260901_02_ as well -- the
+    # data belonging to the two slides beside it -- and report their bytes as
+    # its own. A slide missing its pixels would then pass this check because a
+    # differently-named sibling had some.
+    expected = f"_{stem}_"
     total = 0
     for item in entries:
         full = os.path.join(folder, item)
-        if not os.path.isdir(full) or stem not in item:
+        if not os.path.isdir(full) or item != expected:
             continue
         result["directories"].append(item)
         for root, _dirs, files in os.walk(full):
