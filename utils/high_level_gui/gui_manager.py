@@ -2220,6 +2220,24 @@ class DynamicGUIManager(QObject):
 
     # --- Widget Creation ---
 
+    def _param_applies(self, pconf: Any) -> bool:
+        """Whether a parameter is meaningful at this image's rank.
+
+        Rank comes from the ARRAY, not the config's mode or dimension block:
+        the array is what the step will actually be handed. A parameter with no
+        `ndim` key applies at every rank, so annotating is opt-in and an
+        un-annotated config behaves exactly as before.
+        """
+        if not isinstance(pconf, dict):
+            return True
+        want = pconf.get("ndim")
+        if want is None:
+            return True
+        try:
+            return int(want) == int(getattr(self.image_stack, "ndim", 0))
+        except (TypeError, ValueError):
+            return True     # unreadable annotation: show it rather than hide it
+
     def create_step_widgets(self, step_method_name: str) -> None:
         """Generates parameter widgets for the given step."""
         # Temporarily lock the window size to prevent macOS from shrinking 
@@ -2271,6 +2289,16 @@ class DynamicGUIManager(QObject):
                 if pname in["scale_profiles", "scale_profiles_percentile"] and is_absolute:
                     continue
                 if pname == "scale_profiles_absolute" and not is_absolute:
+                    continue
+                # Rank filtering: a parameter declaring `ndim:` in the config is
+                # shown only at that rank. There is one default config for both
+                # ranks, so it necessarily contains parameters that mean nothing
+                # at the other one -- Z-anisotropy erosion on a single plane, for
+                # example. They stay IN the file (the 3D path still needs their
+                # values, and convention 7 keeps rank-varying settings in the
+                # YAML where they are visible) but showing them invites tuning a
+                # control that cannot affect the result.
+                if not self._param_applies(pconf):
                     continue
 
                 try:
