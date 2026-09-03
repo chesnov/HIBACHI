@@ -128,6 +128,18 @@ execute_trim_edges:
       step: 1
     z_erosion_iterations:
       label: Z-Anisotropy Correction (Erosion)
+      # Hidden by the GUI on a 2D image. `remove_artifacts` runs the erosion
+      # only under `ndim == 3` and skips it on a plane, so on 2D data this knob
+      # looks live and does nothing. The hint below already said so; the GUI
+      # simply had no way to act on it. The value stays here because one config
+      # serves both ranks and the 3D path needs it.
+      #
+      # The ONLY rank-specific parameter in this file. `calculate_solidity`,
+      # `hull_closing_radius` and `otsu_scale_factor` read as 3D-only from
+      # their wording but are all consumed by the 2D path too
+      # (features_2d.calculate_morphology_2d, generate_tight_hull_2d), so none
+      # of them is annotated -- checked rather than assumed.
+      ndim: 3
       type: int
       value: 0
       min: 0
