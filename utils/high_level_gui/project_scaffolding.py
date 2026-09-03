@@ -3,17 +3,15 @@
 
 import os
 import shutil
-import gc
 import yaml  # type: ignore
 import pandas as pd
-import tifffile as tiff  # type: ignore
 from typing import Dict, Any, List, Optional, Callable, Sequence
 
 from .gui_text_utils import (
     clean_filename_for_matching, is_os_sidecar, natural_sort_key,
 )
 from .slide_reader import SetupCancelled  # re-exported for callers
-from .metadata import MetadataExtractor
+from .metadata import MetadataExtractor, probe_tiff_axes, tiff_reject_reason
 
 
 
@@ -657,19 +655,25 @@ def organize_channel_project(
         else:
             meta = MetadataExtractor.read_tiff_metadata(src_path)
 
-        # Get pixel counts from the extracted file
+        # Get pixel counts from the extracted file -- from its HEADER. This
+        # used to be `tiff.imread(target_tif_path)`, which decodes the whole
+        # extracted channel: 24 GB for a VS200 stack, immediately after
+        # extraction had just carefully avoided allocating it. Three integers
+        # are all that is wanted here.
         img_ndim = template_ndim
-        try:
-            mem = tiff.imread(target_tif_path)
-            shape = mem.shape
-            z_slices = shape[0] if mem.ndim == 3 else 1
-            height, width = shape[-2], shape[-1]
+        sizes = probe_tiff_axes(target_tif_path).get('sizes') or {}
+        if 'Y' in sizes and 'X' in sizes:
+            # By NAME. The old code read `shape[0]` as Z whenever the rank was
+            # 3, which is Y in a 'YXS' file and C in a 'CZYX' one, and took
+            # `mem.ndim == 3` as the test for a stack -- so a 4D source
+            # recorded z_slices = 1 and every Z extent it produced was 13 times
+            # too small.
+            z_slices = int(sizes.get('Z', 1))
+            height, width = int(sizes['Y']), int(sizes['X'])
             # The extracted array's own rank, which is what the dimension block
             # and every axis check below are keyed on.
-            img_ndim = 3 if mem.ndim >= 3 else 2
-            del mem
-            gc.collect() # Force immediate release during heavy batch organization
-        except Exception:
+            img_ndim = 3 if z_slices > 1 else 2
+        else:
             z_slices, width, height = 1, 1, 1
 
         # Use the extracted scale to calculate TOTAL microns
@@ -970,29 +974,28 @@ def _channel_index_of(channel_dir: str) -> Optional[int]:
 
 
 def _probe_pixel_counts_quiet(path: str) -> Dict[str, int]:
-    """Pixel counts per axis from a TIFF, shape only. {} on any failure.
+    """Pixel counts per axis from a TIFF, header only. {} on any failure.
 
     Used to test whether a recorded total is really a pixel count, so it must
     never raise: a probe failure just means that check is skipped for the image.
 
     Also carries the image's RANK under ``NDIM_KEY``, because this is the only
-    place the shape's length is seen: both branches below report ``z: 1`` for a
-    2D image, so the counts alone cannot say whether a depth exists -- and the
+    place the shape is seen: a 2D image and a single-slice stack both report
+    ``z: 1``, so the counts alone cannot say whether a depth exists -- and the
     mode string cannot say either now that there is one mode. Consumers read
     this dict with ``.get(axis)``, so the extra key is inert for them.
+
+    Axes come from `probe_tiff_axes`, i.e. by letter. Reading ``shape[0]`` as Z
+    whenever the rank was 3 -- which is what this did -- reports Y as the depth
+    for an 'YXS' image and C for a 'CZYX' one.
     """
     from .dimension_entry import NDIM_KEY
-    try:
-        with tiff.TiffFile(path) as handle:
-            shape = handle.series[0].shape
-    except Exception:
+    sizes = probe_tiff_axes(path).get('sizes') or {}
+    if 'Y' not in sizes or 'X' not in sizes:
         return {}
-    if len(shape) >= 3:
-        return {'z': int(shape[0]), 'y': int(shape[-2]), 'x': int(shape[-1]),
-                NDIM_KEY: 3}
-    if len(shape) == 2:
-        return {'z': 1, 'y': int(shape[0]), 'x': int(shape[1]), NDIM_KEY: 2}
-    return {}
+    depth = int(sizes.get('Z', 1))
+    return {'z': depth, 'y': int(sizes['Y']), 'x': int(sizes['X']),
+            NDIM_KEY: 3 if depth > 1 else 2}
 
 
 def _extractable_sources(drctry: str,
@@ -1060,6 +1063,24 @@ def organize_processing_dir(
     # its own image-less folder and make a single CSV look like two.
     all_files = [f for f in sorted(os.listdir(drctry)) if not is_os_sidecar(f)]
     raw_images = [f for f in all_files if f.lower().endswith(('.tif', '.tiff'))]
+
+    # Images that cannot be processed at all are dropped before anything counts
+    # them, moves them or writes a dimension row. The scanner puts its slide
+    # label and macro overview beside the data as RGB brightfield TIFFs; moved
+    # into a project they became samples whose recorded depth was the image
+    # height and whose width was the sample count. Same predicate detection
+    # uses, so the two cannot disagree about what is importable.
+    rejected: List[Dict[str, str]] = []
+    keep: List[str] = []
+    for img_file in raw_images:
+        reason = tiff_reject_reason(os.path.join(drctry, img_file))
+        if reason:
+            rejected.append({'file': img_file, 'reason': reason})
+            print(f"  Skipping {img_file}: {reason}")
+        else:
+            keep.append(img_file)
+    raw_images = keep
+
     if only_files is not None:
         wanted = {os.path.basename(f) for f in only_files}
         skipped = [f for f in raw_images if f not in wanted]
@@ -1080,7 +1101,8 @@ def organize_processing_dir(
     # which is what organize_channel_project already does. Three separate
     # assumptions downstream make widening the filter above insufficient on its
     # own: the auto-generate branch calls read_tiff_metadata, probes pixel
-    # dimensions with tiff.imread, and then shutil.move()s the source. So those
+    # counts through probe_tiff_axes (which needs a TIFF header), and then
+    # shutil.move()s the source. So those
     # sources are delegated to the extraction path instead of being reimplemented
     # here.
     #
@@ -1102,6 +1124,16 @@ def organize_processing_dir(
         if extract_summary is not None:
             # Nothing else to do: every source in this folder was extractable.
             return extract_summary
+        if rejected:
+            # "nothing could be read" would be a lie here: the images were read
+            # perfectly well and refused for a stated reason, and the user needs
+            # that reason rather than a dead end.
+            listing = '; '.join(f"{r['file']}: {r['reason']}"
+                                for r in rejected[:3])
+            raise ValueError(
+                f"None of the {len(rejected)} image(s) in this folder can be "
+                f"processed. {listing}"
+            )
         raise ValueError(
             'No readable images found. Single-channel setup organizes .tif / '
             '.tiff files; nothing in this folder could be read as an image.'
@@ -1162,6 +1194,7 @@ def organize_processing_dir(
     summary: Dict[str, Any] = {
         'organized': [],
         'unscaled': [],
+        'rejected': rejected,
         'csv': csv_files[0] if csv_files else None,
     }
     # filename -> {axis: source}. Only populated on the auto-generate path; a
@@ -1193,24 +1226,28 @@ def organize_processing_dir(
             except Exception:
                 meta = {'found': False, 'x': 1.0, 'y': 1.0, 'z': 1.0}
 
-            # Pixel counts come from the array, physical scale from the metadata.
-            # If the array can't be read we still emit a row with neutral
-            # dimensions so the image is organized (and its dimensions can be
-            # corrected later in the UI) rather than silently dropped from the
-            # project -- dropping every image is what produced an empty frame and
-            # the loop above.
+            # Pixel counts come from the file's HEADER, physical scale from its
+            # metadata. If the axes can't be read we still emit a row with
+            # neutral dimensions so the image is organized (and its dimensions
+            # can be corrected later in the UI) rather than silently dropped
+            # from the project -- dropping every image is what produced an
+            # empty frame and the loop above.
+            #
+            # This was `tiff.imread(full_path)` with `z_slices = mem.shape[0] if
+            # mem.ndim == 3 else 1`, and it is where the 13x-too-small Z extents
+            # came from: a 'CZYX' source has ndim 4, so z_slices was 1 and a
+            # 13-slice stack was recorded as a single plane. It also decoded the
+            # entire volume to learn three integers.
             width = height = z_slices = 1
             img_ndim = template_ndim
-            try:
-                mem = tiff.imread(full_path)
-                z_slices = mem.shape[0] if mem.ndim == 3 else 1
-                height, width = mem.shape[-2], mem.shape[-1]
-                img_ndim = 3 if mem.ndim >= 3 else 2
-                del mem
-                gc.collect()  # release promptly during heavy batch organization
-            except Exception as exc:
-                print(f"    Warning: could not read pixel data of {img_file} "
-                      f"({exc}); using neutral dimensions.")
+            sizes = probe_tiff_axes(full_path).get('sizes') or {}
+            if 'Y' in sizes and 'X' in sizes:
+                z_slices = int(sizes.get('Z', 1))
+                height, width = int(sizes['Y']), int(sizes['X'])
+                img_ndim = 3 if z_slices > 1 else 2
+            else:
+                print(f"    Warning: could not read the axes of {img_file}; "
+                      "using neutral dimensions.")
 
             # Per-axis scale check, NOT the bare `found` flag. `found` is True for
             # a TIFF carrying XResolution=(1,1)/ResolutionUnit=NONE, whose spacing

@@ -242,6 +242,22 @@ def probe_tiff_axes(path: str) -> Dict[str, Any]:
             'name': name, 'reject': reject}
 
 
+def tiff_reject_reason(path: str):
+    """Why this TIFF must not enter a project, or None if it may.
+
+    The one predicate for that question. Detection (`organize_wizard.
+    detect_raw`), the single-channel move path and extraction itself all call
+    this rather than each deciding for themselves, because a file accepted by
+    one and refused by another is the failure mode that put a slide label into
+    three channel folders.
+
+    A file whose header cannot be read at all returns None, not a reason: that
+    is a different problem, and the callers already report it as one instead of
+    silently dropping the image.
+    """
+    return probe_tiff_axes(path).get('reject')
+
+
 class ChannelExtractionError(RuntimeError):
     """Raised when a channel could not be written, carrying the specific reason.
 

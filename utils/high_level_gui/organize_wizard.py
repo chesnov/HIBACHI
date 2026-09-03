@@ -75,13 +75,22 @@ def detect_raw(raw_dir: str) -> Dict[str, object]:
     """
     Inspect a folder's raw images.
 
-    Returns {'files': [basename,...], 'max_channels': int, 'has_czi': bool}.
+    Returns {'files': [basename,...], 'max_channels': int, 'has_czi': bool,
+    'skipped_sidecars': [...], 'rejected': [{'file','reason'}, ...]}.
     max_channels is the largest channel count across the images (1 if single).
+
+    A TIFF the pipeline cannot process is reported under 'rejected' and left
+    out of 'files', so it is never offered for import and never counts towards
+    max_channels. The scanner writes its slide label and macro overview beside
+    the data as RGB brightfield TIFFs; those used to be detected as three
+    channels each (SizeC=3 on an interleaved RGB image) and imported as
+    samples whose recorded depth was the image height.
     """
-    from .metadata import MetadataExtractor  # lazy: heavy import, keeps helpers testable
+    from .metadata import MetadataExtractor, tiff_reject_reason  # lazy: heavy import, keeps helpers testable
 
     files: List[str] = []
     skipped: List[str] = []
+    rejected: List[Dict[str, str]] = []
     try:
         for f in sorted(os.listdir(raw_dir)):
             if not _is_source_entry(os.path.join(raw_dir, f), f, _RAW_EXTS):
@@ -112,12 +121,25 @@ def detect_raw(raw_dir: str) -> Dict[str, object]:
                     print(f"  [detect] {f} yielded no readable scenes; skipped")
                 continue
 
+            # A plain TIFF is checked here rather than at import: an image the
+            # pipeline cannot process should never appear in the wizard's list
+            # at all. Same predicate the organizers use, so detection and
+            # import cannot disagree about what is importable.
+            if f.lower().endswith(('.tif', '.tiff')):
+                reason = tiff_reject_reason(os.path.join(raw_dir, f))
+                if reason:
+                    rejected.append({'file': f, 'reason': reason})
+                    print(f"  [detect] {f} cannot be processed: {reason}")
+                    continue
+
             files.append(f)
     except OSError:
         pass
     if skipped:
         print(f"  [detect] ignored {len(skipped)} operating-system sidecar "
               f"file(s), e.g. {skipped[0]}")
+    if rejected:
+        print(f"  [detect] excluded {len(rejected)} unprocessable image(s)")
 
     max_channels = 1
     for f in files:
@@ -132,6 +154,7 @@ def detect_raw(raw_dir: str) -> Dict[str, object]:
         "max_channels": max_channels,
         "has_czi": any(f.lower().endswith(".czi") for f in files),
         "skipped_sidecars": skipped,
+        "rejected": rejected,
     }
 
 
@@ -1098,8 +1121,14 @@ if _HAVE_QT:
 
             files = list(self.detect.get("files") or [])
             sidecars = list(self.detect.get("skipped_sidecars") or [])
+            rejected = list(self.detect.get("rejected") or [])
             lines.append("")
             lines.append(f"raw images    : {len(files)}")
+            if rejected:
+                lines.append(f"unprocessable : {len(rejected)}")
+                for item in rejected:
+                    lines.append(f"  - {item.get('file')}: "
+                                 f"{item.get('reason')}")
             if sidecars:
                 lines.append(f"os sidecars ignored: {len(sidecars)} "
                              f"(e.g. {sidecars[0]})")
