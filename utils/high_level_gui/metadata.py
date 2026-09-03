@@ -171,6 +171,76 @@ def require_dimensions(config: Dict[str, Any], mode=None,
     return out
 
 
+#: Axis letters `tifffile` reports in `series.axes`. `S` (samples per pixel) is
+#: listed as meaningful because it has to be RECOGNISED in order to be refused:
+#: it is not an axis the pipeline can process.
+_MEANINGFUL_AXES = frozenset('CZYXS')
+
+
+def probe_tiff_axes(path: str) -> Dict[str, Any]:
+    """Axis letters, sizes and a rejection reason for a TIFF's full-res series.
+
+    Headers only. Opens the file, reads `series[0].axes` and `.shape`, and never
+    decodes a pixel, so this is safe to call on an 18 GB JPEG2000 image.
+
+    Every axis is keyed BY LETTER, never by position, which is the whole point.
+    Index 0 is Y in 'YXS', C in 'CZYX' and Z in 'ZYX'; reading it as any one of
+    those is the single root cause behind the physical-dimension bugs this
+    replaces. `sizes.get('Z', 1)` is the depth at every rank, with no heuristic.
+
+    Returns {} if the file cannot be opened or the series is unreadable, so a
+    caller can treat an empty result as "no information" without catching.
+
+    Keys:
+      axes    letter string, e.g. 'CZYX'
+      shape   matching shape tuple
+      sizes   {letter: length}
+      dtype   numpy dtype string
+      name    the series name (the OME Image Name, where there is one) or None
+      reject  why this image cannot enter a project, or None if it can
+    """
+    try:
+        with tiff.TiffFile(path) as handle:
+            if not handle.series:
+                return {}
+            series = handle.series[0]
+            axes = str(series.axes)
+            shape = tuple(int(n) for n in series.shape)
+            dtype = str(series.dtype)
+            name = getattr(series, 'name', None) or None
+    except Exception:
+        return {}
+    if len(axes) != len(shape):
+        return {}     # inconsistent header; nothing here can be trusted
+
+    sizes = {letter: size for letter, size in zip(axes, shape)}
+    label = f" ('{name}')" if name else ""
+    # Size-1 axes are already squeezed out of `series.shape`, so an unknown
+    # letter surviving here is a real axis with real length.
+    unknown = sorted(letter for letter, size in sizes.items()
+                     if letter not in _MEANINGFUL_AXES and size > 1)
+
+    reject = None
+    if 'X' not in sizes or 'Y' not in sizes:
+        reject = (f"the image{label} has axes '{axes}', which contain no X/Y "
+                  "plane")
+    elif 'S' in sizes:
+        # The VS200 writes its slide label and macro overview as interleaved
+        # RGB brightfield (axes 'YXS', OME Image Name 'Label' / 'Overview').
+        # Samples per pixel are not channels and an RGB snapshot is not
+        # fluorescence data, so such a file has no place in a project.
+        reject = (f"the image{label} stores {sizes['S']} samples per pixel "
+                  f"(axes '{axes}'), so it is an RGB/brightfield image rather "
+                  "than single-channel intensity data")
+    elif unknown:
+        reject = (f"the image{label} has axes '{axes}', and "
+                  f"{', '.join(unknown)} is not an axis the pipeline can "
+                  "interpret")
+
+    return {'axes': axes, 'shape': shape, 'sizes': sizes, 'dtype': dtype,
+            'name': name, 'reject': reject}
+
+
 class ChannelExtractionError(RuntimeError):
     """Raised when a channel could not be written, carrying the specific reason.
 
@@ -221,17 +291,30 @@ class MetadataExtractor:
 
         elif ext in ['.tif', '.tiff']:
             try:
+                sizes = probe_tiff_axes(path).get('sizes') or {}
+                if 'C' in sizes:
+                    return int(sizes['C'])
+                if 'S' in sizes:
+                    # Samples per pixel are NOT channels. This case used to be
+                    # answered by the OME regex below, which matched SizeC="3"
+                    # on an RGB label image: setup then created three channel
+                    # folders, each holding an identical copy of the whole RGB
+                    # array, each with nonsense physical dimensions. One image
+                    # is one image; `probe_tiff_axes` refuses it outright.
+                    return 1
+                # No explicit C axis. tifffile squeezes a length-1 axis out of
+                # the shape, so this is usually a genuinely single-channel
+                # image -- but consult the file's own claim before assuming, in
+                # case tifffile could not resolve the axes at all.
                 with tiff.TiffFile(path) as tif:
                     if tif.imagej_metadata:
                         return int(tif.imagej_metadata.get('channels', 1))
                     if tif.ome_metadata:
                         match = re.search(r'SizeC="(\d+)"', str(tif.ome_metadata))
-                        if match: return int(match.group(1))
-                    if len(tif.series) > 0:
-                        shape = tif.series[0].shape
-                        if len(shape) == 3 and shape[0] < 10 and shape[0] < shape[1]: return shape[0]
-                        if len(shape) == 4: return min(shape[0], shape[1])
-            except Exception: return 1
+                        if match:
+                            return int(match.group(1))
+            except Exception:
+                return 1
         return 1
 
     @staticmethod
