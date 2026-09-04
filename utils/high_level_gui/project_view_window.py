@@ -42,6 +42,45 @@ except ImportError as e:
 class ProjectViewWindow(QMainWindow):
     """The main entry window for selecting a project."""
 
+    #: Every action that used to be a button in the bottom bar: key, label,
+    #: which menu it belongs to, the slot, and the tooltip. One table, so an
+    #: action cannot be created in one place and enabled in another -- the
+    #: shape that let a button's initial state and its update rule disagree.
+    #: `slot` is a factory taking no arguments so the bound method is resolved
+    #: at construction time, after __init__ has defined it.
+    _ACTION_SPECS = (
+        ("set_config", "Set New Channel Config\u2026", "selection",
+         lambda self: self.set_channel_config,
+         "Choose a YAML config template and apply its processing parameters "
+         "to the checked images (image dimensions are preserved). Available "
+         "only when the checked images belong to a single channel."),
+        ("optimize", "Optimize Parameters\u2026", "selection",
+         lambda self: self._optimize_parameters,
+         "Reconcile several checked images into one shared config by "
+         "searching parameters. Needs at least two checked images sharing a "
+         "processing mode."),
+        ("export_run", "Export run config\u2026", "selection",
+         lambda self: self._export_run_config,
+         "Export a single checked, processed image's run config \u2014 either "
+         "as a reusable preset in your Config Library, or to a file "
+         "(byte-for-byte, keeping saved thresholds, dimensions and the "
+         "pipeline version) so a collaborator can reproduce the run."),
+        ("delete_regions", "Delete Regions\u2026", "selection",
+         lambda self: self._delete_checked_regions,
+         "Delete the checked regions and everything computed on them. "
+         "Full-image results are not affected. Enabled when at least one "
+         "region row is checked."),
+        ("cross_channel", "Open Cross-Channel Analyzer", "analysis",
+         lambda self: self.open_cross_channel_analyzer,
+         "Compare channels of one sample, build relational recipes and view "
+         "overlays."),
+        ("config_library", "Config Library\u2026", "library",
+         lambda self: self.open_config_library_manager,
+         "Browse, import, duplicate, rename and export the configs in your "
+         "cross-project library (and see any that failed to load)."),
+    )
+
+
     def __init__(self, project_manager: ProjectManager):
         super().__init__()
         self.project_manager = project_manager
@@ -98,8 +137,37 @@ class ProjectViewWindow(QMainWindow):
         self._content_holder_layout.setContentsMargins(0, 0, 0, 0)
         layout.addWidget(self._content_container)
 
-        # Fixed bottom action bar -- identical for every project kind, so nothing
-        # appears/disappears as you move between single- and multi-channel views.
+        # A menu bar rather than a row of buttons. Seven buttons had accumulated
+        # here, each with a different enable rule, and the row was both crowded
+        # and hard to add to. The grouping below is the one that already
+        # existed implicitly: actions that operate on the CHECKED SET, and
+        # actions that operate on the project or the app.
+        #
+        # `_ACTION_SPECS` is the single table -- label, slot, menu, tooltip --
+        # so an action cannot be created in one place and enabled in another,
+        # and `_update_action_buttons` stays the only thing that decides what
+        # is available.
+        self._actions = {}
+        bar = self.menuBar()
+        menus = {
+            "selection": bar.addMenu("&Selection"),
+            "analysis": bar.addMenu("&Analysis"),
+            "library": bar.addMenu("&Library"),
+        }
+        for key, label, menu_key, slot, tip in self._ACTION_SPECS:
+            action = menus[menu_key].addAction(label)
+            action.setToolTip(tip)
+            action.setStatusTip(tip)
+            action.triggered.connect(slot(self))
+            # Everything selection-scoped starts unavailable: nothing is
+            # checked yet. The initial state therefore comes from the same rule
+            # that later updates it, rather than being written out twice.
+            action.setEnabled(menu_key != "selection" and key != "cross_channel")
+            self._actions[key] = action
+        menus["selection"].insertSeparator(self._actions["delete_regions"])
+
+        # Fixed bottom action bar. One button now: the thing you actually came
+        # here to do. Everything else lives in the menus above.
         button_layout = QHBoxLayout()
 
         self.process_selected_btn = QPushButton("Process Selected")
@@ -111,60 +179,7 @@ class ProjectViewWindow(QMainWindow):
         self.process_selected_btn.setEnabled(False)
         button_layout.addWidget(self.process_selected_btn)
 
-        self.cross_channel_btn = QPushButton("Open Cross-Channel Analyzer")
-        self.cross_channel_btn.clicked.connect(self.open_cross_channel_analyzer)
-        self.cross_channel_btn.setEnabled(False)  # enable once a project loads
-        button_layout.addWidget(self.cross_channel_btn)
-
-        self.set_config_btn = QPushButton("⚙ Set New Channel Config…")
-        self.set_config_btn.setToolTip(
-            "Choose a YAML config template and apply its processing parameters to\n"
-            "the checked images (image dimensions are preserved). Available only\n"
-            "when the checked images belong to a single channel."
-        )
-        self.set_config_btn.clicked.connect(self.set_channel_config)
-        self.set_config_btn.setEnabled(False)
-        button_layout.addWidget(self.set_config_btn)
-
-        self.optimize_btn = QPushButton("\U0001f39b Optimize Parameters\u2026")
-        self.optimize_btn.setToolTip(
-            "Find ONE shared initial-segmentation config for the checked images "
-            "that minimizes how far each image's result drifts from its own "
-            "optimum (curvature-weighted, using the actual masks). Available when "
-            "two or more images of the same mode are checked."
-        )
-        self.optimize_btn.clicked.connect(self._optimize_parameters)
-        self.optimize_btn.setEnabled(False)
-        button_layout.addWidget(self.optimize_btn)
-
-        self.delete_regions_btn = QPushButton("\U0001f5d1 Delete Regions\u2026")
-        self.delete_regions_btn.setToolTip(
-            "Delete the checked regions and everything computed on them. "
-            "Full-image results are not affected. Enabled when at least one "
-            "region row is checked."
-        )
-        self.delete_regions_btn.clicked.connect(self._delete_checked_regions)
-        self.delete_regions_btn.setEnabled(False)
-        button_layout.addWidget(self.delete_regions_btn)
-
-        self.config_library_btn = QPushButton("\U0001f4da Config Library\u2026")
-        self.config_library_btn.setToolTip(
-            "Browse, import, duplicate, rename and export the configs in your "
-            "cross-project library (and see any that failed to load)."
-        )
-        self.config_library_btn.clicked.connect(self.open_config_library_manager)
-        button_layout.addWidget(self.config_library_btn)
-
-        self.export_run_btn = QPushButton("\u2b07 Export run config\u2026")
-        self.export_run_btn.setToolTip(
-            "Export a single checked, processed image's run config — either as a "
-            "reusable preset in your Config Library, or to a file (byte-for-byte, "
-            "keeping saved thresholds, dimensions and the pipeline version) so a "
-            "collaborator can reproduce the run."
-        )
-        self.export_run_btn.clicked.connect(self._export_run_config)
-        self.export_run_btn.setEnabled(False)
-        button_layout.addWidget(self.export_run_btn)
+        button_layout.addStretch(1)
 
         layout.addLayout(button_layout)
         central_widget.setLayout(layout)
@@ -196,7 +211,7 @@ class ProjectViewWindow(QMainWindow):
         self.process_selected_btn.setEnabled(bool(checked))
         # Only meaningful for region rows; a full-image row has nothing to delete.
         from .project_selection import is_roi_leaf
-        self.delete_regions_btn.setEnabled(
+        self._actions["delete_regions"].setEnabled(
             any(is_roi_leaf(k) for k in checked))
 
         # Set Config applies per-channel, so it is only valid when the checked
@@ -204,18 +219,19 @@ class ProjectViewWindow(QMainWindow):
         # the same channel, or a whole single-channel project). Checking a whole
         # multi-channel image spans several channels and therefore disables it.
         keys = view.checked_channel_keys() if view is not None else set()
-        self.set_config_btn.setEnabled(bool(checked) and len(keys) <= 1)
+        self._actions["set_config"].setEnabled(
+            bool(checked) and len(keys) <= 1)
 
         # Export run config is a single-folder, reproducibility action: enable it
         # only when exactly one checked folder actually has a processed run config.
         one = checked[0] if len(checked) == 1 else None
-        self.export_run_btn.setEnabled(
+        self._actions["export_run"].setEnabled(
             one is not None and self._run_config_path(one) is not None
         )
 
         # Parameter optimization reconciles several images into one shared
         # config, so it needs >= 2 checked images that all share one mode.
-        self.optimize_btn.setEnabled(
+        self._actions["optimize"].setEnabled(
             len(checked) >= 2 and self._uniform_mode(checked) is not None
         )
 
@@ -346,7 +362,7 @@ class ProjectViewWindow(QMainWindow):
         self.project_manager.project_path = info.path
         self._cross_scan_dir = info.path
         self._project_root = info.path
-        self.cross_channel_btn.setEnabled(True)
+        self._actions["cross_channel"].setEnabled(True)
         self.project_path_label.setText(f"Project Path: {info.path}")
         self._load_or_organize(info.path)
 
@@ -396,7 +412,7 @@ class ProjectViewWindow(QMainWindow):
         # project root) is what gets scanned for sibling channels.
         self._cross_scan_dir = info.channel_dirs[0] if info.channel_dirs else info.path
         self.project_manager.project_path = self._cross_scan_dir
-        self.cross_channel_btn.setEnabled(True)
+        self._actions["cross_channel"].setEnabled(True)
         self._update_action_buttons()
 
     def _delete_checked_regions(self) -> None:
@@ -1156,7 +1172,7 @@ class ProjectViewWindow(QMainWindow):
             if self.welcome is not None:
                 self.welcome.refresh_recents()
 
-        self.cross_channel_btn.setEnabled(True)
+        self._actions["cross_channel"].setEnabled(True)
         self._update_action_buttons()
 
     def set_channel_config(self) -> None:

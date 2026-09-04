@@ -819,6 +819,12 @@ if _HAVE_QT:
             drop.dropped.connect(self.path_chosen.emit)
             root.addWidget(drop)
 
+            # Side by side in a row with a trailing stretch, rather than added
+            # straight to the vertical layout -- which stretched each one to the
+            # full panel width for a two-word label.
+            actions = QHBoxLayout()
+            actions.setSpacing(8)
+
             # One button for everything: it accepts a project folder, a folder of
             # raw images, or an image file (its folder is used) -- classify_path
             # figures out which and open_path acts accordingly.
@@ -826,16 +832,21 @@ if _HAVE_QT:
             open_btn.setToolTip(
                 "Choose a project folder, a folder of images, or an image file."
             )
+            open_btn.setMinimumWidth(110)
             open_btn.clicked.connect(self._browse)
-            root.addWidget(open_btn)
+            actions.addWidget(open_btn)
 
             # Recent projects live behind a single dropdown button rather than an
             # always-visible list, to give the project tree the vertical space.
             self.recent_btn = QPushButton("Recent projects")
             self.recent_btn.setToolTip("Open a recently used project.")
+            self.recent_btn.setMinimumWidth(150)
             self.recent_menu = QMenu(self.recent_btn)
             self.recent_btn.setMenu(self.recent_menu)
-            root.addWidget(self.recent_btn)
+            actions.addWidget(self.recent_btn)
+
+            actions.addStretch(1)
+            root.addLayout(actions)
 
         # ---- recent menu --------------------------------------------------- #
         def refresh_recents(self) -> None:
