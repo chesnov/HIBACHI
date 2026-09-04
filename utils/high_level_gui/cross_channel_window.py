@@ -57,6 +57,35 @@ def _spacing_from_extents(meta, shape, where=""):
 
 
 
+def _raw_for_display(tif_file: str):
+    """A memory-mapped view of a raw channel TIFF, for DISPLAY only.
+
+    `tiff.memmap`, not `tiff.imread`. One channel of a slide-scanner stack is
+    24 GB, and the callers below load one per channel in a loop, so opening a
+    four-channel composite meant roughly 96 GB of allocations just to look at
+    it. A mapped array lets napari page in the plane it is rendering and
+    nothing else, which is why the single-channel viewer in `app_launch` has
+    always opened these with `tiff.memmap` and works on the same files. The
+    segmentation labels added beside the raw intensity were already
+    `np.memmap`; only the intensity was not.
+
+    Read-only, and only safe because this is the display path: napari does not
+    write to it. The optimizer and the synthetic-null engine also read whole
+    images, and deliberately still do -- they operate on the array rather than
+    just showing it.
+
+    Falls back to a full read if the file cannot be mapped, which happens for a
+    compressed or tiled TIFF, and says so: that is exactly the case where a
+    large file will still hurt, so it should not be silent.
+    """
+    try:
+        return tiff.memmap(tif_file, mode='r')
+    except Exception as exc:
+        print(f"  [display] {os.path.basename(tif_file)} cannot be memory "
+              f"mapped ({exc}); reading it in full instead")
+        return tiff.imread(tif_file)
+
+
 def _safe_name(name: str) -> str:
     """Folder-safe form of a region name, e.g. 'ROI 2' -> 'ROI_2'.
 
@@ -676,7 +705,7 @@ class CrossChannelAnalyzerWindow(QMainWindow):
 
                 # Add Raw Intensity
                 if tif_file:
-                    raw_img = tiff.imread(tif_file)
+                    raw_img = _raw_for_display(tif_file)
                     cmap = colormaps[i % len(colormaps)]
                     viewer.add_image(raw_img, name=f"Raw: {ch_name}", colormap=cmap, blending='additive', opacity=0.5)
 
@@ -1028,7 +1057,7 @@ def open_sample_overlay(project_manager, sample_name, analysis_name=None, parent
                     spacing = _sp
 
             if tif_file:
-                raw_img = tiff.imread(tif_file)
+                raw_img = _raw_for_display(tif_file)
                 cmap = colormaps[i % len(colormaps)]
                 viewer.add_image(raw_img, name=f"Raw: {ch_name}", colormap=cmap,
                                  blending='additive', opacity=0.5)
