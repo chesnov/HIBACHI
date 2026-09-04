@@ -568,6 +568,7 @@ class ProcessingStrategy(abc.ABC):
         _PASSTHROUGH_KEYS = (
             'dimensions', 'voxel_dimensions', 'pixel_dimensions',
             'dimensions_source',   # provenance of the numbers above; travels with them
+            'collapse_2d',         # how a stack became one plane; same reason
             'mode', 'saved_state', 'config_name', 'synthetic',
         )
         for step_key, step_data in current_config.items():
