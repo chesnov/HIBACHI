@@ -509,6 +509,19 @@ class MetadataExtractor:
         # one buffer serves every plane.
         scratch = np.empty((height, width), dtype=dtype)
 
+        # The display pyramid is filled from the planes this loop is already
+        # decoding, so it costs a strided copy each and no extra I/O. Built
+        # here, no extraction ever needs the five-minute background pass that
+        # existing channels do.
+        accumulator = None
+        try:
+            from .display_pyramid import Accumulator
+            candidate = Accumulator(out_shape, dtype)
+            accumulator = candidate if candidate.wanted() else None
+        except Exception as exc:
+            print(f"    Could not prepare a display preview ({exc}); "
+                  f"extraction continues without one.")
+
         def planes():
             with tiff.TiffFile(src_path) as handle:
                 series = handle.series[0]
@@ -528,6 +541,8 @@ class MetadataExtractor:
                         # count at one, but a reader that will not honour `out`
                         # should still produce a correct file.
                         scratch[:] = page.asarray()
+                    if accumulator is not None:
+                        accumulator.add_plane(z_index, scratch)
                     if progress is not None:
                         progress(z_index + 1, depth)
                     yield scratch
@@ -566,6 +581,18 @@ class MetadataExtractor:
             except OSError:
                 pass
             raise
+
+        # After the image is in place, never before: the manifest records the
+        # finished file's size and mtime, and a preview written against the
+        # .part would be stale the moment it was renamed. A preview failure
+        # must not fail an extraction that has already succeeded -- the image
+        # is correct and complete, and the viewer simply builds one later.
+        if accumulator is not None:
+            try:
+                accumulator.write(dest_path)
+            except Exception as exc:
+                print(f"    Extracted the channel but could not write its "
+                      f"display preview ({exc}); the viewer will build one.")
 
     @staticmethod
     def extract_channel_to_tiff(src_path: str, dest_path: str, channel_idx: int,

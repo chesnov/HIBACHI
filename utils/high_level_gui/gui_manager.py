@@ -1562,8 +1562,16 @@ class DynamicGUIManager(QObject):
         if self.roi_active:
             return None
         try:
-            from .display_pyramid import open_levels
-            return open_levels(self.file_loc)
+            from .display_pyramid import ensure_async, open_levels
+            levels = open_levels(self.file_loc)
+            if levels:
+                return levels
+            # No preview yet -- an older project, or one whose image was
+            # re-extracted. Build it in the background and open at full
+            # resolution meanwhile, so the sample is usable now and fast next
+            # time without anyone having to ask for it.
+            ensure_async(self.file_loc)
+            return None
         except Exception as exc:
             print(f"  [display] preview unavailable ({exc}); "
                   "showing full resolution")

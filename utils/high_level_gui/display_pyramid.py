@@ -46,6 +46,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -117,20 +118,101 @@ def factors_for(shape: Tuple[int, ...]) -> List[int]:
     return factors
 
 
+class Accumulator:
+    """Collects reduced levels one plane at a time, then writes them.
+
+    Exists so the pyramid can be produced from planes that are ALREADY being
+    read, rather than by reading the image again. Extraction streams every
+    plane through a buffer on its way to disk; feeding those planes here costs
+    a strided copy each and no extra I/O, which on a drive that reads at tens
+    of MB/s is the difference between free and five minutes per channel.
+
+    `build` below uses the same class, so there is one implementation of what a
+    level is and how it is written, whichever end it is driven from.
+
+    Holds every level in memory while filling -- together they are a few
+    percent of the image, ~2 GB for a 24 GB channel -- and writes sequentially
+    at the end rather than memory-mapping writes onto a FUSE-mounted drive.
+    """
+
+    def __init__(self, shape: Tuple[int, ...], dtype) -> None:
+        self.shape = tuple(int(n) for n in shape)
+        self.dtype = np.dtype(dtype)
+        self.factors = factors_for(self.shape)
+        self.is_3d = len(self.shape) == 3
+        self.depth = int(self.shape[0]) if self.is_3d else 1
+        height, width = int(self.shape[-2]), int(self.shape[-1])
+        self.levels: Dict[int, np.ndarray] = {}
+        for factor in self.factors:
+            lh = -(-height // factor)
+            lw = -(-width // factor)
+            self.levels[factor] = np.empty(
+                (self.depth, lh, lw) if self.is_3d else (lh, lw),
+                dtype=self.dtype)
+
+    def wanted(self) -> bool:
+        """Whether this image is large enough for a pyramid to be worth it."""
+        return bool(self.factors)
+
+    def add_plane(self, z_index: int, plane) -> None:
+        """Reduce one full-resolution plane into every level.
+
+        Strided decimation, not averaging. Microglial processes are one or two
+        pixels wide and bright against near-zero background; a box mean dims
+        them toward the background and they vanish from the overview, while
+        taking every Nth pixel keeps their intensity where it lands. This is a
+        preview, so aliasing is acceptable and losing the processes is not.
+        """
+        for factor, target in self.levels.items():
+            reduced = plane[::factor, ::factor]
+            if self.is_3d:
+                target[z_index] = reduced
+            else:
+                target[:] = reduced
+
+    def write(self, tif_path: str) -> List[str]:
+        """Write the levels beside `tif_path` and record the manifest."""
+        if not self.factors:
+            return []
+        out_dir = display_dir(tif_path)
+        os.makedirs(out_dir, exist_ok=True)
+        written: List[str] = []
+        for factor in self.factors:
+            path = os.path.join(out_dir, _level_name(factor))
+            partial = path + ".part"
+            try:
+                tiff.imwrite(
+                    partial, self.levels[factor], imagej=True,
+                    photometric="minisblack",
+                    metadata={"axes": "ZYX" if self.is_3d else "YX"},
+                )
+                os.replace(partial, path)
+            except BaseException:
+                try:
+                    if os.path.isfile(partial):
+                        os.remove(partial)
+                except OSError:
+                    pass
+                raise
+            written.append(path)
+
+        # The manifest is written LAST and is what `is_current` keys on, so an
+        # interrupted build leaves no manifest and the pyramid is ignored
+        # rather than half-used.
+        manifest = _fingerprint(tif_path)
+        manifest["factors"] = self.factors
+        with open(os.path.join(out_dir, MANIFEST), "w") as fh:
+            json.dump(manifest, fh, indent=2)
+        return written
+
+
 def build(tif_path: str, progress=None, should_cancel=None) -> List[str]:
-    """Build the display pyramid for a full-resolution image. Returns paths.
+    """Build the display pyramid for an existing image. Returns paths.
 
-    Reads the image ONCE, plane by plane, and fills every level from that one
-    plane -- so the cost is one pass over the file, not one per level. The
-    levels themselves are held in memory while building (all of them together
-    are a few percent of the image) and written sequentially afterwards, which
-    avoids memory-mapping a write onto a FUSE-mounted drive.
-
-    Reduction is by strided decimation, not averaging. Microglial processes are
-    one or two pixels wide and bright against near-zero background; a box mean
-    dims them toward the background and they disappear from the overview,
-    while taking every Nth pixel keeps their intensity where it lands. This is
-    a preview, so aliasing is acceptable and losing the processes is not.
+    Reads the image ONCE, plane by plane, feeding each plane to every level --
+    so the cost is one pass over the file, not one per level. For a channel
+    already on disk this is the only option; new extractions fill an
+    `Accumulator` as they write and pay nothing.
 
     `progress` is called as progress(done_planes, total_planes).
     """
@@ -141,65 +223,81 @@ def build(tif_path: str, progress=None, should_cancel=None) -> List[str]:
         shape = tuple(int(n) for n in series.shape)
         dtype = np.dtype(str(series.dtype))
 
-    factors = factors_for(shape)
-    if not factors:
+    accumulator = Accumulator(shape, dtype)
+    if not accumulator.wanted():
         return []
-
-    is_3d = len(shape) == 3
-    depth = int(shape[0]) if is_3d else 1
-    height, width = int(shape[-2]), int(shape[-1])
-
-    levels: Dict[int, np.ndarray] = {}
-    for factor in factors:
-        lh = -(-height // factor)
-        lw = -(-width // factor)
-        levels[factor] = np.empty((depth, lh, lw) if is_3d else (lh, lw),
-                                  dtype=dtype)
 
     full = tiff.memmap(tif_path, mode="r")
     try:
-        for z in range(depth):
+        for z in range(accumulator.depth):
             if should_cancel is not None and should_cancel():
                 raise SetupCancelled("cancelled while building the preview")
-            plane = np.asarray(full[z] if is_3d else full)
-            for factor, target in levels.items():
-                reduced = plane[::factor, ::factor]
-                if is_3d:
-                    target[z] = reduced
-                else:
-                    target[:] = reduced
+            plane = np.asarray(full[z] if accumulator.is_3d else full)
+            accumulator.add_plane(z, plane)
             if progress is not None:
-                progress(z + 1, depth)
+                progress(z + 1, accumulator.depth)
     finally:
         del full
 
-    out_dir = display_dir(tif_path)
-    os.makedirs(out_dir, exist_ok=True)
-    written: List[str] = []
-    for factor in factors:
-        path = os.path.join(out_dir, _level_name(factor))
-        partial = path + ".part"
-        try:
-            tiff.imwrite(
-                partial, levels[factor], imagej=True,
-                photometric="minisblack",
-                metadata={"axes": "ZYX" if is_3d else "YX"},
-            )
-            os.replace(partial, path)
-        except BaseException:
-            try:
-                if os.path.isfile(partial):
-                    os.remove(partial)
-            except OSError:
-                pass
-            raise
-        written.append(path)
+    return accumulator.write(tif_path)
 
-    manifest = _fingerprint(tif_path)
-    manifest["factors"] = factors
-    with open(os.path.join(out_dir, MANIFEST), "w") as fh:
-        json.dump(manifest, fh, indent=2)
-    return written
+
+#: Paths with a build in flight, so two viewers opening the same channel do not
+#: both spend five minutes producing the same file.
+_in_flight: set = set()
+_in_flight_lock = threading.Lock()
+
+
+def ensure_async(tif_path: str) -> bool:
+    """Start building a missing pyramid in the background. True if started.
+
+    This is what makes the preview automatic. A build takes minutes on a slow
+    drive, which is far too long to block the viewer on, so the image opens at
+    full resolution exactly as it would have and the pyramid appears for the
+    NEXT open. Existing projects therefore heal themselves as their samples are
+    looked at, with no action and no prompt.
+
+    Touches only files and numpy -- no Qt or napari objects -- so it is safe
+    off the main thread. Does nothing when a current pyramid exists, when the
+    image is too small to need one, or when a build is already in flight.
+    """
+    try:
+        if is_current(tif_path):
+            return False
+        with tiff.TiffFile(tif_path) as handle:
+            series = handle.series[0]
+            shape = tuple(int(n) for n in series.shape)
+        if not factors_for(shape):
+            return False
+    except Exception:
+        return False
+
+    key = os.path.abspath(tif_path)
+    with _in_flight_lock:
+        if key in _in_flight:
+            return False
+        _in_flight.add(key)
+
+    name = os.path.basename(tif_path)
+
+    def _run() -> None:
+        try:
+            print(f"  [display] building a preview for {name} in the "
+                  f"background; this image opens at full resolution until it "
+                  f"is ready")
+            written = build(tif_path)
+            print(f"  [display] preview ready for {name} "
+                  f"({len(written)} levels)")
+        except Exception as exc:
+            # Never surface this: the image is open and usable, and a failed
+            # preview only means the next open is as slow as this one.
+            print(f"  [display] could not build a preview for {name} ({exc})")
+        finally:
+            with _in_flight_lock:
+                _in_flight.discard(key)
+
+    threading.Thread(target=_run, name=f"pyramid:{name}", daemon=True).start()
+    return True
 
 
 def is_current(tif_path: str) -> bool:

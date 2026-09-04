@@ -89,10 +89,14 @@ def _raw_for_display(tif_file: str):
     large file will still hurt, so it should not be silent.
     """
     try:
-        from .display_pyramid import open_levels
+        from .display_pyramid import ensure_async, open_levels
         levels = open_levels(tif_file)
         if levels:
             return levels
+        # No preview yet. Build it in the background and map full resolution
+        # for now: this composite is slow, the next one is not, and nobody has
+        # to run anything by hand.
+        ensure_async(tif_file)
     except Exception as exc:
         # A missing or broken preview must never stop the image from opening.
         print(f"  [display] preview unavailable for "
