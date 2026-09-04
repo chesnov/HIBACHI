@@ -842,7 +842,7 @@ class ProjectViewWindow(QMainWindow):
         re-setting the project up from scratch.
         """
         from .project_scaffolding import (
-            add_sources_to_project, existing_image_folder_names,
+            SetupCancelled, add_sources_to_project, existing_image_folder_names,
             unorganized_sources,
         )
         from .slide_reader import folder_name_for_source
@@ -900,15 +900,54 @@ class ProjectViewWindow(QMainWindow):
         if not chosen:
             return
 
-        QApplication.setOverrideCursor(Qt.WaitCursor)
+        # add_sources_to_project takes `progress` and `should_cancel` and
+        # nothing was passing them, so adding an image ran a full extraction --
+        # minutes per channel on a slide-scanner stack, plus its display
+        # preview -- behind nothing but a wait cursor and a frozen window. The
+        # setup wizard reports the same work; this path simply never asked for
+        # it.
+        from PyQt5.QtWidgets import QProgressDialog  # type: ignore
+
+        dialog = QProgressDialog(
+            "Adding images…", "Cancel", 0, max(1, len(chosen)), self)
+        dialog.setWindowTitle("Adding images")
+        dialog.setWindowModality(Qt.WindowModal)
+        dialog.setMinimumDuration(0)
+        dialog.setAutoClose(False)
+        dialog.setAutoReset(False)
+        dialog.setValue(0)
+        QApplication.processEvents()
+
+        def _report(message, done, total):
+            dialog.setLabelText(str(message))
+            dialog.setMaximum(max(1, int(total)))
+            dialog.setValue(min(int(done), max(1, int(total))))
+            # The work runs on this thread, so the dialog only repaints and
+            # only notices Cancel if Qt is allowed to run.
+            QApplication.processEvents()
+
         try:
-            result = add_sources_to_project(project_dir, chosen)
+            result = add_sources_to_project(
+                project_dir, chosen,
+                progress=_report,
+                should_cancel=lambda: dialog.wasCanceled(),
+            )
+        except SetupCancelled:
+            dialog.close()
+            self.open_path(project_dir)
+            QMessageBox.information(
+                self, "Adding images cancelled",
+                "Nothing further was added. Images already organized before "
+                "you cancelled are in the project and can be used; the rest "
+                "are still unorganized and can be added again.")
+            return
         except Exception as exc:
-            QApplication.restoreOverrideCursor()
+            dialog.close()
             QMessageBox.critical(self, "Could not add images", str(exc))
             return
         finally:
-            QApplication.restoreOverrideCursor()
+            dialog.close()
+            QApplication.processEvents()
 
         # Rebuild so the new rows appear and the button's count updates.
         self.open_path(project_dir)

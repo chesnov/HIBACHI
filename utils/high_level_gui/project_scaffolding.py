@@ -604,17 +604,19 @@ def organize_channel_project(
         extracted = False
         reason = ''
         try:
-            # Tile-level progress: a single 997 megapixel channel can take
+            # Plane-level progress: a single 928 megapixel channel can take
             # minutes, so the file-level message above is not granular enough to
-            # show that anything is happening.
-            def _tile_progress(done, total, _name=src_file, _i=file_index):
+            # show that anything is happening. Extraction streams one plane at a
+            # time, so this counts planes -- it said "tile" while the old
+            # implementation read whole volumes and reported nothing at all.
+            def _plane_progress(done, total, _name=src_file, _i=file_index):
                 if progress is not None:
                     progress(f"Channel {channel_idx}: {_name}  "
-                             f"(tile {done}/{total})", _i, total_files)
+                             f"(plane {done}/{total})", _i, total_files)
 
             extracted = bool(MetadataExtractor.extract_channel_to_tiff(
                 src_path, target_tif_path, channel_idx,
-                progress=_tile_progress, should_cancel=should_cancel,
+                progress=_plane_progress, should_cancel=should_cancel,
             ))
         except Exception as e:
             from .slide_reader import SetupCancelled
