@@ -468,31 +468,6 @@ def _match_dimension_override(
     return None
 
 
-def _has_real_scale(meta: Dict[str, Any], mode: Any = "", ndim=None) -> bool:
-    """True if `meta` carries a physical scale worth trusting on every axis.
-
-    The ``found`` flag alone is not enough. Many writers (tifffile included)
-    store XResolution=(1,1) with ResolutionUnit=NONE on an uncalibrated image,
-    which ``read_tiff_metadata`` resolves to exactly 1.0 micron/pixel and reports
-    as found=True. That is indistinguishable from "no calibration at all", so a
-    unit spacing is treated as missing and the user is asked instead of silently
-    producing dimensions that are really just pixel counts.
-
-    Now delegates to ``dimension_entry.scale_gaps`` so the check is per-axis and
-    rank-aware. The old version tested only X and Y, so a 3D image with a genuine
-    X/Y but no Z spacing passed as fully calibrated -- and Z is the axis
-    microscopes most often fail to record.
-
-    Pass `ndim` (the image's own rank) whenever it is known: without it, and with
-    one mode string for both ranks, this asks about Z for 2D images too.
-
-    NOTE: no live callers -- both organize paths now call ``scale_gaps``
-    directly, per axis. Kept only because it is importable from outside; a
-    candidate for deletion alongside the §6 cleanups.
-    """
-    from .dimension_entry import scale_gaps
-    return not scale_gaps(meta, mode, ndim)
-
 def organize_channel_project(
     source_files: List[str],
     source_root: str,
@@ -690,10 +665,13 @@ def organize_channel_project(
         # row per source image covers every channel extracted from that image.
         # Per-axis precedence: CSV, then manually-entered values, then the file's
         # own metadata. Tracked per axis rather than per image because a CSV (or
-        # dialog) can pin one axis and leave another unknown. The previous
-        # `if override: ... elif not _has_real_scale(...)` meant ANY csv row
-        # suppressed the unscaled report for the axes it did NOT supply, so a CSV
-        # with only 'Width (um)' silently left Y and Z as pixel counts.
+        # dialog) can pin one axis and leave another unknown. The previous check
+        # asked one whole-image question -- "is there an override, and if not is
+        # the scale real?" -- so ANY csv row suppressed the unscaled report for
+        # the axes it did NOT supply, and a CSV with only 'Width (um)' silently
+        # left Y and Z as pixel counts. That whole-image boolean was the only
+        # thing `_has_real_scale` offered over `scale_gaps`, which is why it has
+        # been deleted rather than kept as a convenience.
         from .dimension_entry import (
             SOURCE_PIXELS_ASSUMED, axes_for_mode, combine_sources,
             per_axis_sources, scale_gaps, stamp_dimensions_source,

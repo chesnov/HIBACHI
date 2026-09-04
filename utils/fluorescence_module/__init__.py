@@ -56,16 +56,6 @@ Conventions for anything added here
     microns per voxel. "In-plane" means the LAST TWO entries at either rank --
     ``spacing[-2:]``, never ``spacing[1:]``, which silently drops Y in 2D.
 
-5.  **Imports inside this package are relative and stay inside it.** Nothing
-    reaches into a sibling package -- not ``high_level_gui``, and not the old
-    ``module_3d`` / ``module_2d`` trees, which is what this rule was originally
-    written against and which no longer exist to import from. Two of the merge
-    session's failures were missing or cross-package imports; a self-contained
-    package cannot have them. The constraint runs the other way too: the GUI
-    imports this package, so this package importing the GUI would make the two
-    impossible to reason about separately (``turntable._locate_layer_list_dock``
-    is deliberately hand-rolled for exactly this reason).
-
 6.  **Old entry-point names are kept as thin translating wrappers.** Existing
     callers, saved projects and batch workflows keep working, and the wrapper is
     the single place a renamed argument is mapped.

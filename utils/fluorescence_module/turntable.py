@@ -673,11 +673,14 @@ def _locate_layer_list_dock(viewer):
     directly beneath it. Kept self-contained (no import from the GUI package)
     so this module has no upward dependency on it.
 
-    The constraint outlives the reason given here originally, which was that the
-    module lived in module_3d/. It now lives in fluorescence_module/, but the
-    rule is the same: the pipeline package must not import from the GUI package,
-    or the two cannot be reasoned about separately (see convention 5 in
-    fluorescence_module/__init__.py)."""
+    A local choice, not a project rule. The convention this used to cite -- that
+    the pipeline package never imports the GUI package -- was never true:
+    `fluorescence_strategy` has always imported `high_level_gui.
+    processing_strategies`, because that module is the seam between the pipeline
+    and the GUI. The wording has been removed. Keeping THIS module self-contained
+    is still worth it: it is a display helper with no other reason to know the
+    GUI exists, and a version-tolerant dock lookup is easier to reason about
+    where the versions are handled."""
     for accessor in (lambda: viewer.window._qt_viewer.dockLayerList,
                      lambda: viewer.window.qt_viewer.dockLayerList):
         try:

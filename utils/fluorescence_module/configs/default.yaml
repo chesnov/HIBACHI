@@ -157,7 +157,11 @@ execute_soma_extraction:
       - 60.0
       element_type: int
     min_fragment_size:
-      label: Min Seed Size (Voxels)
+      label: Min Seed Size
+      description: >-
+        Smallest accepted soma core, counted in voxels for a stack and in
+        pixels for a single plane. The unit is not in the label because it
+        depends on the image's rank, which one config serves both of.
       type: int
       value: 150
       min: 1
@@ -216,7 +220,10 @@ execute_cell_separation:
   name: Execute Cell Separation
   parameters:
     min_size_threshold:
-      label: Min Final Cell Size (Voxels)
+      label: Min Final Cell Size
+      description: >-
+        Smallest accepted cell after separation, counted in voxels for a
+        stack and in pixels for a single plane.
       type: float
       value: 250.01
       min: 0.0
