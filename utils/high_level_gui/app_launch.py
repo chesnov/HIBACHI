@@ -693,6 +693,19 @@ def interactive_segmentation_with_config(selected_folder: str = None,
             app_state.show_project_view_signal.emit()
             return
 
+        # Prepare a fast preview BEFORE the viewer exists. Adding a
+        # 928-megapixel layer freezes napari's main thread while it downscales
+        # the plane to fit the GPU's texture limit and builds a thumbnail, so
+        # an unprepared image locks the window for minutes. Does nothing when
+        # the preview is already current, or when the image is small enough not
+        # to need one.
+        try:
+            from .display_pyramid import build_with_progress
+            build_with_progress([file_loc])
+        except Exception as exc:
+            # The image still opens without a preview, just slowly.
+            log.warning("Could not prepare a display preview: %s", exc)
+
         image_stack = tiff.memmap(file_loc, mode='r') 
         lifecycle("viewer.open",
                   folder=os.path.basename(selected_folder),

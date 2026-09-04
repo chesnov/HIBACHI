@@ -46,7 +46,6 @@ from __future__ import annotations
 
 import json
 import os
-import threading
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -242,62 +241,111 @@ def build(tif_path: str, progress=None, should_cancel=None) -> List[str]:
     return accumulator.write(tif_path)
 
 
-#: Paths with a build in flight, so two viewers opening the same channel do not
-#: both spend five minutes producing the same file.
-_in_flight: set = set()
-_in_flight_lock = threading.Lock()
-
-
-def ensure_async(tif_path: str) -> bool:
-    """Start building a missing pyramid in the background. True if started.
-
-    This is what makes the preview automatic. A build takes minutes on a slow
-    drive, which is far too long to block the viewer on, so the image opens at
-    full resolution exactly as it would have and the pyramid appears for the
-    NEXT open. Existing projects therefore heal themselves as their samples are
-    looked at, with no action and no prompt.
-
-    Touches only files and numpy -- no Qt or napari objects -- so it is safe
-    off the main thread. Does nothing when a current pyramid exists, when the
-    image is too small to need one, or when a build is already in flight.
-    """
+def needs_preview(tif_path: str) -> bool:
+    """Whether this image wants a preview and does not have a current one."""
     try:
         if is_current(tif_path):
             return False
         with tiff.TiffFile(tif_path) as handle:
-            series = handle.series[0]
-            shape = tuple(int(n) for n in series.shape)
-        if not factors_for(shape):
-            return False
+            shape = tuple(int(n) for n in handle.series[0].shape)
+        return bool(factors_for(shape))
     except Exception:
         return False
 
-    key = os.path.abspath(tif_path)
-    with _in_flight_lock:
-        if key in _in_flight:
-            return False
-        _in_flight.add(key)
 
-    name = os.path.basename(tif_path)
+def _plane_count(tif_path: str) -> int:
+    try:
+        with tiff.TiffFile(tif_path) as handle:
+            shape = tuple(int(n) for n in handle.series[0].shape)
+        return int(shape[0]) if len(shape) == 3 else 1
+    except Exception:
+        return 1
 
-    def _run() -> None:
-        try:
-            print(f"  [display] building a preview for {name} in the "
-                  f"background; this image opens at full resolution until it "
-                  f"is ready")
-            written = build(tif_path)
-            print(f"  [display] preview ready for {name} "
-                  f"({len(written)} levels)")
-        except Exception as exc:
-            # Never surface this: the image is open and usable, and a failed
-            # preview only means the next open is as slow as this one.
-            print(f"  [display] could not build a preview for {name} ({exc})")
-        finally:
-            with _in_flight_lock:
-                _in_flight.discard(key)
 
-    threading.Thread(target=_run, name=f"pyramid:{name}", daemon=True).start()
-    return True
+def build_with_progress(tif_paths, parent=None) -> None:
+    """Build any missing previews, showing a modal progress window first.
+
+    Called BEFORE a viewer is created, and blocking on purpose. The
+    alternative -- building in the background while the image opens at full
+    resolution -- read well but behaved badly: napari builds a thumbnail and
+    downscales a 928-megapixel plane on the main thread to get under the GPU's
+    texture limit, so the window froze for minutes per channel exactly as it
+    did before, while the background build competed with it for a drive that
+    collapses to seek-bound speed under concurrent readers. Waiting visibly is
+    both faster and honest.
+
+    Builds are sequential for the same reason: one reader at a time is far
+    quicker on a spinning disk than several interleaved.
+
+    Cancelling stops after the current image and opens the rest at full
+    resolution, which is slow but correct -- the viewer never depends on a
+    preview existing.
+
+    Qt is imported here rather than at module scope so extraction, batch runs
+    and tests can use the rest of this module headless.
+    """
+    pending = [p for p in dict.fromkeys(tif_paths) if p and needs_preview(p)]
+    if not pending:
+        return
+
+    try:
+        from PyQt5.QtCore import Qt  # type: ignore
+        from PyQt5.QtWidgets import (  # type: ignore
+            QApplication, QProgressDialog,
+        )
+    except Exception:
+        for path in pending:
+            build(path)
+        return
+
+    totals = {p: max(1, _plane_count(p)) for p in pending}
+    grand_total = sum(totals.values())
+    done_before = 0
+
+    dialog = QProgressDialog(
+        "Preparing a fast preview for this sample…", "Skip", 0, grand_total,
+        parent)
+    dialog.setWindowTitle("Preparing preview")
+    dialog.setWindowModality(Qt.WindowModal)
+    dialog.setMinimumDuration(0)
+    dialog.setAutoClose(False)
+    dialog.setAutoReset(False)
+    dialog.setValue(0)
+    QApplication.processEvents()
+
+    try:
+        for index, path in enumerate(pending, start=1):
+            name = os.path.basename(os.path.dirname(os.path.abspath(path)))
+            base = done_before
+
+            def _tick(done: int, total: int, _n=name, _i=index, _b=base) -> None:
+                dialog.setLabelText(
+                    f"Preparing a fast preview ({_i} of {len(pending)})\n"
+                    f"{_n} — plane {done} of {total}"
+                )
+                dialog.setValue(_b + done)
+                # The build runs on this thread, so the dialog only repaints
+                # and only notices the Skip button if we let Qt run.
+                QApplication.processEvents()
+
+            try:
+                build(path, progress=_tick,
+                      should_cancel=lambda: dialog.wasCanceled())
+            except Exception as exc:
+                # A preview is an optimisation; losing one must not stop the
+                # sample from opening.
+                print(f"  [display] could not build a preview for "
+                      f"{os.path.basename(path)} ({exc})")
+                if dialog.wasCanceled():
+                    break
+            done_before += totals[path]
+            dialog.setValue(done_before)
+            QApplication.processEvents()
+            if dialog.wasCanceled():
+                break
+    finally:
+        dialog.close()
+        QApplication.processEvents()
 
 
 def is_current(tif_path: str) -> bool:

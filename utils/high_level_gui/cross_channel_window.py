@@ -89,14 +89,10 @@ def _raw_for_display(tif_file: str):
     large file will still hurt, so it should not be silent.
     """
     try:
-        from .display_pyramid import ensure_async, open_levels
+        from .display_pyramid import open_levels
         levels = open_levels(tif_file)
         if levels:
             return levels
-        # No preview yet. Build it in the background and map full resolution
-        # for now: this composite is slow, the next one is not, and nobody has
-        # to run anything by hand.
-        ensure_async(tif_file)
     except Exception as exc:
         # A missing or broken preview must never stop the image from opening.
         print(f"  [display] preview unavailable for "
@@ -122,6 +118,29 @@ def _display_range(data) -> dict:
     except Exception:
         limits = None
     return {"contrast_limits": list(limits)} if limits else {}
+
+
+
+def _prepare_previews(sample_data, parent=None) -> None:
+    """Build any missing previews for a sample's channels, with a progress bar.
+
+    Before the viewer exists, deliberately. Adding a full-resolution
+    928-megapixel layer freezes napari's main thread while it downscales the
+    plane for the GPU and builds a thumbnail, so a composite with even one
+    unprepared channel locks the window for minutes. Waiting on a progress bar
+    is both faster and visible.
+    """
+    try:
+        from .display_pyramid import build_with_progress
+        paths = []
+        for ch_path in sample_data.values():
+            paths.append(next(
+                (os.path.join(ch_path, f) for f in os.listdir(ch_path)
+                 if f.lower().endswith(('.tif', '.tiff'))), None))
+        build_with_progress([p for p in paths if p], parent=parent)
+    except Exception as exc:
+        # The sample still opens without previews, just slowly.
+        print(f"  [display] could not prepare previews ({exc})")
 
 
 def _safe_name(name: str) -> str:
@@ -700,6 +719,7 @@ class CrossChannelAnalyzerWindow(QMainWindow):
         except OSError:
             pass
 
+        _prepare_previews(sample_data, parent=self)
         viewer = napari.Viewer(title=f"Cross-Channel Preview: {sample_name}")
         # Any failure below leaves a live napari window (Qt owns it, so it is not
         # collected when this frame unwinds), holding a GL context and the loaded
@@ -1063,6 +1083,7 @@ def open_sample_overlay(project_manager, sample_name, analysis_name=None, parent
 
     title = (f"Overlay: {analysis_label} | {sample_name}"
              if analysis_name else f"Sample: {sample_name}")
+    _prepare_previews(sample_data, parent=parent)
     viewer = napari.Viewer(title=title)
     # Any failure below leaves a live napari window (Qt owns it, so it is not
     # collected when this frame unwinds), holding a GL context and the loaded
