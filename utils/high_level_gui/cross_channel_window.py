@@ -58,7 +58,11 @@ def _spacing_from_extents(meta, shape, where=""):
 
 
 def _raw_for_display(tif_file: str):
-    """A memory-mapped view of a raw channel TIFF, for DISPLAY only.
+    """A lazily-read view of a raw channel TIFF, for DISPLAY only.
+
+    Returns either a mapped array or, when a display pyramid exists, the list
+    of levels napari wants for `multiscale=True`. Callers pass
+    `multiscale=isinstance(result, list)`.
 
     `tiff.memmap`, not `tiff.imread`. One channel of a slide-scanner stack is
     24 GB, and the callers below load one per channel in a loop, so opening a
@@ -69,6 +73,12 @@ def _raw_for_display(tif_file: str):
     segmentation labels added beside the raw intensity were already
     `np.memmap`; only the intensity was not.
 
+    Mapping fixed the memory but not the time: a plane is 1.86 GB, four
+    channels are 7.4 GB per z-step, and the drive this data lives on reads at
+    ~25 MB/s. The pyramid is what makes the composite open at all -- zoomed
+    out napari reads a ~950 px level per channel instead of a 928-megapixel
+    one. Without a pyramid the behaviour is exactly as before, just slow.
+
     Read-only, and only safe because this is the display path: napari does not
     write to it. The optimizer and the synthetic-null engine also read whole
     images, and deliberately still do -- they operate on the array rather than
@@ -78,6 +88,15 @@ def _raw_for_display(tif_file: str):
     compressed or tiled TIFF, and says so: that is exactly the case where a
     large file will still hurt, so it should not be silent.
     """
+    try:
+        from .display_pyramid import open_levels
+        levels = open_levels(tif_file)
+        if levels:
+            return levels
+    except Exception as exc:
+        # A missing or broken preview must never stop the image from opening.
+        print(f"  [display] preview unavailable for "
+              f"{os.path.basename(tif_file)} ({exc})")
     try:
         return tiff.memmap(tif_file, mode='r')
     except Exception as exc:
@@ -707,7 +726,8 @@ class CrossChannelAnalyzerWindow(QMainWindow):
                 if tif_file:
                     raw_img = _raw_for_display(tif_file)
                     cmap = colormaps[i % len(colormaps)]
-                    viewer.add_image(raw_img, name=f"Raw: {ch_name}", colormap=cmap, blending='additive', opacity=0.5)
+                    viewer.add_image(raw_img, name=f"Raw: {ch_name}", colormap=cmap, blending='additive', opacity=0.5,
+                                     multiscale=isinstance(raw_img, list))
 
                 # Add Segmentation Labels (Semi-transparent)
                 if dat_file:
@@ -1060,7 +1080,8 @@ def open_sample_overlay(project_manager, sample_name, analysis_name=None, parent
                 raw_img = _raw_for_display(tif_file)
                 cmap = colormaps[i % len(colormaps)]
                 viewer.add_image(raw_img, name=f"Raw: {ch_name}", colormap=cmap,
-                                 blending='additive', opacity=0.5)
+                                 blending='additive', opacity=0.5,
+                                 multiscale=isinstance(raw_img, list))
             if dat_file:
                 seg_data = np.memmap(dat_file, dtype=np.int32, mode='r', shape=shape)
                 viewer.add_labels(seg_data, name=f"Seg: {ch_name}", opacity=0.3,

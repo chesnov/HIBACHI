@@ -1546,6 +1546,29 @@ class DynamicGUIManager(QObject):
             else (self.spacing[1], self.spacing[2])
         )
 
+    def _display_levels(self):
+        """Pyramid levels for the image layer, or None to show it directly.
+
+        Only for the FULL image: an ROI crop is a small `.dat` of its own and
+        needs no preview, and `self.image_stack` is then the crop rather than
+        the file `self.file_loc` names, so a pyramid built from the latter
+        would draw the wrong pixels.
+
+        `self.image_stack` is left untouched either way. Every crop, shape and
+        rank check in this class reads it, and the layer is the only thing that
+        should ever see a reduced level -- the pyramid exists to draw pixels,
+        not to measure them.
+        """
+        if self.roi_active:
+            return None
+        try:
+            from .display_pyramid import open_levels
+            return open_levels(self.file_loc)
+        except Exception as exc:
+            print(f"  [display] preview unavailable ({exc}); "
+                  "showing full resolution")
+            return None
+
     def _initialize_layers(self) -> None:
         """Adds the original image to Napari."""
         self.viewer.layers.clear() 
@@ -1553,8 +1576,10 @@ class DynamicGUIManager(QObject):
         if layer_name in self.viewer.layers:
             self.viewer.layers.remove(layer_name)
 
+        levels = self._display_levels()
         layer = self.viewer.add_image(
-            self.image_stack, name=layer_name, scale=self._layer_scale()
+            levels if levels else self.image_stack, name=layer_name,
+            scale=self._layer_scale(), multiscale=bool(levels)
         )
         # Carry the full image's display range into an ROI session. A crop is
         # bounding-box shaped with everything outside the polygon zeroed, so
