@@ -64,10 +64,6 @@ SINGLE_PLANE = "plane"
 #: -- the whitelist that already lost `dimensions` once.
 COLLAPSE_KEY = "collapse_2d"
 
-#: Elements to sample when scoring focus. A focus metric is a statistic, so a
-#: strided read answers it; reading thirteen full planes to choose one of them
-#: would cost the whole 24 GB.
-_FOCUS_SAMPLES = 4_000_000
 
 
 def _spec(method: str, z_index: Optional[int] = None) -> Dict[str, Any]:
@@ -119,21 +115,57 @@ def is_collapsible(tif_path: str) -> bool:
     return plane_count(tif_path) > 1
 
 
+#: Rows per sampled band, and bands per plane. A band spans the FULL width, so
+#: it is one sequential read; scattered square tiles would be hundreds of
+#: thousands of kilobyte-sized seeks on the drive this data lives on, which is
+#: fast only when read sequentially.
+_BAND_ROWS = 512
+_BANDS = 3
+
+#: Width of a scoring tile within a band.
+_TILE = 512
+
+
+def _tenengrad(tile) -> float:
+    """Mean squared gradient magnitude above the tile's own median.
+
+    Gradient energy rises with edge steepness, so an in-focus plane scores
+    higher than the same signal blurred. Masking to pixels above the median
+    keeps a mostly-empty field from being scored on the noise between its
+    cells.
+    """
+    values = np.asarray(tile, dtype=np.float32)
+    if values.size < 16:
+        return 0.0
+    gy, gx = np.gradient(values)
+    energy = gy * gy + gx * gx
+    bright = values > float(np.median(values))
+    return float(energy[bright].mean()) if bright.any() else float(energy.mean())
+
+
 def focus_scores(tif_path: str) -> Dict[str, Any]:
     """Per-plane focus scores, the sharpest plane, and how clear the win is.
 
-    Tenengrad -- the mean squared gradient magnitude -- restricted to pixels
-    above the plane's own median, so a mostly-empty fluorescence field is
-    scored on its cells rather than on the noise between them. An in-focus
-    plane has steep edges; an out-of-focus one has the same total signal spread
-    over softer ones.
+    Each plane is scored as the MEDIAN of per-tile Tenengrad values, and the
+    median is the whole point. Every other aggregate is hijacked by a single
+    bright, sharp artifact -- a speck of dust on the coverslip has steeper
+    edges than any cell, and on a test stack with one such speck the mean over
+    tiles, the mean over the sharpest tiles, the whole-plane mean and a strided
+    sample ALL picked the artifact's plane, by factors of 20 to 100. The median
+    picked the truly focused plane and rated the artifact's plane unremarkable.
+    An artifact is local; focus is not.
 
-    Computed on a strided sample, never on full planes: the answer is a
-    statistic, and reading thirteen 1.86 GB planes to pick one of them would
-    cost the whole image. `margin` is the best score over the runner-up, so a
-    caller can tell a clear winner from a coin toss -- unattended batch work
-    should not silently pick between two planes scoring within a percent of
-    each other.
+    Tiles are cut from full-width bands of rows rather than scattered over the
+    plane: a band is one sequential read, and this data lives on a drive that
+    manages ~84 MB/s sequentially and a fifth of that when seeking. Tiles are
+    full resolution, because gradient energy is only meaningful between
+    adjacent pixels.
+
+    `margin` is the best score over the runner-up, so a caller can tell a clear
+    win from a coin toss. It cannot tell whether the sharpest plane is the one
+    the user wants: the bulk of a cell and its soma need not lie in the same
+    plane, and no metric knows which was intended. Treat the result as a
+    suggestion with the scores shown.
 
     Returns ``{}`` if the image is not a stack or cannot be read.
     """
@@ -147,18 +179,19 @@ def focus_scores(tif_path: str) -> Dict[str, Any]:
 
     try:
         height, width = int(stack.shape[-2]), int(stack.shape[-1])
-        stride = max(1, int(np.ceil(np.sqrt((height * width) / _FOCUS_SAMPLES))))
+        band_rows = min(_BAND_ROWS, height)
+        starts = np.linspace(0, max(0, height - band_rows), _BANDS)
+        starts = sorted({int(s) for s in starts})
+        columns = list(range(0, max(1, width - _TILE + 1), _TILE)) or [0]
+
         scores: List[float] = []
         for z in range(depth):
-            plane = np.asarray(stack[z][::stride, ::stride], dtype=np.float32)
-            if plane.size < 16:
-                scores.append(0.0)
-                continue
-            gy, gx = np.gradient(plane)
-            energy = gy * gy + gx * gx
-            mask = plane > float(np.median(plane))
-            scores.append(float(energy[mask].mean()) if mask.any()
-                          else float(energy.mean()))
+            per_tile: List[float] = []
+            for row in starts:
+                band = np.asarray(stack[z][row:row + band_rows])
+                for col in columns:
+                    per_tile.append(_tenengrad(band[:, col:col + _TILE]))
+            scores.append(float(np.median(per_tile)) if per_tile else 0.0)
     except Exception:
         return {}
     finally:
