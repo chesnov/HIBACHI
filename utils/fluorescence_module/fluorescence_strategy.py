@@ -448,6 +448,32 @@ class FluorescenceStrategy(ProcessingStrategy):
                 shape=self.image_shape
             )
 
+            # Somas from another channel, when this run is configured that
+            # way. A nuclear stain gives one marker per cell, where a distance
+            # transform of a cytoplasmic mask gives two for any cell whose
+            # nucleus is dark -- one either side of it -- and splits the cell in
+            # half. Step 4 is unchanged: it takes the soma mask as an argument
+            # and does not care where it came from.
+            #
+            # Every parameter below is unused in that case, which is why the
+            # widget builder hides them rather than leaving them editable and
+            # inert.
+            external = self.external_soma_seeds(
+                params, trimmed_seg_path, cell_bodies_path)
+            if external is not None:
+                print(f"  Somas taken from {external['channel']}: "
+                      f"{external['seeds_kept']} of "
+                      f"{external['seeds_found']} kept "
+                      f"({external['seeds_dropped']} outside this channel's "
+                      f"segmentation)")
+                if viewer is not None:
+                    cb_display = np.memmap(
+                        cell_bodies_path, dtype=np.int32, mode='r',
+                        shape=self.image_shape
+                    )
+                    self._add_layer_safely(viewer, cb_display, "Cell bodies")
+                return True
+
             soma_extraction_params = {
                 "min_fragment_size": int(_require(params, "min_fragment_size", int)),
                 "intensity_smooth_um": float(_require(params, "intensity_smooth_um", float)),

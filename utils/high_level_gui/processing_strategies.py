@@ -316,6 +316,45 @@ class ProcessingStrategy(abc.ABC):
     # `edge_mask` carries the mode as a PREFIX (`fluorescence_2d_edge_mask.dat`),
     # so a stem-plus-suffix rule would have missed exactly one of the twelve.
 
+    def soma_source_channel(self, params: Dict[str, Any]):
+        """Channel named as this run's soma source, or None for its own somas.
+
+        Lives on the base class so a strategy in `fluorescence_module` can use
+        it without importing `high_level_gui` itself -- convention 5 in that
+        package forbids reaching into a sibling, and its strategy module
+        already stretches that by subclassing this class.
+        """
+        value = (params or {}).get("soma_source_channel")
+        text = str(value).strip() if value is not None else ""
+        return text or None
+
+    def external_soma_seeds(self, params: Dict[str, Any], mask_path: str,
+                            dest_path: str) -> Optional[Dict[str, Any]]:
+        """Write another channel's somas to `dest_path`. None if not configured.
+
+        Raises with a specific reason when a source IS configured but cannot be
+        used, rather than falling back to extracting somas locally: a run that
+        silently seeded itself would look like a successful run of the analysis
+        that was asked for, and be a different one.
+        """
+        channel = self.soma_source_channel(params)
+        if channel is None:
+            return None
+
+        from .soma_source import filter_to_mask, resolve
+
+        artifact = resolve(self.processed_dir, channel)
+        stats = filter_to_mask(artifact, mask_path, dest_path, self.image_shape)
+        stats["channel"] = channel
+        stats["artifact"] = artifact
+        if stats["seeds_kept"] == 0:
+            raise ValueError(
+                f"none of the {stats['seeds_found']} somas from {channel!r} "
+                "overlap this channel's segmentation. The channels may be "
+                "misaligned, or this may be the wrong source channel."
+            )
+        return stats
+
     def _artifact(self, canonical: str, pattern: str) -> str:
         """Path to read/write an artifact: an existing match, else `canonical`.
 
@@ -569,6 +608,7 @@ class ProcessingStrategy(abc.ABC):
             'dimensions', 'voxel_dimensions', 'pixel_dimensions',
             'dimensions_source',   # provenance of the numbers above; travels with them
             'collapse_2d',         # how a stack became one plane; same reason
+            'soma_source',         # which channel seeded the somas; same reason
             'mode', 'saved_state', 'config_name', 'synthetic',
         )
         for step_key, step_data in current_config.items():
