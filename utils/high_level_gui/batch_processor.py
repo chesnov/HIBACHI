@@ -597,7 +597,18 @@ class BatchProcessor:
                                 "step_idx", "total_steps", "step_name"}
         Returns (success, failed, skipped).
         """
+        # A channel seeded from another one must run after it: its step 3
+        # reads the source's cell bodies, so the order the folders were checked
+        # in can turn a valid selection into a run that fails halfway. Only
+        # reorders within this set; a source that was not selected is left to
+        # step 3 to report.
         folders = self.project_manager.image_folders or []
+        try:
+            from .soma_source import order_for_seeding
+            folders = order_for_seeding(folders)
+        except Exception as exc:
+            print(f"[batch] could not order folders by soma source ({exc}); "
+                  "running in the order given")
         total = len(folders)
         success = failed = skipped = 0
 

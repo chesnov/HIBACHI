@@ -2304,6 +2304,75 @@ class DynamicGUIManager(QObject):
         except (TypeError, ValueError):
             return True     # unreadable annotation: show it rather than hide it
 
+    def _add_soma_source_widget(self, layout, config_key: str,
+                                parameters: dict) -> bool:
+        """Add the soma-source dropdown. True if a source is currently set.
+
+        A dropdown of real candidates rather than free text: the only valid
+        answers are channels whose matching segment has reached soma
+        extraction, and typing a channel name that has not been processed
+        would produce a run that fails at step 3 with nothing to show for the
+        wait.
+
+        Failing to build the control leaves the parameter unset and every
+        normal parameter visible, so a project whose layout this cannot read
+        behaves exactly as it did before.
+        """
+        from PyQt5.QtWidgets import QComboBox, QLabel  # type: ignore
+
+        pconf = parameters.get("soma_source_channel") or {}
+        current = str(pconf.get("value") or "").strip()
+
+        try:
+            from .soma_source import candidate_channels
+            candidates = [name for name, _path
+                          in candidate_channels(self.processed_dir)]
+        except Exception as exc:
+            print(f"[gui] could not list soma source channels: {exc}")
+            candidates = []
+
+        if not candidates and not current:
+            return False
+
+        label = QLabel(str(pconf.get("label") or "Take somas from"))
+        label.setStyleSheet("font-weight: bold;")
+        layout.addWidget(label)
+
+        box = QComboBox()
+        box.addItem("Find somas in this channel", "")
+        for name in candidates:
+            box.addItem(name, name)
+        # A channel recorded in the config but no longer offering results is
+        # kept in the list and selected, so the run's provenance stays visible
+        # instead of silently reverting to local extraction.
+        if current and current not in candidates:
+            box.addItem(f"{current}  (no results found)", current)
+        index = box.findData(current)
+        box.setCurrentIndex(index if index >= 0 else 0)
+        layout.addWidget(box)
+
+        note = QLabel(
+            "Cell bodies come from the chosen channel's segmentation of this "
+            "same image, keeping only those inside this channel's cells. The "
+            "parameters below are unused while a channel is chosen."
+            if candidates else
+            "No other channel has reached soma extraction for this image yet."
+        )
+        note.setWordWrap(True)
+        note.setStyleSheet("color: #666; font-style: italic;")
+        layout.addWidget(note)
+
+        def _changed(_index: int, key=config_key) -> None:
+            self.parameter_changed(key, "soma_source_channel",
+                                   box.currentData() or "")
+            # Rebuild so the parameters below appear or disappear with the
+            # choice, matching how the absolute-threshold switch behaves.
+            if self.current_step_method:
+                self.create_step_widgets(self.current_step_method)
+
+        box.currentIndexChanged.connect(_changed)
+        return bool(current)
+
     def create_step_widgets(self, step_method_name: str) -> None:
         """Generates parameter widgets for the given step."""
         # Temporarily lock the window size to prevent macOS from shrinking 
@@ -2344,6 +2413,16 @@ class DynamicGUIManager(QObject):
         lbl.setStyleSheet("font-weight: bold;")
         scroll_l.addWidget(lbl)
 
+        # Somas can be taken from another channel instead of found in this
+        # one's signal. The control is a dropdown of channels whose MATCHING
+        # segment -- this same full image, or this same region -- has reached
+        # soma extraction, because a channel that has not been processed
+        # cannot seed one that is being processed now.
+        seeded_externally = False
+        if "soma_source_channel" in (parameters or {}):
+            seeded_externally = self._add_soma_source_widget(
+                scroll_l, config_key, parameters)
+
         if isinstance(parameters, dict):
             # Check if Absolute mode is enabled
             is_absolute = False
@@ -2351,6 +2430,16 @@ class DynamicGUIManager(QObject):
                 is_absolute = bool(parameters["use_absolute_thresholds"].get("value", False))
 
             for pname, pconf in parameters.items():
+                # The dropdown above is this parameter's control.
+                if pname == "soma_source_channel":
+                    continue
+                # Seeding from another channel makes every soma-finding
+                # parameter here unused: nothing in this step reads them. They
+                # are hidden rather than left editable and inert, for the same
+                # reason rank-inapplicable parameters are -- an editable
+                # control that cannot affect the result invites tuning it.
+                if seeded_externally:
+                    continue
                 # Mutually exclusive parameter filtering
                 if pname in["scale_profiles", "scale_profiles_percentile"] and is_absolute:
                     continue

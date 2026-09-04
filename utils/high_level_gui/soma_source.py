@@ -145,6 +145,83 @@ def resolve(processed_dir: str, channel_name: str) -> str:
     return artifact
 
 
+def configured_source(sample_dir: str) -> Optional[str]:
+    """The channel this sample's config takes somas from, or None.
+
+    Reads the parameter straight from the sample's own config, because that is
+    where the decision lives and batch has no strategy instance to ask.
+    """
+    import glob
+
+    import yaml  # type: ignore
+
+    for path in sorted(glob.glob(os.path.join(sample_dir, "*.y*ml"))):
+        try:
+            with open(path) as handle:
+                config = yaml.safe_load(handle) or {}
+            block = ((config.get("execute_soma_extraction") or {})
+                     .get("parameters") or {})
+            value = (block.get(SOMA_SOURCE_KEY) or {}).get("value")
+            text = str(value).strip() if value is not None else ""
+            if text:
+                return text
+        except Exception:
+            continue
+    return None
+
+
+def order_for_seeding(folders) -> List[str]:
+    """Reorder folders so a channel's soma source is processed before it.
+
+    Batch treats channel projects as independent and runs them in whatever
+    order they were checked. A channel seeded from another one cannot: its step
+    3 needs the source's cell bodies to already exist, so the wrong order turns
+    a valid selection into a run that fails halfway with half the work done.
+
+    Only reorders WITHIN the given set. A source that was not selected is left
+    alone -- it may have been processed in an earlier run, and if it has not,
+    step 3 says so clearly rather than this silently adding work nobody asked
+    for. A dependency cycle (two channels seeding each other) keeps its
+    original order rather than hanging; the run will fail with a readable
+    reason, which beats a scheduler that never terminates.
+    """
+    from .project_selection import split_leaf_key
+
+    keys = list(folders)
+    identity = {}
+    for key in keys:
+        folder, _roi = split_leaf_key(str(key))
+        sample = os.path.basename(os.path.normpath(folder))
+        channel = os.path.basename(channel_dir_of(os.path.join(folder, "x")))
+        identity[key] = (sample, channel, folder)
+
+    # (sample, channel) -> key, so a dependency can be looked up by name.
+    by_identity = {(sample, channel): key
+                   for key, (sample, channel, _f) in identity.items()}
+
+    depends = {}
+    for key, (sample, _channel, folder) in identity.items():
+        source = configured_source(folder)
+        depends[key] = by_identity.get((sample, source)) if source else None
+
+    ordered, placed = [], set()
+    remaining = list(keys)
+    while remaining:
+        progressed = False
+        for key in list(remaining):
+            need = depends.get(key)
+            if need is None or need in placed or need not in remaining:
+                ordered.append(key)
+                placed.add(key)
+                remaining.remove(key)
+                progressed = True
+        if not progressed:
+            # Cyclic: emit the rest in their original order.
+            ordered.extend(remaining)
+            break
+    return ordered
+
+
 def _row_blocks(rows: int):
     for start in range(0, rows, _BLOCK_ROWS):
         yield slice(start, min(start + _BLOCK_ROWS, rows))

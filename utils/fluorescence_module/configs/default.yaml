@@ -119,6 +119,17 @@ execute_trim_edges:
 execute_soma_extraction:
   name: Execute Soma Extraction
   parameters:
+    soma_source_channel:
+      label: Take somas from another channel
+      type: str
+      value: ''
+      description: >-
+        Channel folder whose cell bodies seed this one, or empty to find somas
+        in this channel's own signal. Use it when a nuclear stain marks the
+        cells: a distance transform of a cytoplasmic mask puts a core either
+        side of a dark nucleus and splits the cell in two, while a nuclear
+        stain gives one marker per cell. Every other parameter here is unused
+        when this is set, and is hidden.
     ratios_to_process:
       label: Ratios to Process (Peeling; comma-sep floats)
       type: list
