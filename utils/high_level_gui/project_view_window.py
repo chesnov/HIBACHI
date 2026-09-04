@@ -790,9 +790,7 @@ class ProjectViewWindow(QMainWindow):
         as it finds any organized folder, so the dropped file was never
         considered.
         """
-        from .project_scaffolding import (
-            existing_image_folder_names, unorganized_sources,
-        )
+        from .project_scaffolding import existing_image_folder_names
         from .slide_reader import folder_name_for_source
 
         base = os.path.basename(str(source_file).rstrip("/\\"))
@@ -812,53 +810,65 @@ class ProjectViewWindow(QMainWindow):
             organized = existing_image_folder_names(project_dir)
         except Exception:
             organized = set()
-        if folder_name_for_source(base) in organized:
-            return  # visible as a row already; nothing to explain
 
+        # Ask the file what samples it contributes, then compare each one
+        # against the organized folders. The previous guard tested
+        # `folder_name_for_source(base)` -- a name derived from the bare
+        # filename -- which a multi-scene slide never produces: its folders are
+        # `<stem>_<scene>`. So a fully organized slide always fell through, and
+        # then hit the "could not read it as an image" warning below, which is
+        # both wrong and alarming. Header reads only, so this is cheap.
         try:
-            pending = unorganized_sources(project_dir)
+            from .slide_reader import list_sources
+            keys = list(list_sources(source_file))
         except Exception:
-            pending = []
+            keys = []
 
-        # Source keys for a slide are "file::scene", so match on the file part.
-        mine = [k for k in pending
-                if os.path.basename(k.split("::")[0]) == base]
-
-        if not mine:
-            # Not organized and not organizable: nothing here can read it.
-            from .slide_formats import (
-                unsupported_format_label, unsupported_format_message,
-            )
-            if unsupported_format_label(source_file):
-                QMessageBox.warning(self, "Unsupported file format",
-                                    unsupported_format_message(source_file))
-            else:
-                # The readable list is derived, not written out: the hardcoded
-                # copy here went stale the moment .lif and Zarr were added, so it
-                # told users a format was unreadable while the app was reading it.
-                try:
-                    from .slide_formats import image_extensions
-                    readable = ", ".join(image_extensions())
-                except Exception:
-                    readable = ".tif, .tiff, .czi"
-                QMessageBox.warning(
-                    self, "File not added",
-                    f"{base} is not part of this project and HIBACHI could not "
-                    "read it as an image.\n\n"
-                    f"Readable formats: {readable}"
-                )
+        if keys:
+            # ANY organized sample from this file means the user has already
+            # been asked what to take from it and answered. Setup offers every
+            # scene with a checkbox, so organizing a subset is a decision, not
+            # an oversight -- and prompting for the rest the moment setup
+            # finishes overrides that decision with a question. The tree's
+            # "Add images…" button carries the remaining count for whenever
+            # they do want them.
+            if any(folder_name_for_source(k) in organized for k in keys):
+                return
+            scenes = ""
+            if len(keys) > 1:
+                scenes = (f"\n\nIt contains {len(keys)} scenes, each becoming "
+                          "its own sample.")
+            if QMessageBox.question(
+                self, "Add this image to the project?",
+                f"{base} is in this folder but is not part of the project "
+                f"yet.{scenes}\n\nAdd it now?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes
+            ) == QMessageBox.Yes:
+                self._add_images(project_dir)
             return
 
-        scenes = ""
-        if len(mine) > 1:
-            scenes = f"\n\nIt contains {len(mine)} scenes, each becoming its own sample."
-        if QMessageBox.question(
-            self, "Add this image to the project?",
-            f"{base} is in this folder but is not part of the project yet."
-            f"{scenes}\n\nAdd it now?",
-            QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes
-        ) == QMessageBox.Yes:
-            self._add_images(project_dir)
+        # Not organizable: nothing here can read it.
+        from .slide_formats import (
+            unsupported_format_label, unsupported_format_message,
+        )
+        if unsupported_format_label(source_file):
+            QMessageBox.warning(self, "Unsupported file format",
+                                unsupported_format_message(source_file))
+        else:
+            # The readable list is derived, not written out: the hardcoded copy
+            # here went stale the moment .lif and Zarr were added, so it told
+            # users a format was unreadable while the app was reading it.
+            try:
+                from .slide_formats import image_extensions
+                readable = ", ".join(image_extensions())
+            except Exception:
+                readable = ".tif, .tiff, .czi"
+            QMessageBox.warning(
+                self, "File not added",
+                f"{base} is not part of this project and HIBACHI could not "
+                "read it as an image.\n\n"
+                f"Readable formats: {readable}"
+            )
 
     def _add_images(self, project_dir: str) -> None:
         """Organize raw images still sitting unorganized in the project folder.
