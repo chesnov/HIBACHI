@@ -49,6 +49,12 @@ class ProjectViewWindow(QMainWindow):
     #: `slot` is a factory taking no arguments so the bound method is resolved
     #: at construction time, after __init__ has defined it.
     _ACTION_SPECS = (
+        ("collapse", "Collapse to 2D\u2026", "selection",
+         lambda self: self._collapse_selected,
+         "Replace the checked images with a single plane \u2014 a maximum "
+         "projection or one chosen z \u2014 and delete everything computed from "
+         "the stack. Applies to every channel of the checked samples. The "
+         "original source files are never touched."),
         ("set_config", "Set New Channel Config\u2026", "selection",
          lambda self: self.set_channel_config,
          "Choose a YAML config template and apply its processing parameters "
@@ -213,6 +219,10 @@ class ProjectViewWindow(QMainWindow):
         from .project_selection import is_roi_leaf
         self._actions["delete_regions"].setEnabled(
             any(is_roi_leaf(k) for k in checked))
+        # Collapse rewrites a whole image, so a region row is not a valid
+        # target: enabled when at least one FULL-IMAGE row is checked.
+        self._actions["collapse"].setEnabled(
+            any(not is_roi_leaf(k) for k in checked))
 
         # Set Config applies per-channel, so it is only valid when the checked
         # images belong to at most one channel (a single image, several images in
@@ -979,6 +989,247 @@ class ProjectViewWindow(QMainWindow):
                 self, "Images added",
                 f"{len(chosen)} image(s) added to {result['channels']} "
                 "channel(s), using each channel's existing config.")
+
+    def _collapse_targets(self, checked: list) -> list:
+        """[(sample, channel, folder, depth)] for every channel of each checked
+        sample.
+
+        Checked rows name one channel's copy of a sample, but collapse applies
+        to the WHOLE sample: `cross_channel_window._geometry_for` takes shape
+        and spacing from the first channel and applies them to all, so leaving
+        one channel as a stack would measure it against another's geometry.
+        Region rows are dropped -- there is no such thing as collapsing a
+        region.
+        """
+        from .collapse_2d import plane_count, sample_tif
+        from .gui_text_utils import clean_filename_for_matching
+        from .project_selection import split_leaf_key
+
+        names, fallback = [], {}
+        for key in checked:
+            folder, roi_name = split_leaf_key(key)
+            if roi_name:
+                continue
+            name = clean_filename_for_matching(
+                os.path.basename(os.path.normpath(folder)))
+            names.append(name)
+            fallback.setdefault(name, {})[
+                os.path.basename(os.path.dirname(folder)) or "image"] = folder
+
+        registry = getattr(self.project_manager, "sample_registry", None) or {}
+        targets = []
+        for name in dict.fromkeys(names):
+            # A single-channel project has no channel folders to consolidate,
+            # so the registry can be empty; the checked folder is then the only
+            # copy there is.
+            channels = registry.get(name) or fallback.get(name) or {}
+            for channel_name, folder in sorted(channels.items()):
+                tif_path = sample_tif(folder)
+                depth = plane_count(tif_path) if tif_path else 1
+                targets.append((name, channel_name, folder, depth))
+        return targets
+
+    def _pick_collapse_methods(self, targets: list):
+        """Per-channel collapse choice, or None if cancelled.
+
+        One row per CHANNEL, not per image. The method is a per-channel
+        decision -- fluorophores focus at different depths, so the best plane
+        for DAPI need not be the best for Cy5 -- while a fixed plane or
+        autofocus then resolves per image. Asking per image would be a matrix
+        of choices nobody wants to fill in for twelve samples.
+        """
+        from PyQt5.QtWidgets import (  # type: ignore
+            QComboBox, QDialog, QDialogButtonBox, QFormLayout, QLabel,
+            QSpinBox, QVBoxLayout, QWidget, QHBoxLayout,
+        )
+
+        depths = {}
+        for _sample, channel_name, _folder, depth in targets:
+            depths[channel_name] = min(depths.get(channel_name, depth), depth)
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Collapse to 2D")
+        dlg.setMinimumWidth(460)
+        outer = QVBoxLayout(dlg)
+        head = QLabel(
+            f"{len(targets)} image(s) across {len(depths)} channel(s) will be "
+            "replaced by a single plane.\n\n"
+            "Maximum projection keeps the brightest value through the stack. "
+            "If only one plane is in focus, it also mixes in the haze from "
+            "every other plane \u2014 a single plane is usually the better "
+            "choice for that case.")
+        head.setWordWrap(True)
+        outer.addWidget(head)
+
+        form = QFormLayout()
+        rows = {}
+        for channel_name in sorted(depths):
+            depth = depths[channel_name]
+            box = QComboBox()
+            box.addItem("Sharpest plane (automatic)", "auto")
+            box.addItem("Maximum projection", "max")
+            box.addItem("Fixed plane\u2026", "plane")
+            spin = QSpinBox()
+            spin.setRange(0, max(0, depth - 1))
+            spin.setValue(depth // 2)
+            spin.setPrefix("z = ")
+            spin.setEnabled(False)
+            box.currentIndexChanged.connect(
+                lambda _i, b=box, s=spin: s.setEnabled(
+                    b.currentData() == "plane"))
+            line = QWidget()
+            lay = QHBoxLayout(line)
+            lay.setContentsMargins(0, 0, 0, 0)
+            lay.addWidget(box)
+            lay.addWidget(spin)
+            form.addRow(f"{channel_name}  ({depth} planes)", line)
+            rows[channel_name] = (box, spin)
+        outer.addLayout(form)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.button(QDialogButtonBox.Ok).setText("Continue")
+        buttons.accepted.connect(dlg.accept)
+        buttons.rejected.connect(dlg.reject)
+        outer.addWidget(buttons)
+
+        if dlg.exec_() != QDialog.Accepted:
+            return None
+        return {name: (box.currentData(), int(spin.value()))
+                for name, (box, spin) in rows.items()}
+
+    def _collapse_selected(self) -> None:
+        """Replace the checked samples' stacks with a single plane."""
+        if self._content_view is None:
+            return
+        from PyQt5.QtWidgets import QProgressDialog  # type: ignore
+        from .collapse_2d import (
+            MAX_PROJECTION, SINGLE_PLANE, _spec, collapse_channel,
+            derived_paths, focus_scores,
+        )
+        from .slide_reader import SetupCancelled
+
+        targets = self._collapse_targets(self._content_view.checked_folders())
+        stacks = [t for t in targets if t[3] > 1]
+        if not targets:
+            QMessageBox.information(
+                self, "Nothing to collapse",
+                "Check one or more image rows first.")
+            return
+        if not stacks:
+            QMessageBox.information(
+                self, "Already 2D",
+                f"All {len(targets)} checked image(s) are already a single "
+                "plane.")
+            return
+
+        choices = self._pick_collapse_methods(stacks)
+        if not choices:
+            return
+
+        # Say exactly what is about to be destroyed, and count it before
+        # touching anything: results, saved regions, the run's provenance and
+        # the sample's relational analyses all describe an image that is about
+        # to stop existing.
+        project_root = os.path.dirname(self.project_manager.project_path)
+        doomed = []
+        for sample, _channel, folder, _depth in stacks:
+            doomed.extend(derived_paths(folder, project_root, os.path.basename(
+                os.path.normpath(folder))))
+        doomed = list(dict.fromkeys(doomed))
+        listing = "\n".join(f"  \u2022 {os.path.relpath(p, project_root)}"
+                            for p in doomed[:10])
+        if len(doomed) > 10:
+            listing += f"\n  \u2026 and {len(doomed) - 10} more"
+
+        message = (
+            f"Replace {len(stacks)} image(s) with a single plane?\n\n"
+            "The original source files are not touched, so this can be undone "
+            "by importing them again.")
+        if doomed:
+            message += (
+                f"\n\n{len(doomed)} item(s) computed from these stacks will be "
+                f"deleted:\n{listing}")
+        message += "\n\nThis cannot be undone."
+        if QMessageBox.question(
+                self, "Collapse to 2D", message,
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No) != QMessageBox.Yes:
+            return
+
+        dialog = QProgressDialog("Collapsing…", "Cancel", 0, len(stacks), self)
+        dialog.setWindowTitle("Collapse to 2D")
+        dialog.setWindowModality(Qt.WindowModal)
+        dialog.setMinimumDuration(0)
+        dialog.setAutoClose(False)
+        dialog.setAutoReset(False)
+        dialog.setValue(0)
+        QApplication.processEvents()
+
+        done, errors, notes = 0, [], []
+        try:
+            for index, (sample, channel_name, folder, depth) in enumerate(stacks):
+                if dialog.wasCanceled():
+                    break
+                method, fixed = choices.get(channel_name, ("auto", 0))
+                dialog.setLabelText(f"{sample} \u2014 {channel_name}\n"
+                                    f"image {index + 1} of {len(stacks)}")
+                dialog.setValue(index)
+                QApplication.processEvents()
+
+                scores = None
+                try:
+                    if method == "auto":
+                        from .collapse_2d import sample_tif
+                        found = focus_scores(sample_tif(folder))
+                        if not found:
+                            errors.append(f"{sample}/{channel_name}: could not "
+                                          "score focus; skipped.")
+                            continue
+                        scores = found["scores"]
+                        spec = _spec(SINGLE_PLANE, found["best"])
+                        # A narrow win means the planes are near-identical by
+                        # this metric, which is worth saying rather than
+                        # hiding behind a confident-looking choice.
+                        if found["margin"] < 0.05:
+                            notes.append(
+                                f"{sample}/{channel_name}: planes "
+                                f"{found['best']} and the runner-up scored "
+                                f"within {found['margin'] * 100:.1f}%; "
+                                f"chose {found['best']}.")
+                    elif method == "max":
+                        spec = _spec(MAX_PROJECTION)
+                    else:
+                        spec = _spec(SINGLE_PLANE, min(fixed, depth - 1))
+
+                    collapse_channel(
+                        folder, spec, project_root=project_root, scores=scores,
+                        should_cancel=lambda: dialog.wasCanceled(),
+                    )
+                    done += 1
+                except SetupCancelled:
+                    break
+                except Exception as exc:
+                    errors.append(f"{sample}/{channel_name}: {exc}")
+        finally:
+            dialog.close()
+            QApplication.processEvents()
+
+        # Rebuild the tree: rows that were 3D are now 2D and their results are
+        # gone. `refresh()` rather than `open_path()`, matching how region
+        # deletion refreshes -- it needs no path and keeps the checked set.
+        try:
+            self._content_view.refresh()
+        except Exception:
+            pass
+
+        summary = f"{done} of {len(stacks)} image(s) collapsed."
+        if notes:
+            summary += "\n\n" + "\n".join(notes[:6])
+        if errors:
+            QMessageBox.warning(self, "Some images were not collapsed",
+                                summary + "\n\n" + "\n".join(errors[:6]))
+        else:
+            QMessageBox.information(self, "Collapsed to 2D", summary)
 
     def _pick_sources(self, pending: list) -> list:
         """Checkbox list of unorganized images. Returns the chosen source keys."""
