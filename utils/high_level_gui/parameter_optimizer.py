@@ -151,12 +151,51 @@ def _resolve_config(folder: str, mode: str) -> Tuple[Dict[str, Any], str, str]:
 
 
 def _load_image(path: str) -> np.ndarray:
+    """A lazily-read view of an image, mapped where the file allows it.
+
+    `tiff.memmap`, not `tiff.imread`. The caller reads the shape, picks a crop
+    of at most `_MAX_3D_VOXELS`, and materialises only that -- so reading the
+    whole array first was pure waste, and on a slide-scanner channel it is
+    24 GB of waste. Nothing here writes to the full array; the crop is copied
+    out with `np.ascontiguousarray`, and that copy is what gets segmented.
+
+    Falls back to a full read when the file cannot be mapped (a compressed or
+    tiled TIFF), then to skimage for anything tifffile will not open at all.
+    """
     try:
         import tifffile
-        return np.asarray(tifffile.imread(path))
+        try:
+            return tifffile.memmap(path, mode='r')
+        except Exception:
+            return np.asarray(tifffile.imread(path))
     except Exception:
         from skimage.io import imread  # fallback
         return np.asarray(imread(path))
+
+
+#: Elements to sample when choosing a crop. 2e7 float32 is ~80 MB, which is
+#: enough to locate structure in an image of any size.
+_CROP_SCAN_SAMPLES = 20_000_000
+
+
+def _subsample_steps(shape: Tuple[int, ...]) -> Tuple[int, ...]:
+    """Per-axis strides that bring `shape` down to ~`_CROP_SCAN_SAMPLES`.
+
+    Z is never strided: these stacks are a dozen slices deep, so skipping any
+    of them would drop real structure rather than sample it. The in-plane axes
+    take the same stride, because an anisotropic sample would bias the
+    foreground statistic the crop is chosen on.
+    """
+    total = 1
+    for s in shape:
+        total *= int(s)
+    if total <= _CROP_SCAN_SAMPLES:
+        return tuple(1 for _ in shape)
+    depth = int(shape[0]) if len(shape) == 3 else 1
+    plane_budget = max(1, _CROP_SCAN_SAMPLES // max(1, depth))
+    plane = total // max(1, depth)
+    step = max(1, int(np.ceil(np.sqrt(plane / plane_budget))))
+    return (1, step, step) if len(shape) == 3 else (step, step)
 
 
 def _raw_seg_step_key(config: Dict[str, Any]) -> str:
@@ -419,9 +458,18 @@ def _pick_crop(image: np.ndarray, is_2d: bool) -> Tuple[slice, ...]:
 
     # Score strided window origins by FOREGROUND count (image above a high
     # percentile), so the crop locks onto structures rather than a bright edge.
-    img = image.astype(np.float32)
-    thr = float(np.percentile(img, 92.0))
-    fg = (img > thr)
+    #
+    # Scored on a SUBSAMPLE. `image.astype(np.float32)` is 48 GB for a 24 GB
+    # slide-scanner channel, `np.percentile` copies it again internally, and
+    # the boolean mask adds a third array -- around 140 GB of allocation to
+    # choose a 12-million-voxel window. Both quantities being computed here are
+    # statistics: a high percentile of the intensities, and a per-window count
+    # of how many samples clear it. Striding preserves both and costs ~80 MB.
+    step = _subsample_steps(image.shape)
+    sub = np.asarray(image[tuple(slice(None, None, s) for s in step)],
+                     dtype=np.float32)
+    thr = float(np.percentile(sub, 92.0))
+    fg = sub > thr
     best_origin = tuple(0 for _ in image.shape)
     best_score = -1.0
     steps = [max(1, (s - w) // 6) for s, w in zip(image.shape, win)]
@@ -439,7 +487,11 @@ def _pick_crop(image: np.ndarray, is_2d: bool) -> Tuple[slice, ...]:
                         yield (z0, y, x)
 
     for origin in _iter_origins(ranges):
-        sl = tuple(slice(o, o + w) for o, w in zip(origin, win))
+        # The candidate window's footprint in subsample coordinates. Origins
+        # stay in FULL-image coordinates because that is what this function
+        # returns; only the scoring is done on the sample.
+        sl = tuple(slice(o // s, -(-(o + w) // s))
+                   for o, w, s in zip(origin, win, step))
         score = float(fg[sl].sum())
         if score > best_score:
             best_score, best_origin = score, origin
@@ -585,9 +637,16 @@ def optimize_initial_segmentation(
         if config_ndim(config) == 2 and image.ndim != 2:
             image = np.squeeze(image)
         is_2d = (image.ndim == 2)
+        # Spacing BEFORE cropping, from the full shape. It is the physical
+        # extent divided by the pixel count, so handing it the crop's shape
+        # returns the extent of the whole image spread over a few hundred
+        # pixels -- about 30x too many microns per pixel for a slide-scanner
+        # channel, applied to every physical parameter in the probe
+        # segmentations below. Only images over the budget are cropped, so this
+        # was invisible until one arrived.
+        spacing = _spacing_from_config(config, image.shape)
         crop = _pick_crop(image, is_2d)
         image = np.ascontiguousarray(image[crop])
-        spacing = _spacing_from_config(config, image.shape)
         images.append(image); spacings.append(spacing)
         params_list.append(copy.deepcopy(params)); step_keys.append(step_key)
         base_configs.append(config)
