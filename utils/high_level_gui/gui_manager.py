@@ -1577,9 +1577,22 @@ class DynamicGUIManager(QObject):
             self.viewer.layers.remove(layer_name)
 
         levels = self._display_levels()
+        source = levels if levels else self.image_stack
+        # Explicit limits so napari does not scan pixel data to invent them.
+        # That scan is a large part of the time to open one of these images,
+        # and it reads a different array once a pyramid is present, which is
+        # why the slider handles moved as soon as one appeared.
+        limits: Dict[str, Any] = {}
+        try:
+            from .display_pyramid import contrast_limits_for
+            computed = contrast_limits_for(source)
+            if computed:
+                limits = {"contrast_limits": list(computed)}
+        except Exception:
+            limits = {}
         layer = self.viewer.add_image(
-            levels if levels else self.image_stack, name=layer_name,
-            scale=self._layer_scale(), multiscale=bool(levels)
+            source, name=layer_name, scale=self._layer_scale(),
+            multiscale=bool(levels), **limits
         )
         # Carry the full image's display range into an ROI session. A crop is
         # bounding-box shaped with everything outside the polygon zeroed, so

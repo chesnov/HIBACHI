@@ -224,6 +224,43 @@ def is_current(tif_path: str) -> bool:
                for f in factors)
 
 
+def contrast_limits_for(data) -> Optional[Tuple[float, float]]:
+    """Display range for an image, computed from the SMALLEST array available.
+
+    napari picks contrast limits itself when none are given, and to do that it
+    has to scan pixel data: for a plain array it samples whole planes, which on
+    a 928-megapixel plane over a slow drive is most of the time it takes to
+    open an image, and for a multiscale layer it reads a different array than
+    the non-multiscale path did -- which is why the slider handles land
+    somewhere new the moment a pyramid appears.
+
+    Passing limits explicitly removes both effects. `data` may be a level list
+    (the coarsest level is used, ~23 MB) or a single array (a strided sample of
+    its middle plane). Percentiles rather than min/max: one hot pixel or a
+    saturated speck would otherwise stretch the range and render everything
+    else black.
+
+    Returns None if nothing can be read, in which case the caller should let
+    napari do what it did before rather than guess.
+    """
+    try:
+        array = data[-1] if isinstance(data, (list, tuple)) else data
+        sample = np.asarray(array)
+        if sample.ndim == 3:
+            sample = sample[sample.shape[0] // 2]
+        # Cap the sample regardless of where it came from: without a pyramid
+        # this is a full plane, and reading all of one is what we are avoiding.
+        stride = max(1, int(np.ceil(np.sqrt(sample.size / 4_000_000))))
+        sample = sample[::stride, ::stride]
+        low = float(np.percentile(sample, 1.0))
+        high = float(np.percentile(sample, 99.8))
+    except Exception:
+        return None
+    if not np.isfinite(low) or not np.isfinite(high) or high <= low:
+        return None
+    return (low, high)
+
+
 def open_levels(tif_path: str) -> Optional[List[np.ndarray]]:
     """[full_resolution, reduced...] for napari `multiscale=True`, or None.
 

@@ -105,6 +105,21 @@ def _raw_for_display(tif_file: str):
         return tiff.imread(tif_file)
 
 
+
+def _display_range(data) -> dict:
+    """`contrast_limits` kwarg for add_image, or {} to let napari decide.
+
+    A dict so that failing to compute a range falls back to the previous
+    behaviour rather than forcing a wrong one.
+    """
+    try:
+        from .display_pyramid import contrast_limits_for
+        limits = contrast_limits_for(data)
+    except Exception:
+        limits = None
+    return {"contrast_limits": list(limits)} if limits else {}
+
+
 def _safe_name(name: str) -> str:
     """Folder-safe form of a region name, e.g. 'ROI 2' -> 'ROI_2'.
 
@@ -727,7 +742,8 @@ class CrossChannelAnalyzerWindow(QMainWindow):
                     raw_img = _raw_for_display(tif_file)
                     cmap = colormaps[i % len(colormaps)]
                     viewer.add_image(raw_img, name=f"Raw: {ch_name}", colormap=cmap, blending='additive', opacity=0.5,
-                                     multiscale=isinstance(raw_img, list))
+                                     multiscale=isinstance(raw_img, list),
+                                     **_display_range(raw_img))
 
                 # Add Segmentation Labels (Semi-transparent)
                 if dat_file:
@@ -1081,7 +1097,8 @@ def open_sample_overlay(project_manager, sample_name, analysis_name=None, parent
                 cmap = colormaps[i % len(colormaps)]
                 viewer.add_image(raw_img, name=f"Raw: {ch_name}", colormap=cmap,
                                  blending='additive', opacity=0.5,
-                                 multiscale=isinstance(raw_img, list))
+                                 multiscale=isinstance(raw_img, list),
+                                 **_display_range(raw_img))
             if dat_file:
                 seg_data = np.memmap(dat_file, dtype=np.int32, mode='r', shape=shape)
                 viewer.add_labels(seg_data, name=f"Seg: {ch_name}", opacity=0.3,
