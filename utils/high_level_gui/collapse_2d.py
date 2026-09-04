@@ -66,6 +66,40 @@ COLLAPSE_KEY = "collapse_2d"
 
 
 
+#: Longest in-plane edge a preview level may have. Big enough to pan around and
+#: recognise an artifact, small enough to convert to an image and page through
+#: planes without waiting.
+_PREVIEW_MAX_EDGE = 4096
+
+
+def preview_planes(tif_path: str):
+    """A reduced (Z, Y, X) view for previewing planes, or None.
+
+    Comes from the display pyramid, which keeps every plane at every level, so
+    paging through thirteen planes reads megabytes rather than the 24 GB the
+    full-resolution stack would. Picks the finest level that is still small
+    enough to render.
+
+    Strictly for LOOKING. The focus metric never reads this -- gradient energy
+    is only meaningful between adjacent pixels, and a reduced level has none
+    of the original ones. Two data paths for two purposes.
+
+    Returns None when there is no current pyramid; the caller should build one
+    first rather than fall back to reading full-resolution planes.
+    """
+    try:
+        from .display_pyramid import open_levels
+        levels = open_levels(tif_path)
+    except Exception:
+        return None
+    if not levels or len(levels) < 2:
+        return None
+    for level in levels[1:]:
+        if max(int(level.shape[-2]), int(level.shape[-1])) <= _PREVIEW_MAX_EDGE:
+            return level
+    return levels[-1]
+
+
 def _spec(method: str, z_index: Optional[int] = None) -> Dict[str, Any]:
     """A normalised collapse spec."""
     if method == SINGLE_PLANE:

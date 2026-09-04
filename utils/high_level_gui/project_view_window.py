@@ -1039,6 +1039,159 @@ class ProjectViewWindow(QMainWindow):
                 targets.append((name, channel_name, folder, depth))
         return targets
 
+    def _focus_scores_cached(self, folder: str):
+        """Focus scores for a sample, computed once per window.
+
+        Scoring reads three full-width bands from every plane -- about 1.2 GB
+        for one of these stacks, so tens of seconds on an external drive. The
+        preview and the run itself both want the same answer, and asking twice
+        would double a wait the user can already feel.
+        """
+        cache = getattr(self, "_focus_cache", None)
+        if cache is None:
+            cache = self._focus_cache = {}
+        key = os.path.abspath(folder)
+        if key in cache:
+            return cache[key]
+        from .collapse_2d import focus_scores, sample_tif
+
+        tif_path = sample_tif(folder)
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            cache[key] = focus_scores(tif_path) if tif_path else {}
+        except Exception as exc:
+            print(f"[collapse] could not score focus for {folder}: {exc}")
+            cache[key] = {}
+        finally:
+            QApplication.restoreOverrideCursor()
+        return cache[key]
+
+    def _preview_plane(self, folder: str, initial_z: int, scores=None):
+        """Show a sample's planes so a plane can be chosen by eye. Returns z or None.
+
+        Small on purpose -- not a napari window. It exists because no metric can
+        answer the question being asked: the sharpest plane is not always the
+        wanted one (a cell's bulk and its soma need not share a plane), and the
+        sharpest plane can also land on a speck of dust. Both are things you can
+        see in a second and a number cannot.
+
+        Planes come from the display pyramid, which holds every plane at every
+        level, so paging is instant. The image is shown at 1:1 inside a scroll
+        area so panning is real panning rather than a scaled-down overview.
+        """
+        import numpy as np
+        from PyQt5.QtCore import Qt as _Qt  # type: ignore
+        from PyQt5.QtGui import QImage, QPixmap  # type: ignore
+        from PyQt5.QtWidgets import (  # type: ignore
+            QDialog, QDialogButtonBox, QHBoxLayout, QLabel, QScrollArea,
+            QSlider, QVBoxLayout,
+        )
+        from .collapse_2d import preview_planes, sample_tif
+        from .display_pyramid import build_with_progress
+
+        tif_path = sample_tif(folder)
+        if tif_path is None:
+            QMessageBox.warning(self, "No image", f"No image found in {folder}.")
+            return None
+
+        planes = preview_planes(tif_path)
+        if planes is None:
+            # A sample never opened in a viewer has no preview yet. Building it
+            # is not wasted: the viewer needs it too.
+            build_with_progress([tif_path], parent=self)
+            planes = preview_planes(tif_path)
+        if planes is None:
+            QMessageBox.warning(
+                self, "Preview unavailable",
+                "Could not prepare reduced planes for this image, so there is "
+                "nothing to page through. Choose a plane by number instead.")
+            return None
+
+        depth = int(planes.shape[0])
+        state = {"z": max(0, min(int(initial_z), depth - 1))}
+        chosen = {"z": None}
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle(f"Choose a plane — {os.path.basename(folder)}")
+        dlg.resize(900, 720)
+        outer = QVBoxLayout(dlg)
+
+        canvas = QLabel()
+        canvas.setAlignment(_Qt.AlignCenter)
+        scroll = QScrollArea()
+        scroll.setWidget(canvas)
+        scroll.setWidgetResizable(False)
+        outer.addWidget(scroll, 1)
+
+        caption = QLabel()
+        caption.setWordWrap(True)
+        outer.addWidget(caption)
+
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Plane"))
+        slider = QSlider(_Qt.Horizontal)
+        slider.setRange(0, depth - 1)
+        slider.setValue(state["z"])
+        slider.setTickPosition(QSlider.TicksBelow)
+        slider.setPageStep(1)
+        row.addWidget(slider, 1)
+        outer.addLayout(row)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Cancel)
+        use = buttons.addButton("Use this plane", QDialogButtonBox.AcceptRole)
+        # Enabled only once the plane differs from the one already suggested:
+        # accepting the suggestion needs no button, and an always-live one
+        # invites clicking without looking.
+        use.setEnabled(False)
+        buttons.rejected.connect(dlg.reject)
+        outer.addWidget(buttons)
+
+        def _render() -> None:
+            z = state["z"]
+            frame = np.asarray(planes[z])
+            sample = frame[::4, ::4]
+            low = float(np.percentile(sample, 1.0))
+            high = float(np.percentile(sample, 99.8))
+            if high <= low:
+                low, high = float(sample.min()), float(sample.max() or 1)
+            scaled = np.clip((frame.astype(np.float32) - low)
+                             / max(1e-6, high - low), 0.0, 1.0)
+            eight = (scaled * 255.0).astype(np.uint8)
+            eight = np.ascontiguousarray(eight)
+            # The QImage does not copy, so the buffer has to outlive it.
+            dlg._buffer = eight
+            image = QImage(eight.data, eight.shape[1], eight.shape[0],
+                           eight.strides[0], QImage.Format_Grayscale8)
+            canvas.setPixmap(QPixmap.fromImage(image))
+            canvas.resize(eight.shape[1], eight.shape[0])
+
+            note = f"Plane {z} of {depth - 1}"
+            if scores:
+                try:
+                    best = max(range(len(scores)), key=lambda i: scores[i])
+                    note += (f"   ·   focus score {scores[z]:.0f}"
+                             f"   ·   sharpest is plane {best}")
+                except Exception:
+                    pass
+            note += ("   ·   shown at reduced resolution; the plane extracted "
+                     "is full resolution.")
+            caption.setText(note)
+
+        def _moved(value: int) -> None:
+            state["z"] = int(value)
+            use.setEnabled(int(value) != int(initial_z))
+            _render()
+
+        def _accept() -> None:
+            chosen["z"] = state["z"]
+            dlg.accept()
+
+        slider.valueChanged.connect(_moved)
+        use.clicked.connect(_accept)
+        _render()
+        dlg.exec_()
+        return chosen["z"]
+
     def _pick_collapse_methods(self, targets: list):
         """Per-channel collapse choice, or None if cancelled.
 
@@ -1050,12 +1203,17 @@ class ProjectViewWindow(QMainWindow):
         """
         from PyQt5.QtWidgets import (  # type: ignore
             QComboBox, QDialog, QDialogButtonBox, QFormLayout, QLabel,
-            QSpinBox, QVBoxLayout, QWidget, QHBoxLayout,
+            QPushButton, QSpinBox, QVBoxLayout, QWidget, QHBoxLayout,
         )
 
         depths = {}
-        for _sample, channel_name, _folder, depth in targets:
+        # The first selected image of each channel is the one the preview
+        # shows, because the choice made in it is a CHANNEL-level choice: the
+        # row applies one method to every image in that channel.
+        exemplar = {}
+        for _sample, channel_name, folder, depth in targets:
             depths[channel_name] = min(depths.get(channel_name, depth), depth)
+            exemplar.setdefault(channel_name, folder)
 
         dlg = QDialog(self)
         dlg.setWindowTitle("Collapse to 2D")
@@ -1087,11 +1245,37 @@ class ProjectViewWindow(QMainWindow):
             box.currentIndexChanged.connect(
                 lambda _i, b=box, s=spin: s.setEnabled(
                     b.currentData() == "plane"))
+            preview = QPushButton("Preview…")
+            preview.setToolTip(
+                "Page through this channel's planes and choose one by eye. "
+                "Opens on the plane currently selected here.")
+
+            def _open_preview(_checked=False, ch=channel_name, b=box, sp=spin):
+                folder = exemplar.get(ch)
+                if not folder:
+                    return
+                scores = self._focus_scores_cached(folder)
+                start = (int(sp.value()) if b.currentData() == "plane"
+                         else int((scores or {}).get("best", sp.value())))
+                picked = self._preview_plane(
+                    folder, start, (scores or {}).get("scores"))
+                if picked is None:
+                    return
+                # Choosing a plane by eye IS choosing the fixed-plane method.
+                index = b.findData("plane")
+                if index >= 0:
+                    b.setCurrentIndex(index)
+                sp.setEnabled(True)
+                sp.setValue(int(picked))
+
+            preview.clicked.connect(_open_preview)
+
             line = QWidget()
             lay = QHBoxLayout(line)
             lay.setContentsMargins(0, 0, 0, 0)
             lay.addWidget(box)
             lay.addWidget(spin)
+            lay.addWidget(preview)
             form.addRow(f"{channel_name}  ({depth} planes)", line)
             rows[channel_name] = (box, spin)
         outer.addLayout(form)
@@ -1114,7 +1298,7 @@ class ProjectViewWindow(QMainWindow):
         from PyQt5.QtWidgets import QProgressDialog  # type: ignore
         from .collapse_2d import (
             MAX_PROJECTION, SINGLE_PLANE, _spec, collapse_channel,
-            derived_paths, focus_scores,
+            derived_paths,
         )
         from .slide_reader import SetupCancelled
 
@@ -1189,8 +1373,7 @@ class ProjectViewWindow(QMainWindow):
                 scores = None
                 try:
                     if method == "auto":
-                        from .collapse_2d import sample_tif
-                        found = focus_scores(sample_tif(folder))
+                        found = self._focus_scores_cached(folder)
                         if not found:
                             errors.append(f"{sample}/{channel_name}: could not "
                                           "score focus; skipped.")
