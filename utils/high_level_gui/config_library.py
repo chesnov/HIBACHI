@@ -145,7 +145,8 @@ class ParamChange:
     """One reconcile difference within a step block."""
     step: str
     param: str
-    kind: str          # 'added' | 'removed' | 'type_changed' | 'clamped' | 'structure'
+    kind: str          # 'added' | 'removed' | 'type_changed' | 'clamped' |
+                       # 'structure' | 'definition'
     detail: str = ""
 
 
@@ -156,10 +157,31 @@ class ReconcileResult:
     added_steps: List[str] = field(default_factory=list)
     removed_steps: List[str] = field(default_factory=list)
     param_changes: List[ParamChange] = field(default_factory=list)
+    #: Parameters whose DEFINITION drifted -- bounds, step, label, description
+    #: -- while the value is untouched. Deliberately NOT in `param_changes`,
+    #: which drives result invalidation: everything from the earliest changed
+    #: step onward is deleted, so filing a widened bound or an edited
+    #: description there would destroy results a reference edit cannot
+    #: possibly have invalidated. A definition update is adopted silently and
+    #: costs nothing.
+    definition_updates: List[ParamChange] = field(default_factory=list)
 
     @property
     def is_clean(self) -> bool:
-        return not (self.added_steps or self.removed_steps or self.param_changes)
+        """Whether the source already matches the reference in every respect.
+
+        Includes definition drift, because a source whose bounds are stale is
+        not current -- that staleness is precisely why a widened maximum never
+        reached an existing project: nothing value-affecting had changed, this
+        returned True, and the caller discarded a correctly merged config.
+        """
+        return not (self.added_steps or self.removed_steps
+                    or self.param_changes or self.definition_updates)
+
+    @property
+    def affects_results(self) -> bool:
+        """Whether adopting this would change what a re-run produces."""
+        return bool(self.added_steps or self.removed_steps or self.param_changes)
 
     def summary_lines(self) -> List[str]:
         """Flat, human-readable diff lines for a prompt (no Qt here)."""
@@ -172,6 +194,9 @@ class ReconcileResult:
             sign = {"added": "+", "removed": "-"}.get(c.kind, "~")
             tail = f"  ({c.detail})" if c.detail else ""
             out.append(f"{sign} {c.step} / {c.param}: {c.kind}{tail}")
+        for c in self.definition_updates:
+            tail = f"  ({c.detail})" if c.detail else ""
+            out.append(f"= {c.step} / {c.param}: editor limits refreshed{tail}")
         return out
 
 
@@ -611,6 +636,39 @@ def duplicate_config(entry: LibraryEntry, new_name: str) -> LibraryEntry:
 
 # --------------------------------------------------------------------------- #
 # Reconcile against the canonical reference
+
+#: Definition fields compared for drift. `value` is excluded because it is the
+#: one thing the source owns; `type` is excluded because a type change is
+#: already reported as `type_changed` and does affect the run.
+_DEFINITION_FIELDS = (
+    "label", "description", "min", "max", "step", "element_type", "options",
+    "unit", "ndim",
+)
+
+
+def _definition_drift(src_pdef: Dict[str, Any],
+                      ref_pdef: Dict[str, Any]) -> List[str]:
+    """Definition fields where the source disagrees with the reference.
+
+    Returns human-readable descriptions like ``max 3.0 -> 8.0``, or [] when the
+    source's definition already matches.
+    """
+    out: List[str] = []
+    for field_name in _DEFINITION_FIELDS:
+        in_src = field_name in (src_pdef or {})
+        in_ref = field_name in (ref_pdef or {})
+        if not in_src and not in_ref:
+            continue
+        was = (src_pdef or {}).get(field_name)
+        now = (ref_pdef or {}).get(field_name)
+        if was == now:
+            continue
+        if field_name in ("label", "description"):
+            out.append(f"{field_name} updated")
+        else:
+            out.append(f"{field_name} {was!r} -> {now!r}")
+    return out
+
 # --------------------------------------------------------------------------- #
 def builtin_reference(mode: str) -> Dict[str, Any]:
     """Load the canonical reference config (``default.yaml``) for a mode.
@@ -735,6 +793,16 @@ def reconcile(
                 if change is not None:
                     change.step, change.param = step, pname
                     result.param_changes.append(change)
+                # Definition drift: everything about the parameter except its
+                # value. `merged` is a deepcopy of the reference and only the
+                # value is carried over, so the corrected definition is
+                # already in hand -- this only records that it differs, so a
+                # caller knows the source was stale and adopts it.
+                drifted = _definition_drift(src_pdef, ref_pdef)
+                if drifted:
+                    result.definition_updates.append(ParamChange(
+                        step, pname, "definition", ", ".join(drifted),
+                    ))
             else:
                 result.param_changes.append(ParamChange(
                     step, pname, "added",

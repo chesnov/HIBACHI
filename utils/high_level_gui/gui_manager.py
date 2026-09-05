@@ -1967,6 +1967,31 @@ class DynamicGUIManager(QObject):
         if recon.is_clean:
             return True  # already current — nothing to do
 
+        if not recon.affects_results:
+            # Only the DEFINITIONS drifted: bounds, labels, descriptions. The
+            # values are untouched, so a re-run produces exactly what it would
+            # have produced -- there is nothing to warn about and nothing to
+            # invalidate. Adopt it silently.
+            #
+            # This is what a widened maximum needs. `merged` is a deepcopy of
+            # the reference with the source's values carried over, so it has
+            # been correct all along; `is_clean` used to report True whenever
+            # nothing value-affecting had changed, and the caller discarded it.
+            # A project set up before a bound moved could therefore never see
+            # the new range.
+            self.config = recon.merged
+            self.initial_config = copy.deepcopy(recon.merged)
+            self.strategy.config = self.config
+            try:
+                self.strategy.save_config(self.config)
+            except Exception as exc:
+                print(f"[config] could not persist refreshed definitions: {exc}")
+            for line in recon.summary_lines():
+                print(f"[config] {line}")
+            if self.current_step_method:
+                self.create_step_widgets(self.current_step_method)
+            return True
+
         # Did the user have un-processed edits on the current step when they hit
         # Process? If so, once we canonize we can run those edits straight away
         # instead of forcing a second Process click (the reported friction: the
