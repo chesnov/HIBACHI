@@ -309,10 +309,10 @@ class FluorescenceStrategy(ProcessingStrategy):
             # existed has neither and must behave exactly as it did. Zero and
             # False are "off", which is that behaviour.
             segmentation_input = image_stack
-            even_illumination = bool(
-                params.get("illumination_even_illumination", False))
+            block_um = float(params.get("illumination_block_um", 0.0) or 0.0)
+            max_gain = float(params.get("illumination_max_gain", 1.0) or 1.0)
             correct_z = bool(params.get("illumination_correct_z", False))
-            if even_illumination or correct_z:
+            if block_um > 0 or correct_z:
                 from .illumination import correct_illumination
 
                 corrected_path = files.get("corrected_image")
@@ -329,7 +329,7 @@ class FluorescenceStrategy(ProcessingStrategy):
                 )
                 _, illum_report = correct_illumination(
                     image_stack, self.spacing_checked,
-                    even_illumination=even_illumination, correct_z=correct_z,
+                    block_um=block_um, max_gain=max_gain, correct_z=correct_z,
                     out=corrected,
                 )
                 if illum_report.get("applied"):

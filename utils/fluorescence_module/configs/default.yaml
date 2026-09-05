@@ -46,30 +46,53 @@ execute_raw_segmentation:
         high: 1.0
         smooth_sigma: 0.2
         connect_max_gap_physical: 0.0
-    illumination_even_illumination:
-      # False is off, which is what every run before this parameter existed did.
+    illumination_block_um:
+      # 0 is off, which is what every run before this parameter existed did.
       neutral_default: true
-      label: Even out illumination (segmentation only)
+      label: Illumination Block Size (um, 0 = off)
       description: >-
         Flattens uneven illumination so a single threshold is reachable across
-        the frame -- one side brighter than the other, or darker corners. A
-        block-wise background is subtracted, and where enough of the frame
-        holds signal the remainder is divided by a block-wise gain, so staining
-        that is merely dimmer on one side is brought up rather than only having
-        its background removed. Nothing to tune: the block grid comes from the
-        image's own size, because both surfaces describe the optics rather than
-        anything being measured. Blocks holding nothing above the noise floor
-        are discarded rather than counted as zero, empty regions inherit a
-        neighbour's factor instead of being amplified, the factor is bounded to
-        0.5-2.0, and if too little of the frame holds signal the gain step
-        declines and says so.
+        the frame. Within each block of this size a low percentile is taken as
+        the background and subtracted; a high percentile is the local signal
+        level, used by Max Illumination Gain below.
+        This size decides everything. A block must be large enough to contain
+        background as well as objects -- otherwise its "background" percentile
+        sits inside a cell -- and small enough that illumination is roughly
+        constant across it. Too large is the damaging direction: on one image a
+        block of 960 um produced a background surface spanning 79x, which was a
+        picture of the cells rather than of the illumination. Start at a few
+        times the spacing between objects, in the tens of microns for cells
+        tens of microns apart, and watch the reported background range: a
+        background that varies far more than the illumination plausibly does
+        means the blocks are too big.
+      type: float
+      value: 0.0
+      min: 0.0
+      max: 10000.0
+      step: 1.0
+    illumination_max_gain:
+      # 1.0 means background subtraction only, the previous behaviour.
+      neutral_default: true
+      label: Max Illumination Gain (1 = subtract only)
+      description: >-
+        How much dim regions may be brightened to match bright ones, after the
+        background is removed. 1 leaves the foreground alone and only subtracts
+        the background -- useful when staining is genuinely uneven and should
+        stay that way. Above 1, a region whose signal level is below the frame's
+        median is scaled up, and one above it scaled down, by at most this
+        factor. The run reports how far the signal actually varies across the
+        frame, so this can be set from the image: a frame varying 5x cannot be
+        flattened with a cap of 2, and it says so.
         SEGMENTATION ONLY. From a single image, dimmer-because-less-light and
         dimmer-because-less-antigen cannot be told apart, so evening the
         foreground assumes the true signal is uniform across the field and
         erases any real gradient. The corrected image draws the segmentation
         and nothing else: every measurement is taken from the original image.
-      type: bool
-      value: false
+      type: float
+      value: 1.0
+      min: 1.0
+      max: 20.0
+      step: 0.5
     illumination_correct_z:
       # False is off, which is what every run before this parameter existed did.
       neutral_default: true

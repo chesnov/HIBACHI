@@ -50,51 +50,61 @@ from typing import Optional, Sequence, Tuple
 
 import numpy as np
 
-#: Blocks across the shorter in-plane axis when estimating the foreground
-#: envelope. Coarse on purpose: the envelope describes the optics, and a fine
-#: grid would follow the cells.
-_ENVELOPE_BLOCKS = 12
+#: Smallest block, in pixels, whatever physical size is asked for: percentiles
+#: within a handful of pixels are noise.
+_MIN_BLOCK_PX = 8
 
 #: Percentile taken within a block as its local signal level, and the one
 #: taken as its background.
 _ENVELOPE_PERCENTILE = 95.0
 _BACKGROUND_PERCENTILE = 10.0
 
-#: A block whose signal level is below this multiple of the image's noise floor
-#: holds nothing to measure. Such blocks are DISCARDED rather than counted as
-#: zero -- counting them is what made a divided correction produce a field
-#: spanning hundreds of times, because most of a sparse image is empty.
-_ENVELOPE_MIN_SIGNAL = 3.0
-
-#: Bounds on the gain factor. Whatever the estimate says, no region is scaled
-#: by more than this, so a misjudged envelope cannot amplify a corner into
-#: noise. The correction is meant to make one threshold reachable, not to
-#: rescue signal that was never collected.
-_GAIN_LIMITS = (0.5, 2.0)
+#: Multiple of the measured noise a block's signal must clear to count as
+#: holding anything.
+_SIGNAL_OVER_NOISE = 3.0
 
 #: Fraction of blocks that must hold signal before an envelope is trusted. Too
 #: few and there is nothing to interpolate between, so the correction declines.
 _ENVELOPE_MIN_COVERAGE = 0.15
 
 
-def _block_surfaces(reference, report: dict):
-    """(background, gain) surfaces from block statistics, or (background, None).
+def _noise_sigma(residual) -> float:
+    """Noise level of a background-subtracted image, robustly.
 
-    Both come from percentiles within coarse blocks, which needs no radius: a
-    LOW percentile in a block is its background, a HIGH percentile is its
-    signal level. Coarse on purpose -- these describe the optics, and a fine
-    grid would follow the cells.
+    From the median absolute deviation of the quiet half, so cells cannot
+    inflate it. This replaces deriving a floor from the block signals
+    themselves, which failed badly: with blocks large enough to contain both
+    cells and background, every block's signal looked large, the floor rose
+    with it, and almost no block cleared it -- 0.7% of a frame that was full of
+    cells.
+    """
+    values = np.asarray(residual, dtype=np.float32).ravel()
+    if values.size == 0:
+        return 1.0
+    quiet = values[values <= np.median(values)]
+    if quiet.size == 0:
+        quiet = values
+    mad = float(np.median(np.abs(quiet - np.median(quiet))))
+    return max(1e-6, 1.4826 * mad)
 
-    The gain surface is the part that has to be careful. A block holding
-    nothing above the noise floor is DISCARDED, not recorded as zero: counting
-    empty blocks is what makes a divided correction explode on a sparse image,
-    since most of such an image is empty. Those blocks inherit a neighbour's
-    factor instead, so a region with nothing in it is left alone rather than
-    amplified, and the factor is bounded so a misjudged estimate cannot turn a
-    corner into noise.
+
+def _block_surfaces(reference, block_px: int, max_gain: float, report: dict):
+    """(background, gain) surfaces from block percentiles, or (background, None).
+
+    `block_px` sets everything. A LOW percentile within a block is its
+    background and a HIGH percentile its signal level, so the block must be
+    large enough to contain background but small enough that illumination is
+    roughly constant across it. Too large and its "background" percentile sits
+    inside tissue: at 1477 px the estimated background spanned 79x, which is a
+    picture of the cells, not of the illumination.
+
+    A block whose signal does not clear the measured noise is DISCARDED, not
+    recorded as zero -- counting empty blocks is what makes a divided
+    correction explode on a sparse image. Those blocks inherit a neighbour's
+    factor, so a region with nothing in it is left alone.
 
     Returns None for the gain when too little of the frame holds signal to
-    define one -- decline, do not guess.
+    define one: decline rather than guess.
     """
     from scipy.ndimage import (  # type: ignore
         distance_transform_edt, gaussian_filter,
@@ -103,7 +113,7 @@ def _block_surfaces(reference, report: dict):
 
     plane = np.asarray(reference, dtype=np.float32)
     height, width = plane.shape
-    block = max(8, int(min(height, width) / _ENVELOPE_BLOCKS))
+    block = max(_MIN_BLOCK_PX, int(block_px))
     rows = max(1, height // block)
     cols = max(1, width // block)
 
@@ -111,7 +121,9 @@ def _block_surfaces(reference, report: dict):
     high = np.zeros((rows, cols), dtype=np.float32)
     for r in range(rows):
         for c in range(cols):
-            tile = plane[r * block:(r + 1) * block, c * block:(c + 1) * block]
+            r1 = height if r == rows - 1 else (r + 1) * block
+            c1 = width if c == cols - 1 else (c + 1) * block
+            tile = plane[r * block:r1, c * block:c1]
             if tile.size:
                 low[r, c] = float(np.percentile(tile, _BACKGROUND_PERCENTILE))
                 high[r, c] = float(np.percentile(tile, _ENVELOPE_PERCENTILE))
@@ -126,21 +138,39 @@ def _block_surfaces(reference, report: dict):
     report["background_min"] = round(float(background.min()), 2)
     report["background_max"] = round(float(background.max()), 2)
 
-    # Signal above each block's own background, judged against the quietest
-    # blocks so "has signal" is relative to this image, not an absolute number.
-    signal = np.clip(high - low, 0.0, None)
-    floor = float(np.percentile(signal, 20)) if signal.size else 0.0
-    if floor <= 0:
-        floor = float(np.std(plane)) or 1.0
-    has_signal = signal > (_ENVELOPE_MIN_SIGNAL * floor)
+    if max_gain <= 1.0:
+        report["gain_skipped"] = "maximum gain is 1, so only the background was removed"
+        return background, None
 
+    noise = _noise_sigma(plane - background)
+    signal = np.clip(high - low, 0.0, None)
+    has_signal = signal > (_SIGNAL_OVER_NOISE * noise)
     coverage = float(has_signal.mean()) if has_signal.size else 0.0
+    report["noise_sigma"] = round(noise, 2)
     report["signal_coverage"] = round(coverage, 3)
+
+    if has_signal.any():
+        present = signal[has_signal]
+        # 90th over 10th percentile, not max over min: the sparsest block that
+        # still clears the noise sets the minimum, so max/min reported a 155x
+        # spread on a frame varying 2.5x and advised a cap of 155.
+        spread = float(np.percentile(present, 90)
+                       / max(1e-6, np.percentile(present, 10)))
+        # Reported, NOT turned into advice. A block's signal level tracks how
+        # much is in it as well as how brightly it is lit: a block holding two
+        # cells has a low high-percentile because it is sparse, not because it
+        # is dim. So this number is an upper bound on the illumination
+        # variation, badly inflated wherever density varies -- on a frame with
+        # a 4x brightness ramp it read 46x. It is worth seeing, because a small
+        # value means density is even and the estimate is trustworthy, but it
+        # must not be used to pick the cap.
+        report["signal_spread_upper_bound"] = round(spread, 2)
+
     if coverage < _ENVELOPE_MIN_COVERAGE:
         report["gain_declined"] = (
             f"only {coverage * 100:.0f}% of the frame holds signal above the "
-            f"noise floor, too little to tell uneven illumination from empty "
-            f"space -- the foreground was left unscaled"
+            f"noise ({noise:.1f}), too little to tell uneven illumination from "
+            f"empty space -- the foreground was left unscaled"
         )
         print(f"  [Illumination] {report['gain_declined']}")
         return background, None
@@ -152,11 +182,11 @@ def _block_surfaces(reference, report: dict):
         filled = signal[tuple(indices)]
     filled = gaussian_filter(filled, 1.0, mode="nearest")
 
-    middle = float(np.median(filled[has_signal])) if has_signal.any() else 0.0
+    middle = float(np.median(filled[has_signal]))
     if middle <= 0:
         return background, None
     gain = filled / middle
-    np.clip(gain, _GAIN_LIMITS[0], _GAIN_LIMITS[1], out=gain)
+    np.clip(gain, 1.0 / float(max_gain), float(max_gain), out=gain)
     report["gain_min"] = round(float(gain.min()), 3)
     report["gain_max"] = round(float(gain.max()), 3)
 
@@ -168,19 +198,24 @@ def _block_surfaces(reference, report: dict):
 def correct_illumination(
     volume,
     spacing: Sequence[float],
-    even_illumination: bool = False,
+    block_um: float = 0.0,
+    max_gain: float = 1.0,
     correct_z: bool = False,
     out=None,
     progress=None,
 ) -> Tuple[Optional[np.ndarray], dict]:
     """Write an illumination-corrected copy of `volume`. Returns (out, report).
 
-    `even_illumination` flattens the frame: a block-wise background is
-    subtracted and, where enough of the frame holds signal, the remainder is
-    divided by a bounded block-wise gain so one threshold is reachable
-    everywhere. No radius to choose -- the block grid comes from the image's
-    own size, since both surfaces describe the optics rather than anything
-    being measured.
+    `block_um` is the size of the block both surfaces are measured in, in
+    MICRONS, and 0 disables the whole XY correction. It has to be large enough
+    that a block contains background as well as objects, and small enough that
+    illumination is roughly constant across it.
+
+    `max_gain` caps how much the foreground may be evened out. 1 means
+    background subtraction only. Whatever the estimate says, no region is
+    scaled by more than this, so a misjudged surface cannot amplify a corner
+    into noise -- and the report says how far the signal actually varies, so
+    the cap can be set from the image rather than guessed.
 
     `correct_z` scales each plane of a stack to a common level. Ignored for a
     2D image, which has no depth.
@@ -208,7 +243,8 @@ def correct_illumination(
 
     report: dict = {
         "ndim": ndim,
-        "even_illumination": bool(even_illumination),
+        "block_um": float(block_um),
+        "max_gain": float(max_gain),
         "correct_z": bool(correct_z and ndim == 3),
         "pixel_um": pixel_um,
         "dtype": str(np.dtype(getattr(volume, "dtype", np.float32))),
@@ -242,7 +278,7 @@ def correct_illumination(
     # depth; estimating it per plane would only add noise.
     background = None
     gain_surface = None
-    if even_illumination:
+    if block_um and block_um > 0:
         if is_3d:
             accum = np.zeros(data.shape[-2:], dtype=np.float64)
             for z in range(depth):
@@ -250,7 +286,10 @@ def correct_illumination(
             reference = accum / max(1, depth)
         else:
             reference = np.asarray(data, dtype=np.float32)
-        background, gain_surface = _block_surfaces(reference, report)
+        block_px = max(_MIN_BLOCK_PX,
+                       int(round(float(block_um) / max(1e-6, pixel_um))))
+        background, gain_surface = _block_surfaces(
+            reference, block_px, float(max_gain), report)
 
     if background is None and not report["correct_z"]:
         report["applied"] = False
