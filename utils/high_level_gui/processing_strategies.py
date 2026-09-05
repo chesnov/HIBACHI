@@ -141,6 +141,7 @@ class ProcessingStrategy(abc.ABC):
         self.spacing = spacing
         self.z_scale_factor = scale_factor
         self.mode_name = self._get_mode_name()
+        self._repair_metadata_dimensions()
         self._visibility_cache: Dict[str, bool] = {}
         
         # Dictionary to store runtime state (e.g., calculated thresholds)
@@ -398,6 +399,84 @@ class ProcessingStrategy(abc.ABC):
         return removed
 
     @abc.abstractmethod
+    def _repair_metadata_dimensions(self) -> None:
+        """Restore a `dimensions` block that no longer matches its own image.
+
+        A released version of this app wrote an ROI session's config over the
+        sample's, replacing a whole image's calibration with a region's: a
+        crop's 499 x 452 um recorded against an 18468 x 17725 image, giving a
+        non-square micron-per-pixel and an image that renders squished. Every
+        physical measurement taken from such a config is wrong by that factor.
+
+        Repairing it here rather than by hand: every path that runs a step,
+        a batch or the optimizer constructs a strategy, so a project fixes
+        itself the next time it is used, however it was damaged.
+
+        Deliberately narrow. It acts ONLY when the config itself says the
+        numbers came from the image's own metadata, so a manually entered or
+        CSV-supplied calibration is never second-guessed -- those are the
+        cases where disagreeing with the file is the whole point. And it skips
+        ROI sessions, where a crop's extents against a crop's shape are
+        correct.
+        """
+        try:
+            from .metadata import MetadataExtractor, find_dimensions
+        except Exception:
+            return
+
+        try:
+            if "_roi" in os.path.basename(os.path.normpath(self.processed_dir)):
+                return  # a crop's extents belong to a crop
+            source = str(self.config.get("dimensions_source") or "")
+            if "metadata" not in source.lower():
+                return
+            # `find_dimensions` also locates the legacy keys, so a config that
+            # has not been migrated is repaired under whichever name it uses.
+            key, block = find_dimensions(self.config)
+            if not key or not isinstance(block, dict) or not block:
+                return
+
+            sample_dir = os.path.dirname(os.path.abspath(self.processed_dir))
+            tif = next((os.path.join(sample_dir, f)
+                        for f in sorted(os.listdir(sample_dir))
+                        if f.lower().endswith((".tif", ".tiff"))), None)
+            if tif is None:
+                return
+            meta = MetadataExtractor.read_tiff_metadata(tif)
+            if not meta or not meta.get("found"):
+                return
+
+            shape = tuple(int(n) for n in self.image_shape)
+            axes = {"y": shape[-2], "x": shape[-1]}
+            if len(shape) == 3:
+                axes["z"] = shape[0]
+
+            expected, disagree = {}, []
+            for axis, count in axes.items():
+                per_pixel = float(meta.get(axis) or 0.0)
+                if per_pixel <= 0:
+                    return  # nothing authoritative to compare against
+                expected[axis] = per_pixel * count
+                recorded = float(block.get(axis) or 0.0)
+                if recorded <= 0:
+                    continue
+                if abs(recorded - expected[axis]) / expected[axis] > 0.02:
+                    disagree.append(
+                        f"{axis}: {recorded:.4g} -> {expected[axis]:.4g} um")
+            if not disagree:
+                return
+
+            repaired = dict(block)
+            repaired.update({a: expected[a] for a in axes})
+            self.config[key] = repaired
+            print("[strategy] the recorded dimensions disagreed with the "
+                  "image's own metadata and have been restored from it "
+                  f"({'; '.join(disagree)}). This corrects configs damaged by "
+                  "an earlier version that wrote a region's extents over the "
+                  "whole image's.")
+        except Exception as exc:
+            print(f"[strategy] could not check the recorded dimensions: {exc}")
+
     def _get_mode_name(self) -> str:
         """
         Returns the unique string identifier for this strategy (e.g., 'fluorescence').

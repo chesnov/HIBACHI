@@ -1941,6 +1941,21 @@ class DynamicGUIManager(QObject):
         leave a sample folder with a truncated config -- the one file that makes
         the folder recognisable as a sample.
         """
+        # NOT in an ROI session. `self.config` then describes the CROP -- its
+        # `dimensions` are the region's physical extent, not the image's -- and
+        # `self.inputdir` is still the sample folder, so writing it there
+        # replaces the whole image's calibration with a region's. The result is
+        # a non-square micron-per-pixel and an image that renders squished,
+        # which is exactly what happened: a sample folder ended up with a
+        # crop's 499 x 452 um over an 18468 x 17725 image.
+        #
+        # An ROI session has its own config, written by `_ensure_roi_session`
+        # into the ROI directory, and that is the only file its values belong
+        # in. There is nothing to persist here.
+        if getattr(self, "roi_active", False):
+            print("[config] ROI session: leaving the sample config untouched")
+            return False
+
         try:
             names = [f for f in sorted(os.listdir(self.inputdir))
                      if f.lower().endswith((".yaml", ".yml"))]
