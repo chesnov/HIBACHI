@@ -327,8 +327,15 @@ class FluorescenceStrategy(ProcessingStrategy):
                         self.temp_dir or self.processed_dir,
                         "corrected_image_preview.dat",
                     )
+                # The INPUT's dtype, not float32. Absolute thresholds are
+                # expressed as a fraction of the dtype range ("scaling by
+                # DType Max"), so handing the pipeline float32 silently
+                # redefines every one of them: 0.055 of 65535 is not 0.055 of
+                # 1.0. It also halves what the image costs to keep.
+                corrected_dtype = np.dtype(
+                    getattr(image_stack, "dtype", np.float32))
                 corrected = np.memmap(
-                    corrected_path, dtype=np.float32, mode="w+",
+                    corrected_path, dtype=corrected_dtype, mode="w+",
                     shape=self.image_shape,
                 )
                 _, illum_report = correct_illumination(
@@ -341,11 +348,17 @@ class FluorescenceStrategy(ProcessingStrategy):
                     print(f"  [Illumination] {illum_report}")
                     segmentation_input = corrected
                     if viewer is not None:
+                        # layer_type='image'. The default is 'labels', and a
+                        # corrected intensity image sent to add_labels becomes
+                        # a label array of near-constant small integers -- an
+                        # effectively empty layer that renders as nothing and
+                        # raises no error, which is exactly how this failed.
                         self._add_layer_safely(
                             viewer,
-                            np.memmap(corrected_path, dtype=np.float32,
+                            np.memmap(corrected_path, dtype=corrected_dtype,
                                       mode="r", shape=self.image_shape),
                             "Illumination corrected",
+                            layer_type="image",
                         )
                 else:
                     del corrected

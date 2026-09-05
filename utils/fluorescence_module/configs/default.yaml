@@ -49,22 +49,23 @@ execute_raw_segmentation:
     illumination_xy_scale_um:
       # 0 is off, which is what every run before this parameter existed did.
       neutral_default: true
-      label: Illumination Flattening Scale (um, 0 = off)
+      label: Background Subtraction Radius (um, 0 = off)
       description: >-
-        Removes uneven illumination across the field of view -- one side
-        brighter than the other, or darker corners -- so a single threshold can
-        serve the whole image. Intensity variation broader than this length is
-        treated as illumination and divided out; anything smaller survives.
-        MICRONS, not pixels: it is converted through the image calibration, so
-        the same value means the same thing at any magnification. As a starting
-        point use several times the diameter of a cell -- for cells around 10
-        um across, try 20-50 um. Too SMALL is the damaging mistake: at a few
-        pixels the estimated field follows the cells instead of the gradient
-        and the correction flattens the structure the segmentation needs, so
-        the run warns when the field it measured spans far more than
-        illumination plausibly does. Too large simply stops correcting: a scale
-        approaching the width of the image cannot represent a gradient across
-        it. Applies at both 2D and 3D.
+        Removes uneven illumination and background offset across the field of
+        view -- one side brighter than the other, or darker corners -- so a
+        single threshold can serve the whole image. A rolling ball of this
+        radius is rolled beneath the intensity surface and the surface it
+        reaches is SUBTRACTED as background. Subtraction, not division: a
+        divided correction assumes the frame is filled, and on a mostly empty
+        image it turns background into amplified noise.
+        MICRONS, not pixels: converted through the image calibration, so the
+        same value means the same thing at any magnification. Set it
+        comfortably LARGER than anything being measured -- a ball smaller than
+        the objects rolls over them and subtracts them. For cells around 10 um
+        across, 30 um and up.
+        It corrects a background offset, not a gain difference: if the signal
+        itself is dimmer on one side, subtraction flattens the background under
+        it but does not brighten it back. Applies at both 2D and 3D.
       type: float
       value: 0.0
       min: 0.0
@@ -79,9 +80,10 @@ execute_raw_segmentation:
         Writes the illumination-corrected image into the results folder so it
         can be reopened and exported later. The correction is shown as a layer
         either way; with this off the image lives in a temporary file that
-        disappears when the run ends. It is float32, twice the size of the
-        input, so a 24 GB slide-scanner channel costs 48 GB to keep -- worth
-        turning off for images that large once the correction looks right.
+        disappears when the run ends. It is written in the input's own dtype,
+        so it costs the same as the image again -- 24 GB for a slide-scanner
+        channel, worth turning off for images that large once the correction
+        looks right.
       type: bool
       value: true
     illumination_correct_z:

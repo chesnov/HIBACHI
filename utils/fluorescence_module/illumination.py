@@ -12,21 +12,24 @@ loss looks like biology.
 Two corrections, because they are two different physical effects:
 
 XY (both ranks)
-    Excitation and collection efficiency vary across the field of view. The
-    result is a smooth multiplicative gradient, so it is divided out. The field
-    is estimated by heavily smoothing a DOWNSAMPLED copy: it is low-frequency
-    by definition, so estimating it at a fraction of the resolution loses
-    nothing and costs a fraction of the work -- which matters when a plane is
-    928 megapixels.
+    A background surface is estimated with a rolling ball and SUBTRACTED.
+    Subtraction rather than division, deliberately: dividing by a smoothed
+    local mean assumes the frame is filled, and wherever an image is mostly
+    empty that mean approaches zero, so dividing turns background into
+    amplified noise -- local contrast normalisation, not illumination
+    correction. A rolling ball assumes nothing about how much of the frame is
+    occupied. It is estimated on a downsampled copy, because the ball is
+    expensive and a background broad enough to be illumination survives
+    downsampling intact.
 
 Z (stacks only)
     Deeper planes are dimmer. Each plane is scaled to a common level, measured
     from its own bright pixels so that a plane containing less tissue is not
     mistaken for a dimmer one.
 
-Order matters: Z first, then XY. The XY field is estimated from a projection
-through the stack, and estimating it before Z correction would fold depth
-attenuation into a field that is meant to describe the field of view.
+Order matters: Z first, then XY. The XY background is estimated from a
+projection through the stack, and estimating it before Z correction would fold
+depth attenuation into a surface meant to describe the field of view.
 
 Rank comes from the array, per convention 2 -- `ndim = int(volume.ndim)`,
 never from a flag or a mode string. Z correction is simply absent at rank 2:
@@ -34,11 +37,11 @@ there is no depth to correct.
 
 What this is NOT
 ----------------
-Not a substitute for even illumination. Dividing by an estimated field
-amplifies noise wherever the field is small, so a badly vignetted corner
-becomes a noisy corner rather than a correct one. The correction exists so a
-threshold can be set once for the whole field, and its output is written out
-precisely so it can be looked at rather than trusted.
+Not a substitute for even illumination. Subtracting a background cannot
+recover signal that was never collected, so a severely vignetted corner ends
+up dark and clean rather than correct. The correction exists so a threshold can
+be set once for the whole frame, and its output is written out precisely so it
+can be looked at rather than trusted.
 """
 
 from __future__ import annotations
@@ -47,22 +50,10 @@ from typing import Optional, Sequence, Tuple
 
 import numpy as np
 
-#: Target element count for the downsampled copy the XY field is estimated
-#: from. The field is smooth, so this is about how finely it must be sampled,
-#: not about how much of the image is inspected.
-_FIELD_SAMPLES = 4_000_000
-
-#: Floor applied to the normalised field before dividing. A field value near
-#: zero would turn its region into amplified noise; clipping trades an
-#: uncorrected dark corner for a garbage one.
-_MIN_FIELD = 0.05
-
-#: Dynamic range above which the estimated field is not describing
-#: illumination. Real illumination across a frame varies by a factor of two or
-#: three; a field spanning far more than that is following the cells, because
-#: the scale is comparable to them rather than to the frame. Dividing by such a
-#: field flattens the structure the segmentation needs.
-_FIELD_RANGE_WARN = 5.0
+#: Longest edge the background is estimated on. A rolling ball is expensive and
+#: the background is smooth, so it is estimated on a downsampled copy and
+#: resized back -- the approach skimage itself recommends for large images.
+_BACKGROUND_MAX_EDGE = 1024
 
 
 def _plane_level(plane) -> float:
@@ -86,31 +77,37 @@ def z_levels(volume) -> np.ndarray:
                       dtype=np.float32)
 
 
-def _xy_field(reference, sigma_px: float) -> np.ndarray:
-    """The smooth illumination field of a 2D reference image.
+def _xy_background(reference, radius_px: float) -> np.ndarray:
+    """The background surface of a 2D image, by rolling ball.
 
-    Estimated on a strided copy and resized back. Normalised to its own median
-    so dividing by it preserves the overall intensity level -- the correction
-    should flatten the field, not rescale the image, or every downstream
-    absolute threshold would shift.
+    SUBTRACTIVE, and that is the point. Dividing by a smoothed local mean
+    assumes the field of view is filled: wherever an image is mostly empty the
+    local mean approaches zero, and dividing by it turns background into
+    amplified noise -- local contrast normalisation rather than illumination
+    correction. A rolling ball makes no assumption about how much of the frame
+    is occupied. It rolls a ball of the given radius beneath the intensity
+    surface and takes the highest surface it can reach as the background, so an
+    empty region yields its own low background and a crowded one yields a
+    higher one, with nothing ever divided.
+
+    Estimated on a downsampled copy and resized back, because the ball is
+    expensive and a background broad enough to be illumination survives
+    downsampling intact.
     """
-    from scipy.ndimage import gaussian_filter  # type: ignore
+    from skimage.restoration import rolling_ball  # type: ignore
     from skimage.transform import resize  # type: ignore
 
     plane = np.asarray(reference, dtype=np.float32)
-    step = max(1, int(np.ceil(np.sqrt(plane.size / _FIELD_SAMPLES))))
-    small = plane[::step, ::step]
-    field_small = gaussian_filter(small, max(1.0, sigma_px / step),
-                                  mode="nearest")
-    field = resize(field_small, plane.shape, order=1, mode="edge",
-                   preserve_range=True, anti_aliasing=False)
-    field = np.asarray(field, dtype=np.float32)
-    middle = float(np.median(field))
-    if middle <= 0:
-        return np.ones_like(field)
-    field /= middle
-    np.clip(field, _MIN_FIELD, None, out=field)
-    return field
+    longest = max(plane.shape)
+    factor = max(1, int(np.ceil(longest / _BACKGROUND_MAX_EDGE)))
+    small = plane[::factor, ::factor] if factor > 1 else plane
+    background_small = rolling_ball(small, radius=max(1.0, radius_px / factor))
+    if factor > 1:
+        background = resize(background_small, plane.shape, order=1, mode="edge",
+                            preserve_range=True, anti_aliasing=False)
+    else:
+        background = background_small
+    return np.asarray(background, dtype=np.float32)
 
 
 def correct_illumination(
@@ -123,12 +120,12 @@ def correct_illumination(
 ) -> Tuple[Optional[np.ndarray], dict]:
     """Write an illumination-corrected copy of `volume`. Returns (out, report).
 
-    `xy_scale_um` is the length above which intensity variation is treated as
-    illumination rather than structure: the field is smoothed with that sigma,
-    so features smaller than it survive and gradients broader than it are
-    removed. 0 disables the XY correction. It is a PHYSICAL length, converted
-    through `spacing`, so the same value means the same thing at any pixel
-    size.
+    `xy_scale_um` is the rolling ball's radius: structures narrower than it are
+    kept, and background broader than it is subtracted. It must be comfortably
+    larger than anything being measured, or the ball rolls over the objects
+    themselves and subtracts them. 0 disables the XY correction. A PHYSICAL
+    length, converted through `spacing`, so the same value means the same thing
+    at any pixel size.
 
     `correct_z` scales each plane of a stack to a common level. Ignored for a
     2D image, which has no depth.
@@ -159,6 +156,7 @@ def correct_illumination(
         "xy_scale_um": float(xy_scale_um),
         "correct_z": bool(correct_z and ndim == 3),
         "pixel_um": pixel_um,
+        "dtype": str(np.dtype(getattr(volume, "dtype", np.float32))),
     }
 
     is_3d = ndim == 3
@@ -181,9 +179,12 @@ def correct_illumination(
     # ---- XY field, from a z-corrected mean projection so one field serves
     # every plane. The field of view does not change with depth; measuring it
     # per plane would only add noise.
-    field = None
+    # ---- XY background, from a z-corrected mean projection so one surface
+    # serves every plane. The field of view does not change with depth;
+    # estimating it per plane would only add noise.
+    background = None
     if xy_scale_um and xy_scale_um > 0:
-        sigma_px = float(xy_scale_um) / max(1e-6, pixel_um)
+        radius_px = float(xy_scale_um) / max(1e-6, pixel_um)
         if is_3d:
             accum = np.zeros(data.shape[-2:], dtype=np.float64)
             for z in range(depth):
@@ -191,47 +192,44 @@ def correct_illumination(
             reference = accum / max(1, depth)
         else:
             reference = np.asarray(data, dtype=np.float32)
-        field = _xy_field(reference, sigma_px)
-        report["xy_sigma_px"] = round(sigma_px, 2)
-        report["xy_field_min"] = round(float(field.min()), 4)
-        report["xy_field_max"] = round(float(field.max()), 4)
+        background = _xy_background(reference, radius_px)
+        report["xy_radius_px"] = round(radius_px, 2)
+        report["xy_background_min"] = round(float(background.min()), 2)
+        report["xy_background_max"] = round(float(background.max()), 2)
 
-        # A field with a huge dynamic range is not an illumination field. Say
-        # so: the correction still runs, because refusing silently would be
-        # worse, but a scale this small removes structure rather than gradient
-        # and the resulting image will look flat and washed out.
-        span = float(field.max()) / max(1e-6, float(field.min()))
-        report["xy_field_span"] = round(span, 1)
-        if span > _FIELD_RANGE_WARN:
-            suggested = max(4.0 * float(xy_scale_um), 20.0 * pixel_um)
-            report["warning"] = (
-                f"the estimated field spans {span:.0f}x, which is far more "
-                f"than illumination varies across a frame -- a scale of "
-                f"{xy_scale_um:g} um is {sigma_px:.1f} pixels here, comparable "
-                f"to the cells, so the field is following them and the "
-                f"correction is removing structure. Try {suggested:.0f} um or "
-                f"more."
-            )
-            print(f"  [Illumination] WARNING: {report['warning']}")
-
-    if field is None and not report["correct_z"]:
+    if background is None and not report["correct_z"]:
         report["applied"] = False
         return None, report
     report["applied"] = True
 
+    dtype = np.dtype(getattr(data, "dtype", np.float32))
     if out is None:
-        out = np.empty(data.shape, dtype=np.float32)
+        out = np.empty(data.shape, dtype=dtype)
+
+    # Written in the INPUT's dtype. The pipeline expresses an absolute
+    # threshold as a fraction of the dtype range -- "scaling by DType Max" --
+    # so handing it float32 silently redefines every absolute threshold: 0.055
+    # of 65535 is not 0.055 of 1.0. Keeping the dtype also halves what the
+    # image costs to store.
+    is_integer = np.issubdtype(dtype, np.integer)
+    info = np.iinfo(dtype) if is_integer else None
 
     for z in range(depth):
         plane = np.asarray(data[z] if is_3d else data, dtype=np.float32)
         if scale_per_plane[z] != 1.0:
             plane = plane * scale_per_plane[z]
-        if field is not None:
-            plane = plane / field
+        if background is not None:
+            # Subtract, never divide, and clamp at zero: a background estimate
+            # above the signal means an empty region, not a negative one.
+            plane = plane - background
+            np.clip(plane, 0.0, None, out=plane)
+        if is_integer:
+            np.clip(plane, float(info.min), float(info.max), out=plane)
+            plane = np.rint(plane)
         if is_3d:
-            out[z] = plane
+            out[z] = plane.astype(dtype, copy=False)
         else:
-            out[...] = plane
+            out[...] = plane.astype(dtype, copy=False)
         if progress is not None:
             progress(z + 1, depth)
     if hasattr(out, "flush"):
