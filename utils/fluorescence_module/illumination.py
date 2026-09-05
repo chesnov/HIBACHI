@@ -57,6 +57,13 @@ _FIELD_SAMPLES = 4_000_000
 #: uncorrected dark corner for a garbage one.
 _MIN_FIELD = 0.05
 
+#: Dynamic range above which the estimated field is not describing
+#: illumination. Real illumination across a frame varies by a factor of two or
+#: three; a field spanning far more than that is following the cells, because
+#: the scale is comparable to them rather than to the frame. Dividing by such a
+#: field flattens the structure the segmentation needs.
+_FIELD_RANGE_WARN = 5.0
+
 
 def _plane_level(plane) -> float:
     """A robust brightness level for one plane, from its bright pixels.
@@ -188,6 +195,24 @@ def correct_illumination(
         report["xy_sigma_px"] = round(sigma_px, 2)
         report["xy_field_min"] = round(float(field.min()), 4)
         report["xy_field_max"] = round(float(field.max()), 4)
+
+        # A field with a huge dynamic range is not an illumination field. Say
+        # so: the correction still runs, because refusing silently would be
+        # worse, but a scale this small removes structure rather than gradient
+        # and the resulting image will look flat and washed out.
+        span = float(field.max()) / max(1e-6, float(field.min()))
+        report["xy_field_span"] = round(span, 1)
+        if span > _FIELD_RANGE_WARN:
+            suggested = max(4.0 * float(xy_scale_um), 20.0 * pixel_um)
+            report["warning"] = (
+                f"the estimated field spans {span:.0f}x, which is far more "
+                f"than illumination varies across a frame -- a scale of "
+                f"{xy_scale_um:g} um is {sigma_px:.1f} pixels here, comparable "
+                f"to the cells, so the field is following them and the "
+                f"correction is removing structure. Try {suggested:.0f} um or "
+                f"more."
+            )
+            print(f"  [Illumination] WARNING: {report['warning']}")
 
     if field is None and not report["correct_z"]:
         report["applied"] = False

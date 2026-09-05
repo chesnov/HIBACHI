@@ -54,18 +54,36 @@ execute_raw_segmentation:
         Removes uneven illumination across the field of view -- one side
         brighter than the other, or darker corners -- so a single threshold can
         serve the whole image. Intensity variation broader than this length is
-        treated as illumination and divided out; anything smaller survives. Set
-        it several times larger than a cell so cells are not flattened away,
-        and well below the width of the image: a scale approaching the image
-        size cannot represent the gradient and stops correcting. On a test
-        image with a 2.1x left-to-right gradient and cells 40 px apart, a scale
-        of 25-50 px removed almost all of it, 100 px removed most, and 400 px
-        removed almost none. Applies at both 2D and 3D.
+        treated as illumination and divided out; anything smaller survives.
+        MICRONS, not pixels: it is converted through the image calibration, so
+        the same value means the same thing at any magnification. As a starting
+        point use several times the diameter of a cell -- for cells around 10
+        um across, try 20-50 um. Too SMALL is the damaging mistake: at a few
+        pixels the estimated field follows the cells instead of the gradient
+        and the correction flattens the structure the segmentation needs, so
+        the run warns when the field it measured spans far more than
+        illumination plausibly does. Too large simply stops correcting: a scale
+        approaching the width of the image cannot represent a gradient across
+        it. Applies at both 2D and 3D.
       type: float
       value: 0.0
       min: 0.0
       max: 10000.0
       step: 1.0
+    export_corrected_image:
+      # Only reachable when a correction is switched on, which is off by
+      # default, so this cannot change an existing run either way.
+      neutral_default: true
+      label: Keep the corrected image on disk
+      description: >-
+        Writes the illumination-corrected image into the results folder so it
+        can be reopened and exported later. The correction is shown as a layer
+        either way; with this off the image lives in a temporary file that
+        disappears when the run ends. It is float32, twice the size of the
+        input, so a 24 GB slide-scanner channel costs 48 GB to keep -- worth
+        turning off for images that large once the correction looks right.
+      type: bool
+      value: true
     illumination_correct_z:
       # False is off, which is what every run before this parameter existed did.
       neutral_default: true

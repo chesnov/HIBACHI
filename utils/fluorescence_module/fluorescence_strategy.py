@@ -314,7 +314,19 @@ class FluorescenceStrategy(ProcessingStrategy):
             if xy_scale_um > 0 or correct_z:
                 from .illumination import correct_illumination
 
-                corrected_path = files.get("corrected_image")
+                # Persisting is a toggle because the corrected image is
+                # float32 -- twice the input -- and a slide-scanner channel is
+                # 24 GB, so keeping it is 48 GB per channel. When it is off the
+                # correction still runs and is still shown as a layer, from a
+                # temporary file that goes away with the run.
+                persist = bool(params.get("export_corrected_image", True))
+                if persist:
+                    corrected_path = files.get("corrected_image")
+                else:
+                    corrected_path = os.path.join(
+                        self.temp_dir or self.processed_dir,
+                        "corrected_image_preview.dat",
+                    )
                 corrected = np.memmap(
                     corrected_path, dtype=np.float32, mode="w+",
                     shape=self.image_shape,
