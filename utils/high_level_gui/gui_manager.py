@@ -2273,6 +2273,29 @@ class DynamicGUIManager(QObject):
                 self._ref_cache = {}
         return self._ref_cache
 
+    def _reference_param(self, config_key: str, pname: str):
+        """A parameter's DEFINITION from the built-in reference, or None.
+
+        Definitions belong to the reference and values to the project. A
+        project's config is a snapshot of the reference as it stood when the
+        project was set up, so anything added since is absent from it -- and
+        `_ensure_config_canonical` only reconciles when something is
+        processed, deliberately, so viewing an old run stays frictionless.
+        That leaves the reference as the only place to ask whether a parameter
+        exists at all.
+        """
+        ref = self._reference_config()
+        block = (ref.get(config_key) or {}).get("parameters") or {}
+        pconf = block.get(pname)
+        return pconf if isinstance(pconf, dict) else None
+
+    def _param_defined(self, config_key: str, pname: str,
+                       parameters: Any = None) -> bool:
+        """Whether this parameter exists in the project's config or the reference."""
+        if isinstance(parameters, dict) and isinstance(parameters.get(pname), dict):
+            return True
+        return self._reference_param(config_key, pname) is not None
+
     def _param_applies(self, config_key: str, pname: str, pconf: Any) -> bool:
         """Whether a parameter is meaningful at this image's rank.
 
@@ -2320,7 +2343,9 @@ class DynamicGUIManager(QObject):
         """
         from PyQt5.QtWidgets import QComboBox, QLabel  # type: ignore
 
-        pconf = parameters.get("soma_source_channel") or {}
+        pconf = parameters.get("soma_source_channel")
+        if not isinstance(pconf, dict):
+            pconf = self._reference_param(config_key, "soma_source_channel") or {}
         current = str(pconf.get("value") or "").strip()
 
         try:
@@ -2418,8 +2443,16 @@ class DynamicGUIManager(QObject):
         # segment -- this same full image, or this same region -- has reached
         # soma extraction, because a channel that has not been processed
         # cannot seed one that is being processed now.
+        #
+        # Whether the control belongs here is answered by the REFERENCE as well
+        # as the project's own config. A definition lives in the reference and a
+        # value in the project, so a project set up before this parameter
+        # existed has no trace of it -- and its config is only reconciled when
+        # something is processed, which is far too late for a control that
+        # decides how step 3 runs. Same shape as the `ndim` annotation, which
+        # had to be read from the reference for the same reason.
         seeded_externally = False
-        if "soma_source_channel" in (parameters or {}):
+        if self._param_defined(config_key, "soma_source_channel", parameters):
             seeded_externally = self._add_soma_source_widget(
                 scroll_l, config_key, parameters)
 
@@ -2563,6 +2596,16 @@ class DynamicGUIManager(QObject):
     ) -> None:
         """Updates internal config when UI widgets change."""
         try:
+            # A parameter added to the reference after this project was set up
+            # is not in its config, and the assignment below would raise into
+            # the bare `except` -- the control would look live and change
+            # nothing. Seed the definition from the reference first. An empty
+            # default means the previous behaviour, so seeding decides nothing.
+            block = (self.config.setdefault(config_key, {})
+                     .setdefault("parameters", {}))
+            if not isinstance(block.get(param_name), dict):
+                seed = self._reference_param(config_key, param_name)
+                block[param_name] = dict(seed) if seed else {"value": value}
             self.config[config_key]["parameters"][param_name]["value"] = value
             self.parameter_values[param_name] = value
 
