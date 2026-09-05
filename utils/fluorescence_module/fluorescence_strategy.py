@@ -314,19 +314,7 @@ class FluorescenceStrategy(ProcessingStrategy):
             if xy_scale_um > 0 or correct_z:
                 from .illumination import correct_illumination
 
-                # Persisting is a toggle because the corrected image is
-                # float32 -- twice the input -- and a slide-scanner channel is
-                # 24 GB, so keeping it is 48 GB per channel. When it is off the
-                # correction still runs and is still shown as a layer, from a
-                # temporary file that goes away with the run.
-                persist = bool(params.get("export_corrected_image", True))
-                if persist:
-                    corrected_path = files.get("corrected_image")
-                else:
-                    corrected_path = os.path.join(
-                        self.temp_dir or self.processed_dir,
-                        "corrected_image_preview.dat",
-                    )
+                corrected_path = files.get("corrected_image")
                 # The INPUT's dtype, not float32. Absolute thresholds are
                 # expressed as a fraction of the dtype range ("scaling by
                 # DType Max"), so handing the pipeline float32 silently
@@ -866,6 +854,30 @@ class FluorescenceStrategy(ProcessingStrategy):
             name=layer_name, scale=display_scale
         )
 
+    def _artifact_itemsize_dtype(self, path: str, default=np.float32):
+        """dtype of a headerless .dat, inferred from its size and the shape.
+
+        A `.dat` carries no header, so every reader has to be told the dtype.
+        The corrected image is written in the INPUT's dtype, which varies by
+        project and is not recorded anywhere the viewer can reach on a fresh
+        open -- but the file's own size divided by the element count gives the
+        item size directly, which is self-describing and survives reopening.
+
+        4 bytes is read as float32: the only 4-byte input this pipeline sees is
+        a float image, and the label artifacts are read with their own explicit
+        dtype elsewhere. Anything unrecognised falls back to `default` rather
+        than guessing.
+        """
+        try:
+            count = int(np.prod(self.image_shape))
+            if count <= 0:
+                return default
+            itemsize = os.path.getsize(path) / count
+        except OSError:
+            return default
+        return {1: np.uint8, 2: np.uint16, 4: np.float32,
+                8: np.float64}.get(int(itemsize), default)
+
     def load_checkpoint_data(self, viewer, checkpoint_step: int):
         """Loads results into Napari for the given completion state."""
         if viewer is None:
@@ -879,6 +891,7 @@ class FluorescenceStrategy(ProcessingStrategy):
                 viewer.layers.remove(layer.name)
 
         layer_base_names = [
+            "Illumination corrected",
             "Raw Intermediate Segmentation", "Trimmed Intermediate Segmentation",
             "Edge Mask", "Final segmentation", "Cell bodies", "Skeletons",
             "Neighbor Connections"
@@ -896,6 +909,23 @@ class FluorescenceStrategy(ProcessingStrategy):
 
         # 2. Load layers based on progress
         if checkpoint_step >= 1:
+            # THIS is where layers reach the viewer. StepWorker.run calls
+            # execute_step with `viewer=None` ("Viewer is handled by main
+            # thread, not worker"), so every _add_layer_safely inside a step is
+            # dead when the step is run from the GUI: the guard is never true,
+            # nothing is added, and nothing complains. A new layer belongs
+            # here, not next to the code that computes it.
+            #
+            # Written in the input's dtype, so read back in it: the artifact is
+            # a bare .dat with no header, and reading uint16 as int32 would
+            # halve the shape and misinterpret every value.
+            corrected_path = files.get("corrected_image")
+            if corrected_path and os.path.exists(corrected_path):
+                load_and_add(
+                    "corrected_image", "Illumination corrected",
+                    dtype=self._artifact_itemsize_dtype(corrected_path),
+                    layer_type='image', colormap='gray', blending='additive',
+                )
             load_and_add("raw_segmentation", "Raw Intermediate Segmentation")
         if checkpoint_step >= 2:
             load_and_add("trimmed_segmentation", "Trimmed Intermediate Segmentation")

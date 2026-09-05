@@ -71,21 +71,6 @@ execute_raw_segmentation:
       min: 0.0
       max: 10000.0
       step: 1.0
-    export_corrected_image:
-      # Only reachable when a correction is switched on, which is off by
-      # default, so this cannot change an existing run either way.
-      neutral_default: true
-      label: Keep the corrected image on disk
-      description: >-
-        Writes the illumination-corrected image into the results folder so it
-        can be reopened and exported later. The correction is shown as a layer
-        either way; with this off the image lives in a temporary file that
-        disappears when the run ends. It is written in the input's own dtype,
-        so it costs the same as the image again -- 24 GB for a slide-scanner
-        channel, worth turning off for images that large once the correction
-        looks right.
-      type: bool
-      value: true
     illumination_correct_z:
       # False is off, which is what every run before this parameter existed did.
       neutral_default: true
