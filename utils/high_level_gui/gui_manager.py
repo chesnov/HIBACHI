@@ -2443,6 +2443,20 @@ class DynamicGUIManager(QObject):
         # segment -- this same full image, or this same region -- has reached
         # soma extraction, because a channel that has not been processed
         # cannot seed one that is being processed now.
+        # VALUES come from the config, not from whichever widgets are rendered.
+        # `get_current_values()` is what a step is handed, and it used to be
+        # populated inside the render loop -- so every display filter below
+        # silently removed a parameter from the run. Hiding the soma parameters
+        # while seeding from another channel made step 3 fail with
+        # "required parameter 'min_fragment_size' is missing from the step
+        # config", and the rank filter has the same latent flaw for any hidden
+        # parameter a step requires. Showing and supplying are separate
+        # decisions; only the first is made below.
+        if isinstance(parameters, dict):
+            for _pname, _pconf in parameters.items():
+                if isinstance(_pconf, dict):
+                    self.parameter_values[_pname] = _pconf.get("value")
+
         #
         # Whether the control belongs here is answered by the REFERENCE as well
         # as the project's own config. A definition lives in the reference and a
