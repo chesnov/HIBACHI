@@ -281,15 +281,13 @@ execute_cell_separation:
         when cells touch across a FAINT gap that Watershed Intensity Weight
         alone cannot find. On a two-cell test with the weight at maximum, 1.5
         located a gap down to about 12 percent darker than the cytoplasm, 2.0
-        down to 5 percent, and 2.5-3.0 down to 2 percent. Above 3 it becomes
-        unstable: one cell floods across a faint gap and swallows its
-        neighbour, which is why the maximum is 3. Leave at 1.5 unless
+        down to 5 percent, and 2.5-3.0 down to 2 percent. Leave at 1.5 unless
         boundaries are cutting across gaps you can see -- 1.5 is what every
         run before this parameter existed used.
       type: float
       value: 1.5
-      min: 1.0
-      max: 3.0
+      min: 0.0
+      max: 8.0
       step: 0.1
 execute_calculate_features:
   name: Execute Feature Calculation
