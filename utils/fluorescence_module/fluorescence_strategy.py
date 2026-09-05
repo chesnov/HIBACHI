@@ -591,6 +591,14 @@ class FluorescenceStrategy(ProcessingStrategy):
                 "local_analysis_radius": int(
                     _require(params, "local_analysis_radius", int)
                 ),
+                # Exponent on the watershed speed. `params.get`, not
+                # `_require`, on purpose: this was a code default
+                # (`kwargs.get('speed_power', 1.5)`) until it was exposed, so a
+                # project set up before then has no such key and must keep
+                # behaving exactly as it did. 1.5 here is that same value, so
+                # every existing run is unchanged whether or not its config has
+                # been reconciled.
+                "speed_power": float(params.get("speed_power", 1.5)),
                 "memmap_dir": temp_chunk_dir,
                 "memmap_voxel_threshold": int(
                     params.get("memmap_voxel_threshold", 25_000_000)

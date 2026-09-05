@@ -259,10 +259,37 @@ execute_cell_separation:
       step: 1
     intensity_weight:
       label: Watershed Intensity Weight
+      description: >-
+        How much the boundary follows the image rather than sitting midway
+        between two somas. The watershed travels fast through bright cytoplasm
+        and slowly through dark gaps, by a factor of (1 + this x brightness) --
+        so at 0.01 the image changes the speed by one percent and the
+        boundaries come out as a Voronoi tessellation of straight lines between
+        somas, whatever the picture shows. Raise it when boundaries cut across
+        visible dark gaps between touching cells. The effect saturates: past
+        about 1.0 the boundary is already on the darkest available path.
       type: float
       value: 0.01
       min: 0.0
       max: 10.0
+      step: 0.1
+    speed_power:
+      label: Boundary Contrast Sharpness
+      description: >-
+        Exponent applied to the watershed speed, which amplifies every
+        difference in it -- including the one intensity contributes. Raise it
+        when cells touch across a FAINT gap that Watershed Intensity Weight
+        alone cannot find. On a two-cell test with the weight at maximum, 1.5
+        located a gap down to about 12 percent darker than the cytoplasm, 2.0
+        down to 5 percent, and 2.5-3.0 down to 2 percent. Above 3 it becomes
+        unstable: one cell floods across a faint gap and swallows its
+        neighbour, which is why the maximum is 3. Leave at 1.5 unless
+        boundaries are cutting across gaps you can see -- 1.5 is what every
+        run before this parameter existed used.
+      type: float
+      value: 1.5
+      min: 1.0
+      max: 3.0
       step: 0.1
 execute_calculate_features:
   name: Execute Feature Calculation
