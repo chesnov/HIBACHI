@@ -165,6 +165,14 @@ class ReconcileResult:
     #: possibly have invalidated. A definition update is adopted silently and
     #: costs nothing.
     definition_updates: List[ParamChange] = field(default_factory=list)
+    #: Parameters the reference gained whose default reproduces the behaviour
+    #: of every run made before they existed. Adopted silently for the same
+    #: reason as `definition_updates`: nothing about the result changes, and
+    #: filing them under `param_changes` would delete results a reference edit
+    #: cannot have invalidated. Marked with `neutral_default: true` in the
+    #: reference -- opt-in, because adding some parameters really does change
+    #: the outcome.
+    neutral_additions: List[ParamChange] = field(default_factory=list)
 
     @property
     def is_clean(self) -> bool:
@@ -176,7 +184,8 @@ class ReconcileResult:
         returned True, and the caller discarded a correctly merged config.
         """
         return not (self.added_steps or self.removed_steps
-                    or self.param_changes or self.definition_updates)
+                    or self.param_changes or self.definition_updates
+                    or self.neutral_additions)
 
     @property
     def affects_results(self) -> bool:
@@ -197,6 +206,10 @@ class ReconcileResult:
         for c in self.definition_updates:
             tail = f"  ({c.detail})" if c.detail else ""
             out.append(f"= {c.step} / {c.param}: editor limits refreshed{tail}")
+        for c in self.neutral_additions:
+            tail = f"  ({c.detail})" if c.detail else ""
+            out.append(f"+ {c.step} / {c.param}: added, no effect on "
+                       f"results{tail}")
         return out
 
 
@@ -642,8 +655,12 @@ def duplicate_config(entry: LibraryEntry, new_name: str) -> LibraryEntry:
 #: already reported as `type_changed` and does affect the run.
 _DEFINITION_FIELDS = (
     "label", "description", "min", "max", "step", "element_type", "options",
-    "unit", "ndim",
+    "unit", "ndim", "neutral_default",
 )
+
+#: Marks a parameter whose default reproduces the behaviour of runs made before
+#: it existed, so that ADDING it to an old config is not a change to the result.
+NEUTRAL_DEFAULT_KEY = "neutral_default"
 
 
 def _definition_drift(src_pdef: Dict[str, Any],
@@ -803,6 +820,24 @@ def reconcile(
                     result.definition_updates.append(ParamChange(
                         step, pname, "definition", ", ".join(drifted),
                     ))
+            elif bool((ref_pdef or {}).get(NEUTRAL_DEFAULT_KEY)):
+                # A parameter the reference gained whose default reproduces
+                # exactly what happened before it existed -- `speed_power: 1.5`
+                # IS the old `kwargs.get('speed_power', 1.5)`, and an empty
+                # soma source IS extracting somas locally. Adding it cannot
+                # change a result, so it must not be filed under
+                # `param_changes`: that list drives invalidation, and adopting
+                # two such parameters would have deleted every result from soma
+                # extraction onward for no reason at all.
+                #
+                # OPT-IN, and deliberately so. Some parameters genuinely change
+                # the outcome by being added, so an unmarked addition keeps its
+                # old meaning and still prompts and invalidates.
+                result.neutral_additions.append(ParamChange(
+                    step, pname, "neutral_added",
+                    f"default {ref_pdef.get('value')!r} reproduces previous "
+                    f"behaviour",
+                ))
             else:
                 result.param_changes.append(ParamChange(
                     step, pname, "added",

@@ -2014,10 +2014,11 @@ class DynamicGUIManager(QObject):
             return True  # already current — nothing to do
 
         if not recon.affects_results:
-            # Only the DEFINITIONS drifted: bounds, labels, descriptions. The
-            # values are untouched, so a re-run produces exactly what it would
-            # have produced -- there is nothing to warn about and nothing to
-            # invalidate. Adopt it silently.
+            # Nothing here changes what a re-run produces: definitions that
+            # drifted (bounds, labels, descriptions), and parameters the
+            # reference gained whose defaults reproduce the behaviour of runs
+            # made before they existed. There is nothing to warn about and
+            # nothing to invalidate, so adopt it silently.
             #
             # This is what a widened maximum needs. `merged` is a deepcopy of
             # the reference with the source's values carried over, so it has
