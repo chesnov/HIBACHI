@@ -398,7 +398,6 @@ class ProcessingStrategy(abc.ABC):
                           f"{os.path.basename(path)}: {exc}")
         return removed
 
-    @abc.abstractmethod
     def _repair_metadata_dimensions(self) -> None:
         """Restore a `dimensions` block that no longer matches its own image.
 
@@ -477,6 +476,7 @@ class ProcessingStrategy(abc.ABC):
         except Exception as exc:
             print(f"[strategy] could not check the recorded dimensions: {exc}")
 
+    @abc.abstractmethod
     def _get_mode_name(self) -> str:
         """
         Returns the unique string identifier for this strategy (e.g., 'fluorescence').
