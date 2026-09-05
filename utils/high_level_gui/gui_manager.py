@@ -1922,6 +1922,52 @@ class DynamicGUIManager(QObject):
             print(f"[gui] config migration unavailable: {exc}")
             return config
 
+    def _persist_project_config(self) -> bool:
+        """Write `self.config` back to the sample's own YAML. True if written.
+
+        `strategy.save_config` writes the RUN PROVENANCE record inside the
+        results directory. `app_launch` opens a sample by reading the first
+        .yaml in the sample FOLDER, so anything adopted here that is not written
+        there is lost the moment the viewer closes: the widened bounds reached
+        the provenance file and the editor rebuilt from a config that had never
+        heard of the parameter.
+
+        The same gap applies to an accepted reconcile with real parameter
+        changes -- the merged config was adopted in memory and recorded in the
+        provenance, and the next open reconciled all over again from the stale
+        sample config.
+
+        Written to a temporary file and renamed, so an interrupted write cannot
+        leave a sample folder with a truncated config -- the one file that makes
+        the folder recognisable as a sample.
+        """
+        try:
+            names = [f for f in sorted(os.listdir(self.inputdir))
+                     if f.lower().endswith((".yaml", ".yml"))]
+        except OSError as exc:
+            print(f"[config] could not list {self.inputdir}: {exc}")
+            return False
+        if not names:
+            print(f"[config] no config found in {self.inputdir}; nothing to update")
+            return False
+
+        target = os.path.join(self.inputdir, names[0])
+        partial = target + ".part"
+        try:
+            with open(partial, "w") as handle:
+                yaml.safe_dump(self.config, handle, default_flow_style=False,
+                               sort_keys=False)
+            os.replace(partial, target)
+            return True
+        except Exception as exc:
+            try:
+                if os.path.isfile(partial):
+                    os.remove(partial)
+            except OSError:
+                pass
+            print(f"[config] could not update {os.path.basename(target)}: {exc}")
+            return False
+
     def _ensure_config_canonical(self, step_index: int) -> bool:
         """Make the config match the current pipeline before (re)processing.
 
@@ -1982,10 +2028,13 @@ class DynamicGUIManager(QObject):
             self.config = recon.merged
             self.initial_config = copy.deepcopy(recon.merged)
             self.strategy.config = self.config
+            # BOTH files: the provenance record, and the sample's own config,
+            # which is what app_launch reads when the sample is next opened.
             try:
                 self.strategy.save_config(self.config)
             except Exception as exc:
-                print(f"[config] could not persist refreshed definitions: {exc}")
+                print(f"[config] could not record refreshed definitions: {exc}")
+            self._persist_project_config()
             for line in recon.summary_lines():
                 print(f"[config] {line}")
             if self.current_step_method:
@@ -2033,6 +2082,11 @@ class DynamicGUIManager(QObject):
         self.config = recon.merged
         self.initial_config = copy.deepcopy(recon.merged)
         self.strategy.config = self.config
+        # Write it back to the sample's own config as well, not only to the run
+        # provenance: `app_launch` reads the sample folder's YAML, so a config
+        # adopted here but not written there means the next open reconciles the
+        # same stale file again and re-asks a question already answered.
+        self._persist_project_config()
 
         # Delete the now-invalid results (the earliest changed step and every
         # step after it), so nothing on disk claims to come from the new params.
