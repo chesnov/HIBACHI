@@ -151,6 +151,10 @@ class FluorescenceStrategy(ProcessingStrategy):
     #: PREFIX, which is why the globs are written out rather than derived.
     ARTIFACT_PATTERNS = (
         ("raw_segmentation", "raw_segmentation_{p}.dat", "raw_segmentation*.dat"),
+        # The illumination-corrected input, written so it can be looked at and
+        # reopened -- the point of the correction is to be judged, not trusted.
+        # float32 at the image's shape.
+        ("corrected_image", "corrected_image_{p}.dat", "corrected_image*.dat"),
         ("edge_mask", "{p}_edge_mask.dat", "*edge_mask.dat"),
         ("trimmed_segmentation", "trimmed_segmentation_{p}.dat",
          "trimmed_segmentation*.dat"),
@@ -166,7 +170,7 @@ class FluorescenceStrategy(ProcessingStrategy):
 
     #: Which artifacts each 1-based step owns, for invalidation.
     STEP_ARTIFACTS = {
-        1: ("raw_segmentation",),
+        1: ("raw_segmentation", "corrected_image"),
         2: ("trimmed_segmentation", "edge_mask"),
         3: ("cell_bodies",),
         4: ("final_segmentation",),
@@ -293,9 +297,50 @@ class FluorescenceStrategy(ProcessingStrategy):
                 len(tubular_scales) == 1 and tubular_scales[0] == 0.0
             )
 
+            # --- 1b. ILLUMINATION CORRECTION ---
+            # Flatten uneven illumination before anything measures intensity.
+            # A single threshold cannot serve a field that is bright on one
+            # side and dim on the other: it is met in one corner and missed in
+            # the other, and the cells lost from the dim corner look like
+            # biology.
+            #
+            # `params.get`, not `_require`: both parameters are marked
+            # neutral_default in the reference, so a project set up before they
+            # existed has neither and must behave exactly as it did. Zero and
+            # False are "off", which is that behaviour.
+            segmentation_input = image_stack
+            xy_scale_um = float(params.get("illumination_xy_scale_um", 0.0) or 0.0)
+            correct_z = bool(params.get("illumination_correct_z", False))
+            if xy_scale_um > 0 or correct_z:
+                from .illumination import correct_illumination
+
+                corrected_path = files.get("corrected_image")
+                corrected = np.memmap(
+                    corrected_path, dtype=np.float32, mode="w+",
+                    shape=self.image_shape,
+                )
+                _, illum_report = correct_illumination(
+                    image_stack, self.spacing_checked,
+                    xy_scale_um=xy_scale_um, correct_z=correct_z,
+                    out=corrected,
+                )
+                if illum_report.get("applied"):
+                    self.intermediate_state["illumination"] = illum_report
+                    print(f"  [Illumination] {illum_report}")
+                    segmentation_input = corrected
+                    if viewer is not None:
+                        self._add_layer_safely(
+                            viewer,
+                            np.memmap(corrected_path, dtype=np.float32,
+                                      mode="r", shape=self.image_shape),
+                            "Illumination corrected",
+                        )
+                else:
+                    del corrected
+
             # --- 2. CALL LOGIC ---
             result = segment_cells_first_pass_raw(
-                volume=image_stack,
+                volume=segmentation_input,
                 spacing=self.spacing_checked,
                 tubular_scales=tubular_scales,
                 smooth_sigma=smooth_sigma_input,

@@ -46,6 +46,40 @@ execute_raw_segmentation:
         high: 1.0
         smooth_sigma: 0.2
         connect_max_gap_physical: 0.0
+    illumination_xy_scale_um:
+      # 0 is off, which is what every run before this parameter existed did.
+      neutral_default: true
+      label: Illumination Flattening Scale (um, 0 = off)
+      description: >-
+        Removes uneven illumination across the field of view -- one side
+        brighter than the other, or darker corners -- so a single threshold can
+        serve the whole image. Intensity variation broader than this length is
+        treated as illumination and divided out; anything smaller survives. Set
+        it several times larger than a cell so cells are not flattened away,
+        and well below the width of the image: a scale approaching the image
+        size cannot represent the gradient and stops correcting. On a test
+        image with a 2.1x left-to-right gradient and cells 40 px apart, a scale
+        of 25-50 px removed almost all of it, 100 px removed most, and 400 px
+        removed almost none. Applies at both 2D and 3D.
+      type: float
+      value: 0.0
+      min: 0.0
+      max: 10000.0
+      step: 1.0
+    illumination_correct_z:
+      # False is off, which is what every run before this parameter existed did.
+      neutral_default: true
+      ndim: 3
+      label: Correct Depth Attenuation (stacks)
+      description: >-
+        Scales each z-plane to a common brightness, compensating for planes
+        dimming with depth as excitation and emission are absorbed. Each
+        plane's level is measured from its own bright pixels, so a plane
+        holding less tissue is not mistaken for a dimmer one. Only meaningful
+        for a stack; there is no depth to correct in a single plane, and this
+        is hidden for 2D projects.
+      type: bool
+      value: false
     min_size:
       label: Minimum Size (Voxels, Raw Seg - GLOBAL)
       type: int
