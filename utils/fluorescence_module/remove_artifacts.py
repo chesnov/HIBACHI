@@ -286,12 +286,13 @@ def _find_largest_hull_component_slice_graph(hull_memmap: np.memmap) -> None:
                ndimage.label is deterministic / raster-scan).  Zero out any
                component whose Union-Find root is not the largest.
 
-    Logical equivalence with 2D pipeline:
-      generate_tight_hull_2d already uses scipy.ndimage.label on the
-      downsampled 2D hull — i.e. a single-slice degenerate case of this exact
-      algorithm.  Both pipelines keep the largest connected hull component and
-      remove stray artifacts; only the dimensionality and working resolution
-      differ.
+    Both ranks call this:
+      A 2D hull is passed as a (1, H, W) view, which is the single-slice
+      degenerate case of this algorithm -- one ndimage.label with structure_2d,
+      then keep the root with the highest count. Rank 2 used to have its own
+      branch calling ndimage.label with the DEFAULT structure, so it was
+      deciding with 4-connectivity what this decides with 8; that divergence
+      has been removed in favour of the 8-connectivity chosen here.
     """
     total_z = hull_memmap.shape[0]
 
@@ -494,19 +495,22 @@ def generate_tight_hull_stack(
     # Essential for removing floating artifacts (tile corners, dust).
     # Uses Z-slice graph instead of full-volume dask CCA — see docstring of
     # _find_largest_hull_component_slice_graph for rationale.
+    # ONE path for both ranks. `_find_largest_hull_component_slice_graph`
+    # works slice by slice and touches nothing but `hull_memmap[z]` and
+    # `shape[0]`, so a 2D hull viewed as a single slice runs the identical
+    # algorithm
+    #
+    # The reshape is a view, so writes reach the same file, and it also
+    # replaces the old branch's full-resolution allocations: that branch held
+    # an int32 label array, a ravel for bincount and a comparison array at
+    # once, which is how raising otsu_scale_factor -- fragmenting the mask and
+    # multiplying the component count 
     print("    Filtering disjoint hull artifacts (Keeping Largest Component)...")
     if ndim == 3:
-        # 3D connectivity via the Z-slice graph; see that function's docstring.
         _find_largest_hull_component_slice_graph(hull_memmap)
     else:
-        labeled_hull, num_features = ndimage.label(np.asarray(hull_memmap))
-        if num_features > 1:
-            counts = np.bincount(labeled_hull.ravel())
-            counts[0] = 0
-            largest = int(np.argmax(counts))
-            print(f"    Keeping largest tissue component (Label {largest}). "
-                  f"Removing {num_features - 1} artifacts.")
-            hull_memmap[...] = (labeled_hull == largest)
+        _find_largest_hull_component_slice_graph(
+            hull_memmap.reshape((1,) + tuple(hull_memmap.shape)))
     hull_memmap.flush()
 
     # D3: holes filled ONCE, after the largest component is chosen. Filling
@@ -975,4 +979,3 @@ def apply_hull_trimming_2d(raw_labels_path, original_image, spacing,
         otsu_scale_factor=otsu_scale_factor,
         temp_root_path=temp_root_path,
     )
-
