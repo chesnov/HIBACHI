@@ -132,17 +132,19 @@ def roi_crop_spec(sample_dir: str, roi_name: str,
     crop_h, crop_w = y1 - y0, x1 - x0
 
     try:
-        from skimage.draw import polygon as skpoly
+        from ..high_level_gui.roi_sharing import polygon_mask
     except ImportError:
         return None
 
+    # roi_sharing.polygon_mask, not skimage.draw.polygon: the latter returns the
+    # interior as int64 coordinate arrays, ~80 bytes per interior pixel, which
+    # for a region spanning a whole slide scan is hundreds of GB and gets the
+    # worker killed. The banded fill below produces an identical mask at 1 byte
+    # per pixel with band-sized scratch.
     slice_masks: Dict[int, np.ndarray] = {}
     for z, poly in polys.items():
         p = np.asarray(poly, dtype=float) - np.array([y0, x0], dtype=float)
-        rr, cc = skpoly(p[:, 0], p[:, 1], shape=(crop_h, crop_w))
-        m = np.zeros((crop_h, crop_w), dtype=bool)
-        m[rr, cc] = True
-        slice_masks[int(z)] = m
+        slice_masks[int(z)] = polygon_mask(p, (crop_h, crop_w))
 
     return {"bbox": {"z0": int(bbox.get("z0") or 0),
                      "z1": (int(bbox["z1"]) if bbox.get("z1") is not None

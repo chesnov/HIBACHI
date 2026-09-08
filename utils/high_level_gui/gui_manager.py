@@ -10,7 +10,11 @@ import yaml  # type: ignore
 from typing import Dict, Any, List, Optional, Tuple, Union
 
 import numpy as np
-from skimage.draw import polygon as skimage_polygon  # type: ignore
+# NOTE: skimage.draw.polygon used to be imported here for ROI masking. All
+# polygon rasterisation now goes through roi_sharing.polygon_mask /
+# rasterize_polygon_band, which bands its work instead of returning per-pixel
+# coordinate arrays. Do not reintroduce it: on a whole-slide region the
+# coordinate arrays alone are hundreds of GB and the process is killed.
 from PyQt5.QtWidgets import (  # type: ignore
     QMessageBox, QWidget, QVBoxLayout, QScrollArea, QLabel,
     QTextEdit, QProgressBar, QApplication, QPushButton, QFileDialog, QDockWidget, QLayout
@@ -992,6 +996,33 @@ class DynamicGUIManager(QObject):
                 "the image's coordinate space. Nothing was created. Please "
                 "report this.")
             return None
+
+        # A region's crop is a full second copy of the pixels on disk. That is a
+        # fine trade for a small sub-region and a bad one for a polygon that
+        # traces the whole frame -- which is what selecting an entire coverslip
+        # is. Say so before writing tens of GB, and offer the full image, which
+        # analyses the same pixels with no crop at all.
+        bbox_px = int(crop_h) * int(crop_w)
+        frame_px = int(img_h) * int(img_w)
+        if is_3d:
+            bbox_px *= int(self.image_stack.shape[0])
+            frame_px *= int(self.image_stack.shape[0])
+        coverage = (bbox_px / frame_px) if frame_px else 0.0
+        if coverage >= 0.9:
+            gb = bbox_px * int(self.image_stack.dtype.itemsize) / (1024 ** 3)
+            reply = QMessageBox.question(
+                None, "Region Covers the Whole Image",
+                f"This region's bounding box covers {coverage * 100:.0f}% of the "
+                f"image, so its crop will be about {gb:.1f} GB on disk -- "
+                "effectively a second copy of the image.\n\n"
+                "If you meant to analyse everything, working on the full image "
+                "does the same thing without the crop. Regions are for "
+                "analysing or tuning on a genuine sub-area.\n\n"
+                "Create it anyway?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+            )
+            if reply != QMessageBox.Yes:
+                return None
 
         if is_3d:
             sorted_zs = sorted(z_polygons.keys())

@@ -53,6 +53,329 @@ ROI_CROP_NAME = "roi_image_crop.dat"
 # overlay path can't create an ROI the per-channel path would have rejected.
 MIN_CROP_PX = 10
 
+# Peak scratch memory a single polygon/crop band may use. Bands are sized from
+# this, so RAM stays flat as the region grows instead of scaling with its area.
+ROI_BAND_BYTES = 128 << 20  # 128 MB
+# Rows per band are clamped so a very wide region still bands, and a very narrow
+# one doesn't degenerate into a million one-row iterations.
+ROI_BAND_MIN_ROWS = 8
+ROI_BAND_MAX_ROWS = 4096
+
+
+# --------------------------------------------------------------------------- #
+# Polygon rasterisation
+# --------------------------------------------------------------------------- #
+# Why this is hand-rolled instead of skimage.draw.polygon
+# -------------------------------------------------------
+# Memory. ``skimage.draw.polygon`` returns the interior as two int64 COORDINATE
+# arrays (rr, cc). That costs ~80 bytes of peak RAM per interior pixel -- the
+# two 8-byte output arrays plus the growable buffers behind them -- against 1
+# byte per pixel for the boolean mask that is all any caller here actually
+# wants. A region covering a whole coverslip is billions of pixels, so the
+# coordinate arrays alone run to hundreds of GB and the process is killed before
+# the mask is ever built. Its point-in-polygon inner loop is also
+# O(area x vertices), so tracing a circle with a few hundred vertices multiplies
+# the cost again.
+#
+# The scanline fill below is O(rows x vertices + area) in time, allocates only
+# one band at a time, and defines the mask rule explicitly (see
+# ``rasterize_polygon_band``) rather than inheriting it from whatever skimage is
+# installed.
+#
+# On the relationship to skimage
+# ------------------------------
+# The geometry is the same and the two agree pixel-for-pixel on every outline a
+# user can draw. They can differ by single pixels in two situations, both
+# deliberate:
+#
+#   * A pixel centre within ~1 ULP of an edge. skimage's answer there is a
+#     rounding artifact of its compiled kernel, not a rule: perturbing a
+#     circle's vertices by 1e-12 px changes skimage's pixel count. This module
+#     uses an explicit ``_BOUNDARY_ULPS`` tolerance instead, so the mask is
+#     stable under sub-nanopixel coordinate noise and does not change when
+#     skimage is upgraded or rebuilt on a different compiler.
+#   * A collinear outline -- every vertex on one straight line. skimage
+#     returns just the vertex pixels, which is inconsistent with its own
+#     boundary-inclusive behaviour on real polygons. Such an outline encloses no
+#     region, so it is rejected in ``roi_record_from_polygons`` and yields an
+#     empty mask here. Note this is a collinearity test, not an area test: a
+#     self-crossing figure-of-eight has zero signed area but is a real region,
+#     and is filled by the even-odd rule as before.
+#
+# Deliberately NOT matched: skimage's exact last-bit rounding. Pinning the ROI
+# mask to that would make every region's pixel count -- and therefore every
+# density derived from it -- a function of the installed skimage build.
+# How close a pixel centre must be to an edge, in units of floating-point
+# spacing (ULPs), to count as lying on it. This is a tolerance rather than an
+# exact `==` because vertices arrive as the output of trigonometry and affine
+# scaling: a coordinate that is mathematically 190 routinely arrives as
+# 189.99999999999997, one ULP away. Testing exact equality would drop the
+# tangent pixel at the top and bottom of a circle; a tolerance keeps it, and
+# keeps it under coordinate nudges far smaller than a pixel.
+#
+# 32 ULPs (about 1e-12 px at whole-slide magnitudes) is wide enough to absorb
+# accumulated rounding and far too narrow to reach a genuinely different pixel.
+_BOUNDARY_ULPS = 32
+
+
+class PolygonEdges:
+    """A polygon's edges, pre-split for scanline filling.
+
+    Built once and reused for every band and every Z slice, so per-band work is
+    a small array operation over a handful of edges rather than a fresh sweep.
+
+    ``slanted`` holds the non-horizontal edges (the ones that produce crossings)
+    as ``(y_i, x_i, dy, dx, ymin, ymax)``, indexed the way a crossing kernel
+    indexes them: base vertex ``i``, other endpoint ``j = i - 1``. ``level``
+    holds the horizontal edges as ``(y, xmin, xmax)``; they yield no crossings
+    but can still put pixel centres on the boundary.
+
+    An outline with fewer than three vertices, or with zero signed area (every
+    vertex collinear), is treated as empty: it encloses no region, so there is
+    no mask to build. ``roi_record_from_polygons`` rejects those before they get
+    here, and this is the backstop.
+    """
+
+    __slots__ = ("y_i", "x_i", "dy", "dx", "ymin", "ymax",
+                 "level_y", "level_x0", "level_x1", "y_lo", "y_hi", "empty")
+
+    def __init__(self, poly_yx):
+        p = np.asarray(poly_yx, dtype=float)
+        if (p.ndim != 2 or p.shape[0] < 3 or p.shape[1] != 2
+                or polygon_is_degenerate(p)):
+            p = np.empty((0, 2), dtype=float)
+
+        y_i, x_i = p[:, 0], p[:, 1]
+        y_j, x_j = np.roll(y_i, 1), np.roll(x_i, 1)
+
+        slanted = y_i != y_j
+        self.y_i, self.x_i = y_i[slanted], x_i[slanted]
+        self.dy = y_j[slanted] - self.y_i
+        self.dx = x_j[slanted] - self.x_i
+        self.ymin = np.minimum(self.y_i, y_j[slanted])
+        self.ymax = np.maximum(self.y_i, y_j[slanted])
+
+        level = ~slanted
+        self.level_y = y_i[level]
+        self.level_x0 = np.minimum(x_i[level], x_j[level])
+        self.level_x1 = np.maximum(x_i[level], x_j[level])
+
+        if p.shape[0]:
+            self.y_lo, self.y_hi = float(y_i.min()), float(y_i.max())
+        else:
+            self.y_lo = self.y_hi = 0.0
+        self.empty = p.shape[0] == 0
+
+    def row_span(self, height: int) -> Tuple[int, int]:
+        """Rows of a mask this polygon can touch, clipped to ``[0, height)``.
+
+        Rows outside the outline's own Y extent are all-False, so skipping them
+        makes a region tucked into the corner of a huge frame proportionally
+        cheap instead of costing a full-frame sweep.
+        """
+        if self.empty:
+            return 0, 0
+        row0 = max(0, int(np.floor(self.y_lo)))
+        row1 = min(int(height), int(np.ceil(self.y_hi)) + 1)
+        return (row0, row1) if row1 > row0 else (0, 0)
+
+
+def polygon_is_degenerate(poly_yx) -> bool:
+    """True when an outline encloses nothing because its vertices are collinear.
+
+    NOT a signed-area test. The shoelace area of a figure-of-eight is exactly
+    zero -- the two lobes wind in opposite directions and cancel -- so an area
+    test would reject a self-crossing lasso, which is a perfectly ordinary thing
+    to draw and which the even-odd rule handles correctly.
+
+    What is actually degenerate is an outline with no width: every vertex on one
+    straight line (or all vertices identical). Measured as the largest
+    perpendicular deviation from the longest chord, against a tolerance scaled
+    to the outline's own extent, so a legitimately thin sliver still counts as a
+    region.
+    """
+    p = np.asarray(poly_yx, dtype=float)
+    if p.ndim != 2 or p.shape[0] < 3 or p.shape[1] != 2:
+        return True
+    if not np.isfinite(p).all():
+        return True
+
+    d = p - p[0]
+    lengths = (d * d).sum(axis=1)
+    longest = int(np.argmax(lengths))
+    span = float(np.sqrt(lengths[longest]))
+    if span == 0.0:
+        return True  # every vertex identical
+
+    # Perpendicular distance of each vertex from the line through p[0] and the
+    # furthest vertex.
+    cross = d[:, 0] * d[longest, 1] - d[:, 1] * d[longest, 0]
+    deviation = float(np.abs(cross).max()) / span
+    return deviation <= _BOUNDARY_ULPS * np.spacing(span)
+
+
+def polygon_edges(poly_yx) -> PolygonEdges:
+    """Pre-compute a polygon's edges once for repeated band filling."""
+    return PolygonEdges(poly_yx)
+
+
+def rasterize_polygon_band(
+    edges: PolygonEdges,
+    row0: int,
+    row1: int,
+    width: int,
+    out: Optional[np.ndarray] = None,
+) -> np.ndarray:
+    """Fill rows ``[row0, row1)`` of a polygon into a (row1-row0, width) mask.
+
+    `out` is fully overwritten when given, which lets a caller allocate one band
+    buffer and reuse it for every band and every Z slice. Scratch is
+    O((row1 - row0) x n_edges) -- independent of the region's area, which is the
+    whole point.
+
+    The rule has two terms:
+
+      1. Interior, by the even-odd rule. An edge is counted over the half-open
+         span ``[min(y), max(y))`` so a shared vertex isn't counted twice, and a
+         column ``c`` is inside a crossing pair ``(a, b)`` when ``a <= c < b``.
+         This is the same geometry ``skimage.draw.polygon`` uses.
+      2. Boundary: pixel centres lying on an edge, to within
+         ``_BOUNDARY_ULPS``. The interior term alone is half-open, so without
+         this an axis-aligned outline loses its bottom row and right column, and
+         a circle loses its top and bottom tangent pixel.
+
+    Self-intersecting outlines follow the even-odd rule, as before -- a lasso
+    that crosses itself leaves the overlap unfilled.
+    """
+    height = int(row1) - int(row0)
+    width = int(width)
+    if out is None:
+        out = np.zeros((height, width), dtype=bool)
+    else:
+        out[:] = False
+    if edges.empty or height <= 0:
+        return out
+
+    rows = np.arange(row0, row1, dtype=float)[:, None]
+
+    if edges.y_i.size:
+        xint = edges.dx * (rows - edges.y_i) / edges.dy + edges.x_i
+
+        # --- term 1: interior ---
+        crosses = (edges.ymin <= rows) & (rows < edges.ymax)
+        if crosses.any():
+            # Unhit edges are parked at +inf so sorting leaves each row's real
+            # crossings first, in order.
+            ordered = np.sort(np.where(crosses, xint, np.inf), axis=1)
+            counts = crosses.sum(axis=1)
+            for i in np.nonzero(counts)[0]:
+                pairs = ordered[i, :counts[i]]
+                for k in range(0, pairs.size - 1, 2):
+                    start = max(0, int(np.ceil(pairs[k])))
+                    stop = min(width, int(np.ceil(pairs[k + 1])))
+                    if stop > start:
+                        out[i, start:stop] = True
+
+        # --- term 2: pixel centres sitting on a slanted edge ---
+        # Closed in y here: an endpoint row is on the boundary even though the
+        # interior term deliberately excludes it.
+        nearest = np.round(xint)
+        tol = _BOUNDARY_ULPS * np.spacing(np.maximum(np.abs(xint), 1.0))
+        on_edge = ((edges.ymin <= rows) & (rows <= edges.ymax)
+                   & (np.abs(xint - nearest) <= tol)
+                   & (nearest >= 0) & (nearest < width))
+        if on_edge.any():
+            ri, ei = np.nonzero(on_edge)
+            out[ri, nearest[ri, ei].astype(np.intp)] = True
+
+    # --- term 2b: horizontal edges, which produce no crossings at all ---
+    for y_level, x_start, x_stop in zip(edges.level_y, edges.level_x0,
+                                        edges.level_x1):
+        row_f = np.round(y_level)
+        if abs(y_level - row_f) > _BOUNDARY_ULPS * np.spacing(
+                max(abs(y_level), 1.0)):
+            continue
+        row = int(row_f) - int(row0)
+        if not (0 <= row < height):
+            continue
+        start = max(0, int(np.ceil(x_start)))
+        stop = min(width, int(np.floor(x_stop)) + 1)
+        if stop > start:
+            out[row, start:stop] = True
+
+    return out
+
+
+# Bytes of (rows x edges) scratch the band filler holds per row per edge: two
+# float64 intersection arrays plus two boolean predicates, rounded up.
+_BYTES_PER_ROW_EDGE = 40
+
+
+def band_rows(width: int, bytes_per_row_px: int = 1, n_edges: int = 0,
+              budget: int = ROI_BAND_BYTES) -> int:
+    """How many rows fit in the scratch budget at this width and vertex count.
+
+    `bytes_per_row_px` is the total per-pixel cost of one band across every
+    array held at once, so a caller can account for its own buffers (a uint16
+    image band plus its mask, say) and not just the mask.
+
+    `n_edges` matters because the filler's working set is (rows x edges): an
+    outline traced with a few thousand vertices would otherwise blow the budget
+    on the intersection table even though the mask itself is small.
+    """
+    per_row = (int(width) * max(1, int(bytes_per_row_px))
+               + max(0, int(n_edges)) * _BYTES_PER_ROW_EDGE)
+    rows = int(budget) // max(1, per_row)
+    return int(np.clip(rows, ROI_BAND_MIN_ROWS, ROI_BAND_MAX_ROWS))
+
+
+def polygon_mask(poly_yx, shape: Sequence[int]) -> np.ndarray:
+    """Boolean interior mask of one polygon, built band by band.
+
+    A drop-in replacement for::
+
+        rr, cc = skimage.draw.polygon(poly[:, 0], poly[:, 1], shape=shape)
+        mask = np.zeros(shape, bool); mask[rr, cc] = True
+
+    with identical output and no per-pixel coordinate arrays. The mask itself is
+    still shape[0]*shape[1] bytes, so prefer ``rasterize_polygon_band`` where the
+    consumer can work a band at a time.
+    """
+    height, width = int(shape[0]), int(shape[1])
+    mask = np.zeros((height, width), dtype=bool)
+    edges = polygon_edges(poly_yx)
+    row0, row1 = edges.row_span(height)
+    if row1 <= row0:
+        return mask
+
+    step = band_rows(width, 1, edges.y_i.size)
+    for r0 in range(row0, row1, step):
+        r1 = min(row1, r0 + step)
+        rasterize_polygon_band(edges, r0, r1, width, out=mask[r0:r1])
+    return mask
+
+
+def polygon_pixel_count(poly_yx, shape: Sequence[int]) -> int:
+    """Interior pixel count of one polygon without ever holding a full mask.
+
+    Peak memory is one band, so this is safe to call on a region of any size.
+    """
+    height, width = int(shape[0]), int(shape[1])
+    edges = polygon_edges(poly_yx)
+    row0, row1 = edges.row_span(height)
+    if row1 <= row0:
+        return 0
+
+    step = band_rows(width, 1, edges.y_i.size)
+    scratch = np.zeros((step, width), dtype=bool)
+    total = 0
+    for r0 in range(row0, row1, step):
+        r1 = min(row1, r0 + step)
+        band = rasterize_polygon_band(edges, r0, r1, width,
+                                      out=scratch[:r1 - r0])
+        total += int(np.count_nonzero(band))
+    return total
+
 
 # --------------------------------------------------------------------------- #
 # Building the shared ROI record
@@ -95,6 +418,19 @@ def roi_record_from_polygons(
             raise ValueError(
                 f"Polygon at Z={z} must be an (N>=3, 2) array of YX vertices, "
                 f"got shape {arr.shape}."
+            )
+        if not np.isfinite(arr).all():
+            raise ValueError(
+                f"Polygon at Z={z} contains non-finite vertices."
+            )
+        # Collinear vertices enclose nothing. Caught here rather than at raster
+        # time so the failure is a message about the drawing instead of a
+        # region whose crop is silently a blank rectangle.
+        if polygon_is_degenerate(arr):
+            raise ValueError(
+                f"The outline at Z={z} encloses no area -- its vertices are "
+                "all in a straight line. Draw a closed shape with some width "
+                "to it."
             )
         arrays[int(z)] = arr
 
@@ -656,8 +992,6 @@ def masked_pixel_count(
     given and disagrees with the crop the record describes (which means the
     record belongs to a different image and must not be trusted).
     """
-    from skimage.draw import polygon as _raster  # lazy: keeps this module light
-
     bbox = record.get("bbox") or {}
     try:
         y0, x0 = int(bbox["y0"]), int(bbox["x0"])
@@ -704,11 +1038,10 @@ def masked_pixel_count(
     sorted_zs = sorted(z_polys)
 
     def _count_for(nearest_z: int) -> int:
+        # Banded: a whole-slide region's mask would be gigabytes as one array,
+        # and its coordinate list many times that again.
         poly = z_polys[nearest_z] - np.array([y0, x0], dtype=float)
-        rr, cc = _raster(poly[:, 0], poly[:, 1], shape=(crop_h, crop_w))
-        mask = np.zeros((crop_h, crop_w), dtype=bool)
-        mask[rr, cc] = True
-        return int(mask.sum())
+        return polygon_pixel_count(poly, (crop_h, crop_w))
 
     cache: Dict[int, int] = {}
     if not is_3d:
@@ -982,50 +1315,100 @@ def build_crop_memmap(
     through Z (one entry, applied to every slice), and a true 3D region (one entry
     per drawn level, nearest polygon in between). Slices outside the drawn range
     take the first or last polygon rather than extrapolating to empty.
-    """
-    from skimage.draw import polygon as skimage_polygon
 
+    Memory is bounded by ``ROI_BAND_BYTES`` regardless of how big the region is.
+    The crop is written in horizontal bands, and each band's mask is rasterised
+    on the spot: nothing full-region-sized is ever held, which is what lets a
+    region covering an entire slide scan be created at all. Rows the polygon
+    cannot reach are left as the zeros the memmap was created with rather than
+    being read, masked and written back.
+    """
     is_3d = src.ndim == 3
-    crop_h, crop_w = y1 - y0, x1 - x0
+    crop_h, crop_w = int(y1 - y0), int(x1 - x0)
 
     if is_3d:
         if z1_crop is None:
             z1_crop = src.shape[0]
-        crop_depth = z1_crop - z0_crop
+        crop_depth = int(z1_crop - z0_crop)
         crop_shape = (crop_depth, crop_h, crop_w)
     else:
+        crop_depth = 1
         crop_shape = (crop_h, crop_w)
 
     crop_mm = np.memmap(out_path, dtype=src.dtype, mode='w+', shape=crop_shape)
-    sorted_zs = sorted(z_polygons.keys())
+    sorted_zs = sorted(int(z) for z in z_polygons.keys())
 
-    def _mask_for_z(global_z: int):
-        nearest_z = min(sorted_zs, key=lambda z: abs(z - global_z))
-        poly = np.asarray(z_polygons[nearest_z], dtype=float) - np.array(
-            [y0, x0], dtype=float)
-        rr, cc = skimage_polygon(poly[:, 0], poly[:, 1], shape=(crop_h, crop_w))
-        m = np.zeros((crop_h, crop_w), dtype=bool)
-        m[rr, cc] = True
-        return m
+    # One edge table per drawn Z level, in crop-relative coordinates. Built once
+    # for the whole run: the per-band cost is then a small array operation over
+    # these edges, not a fresh point-in-polygon sweep of the region.
+    offset = np.array([y0, x0], dtype=float)
+    edges_by_z = {
+        z: polygon_edges(np.asarray(z_polygons[z], dtype=float) - offset)
+        for z in sorted_zs
+    }
 
-    if is_3d:
-        if not quiet:
-            print(f"  [ROI] Building 3D crop "
-                  f"({crop_depth} slices x {crop_h} x {crop_w})...")
-        mask_cache: Dict[int, Any] = {}
+    # Only rows some polygon can reach need touching at all.
+    row0, row1 = crop_h, 0
+    for z in sorted_zs:
+        r0, r1 = edges_by_z[z].row_span(crop_h)
+        if r1 > r0:
+            row0, row1 = min(row0, r0), max(row1, r1)
+    if row1 <= row0:
+        crop_mm.flush()
+        return crop_mm
+
+    # Per band we hold: the image band (itemsize), one inverse-mask buffer, and
+    # one rasterised mask per drawn Z level. Sizing from the real total keeps the
+    # budget honest on 16-bit data and on 3D regions with many drawn levels.
+    per_px = int(np.dtype(src.dtype).itemsize) + 1 + max(1, len(sorted_zs))
+    max_edges = max((edges_by_z[z].y_i.size for z in sorted_zs), default=0)
+    step = band_rows(crop_w, per_px, max_edges)
+
+    if not quiet:
+        what = (f"{crop_depth} slices x {crop_h} x {crop_w}" if is_3d
+                else f"{crop_h} x {crop_w}")
+        print(f"  [ROI] Building {'3D' if is_3d else '2D'} crop ({what}) in "
+              f"bands of {step} rows...")
+
+    # Reused across every band and slice; nothing else is allocated in the loop.
+    mask_scratch = {z: np.zeros((step, crop_w), dtype=bool) for z in sorted_zs}
+    inv_scratch = np.zeros((step, crop_w), dtype=bool)
+
+    for band0 in range(row0, row1, step):
+        band1 = min(row1, band0 + step)
+        rows = band1 - band0
+
+        band_masks = {
+            z: rasterize_polygon_band(edges_by_z[z], band0, band1, crop_w,
+                                      out=mask_scratch[z][:rows])
+            for z in sorted_zs
+        }
+
         for local_z in range(crop_depth):
             global_z = z0_crop + local_z
             nearest_z = min(sorted_zs, key=lambda z: abs(z - global_z))
-            if nearest_z not in mask_cache:
-                mask_cache[nearest_z] = _mask_for_z(global_z)
-            mask2d = mask_cache[nearest_z]
-            slice_data = np.array(src[global_z, y0:y1, x0:x1])
-            slice_data[~mask2d] = 0
-            crop_mm[local_z] = slice_data
-    else:
-        mask2d = _mask_for_z(0)
-        crop_mm[:] = src[y0:y1, x0:x1]
-        crop_mm[~mask2d] = 0
+            mask2d = band_masks[nearest_z]
+
+            if is_3d:
+                data = np.array(src[global_z, y0 + band0:y0 + band1, x0:x1])
+            else:
+                data = np.array(src[y0 + band0:y0 + band1, x0:x1])
+
+            # `~mask2d` would allocate a fresh band-sized bool on every slice of
+            # every band; writing into the scratch buffer keeps the loop
+            # allocation-free. Explicit zeroing (rather than multiplying by the
+            # mask) preserves the original behaviour for float data with NaNs.
+            outside = np.logical_not(mask2d, out=inv_scratch[:rows])
+            data[outside] = 0
+
+            if is_3d:
+                crop_mm[local_z, band0:band1, :] = data
+            else:
+                crop_mm[band0:band1, :] = data
+
+        # Push each band to disk as it is finished so dirty pages don't
+        # accumulate into a second copy of the region in RAM.
+        crop_mm.flush()
 
     crop_mm.flush()
     return crop_mm
