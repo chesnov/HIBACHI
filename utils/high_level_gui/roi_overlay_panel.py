@@ -24,7 +24,7 @@ or decides what to delete.
 from __future__ import annotations
 
 import os
-from typing import Dict, List, Optional, Sequence
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 from PyQt5.QtCore import Qt  # type: ignore
@@ -33,6 +33,7 @@ from PyQt5.QtWidgets import (  # type: ignore
     QPushButton, QScrollArea, QVBoxLayout, QWidget,
 )
 
+from .napari_shortcuts import shape_edit_block
 from .roi_sharing import (
     HAS_ROI, NEW, NO_ROI, ORPHAN, REPLACE, SHAPE_MISMATCH, UNUSABLE,
     apply_roi_clear, apply_roi_propagation, choose_shared_roi_name,
@@ -166,8 +167,14 @@ class OverlayROIPanel:
         self.sample_name = sample_name
         self.sample_dirs = list(sample_dirs)
         self.full_shape = tuple(int(v) for v in full_shape) if full_shape else None
-        self._z_polygons: Dict[int, np.ndarray] = {}
-        self._last_count = 0
+        # Per-shape Z tags, aligned with the drawing layer's shape order, plus
+        # a geometry snapshot used only to carry tags across a deletion.
+        # GEOMETRY IS NOT CACHED for later use: _collect_polygons re-reads the
+        # layer, so an edit made after a polygon closed cannot be missed.
+        self._roi_z_tags: List[int] = []
+        self._roi_geometry: List[np.ndarray] = []
+        # Slices where two polygons were drawn, reported by apply_to_channels.
+        self._roi_slice_collisions: int = 0
 
     # ---- shared helpers ------------------------------------------------- #
     def _reference_scale(self):
@@ -304,10 +311,35 @@ class OverlayROIPanel:
         # is dead (see add_overlay_roi_panel) rather than napari misbehaving.
         print(f"  [ROI] draw_roi on '{self.sample_name}', shape={self.full_shape}")
 
+        is_3d = len(self.full_shape) == 3
+
+        # The layer used to be removed and recreated unconditionally, so a
+        # second click on Draw silently discarded the work in progress.
+        existing = self._roi_layer()
+        if existing is not None and len(existing.data):
+            reply = QMessageBox.question(
+                None, "Keep the current drawing?",
+                f"There {'is' if len(existing.data) == 1 else 'are'} already "
+                f"{len(existing.data)} polygon(s) drawn.\n\n"
+                "Yes  -  keep them and carry on drawing\n"
+                "No   -  discard them and start over",
+                QMessageBox.Yes | QMessageBox.No | QMessageBox.Cancel,
+                QMessageBox.Yes,
+            )
+            if reply == QMessageBox.Cancel:
+                return
+            if reply == QMessageBox.Yes:
+                if is_3d:
+                    self.viewer.dims.ndisplay = 2
+                try:
+                    self.viewer.layers.selection.active = existing
+                except Exception:
+                    pass
+                existing.mode = "add_polygon"
+                return
+
         if ROI_LAYER_NAME in self.viewer.layers:
             self.viewer.layers.remove(ROI_LAYER_NAME)
-
-        is_3d = len(self.full_shape) == 3
         # Shapes cannot be drawn while napari is in 3D display mode, and
         # open_sample_overlay puts 3D samples there. Drop to 2D slice view, which
         # is also the only way to tag each polygon with the slice it was drawn on.
@@ -336,28 +368,21 @@ class OverlayROIPanel:
             **shape_kwargs,
         )
 
-        self._z_polygons = {}
-        self._last_count = 0
+        self._roi_reset_drawing_state()
 
         def _on_data_changed(event=None):
-            if ROI_LAYER_NAME not in self.viewer.layers:
-                return
-            shapes = self.viewer.layers[ROI_LAYER_NAME]
-            count = len(shapes.data)
-            if count <= self._last_count:
-                return  # an edit or deletion, not a new polygon
-            self._last_count = count
-            z = 0
-            if is_3d:
-                try:
-                    z = int(self.viewer.dims.current_step[0])
-                except Exception:
-                    z = 0
-            raw = np.array(shapes.data[-1], dtype=float)
-            # In 3D, ndisplay=2 still yields (N,3) vertices; drop the Z column.
-            self._z_polygons[z] = raw[:, 1:] if raw.shape[1] > 2 else raw
-            print(f"  [ROI] Polygon recorded at Z={z} "
-                  f"({len(self._z_polygons)} total)")
+            """Fires on additions, geometry edits AND deletions."""
+            before = len(self._roi_z_tags)
+            self._sync_roi_tags()
+            after = len(self._roi_z_tags)
+            usable = len(self._read_roi_shapes())
+            if after > before:
+                print(f"  [ROI] Polygon recorded at Z="
+                      f"{self._roi_z_tags[-1]} ({usable} usable)")
+            elif after < before:
+                print(f"  [ROI] Polygon deleted ({usable} usable)")
+            else:
+                print(f"  [ROI] Polygon edited ({usable} usable)")
 
         layer.events.data.connect(_on_data_changed)
 
@@ -368,14 +393,22 @@ class OverlayROIPanel:
                 "  2. Click to add vertices, press Escape to close the polygon\n"
                 "  3. Scroll to the next relevant slice and repeat\n\n"
                 "Drawing on only ONE slice extrudes that shape through the whole "
-                "Z stack.\n\nWhen finished, click  \u2713 Apply to channels\u2026"
+                "Z stack.\nOne outline per slice: a second polygon on a slice "
+                "replaces the first.\n\n"
+                + shape_edit_block(
+                    "Closed a polygon before you meant to? A double-click "
+                    "closes it.")
+                + "\n\nWhen finished, click  \u2713 Apply to channels\u2026"
             )
         else:
             msg = (
                 "Draw a polygon on the image to define the sub-region.\n\n"
                 "  \u2022 Click to add vertices\n"
                 "  \u2022 Press Escape to close the polygon\n\n"
-                "When finished, click  \u2713 Apply to channels\u2026"
+                + shape_edit_block(
+                    "Closed the polygon before you meant to? A double-click "
+                    "closes it.")
+                + "\n\nWhen finished, click  \u2713 Apply to channels\u2026"
             )
         QMessageBox.information(None, "Draw ROI", msg)
 
@@ -393,24 +426,135 @@ class OverlayROIPanel:
                 pass
         layer.mode = "add_polygon"
 
-    def _collect_polygons(self) -> Dict[int, np.ndarray]:
-        """Drawn polygons, preferring the Z-tagged map built while drawing.
+    # ---- tracking the drawing layer ------------------------------------- #
+    # Mirrors GUIManager's tracking, and rests on the same four properties of
+    # napari's Shapes layer (verified against napari 0.4.19): a geometry edit
+    # fires events.data with the shape COUNT unchanged, a new shape is appended
+    # at the END, deleting a shape leaves survivors byte-identical, and a 3D
+    # layer's Z column survives edits.
 
-        Falls back to reading Z from the vertex arrays, which covers the case
-        where the user drew before pressing Draw ROI (or reused a layer), exactly
-        as ``confirm_roi`` does.
+    def _roi_reset_drawing_state(self) -> None:
+        """Forget the in-progress drawing.
+
+        Removing the layer alone is not enough: the Z tags would survive and a
+        later Draw could mis-tag its first polygons against them.
         """
-        if self._z_polygons:
-            return dict(self._z_polygons)
-        if ROI_LAYER_NAME not in self.viewer.layers:
-            return {}
+        self._roi_z_tags = []
+        self._roi_geometry = []
+        self._roi_slice_collisions = 0
+
+    def _roi_layer(self):
+        """The drawing layer, or None if it isn't present."""
+        return (self.viewer.layers[ROI_LAYER_NAME]
+                if ROI_LAYER_NAME in self.viewer.layers else None)
+
+    def _roi_is_3d(self) -> bool:
+        return self.full_shape is not None and len(self.full_shape) == 3
+
+    def _roi_current_z(self, arr: Optional[np.ndarray]) -> int:
+        """Z slice to tag a newly seen shape with.
+
+        Prefers the Z slider, which is what the user was looking at, falling
+        back to the shape's own Z column. In ndisplay=3 neither is trustworthy
+        (napari stamps every vertex with the camera focal plane), which is why
+        draw_roi drops to 2D slice view first.
+        """
+        if not self._roi_is_3d():
+            return 0
+        try:
+            if int(self.viewer.dims.ndisplay) == 2:
+                return int(self.viewer.dims.current_step[0])
+        except Exception:
+            pass
+        if arr is not None and arr.ndim == 2 and arr.shape[1] == 3:
+            return int(round(float(np.median(arr[:, 0]))))
+        return 0
+
+    def _sync_roi_tags(self) -> None:
+        """Re-align the Z tags with the layer after any change to it.
+
+        This is what makes editing work. The old handler returned early unless
+        the shape count had grown, so a vertex inserted into an already-closed
+        polygon was never picked up and Apply used the outline as it stood when
+        the polygon closed.
+
+        Three cases, by how the count moved:
+          * unchanged -> a geometry edit; tags stay index-aligned.
+          * grown     -> new shapes, appended at the end; tag those.
+          * shrunk    -> a deletion; match survivors on their (unchanged)
+            vertex arrays to carry the right tags across, rather than guessing
+            which index disappeared.
+        """
+        layer = self._roi_layer()
+        if layer is None:
+            return
+        data = [np.asarray(a, dtype=float) for a in layer.data]
+        tags: List[int] = list(self._roi_z_tags)
+        previous: List[np.ndarray] = list(self._roi_geometry)
+
+        if len(data) > len(tags):
+            for arr in data[len(tags):]:
+                tags.append(self._roi_current_z(arr))
+        elif len(data) < len(tags):
+            carried: List[int] = []
+            claimed = set()
+            for arr in data:
+                match = None
+                for i, old in enumerate(previous):
+                    if i in claimed or old.shape != arr.shape:
+                        continue
+                    if np.array_equal(old, arr):
+                        match = i
+                        break
+                if match is not None and match < len(tags):
+                    claimed.add(match)
+                    carried.append(tags[match])
+                else:
+                    carried.append(self._roi_current_z(arr))
+            tags = carried
+
+        self._roi_z_tags = tags[:len(data)]
+        self._roi_geometry = [a.copy() for a in data]
+
+    def _read_roi_shapes(self) -> List[Tuple[int, np.ndarray]]:
+        """Live (z, YX-vertices) for every usable shape, in layer order.
+
+        Shapes with fewer than three vertices are skipped: napari can hold a
+        half-finished outline, and it describes no region.
+        """
+        layer = self._roi_layer()
+        if layer is None:
+            return []
+        out: List[Tuple[int, np.ndarray]] = []
+        for index, raw in enumerate(layer.data):
+            arr = np.asarray(raw, dtype=float)
+            if arr.ndim != 2 or arr.shape[0] < 3:
+                continue
+            # ndisplay=2 still yields (N,3) vertices on a 3D layer.
+            yx = arr[:, 1:] if arr.shape[1] > 2 else arr
+            z = (self._roi_z_tags[index] if index < len(self._roi_z_tags)
+                 else self._roi_current_z(arr))
+            out.append((int(z), yx))
+        return out
+
+    def _collect_polygons(self) -> Dict[int, np.ndarray]:
+        """The overlay's ONE region, as {z: (N,2) YX} read live from the layer.
+
+        Unlike GUIManager -- where each polygon becomes its own region -- the
+        overlay defines a single region shared across channels, and a region
+        carries at most one outline per slice. So two polygons on the same slice
+        cannot both be kept; the later one wins, and the count of clashes is
+        recorded for apply_to_channels to report rather than silently dropping
+        the earlier outline.
+        """
+        shapes = self._read_roi_shapes()
         out: Dict[int, np.ndarray] = {}
-        for raw in self.viewer.layers[ROI_LAYER_NAME].data:
-            arr = np.array(raw, dtype=float)
-            if arr.shape[1] == 3:
-                out[int(round(float(arr[:, 0].mean())))] = arr[:, 1:]
-            else:
-                out[0] = arr
+        collisions = 0
+        for z, yx in shapes:
+            if z in out:
+                collisions += 1
+            out[z] = yx
+        self._roi_slice_collisions = collisions
         return out
 
     # ---- apply ---------------------------------------------------------- #
@@ -426,6 +570,19 @@ class OverlayROIPanel:
                 "Draw a region first using  \u270f Draw ROI."
             )
             return
+
+        # A region holds one outline per slice, so a second polygon drawn on a
+        # slice replaced the first. Said out loud rather than dropped silently.
+        if self._roi_slice_collisions:
+            proceed = QMessageBox.question(
+                None, "Two polygons on one slice",
+                f"{self._roi_slice_collisions} polygon(s) shared a Z slice with "
+                "another. A region uses a single outline per slice, so the "
+                "later polygon was kept for those slices.\n\nCarry on?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+            )
+            if proceed != QMessageBox.Yes:
+                return
 
         try:
             record = roi_record_from_polygons(polygons, self.full_shape)
