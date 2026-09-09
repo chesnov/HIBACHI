@@ -187,6 +187,23 @@ def _cached_structuring_element(ndim: int, radius: int) -> np.ndarray:
     return fp
 
 
+#: The `[PROFILE|WS]` / `[PROFILE|WS|BOUNDARY]` diagnostic blocks in
+#: `_separate_multi_soma_cells_chunk`. They were added to investigate whether
+#: the watershed was cutting at dark valleys or making Voronoi-style geometric
+#: cuts, and they answer that question well -- but they are pure logging: they
+#: change no result, and every line they print is derived from data the step has
+#: already finished with.
+#:
+#: They are also expensive. Each runs a full-cell comparison PER BASIN
+#: (`ws_local == ws_id`), a dilation, a three-way boolean intersection and
+#: several masked means, and on a profiled run they accounted for roughly a
+#: third of everything step 4 was still doing -- plus the cost of pushing every
+#: resulting line through the GUI log widget.
+#:
+#: Set to True to get them back. Nothing else changes either way.
+_PROFILE_WATERSHED = False
+
+
 def _dilate_local(mask: np.ndarray, footprint: np.ndarray) -> np.ndarray:
     """`binary_dilation(mask, footprint)`, evaluated only where it can be True.
 
@@ -701,8 +718,28 @@ def _separate_multi_soma_cells_chunk(
         )
 
         local_mask = cell_mask_full[bbox_padded]
+
+        # Slicing a memmap yields a VIEW, so every `local_intensity[mask]` below
+        # re-reads through the mapping -- and this cell's intensity is read many
+        # times over: once per basin in the merge tests, once per interface pair,
+        # once per analysis zone. In a profile those reads were ~31% of what step
+        # 4 was still doing. Copying the cell's crop into RAM once removes all of
+        # them.
+        #
+        # Gated on size, because a cell whose bounding box spans the volume would
+        # otherwise pull the volume into memory to avoid re-reading it. Above the
+        # cap the view is used exactly as before, so the fallback is the old
+        # behaviour rather than a failure. Same values either way.
+        _cache_cap = int(kwargs.get('local_cache_bytes', 0) or 0)
         local_soma = soma_mask[bbox_padded]
         local_intensity = intensity_volume[bbox_padded]
+        if _cache_cap > 0:
+            _crop_voxels = int(np.prod(local_intensity.shape))
+            _cost = _crop_voxels * (local_intensity.dtype.itemsize
+                                    + local_soma.dtype.itemsize)
+            if _cost <= _cache_cap:
+                local_intensity = np.array(local_intensity)
+                local_soma = np.array(local_soma)
 
         seeds_in_crop = np.unique(local_soma[local_mask])
         seeds_in_crop = seeds_in_crop[seeds_in_crop > 0]
@@ -930,40 +967,45 @@ def _separate_multi_soma_cells_chunk(
         ws_local = _watershed_with_simpleitk(landscape, markers)
         ws_local[~local_mask] = 0
 
-        # [PROFILING] Log what the watershed actually produced.
-        ws_ids, ws_counts = np.unique(ws_local[ws_local > 0], return_counts=True)
-        flush_print(f"  [PROFILE|WS] watershed output: labels={ws_ids} | voxel_counts={ws_counts}")
+        # `cell_mean_int` is NOT diagnostic: it is passed to
+        # `_build_adjacency_graph_for_cell` below and feeds the bright-cut test.
+        # It stays outside the gate.
         cell_mean_int = float(np.mean(local_intensity[local_mask]))
-        for ws_id, ws_cnt in zip(ws_ids, ws_counts):
-            _ident = sorted(identity_seeds[ws_id - 1]) if (ws_id - 1) < len(identity_seeds) else []
-            seed_id = _ident[0] if len(_ident) == 1 else (_ident or '?')
-            _ref_seed = _ident[0] if _ident else None
-            soma_int = soma_props.get(_ref_seed, {}).get('mean_intensity', float('nan'))
-            basin_mask = ws_local == ws_id
-            basin_mean = float(np.mean(local_intensity[basin_mask]))
-            # Fraction of voxels in this basin that are brighter than the cell mean.
-            # A correct intensity-guided cut should send bright voxels to the bright-soma basin.
-            frac_bright = float(np.mean(local_intensity[basin_mask] > cell_mean_int))
-            flush_print(f"    ws_label={ws_id} (->seed {seed_id}, soma_intensity={soma_int:.1f}): "
-                        f"{ws_cnt} voxels | mean_intensity={basin_mean:.1f} | "
-                        f"frac_above_cell_mean={frac_bright:.2f}")
 
-        # [PROFILING] BOUNDARY INTENSITY CHECK — the most direct test of whether the cut
-        # is at a dark valley. Dilate each basin, intersect with all OTHER basin voxels.
-        # If boundary_mean ≈ cell_mean_int → CUT IS AT WRONG PLACE (bright midpoint, Voronoi).
-        # If boundary_mean << cell_mean_int → CUT IS CORRECT (dark intensity valley).
-        flush_print(f"  [PROFILE|WS|BOUNDARY] cell_mean_intensity={cell_mean_int:.1f}")
-        footprint_b = adjacency_footprint(ndim)
-        for ws_id in ws_ids:
-            basin_mask = ws_local == ws_id
-            dilated = _dilate_local(basin_mask, footprint_b)
-            boundary_voxels = dilated & (ws_local > 0) & (~basin_mask)
-            if np.any(boundary_voxels):
-                bnd_mean = float(np.mean(local_intensity[boundary_voxels]))
-                bnd_frac_below_mean = float(np.mean(local_intensity[boundary_voxels] < cell_mean_int))
-                verdict = "CORRECT (dark valley)" if bnd_mean < 0.7 * cell_mean_int else "WRONG (bright cut — Voronoi bias!)"
-                flush_print(f"    boundary of ws_label={ws_id}: mean_intensity={bnd_mean:.1f} | "
-                            f"frac_below_cell_mean={bnd_frac_below_mean:.2f} | => {verdict}")
+        if _PROFILE_WATERSHED:
+            # [PROFILING] Log what the watershed actually produced.
+            ws_ids, ws_counts = np.unique(ws_local[ws_local > 0], return_counts=True)
+            flush_print(f"  [PROFILE|WS] watershed output: labels={ws_ids} | voxel_counts={ws_counts}")
+            for ws_id, ws_cnt in zip(ws_ids, ws_counts):
+                _ident = sorted(identity_seeds[ws_id - 1]) if (ws_id - 1) < len(identity_seeds) else []
+                seed_id = _ident[0] if len(_ident) == 1 else (_ident or '?')
+                _ref_seed = _ident[0] if _ident else None
+                soma_int = soma_props.get(_ref_seed, {}).get('mean_intensity', float('nan'))
+                basin_mask = ws_local == ws_id
+                basin_mean = float(np.mean(local_intensity[basin_mask]))
+                # Fraction of voxels in this basin that are brighter than the cell mean.
+                # A correct intensity-guided cut should send bright voxels to the bright-soma basin.
+                frac_bright = float(np.mean(local_intensity[basin_mask] > cell_mean_int))
+                flush_print(f"    ws_label={ws_id} (->seed {seed_id}, soma_intensity={soma_int:.1f}): "
+                            f"{ws_cnt} voxels | mean_intensity={basin_mean:.1f} | "
+                            f"frac_above_cell_mean={frac_bright:.2f}")
+
+            # [PROFILING] BOUNDARY INTENSITY CHECK — the most direct test of whether the cut
+            # is at a dark valley. Dilate each basin, intersect with all OTHER basin voxels.
+            # If boundary_mean ≈ cell_mean_int → CUT IS AT WRONG PLACE (bright midpoint, Voronoi).
+            # If boundary_mean << cell_mean_int → CUT IS CORRECT (dark intensity valley).
+            flush_print(f"  [PROFILE|WS|BOUNDARY] cell_mean_intensity={cell_mean_int:.1f}")
+            footprint_b = adjacency_footprint(ndim)
+            for ws_id in ws_ids:
+                basin_mask = ws_local == ws_id
+                dilated = _dilate_local(basin_mask, footprint_b)
+                boundary_voxels = dilated & (ws_local > 0) & (~basin_mask)
+                if np.any(boundary_voxels):
+                    bnd_mean = float(np.mean(local_intensity[boundary_voxels]))
+                    bnd_frac_below_mean = float(np.mean(local_intensity[boundary_voxels] < cell_mean_int))
+                    verdict = "CORRECT (dark valley)" if bnd_mean < 0.7 * cell_mean_int else "WRONG (bright cut — Voronoi bias!)"
+                    flush_print(f"    boundary of ws_label={ws_id}: mean_intensity={bnd_mean:.1f} | "
+                                f"frac_below_cell_mean={bnd_frac_below_mean:.2f} | => {verdict}")
 
         # B. Graph-Based Merging
         nodes, edges = _build_adjacency_graph_for_cell(
@@ -1384,6 +1426,11 @@ def separate_multi_soma_cells(
                 cell_to_somas[cell_id] = set()
             cell_to_somas[cell_id].add(soma_id)
 
+    # How much RAM one cell's intensity/soma crop may occupy (see the use site in
+    # `_separate_multi_soma_cells_chunk`). A quarter of the step's allowance: the
+    # crop is transient, one cell at a time, and the rest of the step needs room
+    # for the chunk arrays and the watershed.
+    kwargs['local_cache_bytes'] = int(_budget.plannable_bytes // 4)
     kwargs['cell_to_somas'] = cell_to_somas
     kwargs['global_soma_centroids'] = global_soma_centroids
     kwargs['global_soma_intensities'] = global_soma_intensities
