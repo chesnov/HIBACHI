@@ -329,9 +329,27 @@ class ProcessingStrategy(abc.ABC):
         text = str(value).strip() if value is not None else ""
         return text or None
 
+    def soma_source_artifact(self, params: Dict[str, Any]) -> str:
+        """Which of the source channel's label images to seed from.
+
+        Here rather than in the step for the same reason as
+        `soma_source_channel`: the fluorescence strategy must not import
+        `high_level_gui`. An absent or unrecognised value normalises to soma
+        cores, which is what every run did before the choice existed, so an old
+        config keeps its behaviour without being migrated.
+        """
+        from .soma_source import normalise_kind
+
+        return normalise_kind((params or {}).get("soma_source_artifact"))
+
     def external_soma_seeds(self, params: Dict[str, Any], mask_path: str,
                             dest_path: str) -> Optional[Dict[str, Any]]:
-        """Write another channel's somas to `dest_path`. None if not configured.
+        """Write another channel's seeds to `dest_path`. None if not configured.
+
+        The seeds are either that channel's soma cores or its finished cells,
+        per `soma_source_artifact`. Both are label images at this shape and are
+        filtered and relabelled identically, so the choice is confined to which
+        file `resolve` returns.
 
         Raises with a specific reason when a source IS configured but cannot be
         used, rather than falling back to extracting somas locally: a run that
@@ -342,17 +360,21 @@ class ProcessingStrategy(abc.ABC):
         if channel is None:
             return None
 
-        from .soma_source import filter_to_mask, resolve
+        from .soma_source import filter_to_mask, kind_label, resolve
 
-        artifact = resolve(self.processed_dir, channel)
+        kind = self.soma_source_artifact(params)
+        artifact = resolve(self.processed_dir, channel, kind)
         stats = filter_to_mask(artifact, mask_path, dest_path, self.image_shape)
         stats["channel"] = channel
         stats["artifact"] = artifact
+        stats["kind"] = kind
+        stats["kind_label"] = kind_label(kind)
         if stats["seeds_kept"] == 0:
             raise ValueError(
-                f"none of the {stats['seeds_found']} somas from {channel!r} "
-                "overlap this channel's segmentation. The channels may be "
-                "misaligned, or this may be the wrong source channel."
+                f"none of the {stats['seeds_found']} "
+                f"{kind_label(kind).lower()} from {channel!r} overlap this "
+                "channel's segmentation. The channels may be misaligned, or "
+                "this may be the wrong source channel."
             )
         return stats
 

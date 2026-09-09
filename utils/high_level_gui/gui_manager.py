@@ -2774,32 +2774,45 @@ class DynamicGUIManager(QObject):
 
     def _add_soma_source_widget(self, layout, config_key: str,
                                 parameters: dict) -> bool:
-        """Add the soma-source dropdown. True if a source is currently set.
+        """Add the soma-source controls. True if a source is currently set.
 
-        A dropdown of real candidates rather than free text: the only valid
-        answers are channels whose matching segment has reached soma
-        extraction, and typing a channel name that has not been processed
-        would produce a run that fails at step 3 with nothing to show for the
-        wait.
+        Two dropdowns: which channel, and which of that channel's label images
+        to seed from. Both are lists of real candidates rather than free text,
+        because the only valid answers are combinations that exist on disk, and
+        naming one that does not would produce a run that fails at step 3 with
+        nothing to show for the wait.
 
-        Failing to build the control leaves the parameter unset and every
+        The second dropdown is offered only when a channel is chosen, and lists
+        only the kinds THAT channel has. A channel that reached soma extraction
+        but not cell separation can seed from its cores and not from its cells;
+        showing both and failing later would be the same trap as free text.
+
+        Failing to build the controls leaves the parameters unset and every
         normal parameter visible, so a project whose layout this cannot read
         behaves exactly as it did before.
         """
         from PyQt5.QtWidgets import QComboBox, QLabel  # type: ignore
+
+        from .soma_source import (DEFAULT_SOURCE_KIND, SOURCE_KINDS,
+                                  kind_label, normalise_kind)
 
         pconf = parameters.get("soma_source_channel")
         if not isinstance(pconf, dict):
             pconf = self._reference_param(config_key, "soma_source_channel") or {}
         current = str(pconf.get("value") or "").strip()
 
+        aconf = parameters.get("soma_source_artifact")
+        if not isinstance(aconf, dict):
+            aconf = self._reference_param(config_key, "soma_source_artifact") or {}
+        current_kind = normalise_kind(aconf.get("value"))
+
         try:
             from .soma_source import candidate_channels
-            candidates = [name for name, _path
-                          in candidate_channels(self.processed_dir)]
+            available = dict(candidate_channels(self.processed_dir))
         except Exception as exc:
             print(f"[gui] could not list soma source channels: {exc}")
-            candidates = []
+            available = {}
+        candidates = sorted(available)
 
         if not candidates and not current:
             return False
@@ -2815,19 +2828,63 @@ class DynamicGUIManager(QObject):
         # A channel recorded in the config but no longer offering results is
         # kept in the list and selected, so the run's provenance stays visible
         # instead of silently reverting to local extraction.
-        if current and current not in candidates:
+        if current and current not in available:
             box.addItem(f"{current}  (no results found)", current)
         index = box.findData(current)
         box.setCurrentIndex(index if index >= 0 else 0)
         layout.addWidget(box)
 
-        note = QLabel(
-            "Cell bodies come from the chosen channel's segmentation of this "
-            "same image, keeping only those inside this channel's cells. The "
-            "parameters below are unused while a channel is chosen."
-            if candidates else
-            "No other channel has reached soma extraction for this image yet."
-        )
+        # ---- which of that channel's label images ------------------------- #
+        kind_box = None
+        if current:
+            kinds = available.get(current) or {}
+            kind_label_widget = QLabel(str(aconf.get("label") or "Seed from"))
+            kind_label_widget.setStyleSheet("font-weight: bold;")
+            layout.addWidget(kind_label_widget)
+
+            kind_box = QComboBox()
+            # SOURCE_KINDS order, not the dict's, so the list reads the same
+            # way every time regardless of what happens to be on disk.
+            for kind in SOURCE_KINDS:
+                if kind in kinds:
+                    kind_box.addItem(kind_label(kind), kind)
+            if not kind_box.count():
+                # The channel is recorded but its results are gone. Keep the
+                # configured choice visible rather than dropping to a default
+                # that would quietly change what the run does.
+                kind_box.addItem(f"{kind_label(current_kind)}  "
+                                 "(no results found)", current_kind)
+            elif current_kind not in kinds:
+                # It has results, but not the kind this config asks for. Said
+                # out loud: silently selecting the other kind would change the
+                # seeds without changing the config.
+                kind_box.addItem(f"{kind_label(current_kind)}  "
+                                 "(not available in that channel)",
+                                 current_kind)
+            kind_index = kind_box.findData(current_kind)
+            kind_box.setCurrentIndex(kind_index if kind_index >= 0 else 0)
+            layout.addWidget(kind_box)
+
+        chosen_kind = (kind_box.currentData() if kind_box is not None
+                       else DEFAULT_SOURCE_KIND) or DEFAULT_SOURCE_KIND
+        if current:
+            note_text = (
+                f"Seeds come from {current}'s "
+                f"{kind_label(chosen_kind).lower()} for this same image, "
+                "keeping only those inside this channel's cells. The "
+                "parameters below are unused while a channel is chosen."
+            )
+        elif candidates:
+            note_text = (
+                "Cell bodies come from the chosen channel's segmentation of "
+                "this same image, keeping only those inside this channel's "
+                "cells. The parameters below are unused while a channel is "
+                "chosen."
+            )
+        else:
+            note_text = ("No other channel has reached soma extraction for "
+                         "this image yet.")
+        note = QLabel(note_text)
         note.setWordWrap(True)
         note.setStyleSheet("color: #666; font-style: italic;")
         layout.addWidget(note)
@@ -2836,11 +2893,23 @@ class DynamicGUIManager(QObject):
             self.parameter_changed(key, "soma_source_channel",
                                    box.currentData() or "")
             # Rebuild so the parameters below appear or disappear with the
-            # choice, matching how the absolute-threshold switch behaves.
+            # choice, matching how the absolute-threshold switch behaves. It
+            # also rebuilds the kind dropdown against the new channel's
+            # available artifacts.
+            if self.current_step_method:
+                self.create_step_widgets(self.current_step_method)
+
+        def _kind_changed(_index: int, key=config_key) -> None:
+            self.parameter_changed(
+                key, "soma_source_artifact",
+                kind_box.currentData() or DEFAULT_SOURCE_KIND)
+            # Rebuilt for the note line, which names the chosen artifact.
             if self.current_step_method:
                 self.create_step_widgets(self.current_step_method)
 
         box.currentIndexChanged.connect(_changed)
+        if kind_box is not None:
+            kind_box.currentIndexChanged.connect(_kind_changed)
         return bool(current)
 
     def create_step_widgets(self, step_method_name: str) -> None:
@@ -2922,8 +2991,12 @@ class DynamicGUIManager(QObject):
                 is_absolute = bool(parameters["use_absolute_thresholds"].get("value", False))
 
             for pname, pconf in parameters.items():
-                # The dropdown above is this parameter's control.
-                if pname == "soma_source_channel":
+                # The two dropdowns above are these parameters' controls.
+                # soma_source_artifact has to be skipped unconditionally, not
+                # only when seeded_externally: with no channel chosen the
+                # dropdown is not built, and falling through would render the
+                # raw key as an editable text box.
+                if pname in ("soma_source_channel", "soma_source_artifact"):
                     continue
                 # Seeding from another channel makes every soma-finding
                 # parameter here unused: nothing in this step reads them. They

@@ -507,12 +507,16 @@ class FluorescenceStrategy(ProcessingStrategy):
                 shape=self.image_shape
             )
 
-            # Somas from another channel, when this run is configured that
+            # Seeds from another channel, when this run is configured that
             # way. A nuclear stain gives one marker per cell, where a distance
             # transform of a cytoplasmic mask gives two for any cell whose
             # nucleus is dark -- one either side of it -- and splits the cell in
             # half. Step 4 is unchanged: it takes the soma mask as an argument
             # and does not care where it came from.
+            #
+            # Which of the source channel's label images is used -- its soma
+            # cores or its finished cells -- is that channel's business too, so
+            # nothing here varies with it beyond what the log says.
             #
             # Every parameter below is unused in that case, which is why the
             # widget builder hides them rather than leaving them editable and
@@ -520,7 +524,8 @@ class FluorescenceStrategy(ProcessingStrategy):
             external = self.external_soma_seeds(
                 params, trimmed_seg_path, cell_bodies_path)
             if external is not None:
-                print(f"  Somas taken from {external['channel']}: "
+                print(f"  Seeds taken from {external['channel']} "
+                      f"({external['kind_label'].lower()}): "
                       f"{external['seeds_kept']} of "
                       f"{external['seeds_found']} kept "
                       f"({external['seeds_dropped']} outside this channel's "

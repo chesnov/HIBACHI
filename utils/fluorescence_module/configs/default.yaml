@@ -188,12 +188,29 @@ execute_soma_extraction:
       type: str
       value: ''
       description: >-
-        Channel folder whose cell bodies seed this one, or empty to find somas
-        in this channel's own signal. Use it when a nuclear stain marks the
-        cells: a distance transform of a cytoplasmic mask puts a core either
-        side of a dark nucleus and splits the cell in two, while a nuclear
-        stain gives one marker per cell. Every other parameter here is unused
-        when this is set, and is hidden.
+        Channel folder whose labels seed this one, or empty to find somas in
+        this channel's own signal. Use it when a nuclear stain marks the cells:
+        a distance transform of a cytoplasmic mask puts a core either side of a
+        dark nucleus and splits the cell in two, while a nuclear stain gives one
+        marker per cell. Every other parameter here is unused when this is set,
+        and is hidden.
+    soma_source_artifact:
+      # Only meaningful when soma_source_channel is set. 'cell_bodies' is the
+      # behaviour every run had before this parameter existed, so an old config
+      # that lacks it keeps working unchanged.
+      neutral_default: true
+      label: Seed from
+      type: str
+      value: cell_bodies
+      description: >-
+        Which of the source channel's label images to use as seeds.
+        'cell_bodies' takes its soma cores as step 3 found them, before
+        splitting and before the size filter -- closest to one marker per
+        nucleus, and the safer default. 'final_segmentation' takes its finished
+        cells, so the seeds carry that channel's splitting and filtering with
+        them; choose it when its cell count is what you trust. Note that a
+        finished cell is much larger than a core, so one seed can span a thin
+        bridge between two of this channel's cells and leave them merged.
     ratios_to_process:
       label: Ratios to Process (Peeling; comma-sep floats)
       type: list

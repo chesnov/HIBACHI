@@ -13,6 +13,22 @@ right by construction rather than by tuning. It also fixes the converse case,
 which is harder to tune away: two cells whose cytoplasm merges into a single
 mask but which have two nuclei.
 
+What can be borrowed
+--------------------
+Either of the source channel's two label images -- see `SOURCE_KINDS`:
+
+  * its SOMA CORES, as step 3 found them, and
+  * its SEGMENTED CELLS, as step 4 finished them.
+
+Both are label images at the full image shape, and both are consumed
+identically: filtered to this channel's mask, relabelled from 1, handed to
+`separate_multi_soma_cells` as seeds. Nothing downstream can tell which it
+got. So the second option costs no new machinery -- it names a different file
+-- and the whole question is which set of labels is the better marker set for
+the sample at hand. Cores are the safer default; finished cells are right when
+what you trust is the source channel's cell count, since they carry its
+splitting and its size filtering with them.
+
 Nothing about step 4 changes. `separate_multi_soma_cells` already takes the
 soma mask as an argument, and `cell_bodies` is read by that step alone --
 feature calculation never touches it -- so the seeds are purely seeds and their
@@ -47,14 +63,79 @@ import numpy as np
 #: extract them from this channel's own intensity, as before.
 SOMA_SOURCE_KEY = "soma_source_channel"
 
+#: Parameter choosing WHICH of that channel's artifacts to seed from.
+SOMA_SOURCE_ARTIFACT_KEY = "soma_source_artifact"
+
 #: Provenance written next to the run's parameters. Added to
 #: `_PASSTHROUGH_KEYS`, without which `save_config` drops it on the next save.
 SOMA_SOURCE_RECORD = "soma_source"
+
+#: What can be borrowed from another channel, as
+#: ``kind -> (glob, label, the step that writes it, what to run to get it)``.
+#:
+#: Both are label images at the full image shape, and both are used the same
+#: way: filtered to this channel's mask, relabelled, handed to
+#: `separate_multi_soma_cells` as seeds. Nothing downstream can tell them
+#: apart, which is why supporting the second one is a matter of naming a
+#: different file rather than a second code path.
+#:
+#: They differ in what one label MEANS, and that is the choice being offered:
+#:
+#:   cell_bodies       -- the soma cores as step 3 found them: before splitting,
+#:                        before the size filter. Closest to "one marker per
+#:                        nucleus" when the source is a nuclear stain.
+#:   final_segmentation -- the source channel's finished cells, after splitting
+#:                        and filtering. One label per cell it actually
+#:                        reported, so the seeds inherit that channel's whole
+#:                        curated result rather than an intermediate of it.
+#:
+#: The trade-off worth knowing: a finished cell is much larger than a soma
+#: core, so a single seed can span a thin bridge between two of THIS channel's
+#: cells and leave them merged. Cores are the safer default; segmented cells
+#: are the right answer when the source channel's cell count is the thing you
+#: trust.
+SOURCE_KINDS: Dict[str, Tuple[str, str, str]] = {
+    "cell_bodies": (
+        "cell_bodies*.dat",
+        "Cell bodies (somas)",
+        "soma extraction",
+    ),
+    "final_segmentation": (
+        "final_segmentation*.dat",
+        "Segmented cells",
+        "cell separation",
+    ),
+}
+
+#: What a config with no artifact choice means: the behaviour every run had
+#: before this parameter existed.
+DEFAULT_SOURCE_KIND = "cell_bodies"
 
 #: Rows processed at a time when filtering seeds. A plane of these images is
 #: 928 megapixels, so a whole-array boolean would be gigabytes; the filter is
 #: two streaming passes instead.
 _BLOCK_ROWS = 64
+
+
+def normalise_kind(value: Any) -> str:
+    """Which artifact a config value asks for, defaulting to the old behaviour.
+
+    An unrecognised value falls back rather than raising: a config hand-edited
+    or written by a newer build must not stop a run, and seeding from soma
+    cores is what every project did before the choice existed.
+    """
+    text = str(value).strip() if value is not None else ""
+    return text if text in SOURCE_KINDS else DEFAULT_SOURCE_KIND
+
+
+def kind_label(kind: str) -> str:
+    """Human name for a source kind, for messages and dropdowns."""
+    return SOURCE_KINDS[normalise_kind(kind)][1]
+
+
+def kind_step(kind: str) -> str:
+    """The step that writes a source kind, so errors can say what to run."""
+    return SOURCE_KINDS[normalise_kind(kind)][2]
 
 
 def sample_dir_of(processed_dir: str) -> str:
@@ -70,8 +151,9 @@ def project_root_of(processed_dir: str) -> str:
     return os.path.dirname(channel_dir_of(processed_dir))
 
 
-def _artifact_in(directory: str) -> Optional[str]:
-    """The cell-bodies artifact in a results directory, or None.
+def _artifact_in(directory: str,
+                 kind: str = DEFAULT_SOURCE_KIND) -> Optional[str]:
+    """The seed artifact of `kind` in a results directory, or None.
 
     By glob, like `ARTIFACT_PATTERNS`: a legacy project's file carries a mode
     string that no longer exists, and an exact name would miss it and report
@@ -79,24 +161,46 @@ def _artifact_in(directory: str) -> Optional[str]:
     """
     import glob
 
-    matches = sorted(glob.glob(os.path.join(directory, "cell_bodies*.dat")))
+    pattern = SOURCE_KINDS[normalise_kind(kind)][0]
+    matches = sorted(glob.glob(os.path.join(directory, pattern)))
     return matches[0] if matches else None
 
 
-def candidate_channels(processed_dir: str) -> List[Tuple[str, str]]:
-    """[(channel_name, artifact_path)] for channels that can seed THIS segment.
+def available_in(directory: str) -> Dict[str, str]:
+    """``{kind: path}`` for every seed artifact present in a results directory.
+
+    Lets the caller offer only what exists. A channel that has reached soma
+    extraction but not cell separation can seed from its cores and not from its
+    cells, and the difference has to be visible before the run rather than at
+    step 3.
+    """
+    found: Dict[str, str] = {}
+    for kind in SOURCE_KINDS:
+        path = _artifact_in(directory, kind)
+        if path is not None:
+            found[kind] = path
+    return found
+
+
+def candidate_channels(processed_dir: str) -> List[Tuple[str, Dict[str, str]]]:
+    """[(channel_name, {kind: artifact_path})] for channels that can seed THIS
+    segment.
 
     Only channels whose matching segment -- the same full image, or the same
-    named region -- has actually reached soma extraction. A channel that has
-    not been processed cannot seed one that is being processed now, and
-    offering it would produce a run that fails at step 3.
+    named region -- has actually produced something to seed with. A channel
+    that has not been processed cannot seed one that is being processed now,
+    and offering it would produce a run that fails at step 3.
+
+    The mapping is returned rather than a flat list so the caller can tell
+    WHICH kinds a given channel can offer, and not present "segmented cells"
+    for a channel that stopped after soma extraction.
     """
     here = os.path.basename(os.path.abspath(processed_dir.rstrip("/\\")))
     sample = os.path.basename(sample_dir_of(processed_dir))
     mine = os.path.basename(channel_dir_of(processed_dir))
     root = project_root_of(processed_dir)
 
-    out: List[Tuple[str, str]] = []
+    out: List[Tuple[str, Dict[str, str]]] = []
     try:
         entries = sorted(os.listdir(root))
     except OSError:
@@ -107,19 +211,26 @@ def candidate_channels(processed_dir: str) -> List[Tuple[str, str]]:
         other = os.path.join(root, name, sample, here)
         if not os.path.isdir(other):
             continue
-        artifact = _artifact_in(other)
-        if artifact is not None:
-            out.append((name, artifact))
+        found = available_in(other)
+        if found:
+            out.append((name, found))
     return out
 
 
-def resolve(processed_dir: str, channel_name: str) -> str:
+def resolve(processed_dir: str, channel_name: str,
+            kind: str = DEFAULT_SOURCE_KIND) -> str:
     """The seed artifact for `channel_name`, or raise saying why not.
 
     Raises rather than returning None: a run configured to seed from another
     channel must not quietly fall back to extracting its own somas, because
     the result would look like a successful run of a different analysis.
+
+    That applies to the KIND as much as the channel. A run configured to seed
+    from another channel's finished cells must not silently settle for its soma
+    cores -- those are different seeds and a different analysis -- so a channel
+    that has the one but not the other is an error naming the step to run.
     """
+    kind = normalise_kind(kind)
     sample = os.path.basename(sample_dir_of(processed_dir))
     here = os.path.basename(os.path.abspath(processed_dir.rstrip("/\\")))
     root = project_root_of(processed_dir)
@@ -136,11 +247,18 @@ def resolve(processed_dir: str, channel_name: str) -> str:
             f"{channel_name!r} has no results for {sample!r} "
             f"({here}). Process that channel first."
         )
-    artifact = _artifact_in(other)
+    artifact = _artifact_in(other, kind)
     if artifact is None:
+        also = available_in(other)
+        extra = ""
+        if also:
+            names = ", ".join(kind_label(k).lower() for k in sorted(also))
+            extra = f" It does have: {names}."
         raise FileNotFoundError(
-            f"{channel_name!r} has results for {sample!r} but has not reached "
-            "soma extraction. Run its first three steps, then this one."
+            f"this run seeds from {channel_name!r}'s "
+            f"{kind_label(kind).lower()}, but that channel has results for "
+            f"{sample!r} without them. Run its {kind_step(kind)} step, then "
+            f"this one.{extra}"
         )
     return artifact
 
