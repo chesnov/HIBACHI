@@ -534,6 +534,27 @@ PINNED: Dict[str, Tuple[Any, str]] = {
         "Same reason as split_chunk_shape_*, and it is the parameter that "
         "directly encodes the inside-chunk/deferred boundary.",
     ),
+    "dask_chunk_shape_3d": (
+        (128, 512, 512),
+        "One function supplies this shape to dask_image's gaussian_filter, "
+        "binary_closing AND ndmeasure.label. The filters go through "
+        "map_overlap with a sigma-derived depth and SHOULD be chunk-invariant, "
+        "but `label` provably is not: it numbers each block independently and "
+        "then resolves equivalences, so the partition is chunk-independent "
+        "while the IDs are not. Step 1 uses those IDs structurally (soma_lut, "
+        "the size/seed filter's 1..maxid walk), and step 3's peak grid "
+        "resolves cross-label soma conflicts in ascending label order -- so a "
+        "renumbering changes which somata survive, not just their names. "
+        "Rather than split this on an unverified assumption about dask_image's "
+        "depth, the shape is fixed at both ranks and only the scheduler's "
+        "concurrency is scaled.",
+    ),
+    "dask_chunk_shape_2d": (
+        (2048, 2048),
+        "As dask_chunk_shape_3d, at rank 2. The 8x footprint difference "
+        "between the ranks is inherited from the pre-merge tracks and is "
+        "deliberately NOT unified: doing so would renumber one rank's labels.",
+    ),
     "threshold_sample_stride_inplane_max": (
         16,
         "Step 1 estimates its percentile thresholds from a strided sample. "

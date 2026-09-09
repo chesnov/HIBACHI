@@ -7,8 +7,8 @@ import yaml  # type: ignore
 from PyQt5.QtGui import QCloseEvent, QIcon  # type: ignore
 from PyQt5.QtCore import Qt, QEvent  # type: ignore
 from PyQt5.QtWidgets import (  # type: ignore
-    QApplication, QFileDialog, QMessageBox, QMainWindow, QVBoxLayout, QHBoxLayout,
-    QPushButton, QWidget, QLabel, QInputDialog
+    QAction, QApplication, QFileDialog, QMessageBox, QMainWindow, QVBoxLayout,
+    QHBoxLayout, QPushButton, QWidget, QLabel, QInputDialog
 )
 
 from .gui_text_utils import app_icon_path, clean_filename_for_matching
@@ -162,6 +162,17 @@ class ProjectViewWindow(QMainWindow):
         }
         for key, label, menu_key, slot, tip in self._ACTION_SPECS:
             action = menus[menu_key].addAction(label)
+            # macOS ONLY, but set unconditionally so the two platforms cannot
+            # drift. Qt's Cocoa plugin guesses a "menu role" from the action's
+            # TEXT and relocates matches into the application (HIBACHI) menu:
+            # anything starting with About / Config / Preference / Options /
+            # Setting / Setup / Quit / Exit. "Config Library..." starts with
+            # "Config", so it was silently moved out of &Library -- and since
+            # it was that menu's only item, the now-empty &Library disappeared
+            # from the menu bar entirely (Qt does not draw empty native menus).
+            # The merged copy also ignores our setEnabled rules. NoRole says
+            # "this is an ordinary item, leave it where I put it".
+            action.setMenuRole(QAction.NoRole)
             action.setToolTip(tip)
             action.setStatusTip(tip)
             action.triggered.connect(slot(self))

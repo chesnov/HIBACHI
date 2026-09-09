@@ -10,6 +10,7 @@ from typing import Tuple, List, Dict, Any, Optional, Sequence, Union, Generator
 
 import numpy as np
 import zarr
+import dask
 import dask.array as da
 import dask_image.ndmorph
 import dask_image.ndfilters
@@ -23,6 +24,7 @@ from tqdm import tqdm
 # Shared 2D/3D primitives. See dim_utils for why rank-varying operations are
 # centralised rather than open-coded.
 try:
+    from . import resource_budget
     from .dim_utils import (
         binary_structure,
         chunk_read_write_slices,
@@ -32,6 +34,7 @@ try:
         write_offset_in_read,
     )
 except ImportError:  # pragma: no cover - direct script execution
+    import resource_budget
     from dim_utils import (
         binary_structure,
         chunk_read_write_slices,
@@ -287,18 +290,245 @@ _ENHANCE_MIN_OVERLAP_PX = 32
 
 def _dask_chunks(ndim: int) -> Tuple[int, ...]:
     """
-    Dask chunk shape for the whole-array labelling/merging steps.
+    Dask chunk shape for the whole-array filtering and labelling steps.
 
-    Rank-dependent because it is a memory-shape choice, not a parameter: the 3D
-    track used (128, 512, 512) and the 2D track (2048, 2048). Passing a 3-tuple
-    to a 2D array raises in dask, which is how the merge caught this.
+    PINNED, not budget-driven, and the values are exactly what they always
+    were. This one function feeds `gaussian_filter`, `binary_closing` and
+    `ndmeasure.label`. The two filters go through `map_overlap` with a
+    sigma-derived depth and should therefore be chunk-invariant, but `label`
+    is not: it numbers each block independently and resolves equivalences
+    afterwards, so the PARTITION is chunk-independent while the IDs are not.
+
+    That is not cosmetic. Step 1 consumes those IDs structurally (`soma_lut`,
+    the `1..maxid` walk in the size/seed filter) and, more seriously, step 3
+    iterates clumps in ascending label order against a peak grid that holds
+    only prior-label peaks -- so whichever clump is reached first places its
+    soma and a nearby one from another clump is shrunk or dropped. Renumbering
+    therefore changes which somata survive.
+
+    Splitting this into "safe for filters, pinned for labelling" would rest on
+    dask_image's overlap depth being provably sufficient, which is not
+    verifiable from here. So the geometry is fixed and the speedup comes from
+    `_dask_workers` instead, which cannot affect any result.
+
+    See `resource_budget.PINNED['dask_chunk_shape_3d']`.
     """
-    return (128, 512, 512) if ndim == 3 else (2048,) * ndim
+    return resource_budget.pinned(
+        'dask_chunk_shape_3d' if ndim == 3 else 'dask_chunk_shape_2d')
 
 
-def _enhance_chunk_shape(ndim: int) -> Tuple[int, ...]:
-    """Chunk shape for the enhancement pass, preserving each track's default."""
-    return (64, 512, 512) if ndim == 3 else (2048,) * ndim
+def _dask_workers(budget: "resource_budget.Budget", ndim: int,
+                  operation: str = "float32_pass") -> int:
+    """
+    How many dask tasks may be in flight at once, given the RAM ceiling.
+
+    The chunk shape is fixed (see `_dask_chunks`), so the only thing left to
+    scale is concurrency -- and concurrency is exactly what was missing: dask's
+    threaded scheduler defaults to one worker per core with no notion of how
+    large a chunk is, which is the same "chunk size and worker count chosen
+    independently" mistake the hardcoded constants made everywhere else.
+
+    Bit-identical by construction: the number of threads changes which order
+    chunks complete in, not what any chunk contains. The one caveat is that
+    each thread holds a chunk, so peak memory is workers x chunk bytes, which
+    is precisely what is being budgeted here.
+    """
+    chunk = _dask_chunks(ndim)
+    per_element = resource_budget.cost_bytes_per_voxel(operation)
+    per_chunk = per_element
+    for v in chunk:
+        per_chunk *= v
+    workers = int(budget.plannable_bytes // max(1, int(per_chunk)))
+    return max(1, min(budget.cores, workers))
+
+
+#: Base chunk shape for the vesselness enhancement pass, scaled UP by the
+#: budget. Unlike `_dask_chunks` this one is safe to scale, and the reason is
+#: worth stating because it is the test every budget-driven geometry has to
+#: pass: every operator in `_process_block_worker` has a bounded reach --
+#: Frangi and Sato are Gaussian derivatives with `truncate=4` (reach 4*sigma),
+#: `_crest_weight` samples at 2*sigma, and the recovery `grey_dilation` adds
+#: about sigma -- and `overlap_px` is `max(32, ceil(4*sigma))`, which covers
+#: the largest of them. Only the owned region is written, and at the true
+#: volume boundary the read block is clipped identically whatever the chunk
+#: shape, so `mode='nearest'` sees the same context. The output is therefore
+#: byte-for-byte independent of this shape.
+_ENHANCE_BASE_CHUNK_3D = (64, 512, 512)
+_ENHANCE_BASE_CHUNK_2D = 2048
+
+
+def _enhance_base_chunk_shape(ndim: int) -> Tuple[int, ...]:
+    """Unscaled enhancement chunk shape: each track's historical default."""
+    return (_ENHANCE_BASE_CHUNK_3D if ndim == 3
+            else (_ENHANCE_BASE_CHUNK_2D,) * ndim)
+
+
+def _traversal_chunk_shape(
+    budget: "resource_budget.Budget",
+    shape: Tuple[int, ...],
+    ndim: int,
+    operation: str = "float32_pass",
+    name: str = "traversal",
+) -> Tuple[int, ...]:
+    """
+    Chunk shape for a POINTWISE traversal: copies, casts, OR-merges, writes.
+
+    These loops used to borrow `_enhance_chunk_shape`, which was never what it
+    described -- they do not run the vesselness filter, they walk the array
+    copying or OR-ing blocks. Nothing about a pointwise operation depends on
+    where the block boundaries fall, so the shape is purely a memory choice and
+    the budget sets it. On a small machine it lands near the old constant; on
+    the workstation it is much larger, which is most of the win in these loops
+    because they are dominated by per-block overhead rather than arithmetic.
+    """
+    plan = budget.plan_scaled_block(
+        shape, _enhance_base_chunk_shape(ndim), operation,
+        overlap=0, max_workers=1, name=name,
+    )
+    return plan.block_shape
+
+
+# --------------------------------------------------------------------------
+# Exact percentiles without materialising the sample
+# --------------------------------------------------------------------------
+#: Below this many sampled voxels the sample is small enough that materialising
+#: it is free, so the original one-liner is used verbatim. Above it the
+#: streaming path runs. Both produce bit-identical numbers (verified against
+#: `np.percentile` over ~11k cases spanning uniform, heavy-tailed, tied and
+#: degenerate float32 distributions), so the switch is a memory decision only.
+_SAMPLE_INLINE_LIMIT = 32 << 20   # 32 Mi samples = 128 MB as float32
+
+
+def _sample_blocks(source: np.ndarray, rows_per_block: int):
+    """Yield contiguous float32 blocks of `source`, split along axis 0.
+
+    `source` is the STRIDED view of the enhanced volume, so each block is a
+    strided read that `ascontiguousarray` materialises one slab at a time.
+    Order is preserved but irrelevant: every consumer below is either an order
+    statistic or a count, both order-independent.
+    """
+    n_rows = source.shape[0]
+    step = max(1, int(rows_per_block))
+    for start in range(0, n_rows, step):
+        blk = np.ascontiguousarray(source[start:start + step], dtype=np.float32)
+        yield blk.ravel()
+
+
+def _order_statistics_streaming(block_iter_factory, ranks, min_value: float):
+    """
+    Exact k-th smallest values of the sample, in O(1) memory.
+
+    The trick is that POSITIVE IEEE-754 float32 values are order-isomorphic to
+    their uint32 bit patterns: if x < y then bits(x) < bits(y). So a histogram
+    over those patterns is a histogram over sorted position, and two passes are
+    enough to pin an order statistic to an exact bit pattern -- one over the
+    high 16 bits to find which of 65536 buckets the rank falls in, one over the
+    low 16 bits within that bucket. The result is the exact value that would
+    have been at that index of the fully sorted sample; nothing is estimated,
+    interpolated or binned away.
+
+    Every sample here is `> min_value >= 0`, so the positivity precondition
+    holds. NaN and +inf sort above every finite value in bit order too, which
+    matches how `np.sort` places them, but they cannot occur downstream of the
+    normalisation and are not relied on.
+
+    Returns ``(values_by_rank, n)``.
+    """
+    ranks = sorted({int(r) for r in ranks})
+    hi_hist = np.zeros(1 << 16, dtype=np.int64)
+    n = 0
+    for blk in block_iter_factory():
+        sel = blk[blk > min_value]
+        if not sel.size:
+            continue
+        bits = sel.view(np.uint32)
+        n += sel.size
+        hi_hist += np.bincount(bits >> np.uint32(16), minlength=1 << 16)
+    if n == 0:
+        return {}, 0
+
+    cum = np.cumsum(hi_hist)
+    wanted: Dict[int, List[Tuple[int, int]]] = {}
+    for k in ranks:
+        kk = min(max(k, 0), n - 1)
+        bucket = int(np.searchsorted(cum, kk, side='right'))
+        below = int(cum[bucket - 1]) if bucket else 0
+        wanted.setdefault(bucket, []).append((k, kk - below))
+
+    out: Dict[int, np.float32] = {}
+    for bucket, targets in wanted.items():
+        lo_hist = np.zeros(1 << 16, dtype=np.int64)
+        for blk in block_iter_factory():
+            sel = blk[blk > min_value]
+            if not sel.size:
+                continue
+            bits = sel.view(np.uint32)
+            inside = bits[(bits >> np.uint32(16)) == np.uint32(bucket)]
+            if inside.size:
+                lo_hist += np.bincount(inside & np.uint32(0xFFFF),
+                                       minlength=1 << 16)
+        lcum = np.cumsum(lo_hist)
+        for k, local_rank in targets:
+            low = int(np.searchsorted(lcum, local_rank, side='right'))
+            pattern = np.uint32((bucket << 16) | low)
+            out[k] = np.array([pattern], dtype=np.uint32).view(np.float32)[0]
+    return out, n
+
+
+def _percentile_from_order_statistics(stats: Dict[int, Any], n: int,
+                                      p: float) -> float:
+    """
+    `np.percentile(sample, p)` reproduced bit-for-bit from order statistics.
+
+    Three details in numpy's implementation have to be copied exactly, and each
+    one moves the last bit if it is not:
+
+    1. The virtual index for method='linear' is ``(n - 1) * q`` with
+       ``q = p / 100`` in float64.
+    2. The two bracketing order statistics are combined by numpy's `_lerp`,
+       which for ``gamma >= 0.5`` interpolates DOWN from the upper value
+       (``b - diff*(1-gamma)``) instead of up from the lower one. Those are not
+       the same expression in floating point.
+    3. The arithmetic happens in FLOAT32, not float64. `gamma` reaches `_lerp`
+       as a Python float, and under NEP 50 weak promotion a Python float does
+       not upcast a float32 operand -- so the difference, the product and the
+       sum all stay float32. Computing in float64 and rounding at the end gives
+       a different answer.
+    """
+    q = np.float64(p) / np.float64(100)
+    virtual = (n - 1) * q
+    if virtual >= n - 1:
+        lo = hi = n - 1
+    elif virtual <= 0:
+        lo = hi = 0
+    else:
+        lo = int(np.floor(virtual))
+        hi = lo + 1
+    gamma = float(virtual - np.floor(virtual)) if lo != hi else 0.0
+    a = np.float32(stats[lo])
+    b = np.float32(stats[hi])
+    diff = np.float32(b - a)
+    if gamma >= 0.5:
+        return float(np.float32(b - diff * (1.0 - gamma)))
+    return float(np.float32(a + diff * gamma))
+
+
+def _count_above_streaming(block_iter_factory, min_value: float,
+                           threshold: float) -> Tuple[int, int]:
+    """``(count of sample > threshold, sample size)``, streamed.
+
+    Replaces ``np.mean(samples > grow_thresh)``. `np.mean` of a boolean array
+    accumulates 1.0s into a float64, which is exact for any count below 2**53,
+    so a count divided by the total is the identical float.
+    """
+    above = 0
+    total = 0
+    for blk in block_iter_factory():
+        sel = blk[blk > min_value]
+        total += int(sel.size)
+        if sel.size:
+            above += int(np.count_nonzero(sel > threshold))
+    return above, total
 
 
 def enhance_tubular_structures_blocked(
@@ -327,13 +557,19 @@ def enhance_tubular_structures_blocked(
     spacing_float = normalise_spacing(spacing, ndim)
     print(f"  [Enhance] Data: {volume.shape}, Spacing: {spacing_float}")
 
-    chunk_shape = _enhance_chunk_shape(ndim)
+    budget = resource_budget.open_budget("step 1.3 vesselness")
     output_temp_dir = _get_safe_temp_dir(temp_root_path, 'tubular_output')
     output_path = os.path.join(output_temp_dir, 'processed_volume.dat')
     output_memmap = np.memmap(output_path, dtype=np.float32, mode='w+', shape=volume.shape)
 
     if skip_tubular_enhancement:
-        chunk_gen = _get_chunk_slices(volume.shape, chunk_shape, overlap=0)
+        # A pure copy: no filter reach, so no overlap and a plain traversal
+        # shape. Sized by the budget like every other pointwise loop.
+        chunk_gen = _get_chunk_slices(
+            volume.shape,
+            _traversal_chunk_shape(budget, volume.shape, ndim,
+                                   "float32_pass", "enhance passthrough"),
+            overlap=0)
         for _, write_slice in tqdm(list(chunk_gen), desc="  [Enhance] Copying"):
             output_memmap[write_slice] = volume[write_slice].astype(np.float32)
         output_memmap.flush()
@@ -368,8 +604,19 @@ def enhance_tubular_structures_blocked(
                           black_ridges=black_ridges, frangi_alpha=frangi_alpha, 
                           frangi_beta=frangi_beta, frangi_gamma=frangi_gamma)
 
+    # Chunk shape AND worker count from one plan, which is the whole point:
+    # the old code took the shape from a constant and the process count from
+    # `os.cpu_count() - 2`, so peak memory was the product of two numbers that
+    # never met. On a 16-core 8 GB laptop that product was already ~3.5 GB
+    # before anything else in the app was counted.
+    plan = budget.report(budget.plan_scaled_block(
+        volume.shape, _enhance_base_chunk_shape(ndim), "vesselness",
+        overlap=overlap_px, name=f"vesselness (overlap {overlap_px}px)",
+    ))
+    chunk_shape = plan.block_shape
+
     chunks = list(_get_chunk_slices(volume.shape, chunk_shape, overlap=overlap_px))
-    pool = mp.Pool(processes=max(1, os.cpu_count()-2), initializer=_init_worker)
+    pool = mp.Pool(processes=max(1, plan.workers), initializer=_init_worker)
     try:
         results = list(tqdm(pool.imap_unordered(worker_func, chunks), total=len(chunks), desc="  [Enhance] Vessel Filters"))
         if any(r is not None for r in results): raise RuntimeError(f"Error: {next(r for r in results if r)}")
@@ -917,6 +1164,11 @@ def segment_cells_first_pass_raw(
     spacing = normalise_spacing(spacing, ndim)
 
     print(f"\n--- Step 1: Raw Segmentation (Strict Independence Mode) ---")
+    # One budget for the whole step. Opened here rather than per stage so the
+    # log carries the machine and the ceiling once, and so every stage below
+    # plans against the same figure.
+    _budget = resource_budget.open_budget("step 1 raw segmentation")
+    print(resource_budget.describe_environment(_budget.settings))
     n_scales = len(tubular_scales)
 
     if n_scales == 0:
@@ -975,7 +1227,9 @@ def segment_cells_first_pass_raw(
                     norm_factor = float(np.iinfo(volume.dtype).max)
                 
                 print(f"    Normalization skipped for Absolute mode; scaling by DType Max ({norm_factor}) to [0, 1] range.")
-                for read_sl, _ in tqdm(list(_get_chunk_slices(volume.shape, _enhance_chunk_shape(ndim))), desc="    Applying"):
+                _trav = _traversal_chunk_shape(_budget, volume.shape, ndim,
+                                               "float32_pass", "dtype scaling")
+                for read_sl, _ in tqdm(list(_get_chunk_slices(volume.shape, _trav)), desc="    Applying"):
                     norm_mm[read_sl] = volume[read_sl].astype(np.float32) / norm_factor
                 norm_mm.flush()
             else:
@@ -1017,18 +1271,69 @@ def segment_cells_first_pass_raw(
                 # a different sigma and bake a per-tile strictness seam into the
                 # downstream global percentile threshold.
                 _planes = list(planes_of(volume))
+                # Three plane buffers, allocated ONCE and reused, with the
+                # arithmetic done in place. The previous version allocated a
+                # fresh float32 plane for each of `s2d`, `bg`, `resid` and
+                # `absr` on every iteration, and `np.clip(...)/sigma` added two
+                # more, so peak was about six plane-sized buffers plus the copy
+                # `np.median` makes internally to partition. At the 24615x18462
+                # cross-section this module's own comments cite, that is ~1.8 GB
+                # each and roughly 11 GB peak -- infeasible on an 8 GB machine
+                # for reasons no chunk setting can fix.
+                #
+                # Every operation below is the same operation on the same
+                # values: `np.subtract(x, y, out=x)` is `x - y`, and
+                # `np.clip(x, 0, None, out=x); x /= sigma` is
+                # `np.clip(x, 0, None) / sigma`. In-place only changes WHERE
+                # the result lands. `sigma` and `bg` stay Python floats so NEP
+                # 50 weak promotion keeps everything float32, exactly as before.
+                #
+                # `_s_buf` must be a real copy rather than the `np.asarray`
+                # view the old code used: for a float32 input volume that
+                # returned a view onto the source memmap, and writing through
+                # it in place would corrupt the input.
+                _plane_shape = None
+                _s_buf = _bg_buf = _absr_buf = None
+                _plane_bytes = None
                 for _pidx, _plane_src in tqdm(_planes, desc="    Standardizing",
                                               total=len(_planes)):
-                    s2d = np.asarray(_plane_src, dtype=np.float32)
+                    if _plane_shape != _plane_src.shape:
+                        _plane_shape = _plane_src.shape
+                        _s_buf = np.empty(_plane_shape, dtype=np.float32)
+                        _bg_buf = (np.empty(_plane_shape, dtype=np.float32)
+                                   if win > 0 else None)
+                        _absr_buf = np.empty(_plane_shape, dtype=np.float32)
+                        # Four plane-sized buffers live at peak: these three
+                        # plus the copy np.median makes. Reported rather than
+                        # worked around, because the plane is genuinely the unit
+                        # here -- the background and the noise sigma are
+                        # plane-GLOBAL statistics and tiling them would bake a
+                        # per-tile strictness seam into the global percentile.
+                        _plane_bytes = 4 * int(np.prod(_plane_shape))
+                        _needed = 4 * _plane_bytes
+                        if _needed > _budget.plannable_bytes:
+                            print(
+                                f"    [resources] *** one {_plane_shape} plane "
+                                f"needs ~{_needed / (1024 ** 3):.2f} GB of "
+                                f"working buffers, above the "
+                                f"{_budget.plannable_bytes / (1024 ** 3):.2f} GB "
+                                f"available to this step. Normalisation will be "
+                                f"attempted anyway and may swap or fail. Raise "
+                                f"the RAM ceiling in Settings. ***"
+                            )
+                    np.copyto(_s_buf, _plane_src, casting='unsafe')
+                    s2d = _s_buf
                     # Local background: removes the (possibly structured) pedestal
                     # while preserving structures smaller than the window.
                     if win > 0:
-                        bg = ndimage.grey_opening(s2d, size=(win, win))
+                        bg = ndimage.grey_opening(s2d, size=(win, win),
+                                                  output=_bg_buf)
                         bg_center = float(np.median(bg))
                     else:
                         bg = float(np.median(s2d))
                         bg_center = bg
-                    resid = s2d - bg
+                    np.subtract(s2d, bg, out=s2d)
+                    resid = s2d
 
                     # Noise scale: a SINGLE robust GLOBAL value per FULL slice, NOT a
                     # spatially-varying local RMS. A local RMS is dominated by the
@@ -1039,17 +1344,19 @@ def segment_cells_first_pass_raw(
                     # background noise even with cells present. Fallback covers the
                     # degenerate case of a large constant region (e.g. zero-padding
                     # outside the FOV) where the MAD would otherwise be 0.
-                    absr = np.abs(resid)
+                    absr = np.abs(resid, out=_absr_buf)
                     sigma = 1.4826 * float(np.median(absr))
                     if not np.isfinite(sigma) or sigma < 1e-6:
                         nz = absr[absr > 0]
                         sigma = float(np.mean(nz)) if nz.size else 1.0
                     sigma = max(sigma, 1e-6)
 
+                    np.clip(resid, 0.0, None, out=resid)
+                    np.divide(resid, sigma, out=resid)
                     if volume.ndim == 3:
-                        norm_mm[_pidx] = np.clip(resid, 0.0, None) / sigma
+                        norm_mm[_pidx] = resid
                     else:
-                        norm_mm[...] = np.clip(resid, 0.0, None) / sigma
+                        norm_mm[...] = resid
                     # Accumulated at BOTH ranks. The 2D track omitted these, so
                     # its log gave no way to tell a failed normalisation from a
                     # correct one.
@@ -1116,8 +1423,13 @@ def segment_cells_first_pass_raw(
                     d_norm = da.from_array(norm_mm, chunks=_dask_chunks(ndim))
                     d_smooth = dask_image.ndfilters.gaussian_filter(d_norm, sigma=sigma_vox)
 
+                    # `num_workers` is the budgeted quantity here, not the chunk
+                    # shape (see `_dask_chunks`). Thread count changes the order
+                    # chunks complete in, never their contents.
+                    _nw = _dask_workers(_budget, ndim, "float32_pass")
                     with ProgressBar(dt=5):
-                        da.store(d_smooth, smoothed_mm, scheduler='threads')
+                        da.store(d_smooth, smoothed_mm, scheduler='threads',
+                                 num_workers=_nw)
                     smoothed_mm.flush()
                 else:
                     smoothed_mm = norm_mm
@@ -1157,15 +1469,84 @@ def segment_cells_first_pass_raw(
                     # different noise (item 1 flattened the noise scale). `low` is
                     # the detection threshold; `high` optionally adds a stricter
                     # connectivity seed (only when low < high < 100; off at high=100).
-                    samples = enh_mm[sample_sel].ravel()
-                    samples = samples[samples > 1e-7]
-                    if samples.size > 1000:
+                    # The sample is NEVER materialised as a whole.
+                    #
+                    # `sample_sel` strides by at most 16 in-plane and 4 along
+                    # the leading axis, so the number of samples grows LINEARLY
+                    # with the volume: at brain scale `enh_mm[sample_sel]` is
+                    # tens of GB, and `np.percentile` then copies it again to
+                    # partition. Those strides cannot be raised to bound it,
+                    # because the sampled SET is the threshold estimate -- see
+                    # `resource_budget.PINNED['threshold_sample_stride_*']`.
+                    #
+                    # So the sampled set is unchanged and only the arithmetic
+                    # moves out of core. Sampling remains a strided view; the
+                    # percentiles come from exact order statistics found by a
+                    # two-level histogram over float32 bit patterns. The
+                    # numbers are bit-identical to the previous
+                    # `np.percentile` calls, so thresholds -- and therefore
+                    # every downstream mask -- are unchanged.
+                    _sample_view = enh_mm[sample_sel]
+                    _n_sample_est = int(np.prod(_sample_view.shape))
+                    _rows = max(1, int(
+                        _budget.plannable_bytes
+                        // max(1, 4 * int(np.prod(_sample_view.shape[1:])))))
+                    _blocks = (lambda: _sample_blocks(_sample_view, _rows))
+
+                    if _n_sample_est <= _SAMPLE_INLINE_LIMIT:
+                        # Small enough that a copy is free; keep the original
+                        # expression verbatim rather than route the common case
+                        # through new code.
+                        samples = _sample_view.ravel()
+                        samples = samples[samples > 1e-7]
+                        _n = int(samples.size)
+
+                        def _pctl(_p, _s=samples):
+                            return float(np.percentile(_s, _p))
+
+                        def _occupancy(_t, _s=samples):
+                            return float(np.mean(_s > _t)) * 100.0
+                    else:
+                        _stats_cache: Dict[int, Any] = {}
+                        _n_holder = _order_statistics_streaming(_blocks, [0], 1e-7)
+                        _n = _n_holder[1]
+
+                        def _pctl(_p, _n=_n):
+                            q = np.float64(_p) / np.float64(100)
+                            virtual = (_n - 1) * q
+                            if virtual >= _n - 1:
+                                need = [_n - 1]
+                            elif virtual <= 0:
+                                need = [0]
+                            else:
+                                need = [int(np.floor(virtual)),
+                                        int(np.floor(virtual)) + 1]
+                            missing = [k for k in need if k not in _stats_cache]
+                            if missing:
+                                got, _ = _order_statistics_streaming(
+                                    _blocks, missing, 1e-7)
+                                _stats_cache.update(got)
+                            return _percentile_from_order_statistics(
+                                _stats_cache, _n, _p)
+
+                        def _occupancy(_t):
+                            above, total = _count_above_streaming(
+                                _blocks, 1e-7, _t)
+                            return (float(above) / float(total) * 100.0
+                                    if total else 0.0)
+
+                        print(f"      [Scale {scale}] {_n} sampled voxels; "
+                              f"percentiles computed out of core "
+                              f"(sample would be "
+                              f"{_n * 4 / (1024 ** 3):.2f} GB in RAM)")
+
+                    if _n > 1000:
                         low_p = min(max(float(current_low_p), 0.0), 100.0)
-                        grow_thresh = max(float(np.percentile(samples, low_p)), 1e-5)
+                        grow_thresh = max(_pctl(low_p), 1e-5)
                         high_p = float(current_high_p)
                         if low_p < high_p < 100.0:
-                            seed_thresh = max(float(np.percentile(samples, high_p)), grow_thresh)
-                        occ = float(np.mean(samples > grow_thresh)) * 100.0
+                            seed_thresh = max(_pctl(high_p), grow_thresh)
+                        occ = _occupancy(grow_thresh)
                         seed_msg = (f", seed(p{high_p:g})={seed_thresh:.5f}"
                                     if seed_thresh is not None else ", seed OFF")
                         print(f"      [Scale {scale}] grow(p{low_p:g})={grow_thresh:.5f} "
@@ -1184,10 +1565,15 @@ def segment_cells_first_pass_raw(
                     struct = np.ones(tuple(max(1, 2 * r + 1) for r in rv), dtype=bool)
 
                     clean_dask = dask_image.ndmorph.binary_closing((enh_dask > grow_thresh), structure=struct)
+                    _nw = _dask_workers(_budget, ndim, "binary_morphology")
                     
                     record_s0 = (scale == 0 and scale0_mm is not None)
-                    for read_sl, _ in tqdm(list(_get_chunk_slices(volume.shape, _enhance_chunk_shape(ndim))), desc="      Merging"):
-                        blk = clean_dask[read_sl].compute().astype(np.uint8)
+                    _trav = _traversal_chunk_shape(
+                        _budget, volume.shape, ndim, "binary_morphology",
+                        "threshold/close merge")
+                    for read_sl, _ in tqdm(list(_get_chunk_slices(volume.shape, _trav)), desc="      Merging"):
+                        blk = clean_dask[read_sl].compute(
+                            scheduler='threads', num_workers=_nw).astype(np.uint8)
                         master_mm[read_sl] |= blk
                         if record_s0:
                             scale0_mm[read_sl] |= blk
@@ -1224,15 +1610,20 @@ def segment_cells_first_pass_raw(
         lab_dir = _get_safe_temp_dir(temp_root_path, 'lab_zarr'); temp_dirs_to_clean.append(lab_dir)
         m_dask = da.from_array(master_mm, chunks=_dask_chunks(ndim))
         labeled_dask, num_feats_dask = dask_image.ndmeasure.label((m_dask > 0), structure=binary_structure(ndim))
-        labeled_dask.to_zarr(os.path.join(lab_dir, 'l.zarr'), overwrite=True)
-        num_feats = num_feats_dask.compute()
+        # Labelling geometry is pinned; only the thread count is budgeted.
+        _nw = _dask_workers(_budget, ndim, "copy_int32")
+        with dask.config.set(scheduler='threads', num_workers=_nw):
+            labeled_dask.to_zarr(os.path.join(lab_dir, 'l.zarr'), overwrite=True)
+            num_feats = num_feats_dask.compute()
 
         if trace_max_gap > 0.0:
             # Trace-link BEFORE the size filter: write raw labels, reconnect
             # fragments broken by dim gaps, THEN apply the global size filter to
             # the merged labels. Memory-light throughout.
             lz = zarr.open(os.path.join(lab_dir, 'l.zarr'), mode='r')
-            for rs, ws in tqdm(list(_get_chunk_slices(volume.shape, _enhance_chunk_shape(ndim))), desc="    Writing labels"):
+            _trav = _traversal_chunk_shape(_budget, volume.shape, ndim,
+                                           "copy_int32", "label writeout")
+            for rs, ws in tqdm(list(_get_chunk_slices(volume.shape, _trav)), desc="    Writing labels"):
                 final_mm[ws] = lz[rs]
             final_mm.flush()
             # Flag which labels are somata (scale-0 objects): a label is a soma
@@ -1316,7 +1707,9 @@ def segment_cells_first_pass_raw(
             lookup = np.zeros(num_feats + 1, dtype=np.int32)
             for i, old_id in enumerate(valid): lookup[old_id] = i + 1
 
-            for rs, ws in tqdm(list(_get_chunk_slices(volume.shape, _enhance_chunk_shape(ndim))), desc="    Filtering"):
+            _trav = _traversal_chunk_shape(_budget, volume.shape, ndim,
+                                           "copy_int32", "size filter")
+            for rs, ws in tqdm(list(_get_chunk_slices(volume.shape, _trav)), desc="    Filtering"):
                 final_mm[ws] = lookup[lz[rs]]
             final_mm.flush()
 
@@ -1362,4 +1755,3 @@ def enhance_tubular_structures_blocked_2d(image, scales, spacing, temp_root_path
     return enhance_tubular_structures_blocked(
         image, scales, spacing, temp_root_path, **kwargs
     )
-
