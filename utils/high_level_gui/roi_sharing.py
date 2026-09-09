@@ -890,7 +890,8 @@ def summarize_plan(plan: Sequence[Dict[str, Any]]) -> str:
     return "\n\n".join(lines) if lines else "Nothing to do."
 
 
-def propagation_rows(plan: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def propagation_rows(plan: Sequence[Dict[str, Any]],
+                     default_replace: bool = True) -> List[Dict[str, Any]]:
     """Checkbox rows describing a propagation plan, one per channel.
 
     Returns ``{entry, enabled, default, label, tooltip}`` dicts, ready to hand to
@@ -900,6 +901,15 @@ def propagation_rows(plan: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
     describe the same plan in the same words. When this lived inside the overlay
     panel the per-channel viewer had no way to reuse it, which is how the two
     drawing paths came to behave differently in the first place.
+
+    `default_replace` is whether REPLACE rows start ticked. It exists because
+    the same dialog serves two situations with opposite safe defaults. Sharing a
+    NEWLY drawn region uses a name chosen free in every channel, so a REPLACE
+    row cannot occur and the value is moot. Sharing an EXISTING region reuses
+    its name, so a channel that already has that name shows up as REPLACE --
+    and accepting it would delete that channel's results for the region. There
+    the row must start unticked, so destroying results is something you opt into
+    rather than something the default does for you.
 
     Ineligible channels come back as disabled rows carrying their reason rather
     than being dropped: a channel silently missing from the list reads as a bug,
@@ -918,7 +928,7 @@ def propagation_rows(plan: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
         elif status == REPLACE:
             n = len(entry.get("discards") or [])
             rows.append({
-                "entry": entry, "enabled": True, "default": True,
+                "entry": entry, "enabled": True, "default": default_replace,
                 "label": (f"{channel}  \u2014  replaces existing ROI"
                           + (f" ({n} result file(s) deleted)" if n else "")),
                 "tooltip": entry.get("roi_dir", ""),
@@ -1392,6 +1402,120 @@ def list_roi_sessions(sample_dir: str) -> List[Dict[str, Any]]:
         })
     out.sort(key=lambda e: (not e["legacy"], _name_sort_key(e["name"])))
     return out
+
+
+def available_roi_sessions(sample_dir: str) -> List[Dict[str, Any]]:
+    """Every region a channel can open: its own, plus its siblings' regions.
+
+    This is what makes a region drawn in one channel reachable from the others.
+    ``list_roi_sessions`` answers "what is written HERE", which is the right
+    question for naming and for cross-channel analysis but the wrong one for a
+    region picker: a region is defined by a polygon in shared full-image
+    coordinates, so one that exists in any channel of the sample is openable in
+    all of them.
+
+    Resolved lazily rather than by copying the record into every channel when it
+    is drawn. Lazy is better here for three reasons: it works for regions drawn
+    before any of this existed, so there is nothing to migrate; it costs no
+    dialog at draw time; and a channel never accumulates regions someone only
+    ever wanted next door.
+
+    Returns dicts shaped like ``list_roi_sessions`` entries plus:
+
+      ``local``          True if the record is already in this channel.
+      ``source_dir``     the sample folder the record was read from.
+      ``source_channel`` that folder's channel name, for labelling.
+      ``record``         the loaded polygon record (adoptable entries only).
+
+    Local regions win on name. If a name exists both here and next door, this
+    channel's own copy is what opens -- adopting over it would delete this
+    channel's crop, config and results, which is never what picking a region
+    from a list should do.
+    """
+    local = [s for s in list_roi_sessions(sample_dir) if s["has_polygon"]]
+    out: List[Dict[str, Any]] = []
+    for session in local:
+        entry = dict(session)
+        entry.update({"local": True, "source_dir": sample_dir,
+                      "source_channel": os.path.basename(
+                          os.path.dirname(sample_dir)),
+                      "record": None})
+        out.append(entry)
+
+    seen = {s["name"] for s in local}
+    for sibling in sibling_channel_dirs(sample_dir)[1:]:
+        for session in list_roi_sessions(sibling):
+            if not session["has_polygon"] or session["name"] in seen:
+                continue
+            record = load_roi_record(session["roi_dir"])
+            if record is None:
+                continue
+            seen.add(session["name"])
+            out.append({
+                "name": session["name"],
+                "dir_name": session["dir_name"],
+                # Where it would live HERE once adopted, not where it is now, so
+                # a caller that opens by path is pointed at this channel.
+                "roi_dir": roi_session_dir(sample_dir, session["name"]),
+                "has_polygon": True,
+                "legacy": session["legacy"],
+                "local": False,
+                "source_dir": sibling,
+                "source_channel": os.path.basename(os.path.dirname(sibling)),
+                "record": record,
+            })
+
+    out.sort(key=lambda e: (not e["legacy"], _name_sort_key(e["name"])))
+    return out
+
+
+def adopt_roi_session(sample_dir: str,
+                      entry: Dict[str, Any]) -> Optional[str]:
+    """Write a sibling's region into this channel. Returns an error, or None.
+
+    The step that turns an offered region into an openable one. Only the small
+    JSON is written: ``_try_load_existing_roi_session`` derives the crop from
+    this channel's own image and the config from this channel's own config when
+    they are absent, which is exactly right -- the polygon is shared, the pixel
+    data and the tuned parameters are not.
+
+    Goes through plan/apply rather than copying the file directly, so the shape
+    check and the clearing of stale derived artifacts both still happen. A
+    channel whose image does not match the frame the polygon was drawn on is
+    refused with a reason instead of being given coordinates that mean nothing
+    there.
+    """
+    record = entry.get("record")
+    if record is None:
+        record = load_roi_record(entry.get("source_roi_dir")
+                                 or entry["roi_dir"])
+    if record is None:
+        return "its polygon file could not be read"
+
+    shape = record.get("full_image_shape")
+    if not shape:
+        # A v1 record predating the field. The source channel's own image is
+        # the frame it was drawn against, and every channel of a sample shares
+        # dimensions, so reading it there is sound.
+        info = describe_channel(entry["source_dir"])
+        shape = _image_shape(info["tif"]) if info else None
+    if not shape:
+        return "the image shape it was drawn on could not be determined"
+
+    plan = plan_roi_propagation([sample_dir], tuple(int(v) for v in shape),
+                                roi_name=entry["name"])
+    if not plan:
+        return "this channel could not be inspected"
+    status = plan[0].get("status")
+    if status not in (NEW, REPLACE):
+        return plan[0].get("reason") or "this channel cannot take it"
+
+    result = apply_roi_propagation(plan, record)
+    if result["errors"]:
+        return result["errors"][0]["error"]
+    if not result["written"]:
+        return "nothing was written"
+    return None
 
 
 def _name_sort_key(name: str):
