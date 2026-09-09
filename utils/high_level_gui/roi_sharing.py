@@ -535,6 +535,23 @@ def describe_channel(sample_dir: str) -> Optional[Dict[str, Any]]:
     }
 
 
+def _looks_like_sample_folder(path: str) -> bool:
+    """True for a folder holding an image and a config, i.e. one channel's sample.
+
+    The same test ``ProjectManager.build_consolidated_sample_registry`` applies,
+    kept identical on purpose: the two decide which folders are channels of a
+    sample, and if they disagree the ROI channel list and the overlay's channel
+    list would disagree. Says nothing about whether the channel is *ready* to be
+    processed -- that is describe_channel's stricter question.
+    """
+    try:
+        contents = os.listdir(path)
+    except OSError:
+        return False
+    return (any(f.lower().endswith((".tif", ".tiff")) for f in contents)
+            and any(f.lower().endswith((".yaml", ".yml")) for f in contents))
+
+
 def sibling_channel_dirs(sample_dir: str) -> List[str]:
     """Every channel folder holding the same sample as `sample_dir`, itself first.
 
@@ -549,11 +566,19 @@ def sibling_channel_dirs(sample_dir: str) -> List[str]:
     Where a registry IS available the two agree, because both normalise names
     through ``clean_filename_for_matching``.
 
-    `sample_dir` always comes back first and is always included even if it fails
-    ``describe_channel`` -- the caller is standing in it, so excluding it would
-    mean refusing to write the region the user just drew. Every OTHER candidate
-    must pass ``describe_channel``: a name match with no image/config pair is an
-    export folder or a stray copy, not a channel.
+    `sample_dir` always comes back first and is always included even if it does
+    not look like a sample folder -- the caller is standing in it, so excluding
+    it would mean refusing to write the region the user just drew.
+
+    A candidate qualifies on the image + config pair alone, which is
+    deliberately the registry's rule and NOT the stricter ``describe_channel``
+    one. describe_channel also demands a usable processing mode, and filtering on
+    that here made a channel that has never been given a mode vanish from the
+    caller's channel list instead of appearing in it as an unusable row with a
+    reason. Deciding a channel cannot take the region is
+    ``plan_roi_propagation``'s job -- it has the UNUSABLE status for exactly
+    this -- so the only thing being answered here is "is this a channel of this
+    sample at all".
 
     Returns a single-element list when there is nothing to match against, which
     is what makes every caller safe on a one-channel project.
@@ -587,7 +612,7 @@ def sibling_channel_dirs(sample_dir: str) -> List[str]:
             real = os.path.realpath(path)
             if real in seen or not os.path.isdir(path):
                 continue
-            if describe_channel(path) is None:
+            if not _looks_like_sample_folder(path):
                 continue
             seen.add(real)
             out.append(path)
