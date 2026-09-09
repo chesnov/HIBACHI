@@ -46,6 +46,7 @@ can be looked at rather than trusted.
 
 from __future__ import annotations
 
+import os
 from typing import Optional, Sequence, Tuple
 
 import numpy as np
@@ -193,6 +194,124 @@ def _block_surfaces(reference, block_px: int, max_gain: float, report: dict):
     surface = resize(gain, plane.shape, order=1, mode="edge",
                      preserve_range=True, anti_aliasing=False)
     return background, np.asarray(surface, dtype=np.float32)
+
+
+# --------------------------------------------------------------------------- #
+# Reading back a corrected image written by an earlier step
+# --------------------------------------------------------------------------- #
+#: Rows examined at a time when checking a corrected image is not blank. A
+#: plane here can be hundreds of megapixels, so the check streams instead of
+#: materialising a whole-array comparison.
+_CHECK_ROWS = 64
+
+
+def _infer_corrected_dtype(path: str, shape: Sequence[int],
+                           preferred=None) -> np.dtype:
+    """The dtype a corrected-image file is actually stored in.
+
+    Derived from the file SIZE rather than assumed, for two reasons. The
+    artifact is written in the INPUT's dtype (see `correct_illumination`), so
+    there is no single right answer to hardcode; and an older build, or the
+    stale comment in `ARTIFACT_PATTERNS` that still calls this artifact
+    float32, means a project on disk may disagree with what this build would
+    write. Reading a uint16 file as float32 does not fail -- it silently
+    produces an array of the wrong shape's worth of garbage -- so the size is
+    checked rather than trusted.
+
+    Raises if the size matches no plausible dtype, which also catches a
+    truncated or partly-written file.
+    """
+    voxels = 1
+    for dim in shape:
+        voxels *= int(dim)
+    size = os.path.getsize(path)
+    if voxels <= 0:
+        raise ValueError("image shape is empty")
+    if size % voxels:
+        raise ValueError(
+            f"the corrected image is {size} bytes, which is not a whole "
+            f"number of values for a {tuple(shape)} image. It may be "
+            "truncated or left over from a different image; re-run step 1."
+        )
+    itemsize = size // voxels
+
+    # The dtype this build would have written comes first, so the common case
+    # needs no guessing at all.
+    candidates = []
+    if preferred is not None:
+        candidates.append(np.dtype(preferred))
+    candidates += [np.dtype(t) for t in
+                   (np.uint16, np.float32, np.uint8, np.uint32, np.float64,
+                    np.int16, np.int32)]
+    for dtype in candidates:
+        if dtype.itemsize == itemsize:
+            return dtype
+    raise ValueError(
+        f"the corrected image stores {itemsize} bytes per value, which "
+        "matches no expected pixel type. Re-run step 1."
+    )
+
+
+def _looks_written(array) -> bool:
+    """True if an array holds any nonzero value.
+
+    The guard this exists for: the step that writes the corrected image
+    creates its memmap with ``mode="w+"`` BEFORE calling
+    `correct_illumination`, and that function returns early without writing
+    when it decides no correction applies. So the artifact can exist, be
+    exactly the right size, and be entirely zeros -- an image that would pass
+    every structural check and then silently flatten every intensity gate
+    downstream to no contrast at all.
+
+    Streams with an early exit, so the usual case stops at the first block and
+    only a genuinely blank file is read in full -- which is the case that must
+    not be got wrong.
+    """
+    rows = int(array.shape[0])
+    for start in range(0, rows, _CHECK_ROWS):
+        block = np.asarray(array[start:min(start + _CHECK_ROWS, rows)])
+        if block.any():
+            return True
+    return False
+
+
+def open_corrected(path: Optional[str], shape: Sequence[int],
+                   preferred_dtype=None):
+    """Memmap a corrected image written by an earlier step, or raise why not.
+
+    Raises rather than returning None so the caller cannot quietly fall back to
+    the raw image. A run configured to measure intensity on the corrected image
+    and silently measuring it on the raw one would look like a successful run
+    of the analysis that was asked for, and be a different one -- the same
+    reasoning as `soma_source.resolve`.
+
+    Read-only, and at the image's own shape, so this never rewrites or
+    reinterprets the artifact it was handed.
+    """
+    if not path:
+        raise FileNotFoundError(
+            "this run measures intensity on the illumination-corrected image, "
+            "but this build has no such artifact for this segment."
+        )
+    if not os.path.exists(path):
+        raise FileNotFoundError(
+            "this run measures intensity on the illumination-corrected image, "
+            "but step 1 did not write one. Turn on illumination correction "
+            "there (a block size above zero, or Z correction) and re-run it, "
+            "or untick this."
+        )
+
+    dtype = _infer_corrected_dtype(path, shape, preferred_dtype)
+    array = np.memmap(path, dtype=dtype, mode="r", shape=tuple(shape))
+    if not _looks_written(array):
+        del array
+        raise ValueError(
+            "the illumination-corrected image for this segment is entirely "
+            "zero, which means step 1 created the file but decided no "
+            "correction applied. Check step 1's illumination settings and "
+            "re-run it, or untick this to measure on the raw image."
+        )
+    return array
 
 
 def correct_illumination(

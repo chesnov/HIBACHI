@@ -338,6 +338,24 @@ execute_cell_separation:
       min: 1
       max: 1000
       step: 1
+    use_corrected_image:
+      # Off means "measure on the raw image", which is what every run did
+      # before this parameter existed, so an old config keeps its behaviour
+      # without being migrated.
+      neutral_default: true
+      label: Measure intensity on the illumination-corrected image
+      type: bool
+      value: false
+      description: >-
+        Use the illumination-corrected image step 1 wrote, instead of the raw
+        fluorescence, for every intensity judgement this step makes -- the
+        watershed speed, the path-intensity ratio and the local-intensity
+        difference. Worth turning on when the field is brighter on one side
+        than the other: those three gates compare brightness between places,
+        so an uneven field makes the same real gap pass in the bright corner
+        and fail in the dim one. Requires illumination correction to have
+        actually been applied in step 1; the run stops with a reason if it was
+        not, rather than falling back to the raw image.
     intensity_weight:
       label: Watershed Intensity Weight
       description: >-

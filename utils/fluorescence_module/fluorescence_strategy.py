@@ -629,6 +629,7 @@ class FluorescenceStrategy(ProcessingStrategy):
         trimmed_labels_memmap = None
         cell_bodies_ref = None
         final_separated_cells = None
+        intensity_ref = None
 
         try:
             trimmed_labels_memmap = np.memmap(
@@ -639,6 +640,36 @@ class FluorescenceStrategy(ProcessingStrategy):
                 cell_bodies_path, dtype=np.int32, mode='r',
                 shape=self.image_shape
             )
+
+            # Which image this step's three intensity gates read: the raw
+            # fluorescence, or the illumination-corrected copy step 1 wrote.
+            #
+            # It matters here more than it looks. All three -- the watershed
+            # speed, min_path_intensity_ratio and
+            # min_local_intensity_difference -- compare brightness BETWEEN
+            # places, so an uneven field makes the same real gap pass on the
+            # bright side of the image and fail on the dim side. Step 1 already
+            # persists the corrected image precisely so it can be reused rather
+            # than recomputed.
+            #
+            # `params.get`, not `_require`: the parameter is neutral_default in
+            # the reference, so a project set up before it existed has no such
+            # key and must behave exactly as it did. False is that behaviour.
+            intensity_input = image_stack
+            if bool(params.get("use_corrected_image", False)):
+                from .illumination import open_corrected
+
+                # Raises with a reason when the artifact is missing, the wrong
+                # size, or was created but never filled -- rather than falling
+                # back to `image_stack`, which would silently be a different
+                # analysis from the one configured.
+                intensity_ref = open_corrected(
+                    files.get("corrected_image"), self.image_shape,
+                    preferred_dtype=getattr(image_stack, "dtype", None),
+                )
+                intensity_input = intensity_ref
+                print("  Intensity measured on the illumination-corrected "
+                      f"image ({intensity_ref.dtype})")
 
             separation_params = {
                 "min_size_threshold": int(_require(params, "min_size_threshold", int)),
@@ -670,7 +701,7 @@ class FluorescenceStrategy(ProcessingStrategy):
             }
 
             final_separated_cells = separate_multi_soma_cells(
-                trimmed_labels_memmap, image_stack, cell_bodies_ref,
+                trimmed_labels_memmap, intensity_input, cell_bodies_ref,
                 self.spacing_checked, **separation_params
             )
 
@@ -698,6 +729,10 @@ class FluorescenceStrategy(ProcessingStrategy):
         finally:
             self._close_memmap(trimmed_labels_memmap)
             self._close_memmap(cell_bodies_ref)
+            # Released like the other two. Left open it would hold a mapping
+            # over an artifact a later edit may delete, which on Windows makes
+            # the delete fail outright.
+            self._close_memmap(intensity_ref)
             if 'final_separated_cells' in locals():
                 del final_separated_cells
 
