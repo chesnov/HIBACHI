@@ -935,7 +935,7 @@ def _separate_multi_soma_cells_chunk(
         footprint_b = adjacency_footprint(ndim)
         for ws_id in ws_ids:
             basin_mask = ws_local == ws_id
-            dilated = binary_dilation(basin_mask, footprint=footprint_b)
+            dilated = _dilate_local(basin_mask, footprint_b)
             boundary_voxels = dilated & (ws_local > 0) & (~basin_mask)
             if np.any(boundary_voxels):
                 bnd_mean = float(np.mean(local_intensity[boundary_voxels]))
@@ -1013,7 +1013,7 @@ def _separate_multi_soma_cells_chunk(
 
                 if not has_seed:
                     # Orphan detected: merge into best neighbor
-                    dilated = binary_dilation(frag_mask, footprint=dilation_struct)
+                    dilated = _dilate_local(frag_mask, dilation_struct)
                     neighbor_labels = final_local_mask[dilated]
                     valid_neighbors = neighbor_labels[
                         (neighbor_labels != 0) & (neighbor_labels != uid)
@@ -1140,7 +1140,7 @@ def _reassign_disconnected_islands(
             n_orphans += 1
             frag_size = int(np.sum(frag_mask))
 
-            dilated_frag = ndimage.binary_dilation(frag_mask, structure=dilate_struct)
+            dilated_frag = _dilate_local(frag_mask, dilate_struct)
 
             # Neighbours of a DIFFERENT label. NOTE: the dilation includes the
             # fragment itself, so raw values always contain label_id; excluding
@@ -1798,7 +1798,7 @@ def separate_multi_soma_cells(
                         ws_e_mask = (ws_local == 1) & local_domain
                         ws_i_mask = (ws_local == 2) & local_domain
                         if np.any(ws_e_mask) and np.any(ws_i_mask):
-                            dil_e = binary_dilation(ws_e_mask, footprint=adjacency_footprint(ndim))
+                            dil_e = _dilate_local(ws_e_mask, adjacency_footprint(ndim))
                             resolved_boundary = dil_e & ws_i_mask
                             if np.any(resolved_boundary):
                                 bnd_mean = float(np.mean(local_int_sub[resolved_boundary]))
