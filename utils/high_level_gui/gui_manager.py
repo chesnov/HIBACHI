@@ -17,7 +17,7 @@ from .napari_shortcuts import shape_edit_block
 # coordinate arrays. Do not reintroduce it: on a whole-slide region the
 # coordinate arrays alone are hundreds of GB and the process is killed.
 from PyQt5.QtWidgets import (  # type: ignore
-    QMessageBox, QWidget, QVBoxLayout, QScrollArea, QLabel,
+    QMessageBox, QWidget, QVBoxLayout, QScrollArea, QLabel, QDialog,
     QTextEdit, QProgressBar, QApplication, QPushButton, QFileDialog, QDockWidget, QLayout
 )
 from PyQt5.QtCore import QThread, pyqtSignal, QObject, Qt, QTimer  # type: ignore
@@ -1228,12 +1228,27 @@ class DynamicGUIManager(QObject):
                 "crop_h": crop_h, "crop_w": crop_w,
                 "z0": z0_crop, "z1": z1_crop, "z_desc": z_desc}
 
-    def _write_roi_session(self, spec):
-        """Create one region on disk. Returns (name, dir, crop memmap, config)."""
-        from .roi_sharing import next_roi_name, roi_session_dir
+    def _write_roi_session(self, spec, roi_name: Optional[str] = None):
+        """Create one region on disk. Returns (name, dir, crop memmap, config, record).
+
+        `roi_name` is allocated by the caller, against every channel of the
+        sample rather than this one alone -- see ``confirm_roi``. It is an
+        argument rather than derived here because a name has to be reserved
+        before the region is written, so that several regions drawn in one go
+        don't all pick the same number.
+
+        The record itself now comes from ``roi_sharing.roi_record_from_polygons``
+        instead of being assembled here. The two were the same computation
+        written twice, and the sibling channels are given THIS record verbatim --
+        so if they ever diverged, a channel's crop would no longer be the region
+        the drawing channel is analysing.
+        """
+        from .roi_sharing import roi_record_from_polygons, roi_session_dir
 
         sample_dir = os.path.dirname(self._full_processed_dir)
-        roi_name = next_roi_name(sample_dir)
+        if roi_name is None:
+            from .roi_sharing import next_roi_name
+            roi_name = next_roi_name(sample_dir)
         roi_dir = roi_session_dir(sample_dir, roi_name)
         if not roi_dir:
             # describe_channel could not read the folder; fall back to the legacy
@@ -1248,18 +1263,10 @@ class DynamicGUIManager(QObject):
         z0_crop, z1_crop = spec["z0"], spec["z1"]
         z_polygons = spec["z_polygons"]
 
-        roi_data = {
-            "format": "v2",
-            "z_polygons": [
-                {"z": int(z), "polygon_yx": np.asarray(poly, dtype=float).tolist()}
-                for z, poly in sorted(z_polygons.items())
-            ],
-            "bbox": {"y0": y0, "x0": x0, "y1": y1, "x1": x1,
-                     "z0": z0_crop, "z1": z1_crop},
-            "full_image_shape": list(self._full_image_stack.shape),
-        }
+        record = roi_record_from_polygons(z_polygons,
+                                          self._full_image_stack.shape)
         with open(os.path.join(roi_dir, "roi_polygon.json"), 'w') as fh:
-            json.dump(roi_data, fh, indent=2)
+            json.dump(record, fh, indent=2)
 
         crop_mm = self._build_crop_memmap(
             self._full_image_stack, y0, x0, y1, x1, z_polygons,
@@ -1271,7 +1278,128 @@ class DynamicGUIManager(QObject):
         with open(os.path.join(roi_dir, config_basename()), 'w') as fh:
             yaml.safe_dump(roi_config, fh, default_flow_style=False,
                            sort_keys=False)
-        return roi_name, roi_dir, crop_mm, roi_config
+        return roi_name, roi_dir, crop_mm, roi_config, record
+
+    # --- Sharing a region with the sample's other channels ---
+
+    def _sibling_sample_dirs(self) -> List[str]:
+        """This sample's OTHER channel folders, or [] when there are none.
+
+        The drawing channel is dropped from the front of the list: it is written
+        by the normal ``_write_roi_session`` path, which also builds its crop and
+        config, so including it in the propagation plan would have it flagged
+        REPLACE against a directory that was just created.
+        """
+        from .roi_sharing import sibling_channel_dirs
+        sample_dir = os.path.dirname(self._full_processed_dir
+                                     or self.processed_dir)
+        return sibling_channel_dirs(sample_dir)[1:]
+
+    def _ask_which_channels_to_share(self, siblings, names, record):
+        """Confirm which sibling channels should receive the drawn region(s).
+
+        Returns the chosen plan entries, or None if the user cancelled the whole
+        operation (which must abort the draw, not silently write to one channel).
+        An empty list means "this channel only", which is the pre-existing
+        behaviour and stays available.
+
+        The plan is built for the FIRST region only, because the picker is about
+        channels, not regions: every name in `names` was chosen free in every
+        channel, so no channel can be in a different state for the second region
+        than it is for the first. That also means no entry can come back
+        REPLACE, so nothing is ever deleted by this path -- unlike the overlay's
+        Apply, which can be pointed at an existing region name.
+        """
+        from .roi_sharing import plan_roi_propagation, propagation_rows
+        from .roi_overlay_panel import ChannelSelectDialog
+
+        plan = plan_roi_propagation(siblings, self._full_image_stack.shape,
+                                    roi_name=names[0])
+        rows = propagation_rows(plan)
+        if not any(row["enabled"] for row in rows):
+            # Nothing can receive it. Say so rather than showing a dialog whose
+            # every row is greyed out and whose OK button can't be pressed.
+            detail = "\n".join(f"  \u2022 {row['label']}" for row in rows)
+            QMessageBox.information(
+                None, "Cannot share this region",
+                "This sample's other channels cannot take the region:\n\n"
+                f"{detail}\n\nIt will be created in this channel only.")
+            return []
+
+        bbox = record["bbox"]
+        z_note = ""
+        full_shape = self._full_image_stack.shape
+        if bbox.get("z1") is not None and len(full_shape) == 3:
+            z_note = (f", Z {bbox['z0']}\u2013{bbox['z1']}"
+                      if bbox["z1"] - bbox["z0"] != full_shape[0]
+                      else ", all Z")
+
+        what = (f"'{names[0]}'" if len(names) == 1
+                else f"{len(names)} regions ({', '.join(names)})")
+        intro = (
+            f"You drew {what} in "
+            f"{os.path.basename(os.path.dirname(self.inputdir))}.\n\n"
+            f"First region: {bbox['y1'] - bbox['y0']} \u00d7 "
+            f"{bbox['x1'] - bbox['x0']} px{z_note}, from "
+            f"{len(record['z_polygons'])} polygon(s).\n\n"
+            "Tick the channels that should get the same region under the same "
+            "name, so it can be opened and processed from any of them and "
+            "compared across them. Each channel crops its own image and gets "
+            "its own config, starting from step 1. Existing regions are left "
+            "alone.\n\n"
+            "Untick everything to keep the region in this channel only."
+        )
+
+        dlg = ChannelSelectDialog(
+            "Share region with other channels", intro, rows, "Share")
+        if dlg.exec_() != QDialog.Accepted:
+            return None
+        return dlg.selected()
+
+    def _share_regions(self, chosen, records) -> Dict[str, Any]:
+        """Write each region's record into every chosen sibling channel.
+
+        One plan per region, re-planned against the chosen channels only, so a
+        channel the user unticked is never visited. Sibling channels get the JSON
+        and nothing else on purpose: ``_try_load_existing_roi_session`` rebuilds
+        the crop from that channel's own image and the config from that channel's
+        own config when they are absent. The polygon is shared; the pixel data
+        and the tuned parameters are not.
+        """
+        from .roi_sharing import apply_roi_propagation, plan_roi_propagation
+
+        dirs = [entry["sample_dir"] for entry in chosen]
+        written, errors = 0, []
+        for roi_name, record in records:
+            plan = plan_roi_propagation(dirs, self._full_image_stack.shape,
+                                        roi_name=roi_name)
+            result = apply_roi_propagation(plan, record)
+            written += len(result["written"])
+            errors.extend(result["errors"])
+        return {"written": written, "errors": errors, "channels": len(dirs)}
+
+    @staticmethod
+    def _report_sharing(what: str, share: Dict[str, Any]) -> None:
+        """Tell the user where the region went, and name anything that failed.
+
+        A per-channel failure is reported rather than raised: the region exists
+        in this channel and in the channels that did succeed, and throwing away
+        that work because a fourth channel's disk was read-only would be worse
+        than saying which one to retry.
+        """
+        body = (f"{what} was shared with {share['channels']} other channel(s). "
+                "Open one from the Project View to segment it there.")
+        if not share["errors"]:
+            QMessageBox.information(None, "Region shared", body)
+            return
+        detail = "\n".join(
+            f"  \u2022 {os.path.basename(e['sample_dir'])}: {e['error']}"
+            for e in share["errors"]
+        )
+        QMessageBox.warning(
+            None, "Region shared",
+            f"{body}\n\n{len(share['errors'])} channel(s) could not be "
+            f"written:\n{detail}")
 
     def _group_drawn_polygons(self, drawn, is_3d: bool):
         """Split drawn polygons into one entry per region.
@@ -1425,14 +1553,49 @@ class DynamicGUIManager(QObject):
         if reply != QMessageBox.Yes:
             return
 
+        # _full_image_stack has to exist before names are allocated or channels
+        # planned: both read the full image's shape, and the helpers below take
+        # it from there rather than from self.image_stack, which is the crop once
+        # a region is open.
+        self._remember_full_image_state()
+
+        # --- Name every region against ALL of the sample's channels -------
+        # Previously names came from next_roi_name(this channel), so channel A's
+        # "ROI 2" and channel B's "ROI 2" could be different regions. Every
+        # cross-channel path keys on the name -- RelationalEngine._find_dat
+        # (roi_name=...), regions_common_to_channels -- so that mismatch silently
+        # compares two different parts of the slide. A shared name is what makes
+        # a region mean one thing sample-wide.
+        siblings = self._sibling_sample_dirs()
+        from .roi_sharing import (choose_shared_roi_name,
+                                  roi_record_from_polygons)
+        naming_scope = [os.path.dirname(self._full_processed_dir)] + siblings
+        names: List[str] = []
+        for _ in specs:
+            names.append(choose_shared_roi_name(naming_scope, reserved=names))
+
+        # --- Offer the region to the other channels -----------------------
+        chosen: List[dict] = []
+        if siblings:
+            preview = roi_record_from_polygons(specs[0]["z_polygons"],
+                                               self._full_image_stack.shape)
+            chosen = self._ask_which_channels_to_share(siblings, names, preview)
+            if chosen is None:
+                return          # cancelled; nothing written
+
         QApplication.setOverrideCursor(Qt.WaitCursor)
         created = []
         try:
-            # Save full-image references (idempotent if called again)
-            self._remember_full_image_state()
+            for spec, name in zip(specs, names):
+                created.append(self._write_roi_session(spec, roi_name=name))
 
-            for spec in specs:
-                created.append(self._write_roi_session(spec))
+            # Siblings only after this channel's own write succeeded, so a
+            # failure here can't leave the region visible everywhere except
+            # where it was drawn.
+            share = None
+            if chosen:
+                share = self._share_regions(
+                    chosen, [(n, rec) for n, _d, _m, _c, rec in created])
 
             # --- Remove the draw layer before reinitializing ---
             if layer_name in self.viewer.layers:
@@ -1441,24 +1604,31 @@ class DynamicGUIManager(QObject):
 
             if len(created) == 1:
                 # One region: step into it, as before.
-                name, roi_dir, crop_mm, roi_config = created[0]
+                name, roi_dir, crop_mm, roi_config, _rec = created[0]
                 self._switch_to_roi_mode(crop_mm, roi_dir, roi_config,
                                          call_restore=False, roi_name=name)
+                if share is not None:
+                    QApplication.restoreOverrideCursor()
+                    self._report_sharing(name, share)
             else:
                 # Several regions: stepping into an arbitrary one would be a
                 # guess, so stay on the full image and show them all. Use
                 # "Open region" to enter one.
-                for _n, _d, crop_mm, _c in created:
+                for _n, _d, crop_mm, _c, _rec in created:
                     del crop_mm
                 self._show_saved_region_layers()
                 QApplication.restoreOverrideCursor()
                 QMessageBox.information(
                     None, "Regions created",
                     f"{len(created)} regions were created:\n\n"
-                    + "\n".join(f"  \u2022 {n}" for n, _d, _m, _c in created)
-                    + "\n\nThey are outlined on the full image. Use "
+                    + "\n".join(f"  \u2022 {n}" for n, _d, _m, _c, _r in created)
+                    + (f"\n\nEach was also written to {share['channels']} other "
+                       "channel(s).\n" if share else "\n")
+                    + "\nThey are outlined on the full image. Use "
                       "'Open region' to work on one, or process them from the "
                       "Project View.")
+                if share and share["errors"]:
+                    self._report_sharing("The regions", share)
 
         except Exception as exc:
             print(f"[ROI] confirm_roi failed: {exc}")

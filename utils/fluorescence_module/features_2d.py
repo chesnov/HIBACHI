@@ -625,7 +625,14 @@ def analyze_segmentation_2d(
     spacing_yx: Tuple[float, float] = None,
     calculate_distances: bool = True,
     calculate_skeletons: bool = True,
-    calculate_solidity: bool = True,
+    # False, matching `features_3d.analyze_segmentation`, the rank-agnostic
+    # `calculate_features.analyze_segmentation` dispatcher and the shipped
+    # `default.yaml`. This was the one parameter whose default differed by rank
+    # (2D defaulted True), which meant a direct call measured a different
+    # feature set depending only on the rank of the array handed to it. No
+    # in-app path is affected: every strategy passes the value explicitly from
+    # the config, so this changes behaviour for direct/notebook callers only.
+    calculate_solidity: bool = False,
     skeleton_export_path: Optional[str] = None,
     fcs_export_path: Optional[str] = None,
     temp_dir: Optional[str] = None,

@@ -143,7 +143,18 @@ def shortest_distance(
         return pd.DataFrame(), pd.DataFrame()
 
     # --- 1. Surface Extraction ---
+    # `actual_labels` records WHICH label each row of `_ALL_SURFACES` belongs to.
+    # It is not bookkeeping for its own sake: a label is skipped when its bbox
+    # is None or when erosion leaves no boundary voxel, so `_ALL_SURFACES` can be
+    # shorter than `labels` and the two stop being index-aligned at the first
+    # skip. Everything downstream is indexed by POSITION in the surface list --
+    # the memmap rows, the winning pairs, the matrix axes -- so without this the
+    # row for surface i would be reported under `labels[i]`, which is a
+    # different object, and `pd.DataFrame(..., index=labels)` on an
+    # (n_valid, n_valid) matrix raises outright. The 2D contour path already
+    # carried this list; the 3D copy did not.
     _ALL_SURFACES = []
+    actual_labels: List[int] = []
     locations = ndi.find_objects(segmented_array)
     struct = ndi.generate_binary_structure(3, 1) # 6-connectivity
     
@@ -159,8 +170,10 @@ def shortest_distance(
                 y + sl[1].start, 
                 x + sl[2].start
             )))
+            actual_labels.append(lbl)
 
-    n_valid = len(_ALL_SURFACES)
+    n_valid = len(actual_labels)
+    flush_print(f"[Dist] Found {n_valid} valid masks with surfaces.")
     
     # Fast exit if objects shrunk to 0 during erosion
     if n_valid <= 1:
@@ -205,13 +218,15 @@ def shortest_distance(
         row[i] = np.inf
         j = np.argmin(row)
         if not np.isinf(row[j]):
-            winning_pairs.append((labels[i], labels[j], i, j, spacing_arr))
+            winning_pairs.append(
+                (actual_labels[i], actual_labels[j], i, j, spacing_arr))
 
     with mp.Pool(n_jobs, **pool_kwargs) as pool:
         points_list = list(tqdm(pool.imap_unordered(_extract_winning_points_worker_3d, winning_pairs),
                                total=len(winning_pairs), desc="    Distance Pass 2/2"))
 
-    dist_df = pd.DataFrame(np.array(dist_mat_mm), index=labels, columns=labels)
+    dist_df = pd.DataFrame(np.array(dist_mat_mm),
+                           index=actual_labels, columns=actual_labels)
     points_df = pd.DataFrame(points_list)
 
     _ALL_SURFACES = []
@@ -535,6 +550,12 @@ def analyze_segmentation(
                 'shortest_distance_um': np.nanmin(temp_mat, axis=1), 
                 'closest_neighbor_label': dist_df.columns[np.nanargmin(temp_mat, axis=1)].astype(int)
             })
+            # Both merge keys coerced to int. `dist_metrics['label']` comes from
+            # a DataFrame index and `metrics_df['label']` from the measurement
+            # tables, so the two can carry different integer widths (or object
+            # dtype); pandas then matches nothing and every distance column
+            # arrives as NaN with no error. The 2D path already did this.
+            metrics_df['label'] = metrics_df['label'].astype(int)
             metrics_df = pd.merge(metrics_df, dist_metrics, on='label', how='left')
             if return_detailed and not pts_df.empty:
                 detailed_outputs['distance_matrix'] = dist_df

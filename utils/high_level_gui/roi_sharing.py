@@ -45,6 +45,13 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
+# The one rule for "these two folders are the same sample in different
+# channels". Imported rather than reimplemented so sibling_channel_dirs agrees
+# with ProjectManager.build_consolidated_sample_registry instead of inventing a
+# second, subtly different notion of sameness. gui_text_utils is Qt-free, so
+# this module stays importable in a batch worker.
+from .gui_text_utils import clean_filename_for_matching
+
 ROI_DIR_SUFFIX = "_roi"
 ROI_JSON_NAME = "roi_polygon.json"
 ROI_CROP_NAME = "roi_image_crop.dat"
@@ -528,6 +535,65 @@ def describe_channel(sample_dir: str) -> Optional[Dict[str, Any]]:
     }
 
 
+def sibling_channel_dirs(sample_dir: str) -> List[str]:
+    """Every channel folder holding the same sample as `sample_dir`, itself first.
+
+    A project is laid out as ``<root>/<channel project>/<sample>``, so a sample's
+    other channels are the identically-named folders under the sibling channel
+    projects.
+
+    Resolved from the filesystem rather than from a ProjectManager on purpose.
+    The single-channel viewer is reachable without one (`project_manager` is an
+    optional argument to ``interactive_segmentation_with_config``), and this
+    module has to stay importable in a batch worker where no GUI object exists.
+    Where a registry IS available the two agree, because both normalise names
+    through ``clean_filename_for_matching``.
+
+    `sample_dir` always comes back first and is always included even if it fails
+    ``describe_channel`` -- the caller is standing in it, so excluding it would
+    mean refusing to write the region the user just drew. Every OTHER candidate
+    must pass ``describe_channel``: a name match with no image/config pair is an
+    export folder or a stray copy, not a channel.
+
+    Returns a single-element list when there is nothing to match against, which
+    is what makes every caller safe on a one-channel project.
+    """
+    sample_dir = os.path.abspath(sample_dir)
+    root = os.path.dirname(os.path.dirname(sample_dir))
+    target = clean_filename_for_matching(os.path.basename(sample_dir))
+
+    out = [sample_dir]
+    # realpath, so a symlinked channel project can't yield the same folder twice
+    # and have propagation delete a directory it is about to write into.
+    seen = {os.path.realpath(sample_dir)}
+
+    try:
+        channel_projects = sorted(os.listdir(root))
+    except OSError:
+        return out
+
+    for channel in channel_projects:
+        channel_path = os.path.join(root, channel)
+        if not os.path.isdir(channel_path):
+            continue
+        try:
+            folders = sorted(os.listdir(channel_path))
+        except OSError:
+            continue
+        for folder in folders:
+            if clean_filename_for_matching(folder) != target:
+                continue
+            path = os.path.join(channel_path, folder)
+            real = os.path.realpath(path)
+            if real in seen or not os.path.isdir(path):
+                continue
+            if describe_channel(path) is None:
+                continue
+            seen.add(real)
+            out.append(path)
+    return out
+
+
 # --------------------------------------------------------------------------- #
 # Plan / apply
 # --------------------------------------------------------------------------- #
@@ -538,20 +604,36 @@ SHAPE_MISMATCH = "shape_mismatch"  # channel's image doesn't match the drawing
 UNUSABLE = "unusable"        # not a valid sample folder (missing tif/yaml/mode)
 
 
-def choose_shared_roi_name(sample_dirs: Sequence[str]) -> str:
+def choose_shared_roi_name(sample_dirs: Sequence[str],
+                           reserved: Sequence[str] = ()) -> str:
     """An ROI name free in EVERY channel of a sample.
 
     Regions are propagated under one shared name so that "ROI 2" means the same
     region in every channel. Cross-channel analysis within a region depends on
     that correspondence, so the name has to be free everywhere rather than
     allocated per channel.
+
+    `reserved` are names already handed out in this same operation but not yet
+    on disk. One Apply can create several regions, and they are all named before
+    any is written, so disk state alone would name every one of them the same.
+
+    With a single-element `sample_dirs` and no reservations this is exactly
+    ``next_roi_name``, which is why a one-channel project sees no change in
+    behaviour from routing through here.
     """
     used = set()
+
+    def _claim(name: Any) -> None:
+        for token in str(name).split():
+            if token.isdigit():
+                used.add(int(token))
+
     for sample_dir in sample_dirs:
         for session in list_roi_sessions(sample_dir):
-            for token in str(session["name"]).split():
-                if token.isdigit():
-                    used.add(int(token))
+            _claim(session["name"])
+    for name in reserved:
+        _claim(name)
+
     n = 1
     while n in used:
         n += 1
@@ -781,6 +863,51 @@ def summarize_plan(plan: Sequence[Dict[str, Any]]) -> str:
                 )
             )
     return "\n\n".join(lines) if lines else "Nothing to do."
+
+
+def propagation_rows(plan: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Checkbox rows describing a propagation plan, one per channel.
+
+    Returns ``{entry, enabled, default, label, tooltip}`` dicts, ready to hand to
+    a checkbox dialog. Qt-free: the caller builds the widgets.
+
+    Shared by the overlay panel and the single-channel viewer so the two paths
+    describe the same plan in the same words. When this lived inside the overlay
+    panel the per-channel viewer had no way to reuse it, which is how the two
+    drawing paths came to behave differently in the first place.
+
+    Ineligible channels come back as disabled rows carrying their reason rather
+    than being dropped: a channel silently missing from the list reads as a bug,
+    while a greyed row saying "image size doesn't match" explains itself.
+    """
+    rows: List[Dict[str, Any]] = []
+    for entry in plan:
+        status = entry.get("status")
+        channel = entry.get("channel", "?")
+        if status == NEW:
+            rows.append({
+                "entry": entry, "enabled": True, "default": True,
+                "label": f"{channel}  \u2014  no ROI yet",
+                "tooltip": entry.get("roi_dir", ""),
+            })
+        elif status == REPLACE:
+            n = len(entry.get("discards") or [])
+            rows.append({
+                "entry": entry, "enabled": True, "default": True,
+                "label": (f"{channel}  \u2014  replaces existing ROI"
+                          + (f" ({n} result file(s) deleted)" if n else "")),
+                "tooltip": entry.get("roi_dir", ""),
+            })
+        else:
+            reason = entry.get("reason") or (
+                "image size doesn't match" if status == SHAPE_MISMATCH
+                else "not a usable image folder"
+            )
+            rows.append({
+                "entry": entry, "enabled": False,
+                "label": f"{channel}  \u2014  cannot apply: {reason}",
+            })
+    return rows
 
 
 # --------------------------------------------------------------------------- #

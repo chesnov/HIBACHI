@@ -35,10 +35,11 @@ from PyQt5.QtWidgets import (  # type: ignore
 
 from .napari_shortcuts import shape_edit_block
 from .roi_sharing import (
-    HAS_ROI, NEW, NO_ROI, ORPHAN, REPLACE, SHAPE_MISMATCH, UNUSABLE,
+    HAS_ROI, NO_ROI, ORPHAN,
     apply_roi_clear, apply_roi_propagation, choose_shared_roi_name,
     group_rois_by_name, load_existing_rois, plan_roi_clear,
-    plan_roi_propagation, roi_record_from_polygons, rois_are_identical,
+    plan_roi_propagation, propagation_rows, roi_record_from_polygons,
+    rois_are_identical,
 )
 
 ROI_LAYER_NAME = "ROI Selection"
@@ -595,33 +596,7 @@ class OverlayROIPanel:
         new_name = choose_shared_roi_name(self.sample_dirs)
         plan = plan_roi_propagation(self.sample_dirs, self.full_shape,
                                     roi_name=new_name)
-        rows = []
-        for entry in plan:
-            status = entry.get("status")
-            channel = entry.get("channel", "?")
-            if status == NEW:
-                rows.append({
-                    "entry": entry, "enabled": True, "default": True,
-                    "label": f"{channel}  \u2014  no ROI yet",
-                    "tooltip": entry.get("roi_dir", ""),
-                })
-            elif status == REPLACE:
-                n = len(entry.get("discards") or [])
-                rows.append({
-                    "entry": entry, "enabled": True, "default": True,
-                    "label": (f"{channel}  \u2014  replaces existing ROI"
-                              + (f" ({n} result file(s) deleted)" if n else "")),
-                    "tooltip": entry.get("roi_dir", ""),
-                })
-            else:
-                reason = entry.get("reason") or (
-                    "image size doesn't match" if status == SHAPE_MISMATCH
-                    else "not a usable image folder"
-                )
-                rows.append({
-                    "entry": entry, "enabled": False,
-                    "label": f"{channel}  \u2014  cannot apply: {reason}",
-                })
+        rows = propagation_rows(plan)
 
         bbox = record["bbox"]
         z_note = ""

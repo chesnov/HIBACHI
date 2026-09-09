@@ -28,8 +28,10 @@ What this module guarantees
 ---------------------------
 *   `analyze_segmentation` works at either rank, taking `spacing` ordered like
     the array axes.
-*   `analyze_segmentation_2d` still exists and still behaves exactly as it did,
-    so existing callers and saved workflows keep working.
+*   `analyze_segmentation_2d` still exists, so existing callers and saved
+    workflows keep working. Its signature is unchanged with one exception:
+    `calculate_solidity` defaults to False rather than True, which is now the
+    same default at both ranks and the same as the shipped config.
 *   `export_to_fcs` is defined once here. The two tracks' copies were identical
     apart from a docstring and one error string, so it was never rank-specific.
 
@@ -170,7 +172,12 @@ def analyze_segmentation_2d(segmented_array, *args, **kwargs):
     2D entry point, kept so existing callers keep working.
 
     Forwards untouched to the 2D implementation, including its `spacing_yx`
-    argument name and its `calculate_solidity=True` default. New code should call
-    `analyze_segmentation`.
+    argument name. New code should call `analyze_segmentation`.
+
+    `calculate_solidity` now defaults to False here, in `features_2d` and in
+    `features_3d` alike. It was the one parameter whose default depended on
+    rank, so a direct call measured a different feature set for a plane than
+    for a stack. Nothing in the app relied on it -- every strategy passes the
+    value from the config -- so the only callers affected are direct ones.
     """
     return _impl(2).analyze_segmentation_2d(segmented_array, *args, **kwargs)
