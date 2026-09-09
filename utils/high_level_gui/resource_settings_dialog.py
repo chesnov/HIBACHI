@@ -20,8 +20,13 @@ from PyQt5.QtWidgets import (  # type: ignore
     QHBoxLayout, QLabel, QMessageBox, QPushButton, QSpinBox, QVBoxLayout,
 )
 
+# This module lives in `high_level_gui/`; `resource_budget` lives in
+# `fluorescence_module/` beside the pipeline steps that consume it. Same
+# cross-package form `project_view_window` already uses for
+# `config_migration.normalise_mode`. Getting this wrong is silent until the
+# dialog is opened, at which point the import fails.
 try:
-    from . import resource_budget
+    from ..fluorescence_module import resource_budget
 except ImportError:  # pragma: no cover - direct script execution
     import resource_budget
 
