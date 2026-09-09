@@ -19,6 +19,12 @@
 # programs in Windows PowerShell 5.1 -- which is exactly how a failed `git fetch`
 # used to slip through and leave the old version installed while reporting success.
 #
+# The same preference has the opposite failure mode for REDIRECTED native
+# output: `cmd 2>&1` under "Stop" turns the first stderr line into a
+# terminating error, so a harmless pip warning killed successful installs. Every
+# `2>&1` in this file therefore drops back to "Continue" and decides success
+# from the exit code. See the pip phase (section 4) for the full story.
+#
 # =============================================================================
 # WHY THERE IS A PROGRESS WINDOW  (the most important thing in this file)
 # -----------------------------------------------------------------------------
@@ -475,8 +481,17 @@ if missing:
 '@
     $probeFile = Join-Path $InstallDir ".env_probe.py"
     Set-Content -LiteralPath $probeFile -Value $probe -Encoding UTF8 -Force
-    $out = & $EnvPy $probeFile @RequiredModules 2>&1
-    $rc  = $LASTEXITCODE
+    # Same 5.1 trap as the pip phase: a redirected native command that writes to
+    # stderr raises a terminating error under "Stop". Python routinely writes
+    # DeprecationWarnings there, and one of those must not be mistaken for a
+    # broken environment (or, worse, abort the whole installer). The probe's
+    # exit code is the verdict.
+    $prevEap = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try {
+        $out = & $EnvPy $probeFile @RequiredModules 2>&1 | ForEach-Object { [string]$_ }
+        $rc  = $LASTEXITCODE
+    } finally { $ErrorActionPreference = $prevEap }
     Remove-Item -LiteralPath $probeFile -Force -ErrorAction SilentlyContinue
     if ($rc -eq 0) { return "" }
     return ($out | Out-String)
@@ -590,7 +605,23 @@ try {
         # updates.
         $n   = 0
         $pct = 32.0
-        & $EnvPy -m pip install --no-input --progress-bar off -r $reqsFile 2>&1 | ForEach-Object {
+        # WHY $ErrorActionPreference IS RELAXED HERE
+        # Windows PowerShell 5.1 wraps every stderr line from a native command
+        # in a NativeCommandError record as soon as the stream is redirected
+        # (`2>&1`), and with the preference set to "Stop" the FIRST such line is
+        # a TERMINATING error. pip uses stderr for ordinary warnings -- notably
+        # "WARNING: The script qtpy.exe is installed in ...\Scripts which is not
+        # on PATH", emitted at the very end of a SUCCESSFUL install -- so a
+        # complete environment used to be thrown away at ~90% with that warning
+        # reported to the user as the reason setup failed. Success is judged by
+        # pip's exit code below, never by whether it wrote to stderr.
+        # --no-warn-script-location silences that particular warning too: the
+        # env is only ever used through its absolute interpreter path, so
+        # nothing here needs Scripts\ on PATH.
+        $prevEap = $ErrorActionPreference
+        $ErrorActionPreference = "Continue"
+        try {
+        & $EnvPy -m pip install --no-input --no-warn-script-location --progress-bar off -r $reqsFile 2>&1 | ForEach-Object {
             $line = [string]$_
             Add-Content -LiteralPath $PipLog -Value $line
             if ($line -match 'Collecting\s+(.+)$') {
@@ -608,6 +639,7 @@ try {
             }
         }
         $pipRc = $LASTEXITCODE
+        } finally { $ErrorActionPreference = $prevEap }
         Remove-Item -LiteralPath $reqsFile -Force -ErrorAction SilentlyContinue
         if ($pipRc -ne 0) {
             Assert-NotCancelled       # a Cancel mid-download kills pip
