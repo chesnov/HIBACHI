@@ -401,6 +401,7 @@ def _find_largest_hull_component_slice_graph(hull_memmap: np.memmap) -> None:
     prev_labeled = None
 
     for z in tqdm(range(total_z), desc="    SliceGraph Pass 1"):
+        resource_budget.check_cancelled()
         hull_slice = hull_memmap[z]
         if not np.any(hull_slice):
             prev_labeled = None
@@ -453,6 +454,7 @@ def _find_largest_hull_component_slice_graph(hull_memmap: np.memmap) -> None:
     removed = 0
 
     for z in tqdm(range(total_z), desc="    SliceGraph Pass 2"):
+        resource_budget.check_cancelled()
         hull_slice = hull_memmap[z].copy()
         if not np.any(hull_slice):
             continue
@@ -650,6 +652,7 @@ def _trim_zero_data_edges(
     _tiles = list(chunk_read_write_slices(
         labels_memmap.shape, plan.block_shape, overlap=halo))
     for read_sl, write_sl in tqdm(_tiles, desc="    Zero-Edge Trim"):
+        resource_budget.check_cancelled()
         vol_chunk = np.asarray(volume[read_sl])
 
         # 1. Identify 'True Zero' (with epsilon)
@@ -756,6 +759,7 @@ def trim_edges_with_core_protection(
 
     for _z, _hp in tqdm(list(planes_of(np.asarray(hull_memmap))),
                         desc="    Distance Transform"):
+        resource_budget.check_cancelled()
         for _r, _w in _inplane_tiles:
             _sub = distance_transform_edt(
                 _hp[_r], sampling=spacing_yx).astype(np.float32)
@@ -802,6 +806,7 @@ def trim_edges_with_core_protection(
     _tiles = list(chunk_read_write_slices(
         labels_memmap.shape, _scan_plan.block_shape, overlap=scan_overlap))
     for read_sl, write_sl in tqdm(_tiles, desc="    Processing"):
+        resource_budget.check_cancelled()
         lbl_chunk = np.asarray(labels_memmap[read_sl])
         if not np.any(lbl_chunk):
             continue

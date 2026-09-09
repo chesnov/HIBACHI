@@ -70,6 +70,7 @@ from __future__ import annotations
 
 import json
 import math
+import threading
 import os
 import subprocess
 import sys
@@ -87,6 +88,11 @@ except ImportError:  # pragma: no cover - psutil is in environment.yml
 
 __all__ = [
     "GB",
+    "ProcessingCancelled",
+    "cancel_requested",
+    "check_cancelled",
+    "clear_cancel",
+    "request_cancel",
     "MIN_RAM_GB",
     "PINNED",
     "BlockPlan",
@@ -1238,6 +1244,77 @@ def describe_environment(settings: Optional[ResourceSettings] = None) -> str:
         f"[{cfg.origin}]\n"
         f"  [resources] settings file: {settings_path()}"
     )
+
+
+# --------------------------------------------------------------------------
+# Cooperative cancellation
+# --------------------------------------------------------------------------
+# Here rather than in a module of its own because it is the other half of the
+# same question -- a budget says how much of the machine a run may use, this
+# says for how long -- and because every step already imports this module, so a
+# cancellation point costs no new import.
+#
+# Why it is needed: `gui_manager._stop_worker_safely` used to stop a step by
+# killing the child processes it had spawned, on the stated assumption that the
+# worker thread would then unwind on its own. That holds only for steps that
+# USE a pool. Steps 2 and 4 are single-threaded and in-process, so there were no
+# children to kill: the thread was detached and ran the entire step to
+# completion, holding a core and several GB long after the window had closed.
+#
+# `QThread.terminate()` is not the alternative. It stops a thread at an
+# arbitrary instruction, which halfway through writing a memmap leaves a
+# truncated artifact and inside a C extension aborts the process. Hence a
+# cooperative flag, checked at boundaries the step chooses.
+#
+# Usage, once per chunk / tile / window -- never per voxel:
+#
+#     resource_budget.check_cancelled()
+#
+# A cancellation point must be somewhere stopping is SAFE: every artifact
+# written so far either complete, or about to be deleted by the caller. Do not
+# put one between two writes that must both land.
+#
+# Process-global, deliberately: one window runs one step at a time, and
+# threading a token through five modules' call signatures would touch far more
+# code than the problem is worth. It is not inherited by multiprocessing
+# children -- those are still stopped by killing them, which stays correct.
+
+class ProcessingCancelled(Exception):
+    """Raised by `check_cancelled()` when the user has asked the current step to stop.
+
+    Caught by `StepWorker.run`, which reports it as a cancellation rather than
+    an error -- it is not a failure, and it should not raise an error dialog or
+    a crash report.
+    """
+
+
+_cancelled = threading.Event()
+
+
+def request_cancel() -> None:
+    """Ask the running step to stop at its next cancellation point."""
+    _cancelled.set()
+
+
+def clear_cancel() -> None:
+    """Reset before starting a step.
+
+    Called when a step is launched, not when one finishes: a step that ended by
+    being cancelled must leave the flag set until the next one starts, or a
+    second step queued behind it would run with a stale request.
+    """
+    _cancelled.clear()
+
+
+def cancel_requested() -> bool:
+    """True when cancellation has been asked for. Does not raise."""
+    return _cancelled.is_set()
+
+
+def check_cancelled() -> None:
+    """Raise `ProcessingCancelled` if cancellation has been requested."""
+    if _cancelled.is_set():
+        raise ProcessingCancelled("processing cancelled by the user")
 
 
 if __name__ == "__main__":  # pragma: no cover - manual inspection

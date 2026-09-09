@@ -155,6 +155,23 @@ class OutputStream(QObject):
 
 import atexit
 
+# Cancellation lives in `resource_budget` (fluorescence_module) rather than in a
+# module of its own: it is the other half of the same question -- a budget says
+# how much of the machine a run may use, this says for how long -- and every
+# pipeline step already imports that module.
+try:
+    from ..fluorescence_module.resource_budget import (
+        ProcessingCancelled,
+        clear_cancel as _cancel_clear,
+        request_cancel as _cancel_request,
+    )
+except ImportError:  # pragma: no cover - direct script execution
+    from resource_budget import (
+        ProcessingCancelled,
+        clear_cancel as _cancel_clear,
+        request_cancel as _cancel_request,
+    )
+
 _orphan_threads = []
 _quit_hook_connected = False
 
@@ -163,14 +180,28 @@ def _cleanup_all_orphans():
     pending = [w for w in _orphan_threads if w is not None]
     if pending:
         lifecycle("orphan_threads.cleanup", count=len(pending))
+    # Ask first, then wait, then force. `terminate()` alone was the whole
+    # policy, and it stops a thread at an arbitrary instruction -- mid-write to
+    # a memmap, or inside a C extension where it aborts the process. Requesting
+    # cancellation gives the step a chance to stop at a boundary it chose; the
+    # wait below is what makes that chance real.
+    _cancel_request()
+    deadline_ms = 10_000
     for worker in list(_orphan_threads):
         try:
             if worker is not None and worker.isRunning():
-                log.warning("Terminating still-running orphan worker thread at exit: %r", worker)
-                worker.terminate()
-                worker.wait(200) # Give it time to cleanly exit C++ scope
+                log.warning("Waiting for orphan worker thread to stop: %r", worker)
+                if not worker.wait(deadline_ms):
+                    log.warning("Orphan worker did not stop in %ss; terminating: %r",
+                                deadline_ms // 1000, worker)
+                    worker.terminate()
+                    worker.wait(200)  # Give it time to cleanly exit C++ scope
+                # Only the FIRST thread gets the full grace period. Several
+                # orphans each waiting ten seconds would make closing the window
+                # feel broken.
+                deadline_ms = 1_000
         except Exception:
-            log.exception("Error terminating orphan thread")
+            log.exception("Error stopping orphan thread")
     _orphan_threads.clear()
 
 def _register_quit_hook():
@@ -278,6 +309,16 @@ class StepWorker(QThread):
             )
             lifecycle("worker.run.finish", step=self.step_index, success=bool(success))
             self.finished_signal.emit(success)
+        except ProcessingCancelled:
+            # Not a failure: the user closed the window or moved on, and the step
+            # stopped at a boundary it chose. Reported separately so it raises no
+            # error dialog and writes no crash report. Any partial artifact is
+            # removed by `_discard_step_artifact` in the manager, because a step
+            # is judged complete by its artifact EXISTING -- a truncated file
+            # would be treated as a finished step on the next run.
+            lifecycle("worker.run.cancelled", step=self.step_index)
+            log.info("Step %s cancelled by user request.", self.step_index)
+            self.finished_signal.emit(False)
         except Exception as e:
             log.exception("Worker step %s failed", self.step_index)
             self.error_signal.emit(str(e))
@@ -1726,6 +1767,34 @@ class DynamicGUIManager(QObject):
 
         print("[ROI] Returned to full-image mode.")
 
+    def _discard_step_artifact(self) -> None:
+        """Delete the output of the step that was just interrupted.
+
+        Best-effort and deliberately narrow: only the artifact named by the
+        interrupted step's `StepDefinition`, never a whole directory. Losing a
+        cancelled step's partial output is correct; deleting a neighbouring
+        completed one would not be.
+        """
+        idx = getattr(self, "_cancelled_step_index", None)
+        strategy = getattr(self, "strategy", None)
+        if idx is None or strategy is None:
+            return
+        try:
+            steps = strategy.get_step_definitions()
+            if not (0 <= idx < len(steps)):
+                return
+            key = steps[idx].get("artifact")
+            if not key:
+                return                      # repeatable step, nothing to undo
+            path = strategy.get_checkpoint_files().get(key)
+            if path and os.path.exists(path):
+                os.remove(path)
+                lifecycle("worker.stop.artifact_discarded", step=idx, key=key)
+                log.info("Discarded partial artifact for cancelled step %s: %s",
+                         idx, path)
+        except Exception:
+            log.exception("Could not discard the cancelled step's artifact")
+
     def _stop_worker_safely(self) -> None:
         """Stops a running step: kills the worker processes it spawned, then
         detaches the (now quickly-unwinding) thread so it can't crash the app on
@@ -1735,9 +1804,20 @@ class DynamicGUIManager(QObject):
                       baseline_pids=len(getattr(self, '_worker_child_baseline', set())))
             _register_quit_hook()  # Ensure cleanup happens at shutdown
 
-            # Kill the multiprocessing.Pool workers this step spawned. Once they
-            # die, the imap loop in the worker thread raises and unwinds on its
-            # own — no computation keeps running in the background.
+            # FIRST, ask the step itself to stop.
+            #
+            # Killing the children is not enough, and the comment below used to
+            # claim it was. Steps 2 and 4 are single-threaded and in-process, so
+            # they spawn no children: nothing was killed, the thread was
+            # detached, and it went on to run the entire step -- holding a core
+            # and several GB long after the window was gone. The flag is checked
+            # at chunk boundaries, so the step stops somewhere its data is in a
+            # known state.
+            _cancel_request()
+
+            # Then kill the multiprocessing.Pool workers this step spawned, for
+            # the steps that have them. Once they die, the imap loop in the
+            # worker thread raises and unwinds on its own.
             try:
                 _terminate_new_children(getattr(self, '_worker_child_baseline', set()))
             except Exception:
@@ -1761,6 +1841,16 @@ class DynamicGUIManager(QObject):
             # reading a memmap we might otherwise free.
             self.worker._preserved_strategy = self.strategy
             self.worker._preserved_stack = self.image_stack
+
+            # Remove the artifact of the step being interrupted.
+            #
+            # A step is judged complete by its artifact EXISTING
+            # (`StepDefinition.artifact`), and several steps create their output
+            # file at full size before filling it -- step 4 opens
+            # `final_seg_path` with mode='w+' and then copies into it. Stopping
+            # midway would leave a correctly-sized, partly-written file that the
+            # next run reads as a finished step and builds on.
+            self._discard_step_artifact()
 
             self.worker.setParent(None)
             _orphan_threads.append(self.worker)
@@ -2578,6 +2668,11 @@ class DynamicGUIManager(QObject):
         # Record existing children first so _stop_worker_safely can later kill
         # only the pool workers *this* step spawns.
         self._worker_child_baseline = _snapshot_child_pids()
+        # Cleared here rather than when a step ENDS: a step that ended by being
+        # cancelled must leave the flag set, or anything queued behind it would
+        # start with a stale request already pending.
+        _cancel_clear()
+        self._cancelled_step_index = step_index
         lifecycle("worker.start", step=step_index,
                   baseline_children=len(self._worker_child_baseline))
         self.worker = StepWorker(
