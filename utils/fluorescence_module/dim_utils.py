@@ -32,7 +32,7 @@ entries in both cases, which is why several helpers index ``[-2:]`` rather than
 """
 
 import sys
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 
@@ -303,7 +303,7 @@ def generate_tiles(
 def chunk_read_write_slices(
     shape: Sequence[int],
     chunk_shape: Optional[Sequence[int]] = None,
-    overlap: int = 0,
+    overlap: Union[int, Sequence[int]] = 0,
 ):
     """
     Yield ``(read_slice, write_slice)`` pairs for chunked processing, any rank.
@@ -318,6 +318,14 @@ def chunk_read_write_slices(
 
     ``chunk_shape`` defaults to ``(64, 512, 512)`` in 3D and ``(2048, 2048)`` in
     2D, preserving each track's original default. A scalar is broadcast.
+
+    ``overlap`` is a scalar broadcast to every axis, or one value PER AXIS. The
+    per-axis form exists because a halo derived from a PHYSICAL reach is not the
+    same number of voxels on every axis: a 30um reach is 100 pixels at 0.3um
+    in-plane but 15 at 2um in Z, and a scalar halo would have to take the
+    largest of those and pay it on every axis -- nearly seven times the
+    redundant computation along Z, for nothing. Callers computing a halo from
+    microns should divide by each axis's own spacing.
     """
     shape = tuple(int(v) for v in shape)
     nd = len(shape)
@@ -330,6 +338,18 @@ def chunk_read_write_slices(
         chunk_shape = (chunk_shape[-nd:] if len(chunk_shape) > nd
                        else (chunk_shape[0],) * (nd - len(chunk_shape)) + chunk_shape)
 
+    if np.isscalar(overlap):
+        overlaps = (int(overlap),) * nd
+    else:
+        overlaps = tuple(int(v) for v in overlap)
+        if len(overlaps) != nd:
+            raise ValueError(
+                f"overlap must be a scalar or one value per axis; got "
+                f"{len(overlaps)} values for a {nd}D shape"
+            )
+    if any(v < 0 for v in overlaps):
+        raise ValueError(f"overlap must be non-negative; got {overlaps}")
+
     def rec(axis: int, w: List[slice], r: List[slice]):
         if axis == nd:
             yield tuple(r), tuple(w)
@@ -339,8 +359,8 @@ def chunk_read_write_slices(
             yield from rec(
                 axis + 1,
                 w + [slice(start, stop)],
-                r + [slice(max(0, start - overlap),
-                           min(shape[axis], stop + overlap))],
+                r + [slice(max(0, start - overlaps[axis]),
+                           min(shape[axis], stop + overlaps[axis]))],
             )
 
     yield from rec(0, [], [])

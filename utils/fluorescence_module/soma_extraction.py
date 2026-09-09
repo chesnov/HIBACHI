@@ -20,6 +20,7 @@ import gc
 import math
 import time
 import traceback
+import multiprocessing as mp
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
@@ -34,6 +35,7 @@ from tqdm import tqdm
 # structuring elements, spacing conventions, tiling -- lives there, so this
 # module carries one implementation instead of two that drift apart.
 try:
+    from . import resource_budget
     from .dim_utils import (
         generate_tiles,
         normalise_spacing,
@@ -42,6 +44,7 @@ try:
         tile_target_contains,
     )
 except ImportError:  # pragma: no cover - direct script execution
+    import resource_budget
     from dim_utils import (
         generate_tiles,
         normalise_spacing,
@@ -238,6 +241,380 @@ def get_min_distance_pixels(
     return pixels_from_physical(spacing, physical_distance,
                                 min_pixels=3, label=label)
 
+# --------------------------------------------------------------------------
+# Candidate generation, split out so it can run in parallel
+# --------------------------------------------------------------------------
+def _generate_label_candidates(
+    lbl: int,
+    sl: Tuple[slice, ...],
+    segmentation_mask: np.ndarray,
+    intensity_image: np.ndarray,
+    spacing: Sequence[float],
+    ndim: int,
+    strategies: List[Dict[str, Any]],
+    tile_size: Sequence[int],
+    min_seed_vol: int,
+    absolute_min_thickness_um: float,
+    absolute_max_thickness_um: float,
+    max_allowed_core_aspect_ratio: float,
+    intensity_smooth_um: float,
+    intensity_weight: float,
+    int_peak_sep: int,
+    memmap_voxel_threshold: int,
+    show_tile_bar: bool = True,
+) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
+    """
+    Every candidate one label offers, plus that label's diagnostic tallies.
+
+    Lifted verbatim out of the main loop. Nothing in here reads or writes the
+    placed-peak grid, the output mask or the running label id, which is the
+    property that makes it safe to run several labels at once: generation is a
+    pure function of the label's bounding box and the two read-only images.
+    Placement is the part that carries state, and it stays sequential and in
+    ascending label order in the caller.
+
+    Two ordering guarantees this function must keep, because the caller's
+    `sort(key=(score, vol), reverse=True)` is STABLE and therefore breaks ties
+    by insertion order:
+
+      * tiles are visited in `generate_tiles` order, and
+      * strategies in `strategies` order,
+
+    so `label_candidates` comes back in exactly the sequence the single-threaded
+    version built it. Reassembling label results out of order, or appending
+    across labels, would silently re-break those ties.
+
+    `diag_stats` is returned as a delta rather than mutated in place, since a
+    worker process cannot share the caller's dict. The counters are pure sums,
+    so merging deltas in any order gives the same totals.
+    """
+    diag_stats = {
+        "cores_evaluated": 0,
+        "cores_too_small": 0,
+        "thickness_rejected": 0,
+        "aspect_ratio_rejected": 0,
+        "spatial_overlap_rejected": 0,
+        "pushed_and_dropped": 0,
+    }
+    # `sl` arrives as a parameter now; the loop used to read it from the
+    # module-level `slices` list, which a worker process does not have.
+    num_voxels = np.prod([s.stop - s.start for s in sl])
+    is_huge = num_voxels > memmap_voxel_threshold
+
+    # Tile clump if it exceeds threshold
+    tiles = generate_tiles(
+        sl, tile_size,
+        padding=int(absolute_max_thickness_um / min(spacing) + 2)
+    )
+    label_candidates = []
+
+    # Per-label deduplication list (Fix 1 from previous iteration):
+    # prevents two seeds from the same merged object being placed too close.
+    # Cross-label deduplication is handled by the pixel-overlap check.
+    label_placed_peaks: List = []
+
+    tile_pbar = tqdm(
+        tiles, desc=f"  ↳ Clump {lbl}", leave=False, unit="tile",
+        disable=not (is_huge and show_tile_bar)
+    )
+
+    for t_idx, t in enumerate(tile_pbar):
+        pad_sl = tile_slices(t["pad"])
+        t_mask = segmentation_mask[pad_sl] == lbl
+        if not np.any(t_mask):
+            continue
+
+        t_int = intensity_image[pad_sl]
+        offset = np.array([sl_.start for sl_ in pad_sl])
+        dt_obj = ndimage.distance_transform_edt(t_mask, sampling=spacing)
+        max_dt_val = np.max(dt_obj)
+
+        def process_frag_logic(mask_arr, sub_off):
+            """Checks morphological validity and converts to global coords."""
+            local_coords = np.argwhere(mask_arr)
+            tile_coords = local_coords + sub_off
+            g_coords = tile_coords + offset
+
+            # Thickness: max inscribed radius in the full object (Fix 1)
+            dt_vals = dt_obj[tuple(tile_coords.T)]
+            max_thick = np.max(dt_vals)
+
+            # Lower bound is a hard rejection: the fragment is too thin regardless
+            # of how it is sub-sampled, so discard immediately.
+            if max_thick < absolute_min_thickness_um:
+                diag_stats["thickness_rejected"] += 1
+                return
+
+            # Upper bound: rather than discarding the whole fragment, attempt to
+            # recover a sub-kernel — the voxels whose inscribed-sphere radius is
+            # within the accepted thickness window.  This preserves somas that have
+            # already been selected from a neighbouring strategy while still
+            # honouring the morphological constraint at the kernel level.
+            if max_thick > absolute_max_thickness_um:
+                # Keep the inner core, discard the periphery
+                min_allowed_dt = max_thick - absolute_max_thickness_um
+                within_upper = dt_vals >= min_allowed_dt
+                
+                if not np.any(within_upper):
+                    diag_stats["thickness_rejected"] += 1
+                    return
+                
+                sub_dt_vals = dt_vals[within_upper]
+                
+                # Effective thickness is the internal radius from the new boundary to the peak
+                effective_thickness = np.max(sub_dt_vals) - np.min(sub_dt_vals)
+                if effective_thickness < absolute_min_thickness_um:
+                    diag_stats["thickness_rejected"] += 1
+                    return
+                    
+                # Narrow all coordinate arrays to the valid sub-kernel voxels.
+                local_coords = local_coords[within_upper]
+                tile_coords  = tile_coords[within_upper]
+                g_coords     = g_coords[within_upper]
+                dt_vals      = sub_dt_vals
+                max_thick    = np.max(sub_dt_vals)  # keeps the true peak value intact
+                sub_min      = local_coords.min(axis=0)
+                sub_shape    = local_coords.max(axis=0) - sub_min + 1
+                mask_arr     = np.zeros(sub_shape, dtype=bool)
+                mask_arr[tuple((local_coords - sub_min).T)] = True
+                local_coords = local_coords - sub_min
+
+            # DT peak voxel — nucleus geometric centre regardless of strategy
+            peak_idx = int(np.argmax(dt_vals))
+            peak_coord_g = g_coords[peak_idx]          # global voxel coords
+
+            # Per-coord intensity, retained so an Int candidate can later be
+            # shrunk by its OWN brightness (family-preserving push-apart).
+            int_vals = t_int[tuple(tile_coords.T)]
+
+            # Elongation check (3D). A near-zero minor axis (a 1-voxel-thick
+            # line) is the degenerate, maximally-elongated case -> treated as
+            # elongated by _core_is_elongated.
+            if mask_arr.sum() > 10 and _core_is_elongated(
+                local_coords, spacing, max_allowed_core_aspect_ratio, ndim
+            ):
+                # Recovery: shave the low-DT tails, then keep the LARGEST
+                # connected fragment, recompute the peak, and RE-CHECK size +
+                # aspect (same threshold). A survivor that is still elongated
+                # (a real process with no compact body) is rejected.
+                core_threshold = max_thick - (absolute_min_thickness_um * 0.5)
+                valid_core = dt_vals >= core_threshold
+                ok, keep, pk = _finalize_core(
+                    g_coords[valid_core], dt_vals[valid_core], spacing,
+                    min_seed_vol, max_allowed_core_aspect_ratio, ndim
+                )
+                if not ok:
+                    diag_stats["aspect_ratio_rejected"] += 1
+                    return
+                # Re-align every per-coord array to the recovered core.
+                vc = valid_core
+                g_coords = g_coords[vc][keep]
+                dt_vals  = dt_vals[vc][keep]
+                int_vals = int_vals[vc][keep]
+                peak_coord_g = pk
+                mask_arr = np.ones(g_coords.shape[0], dtype=bool)  # vol == len(coords)
+
+            # Tiling check: use mean centroid (unchanged)
+            cent = np.mean(g_coords, axis=0)
+            if tile_target_contains(t["target"], cent):
+                rank_vals = int_vals if strat["type"] == "Int" else dt_vals
+                label_candidates.append(
+                    {
+                        "coords": g_coords.astype(np.int32),
+                        "peak_coord": peak_coord_g,
+                        "vol": int(mask_arr.sum()),
+                        "score": strat["score"],
+                        "strat_name": f"{strat['type']}_{strat['val']}",
+                        "frag_max_thick": max_thick,
+                        "family": strat["type"],
+                        "dt_vals": np.asarray(dt_vals, np.float32),
+                        "rank_vals": np.asarray(rank_vals, np.float32),
+                    }
+                )
+
+        # Strategy Loop with Early Stopping
+        _t_int_smooth = None  # per-tile cache of the smoothed intensity
+        for strat in strategies:
+            if is_huge and show_tile_bar:
+                tile_pbar.set_postfix(
+                    {
+                        "Strat": f"{strat['type']}{strat['val']}",
+                        "Cands": len(label_candidates),
+                        "RAM": f"{get_ram_usage():.1f}G",
+                    }
+                )
+
+            if strat["type"] == "DT":
+                thresh = max_dt_val * strat["val"]
+                if thresh <= 0:
+                    continue
+                core = (dt_obj >= thresh) & t_mask
+                dt_ref = dt_obj
+            else:
+                # Intensity percentile strategy
+                #
+                # Threshold a SMOOTHED copy when intensity_smooth_um > 0.
+                # Percentile thresholding inside a nucleus selects speckle
+                # texture, so the surviving core is a dendritic web rather than a
+                # blob: measured on a Hoechst stack, 72% of placed seeds had a
+                # bounding-box fill below 0.30, and the p85 core of one object was
+                # 1357 voxels spread over 35 disconnected fragments, nearly all of
+                # which then died on min_fragment_size. Smoothing is applied in
+                # PHYSICAL units so anisotropic z is honoured, and is cached once
+                # per tile. 0.0 um reproduces the previous behaviour exactly.
+                t_int_thresh = t_int
+                _sm_um = float(intensity_smooth_um)
+                if _sm_um > 0:
+                    if _t_int_smooth is None:
+                        _t_int_smooth = ndimage.gaussian_filter(
+                            t_int.astype(np.float32),
+                            tuple(_sm_um / sp for sp in spacing),
+                        )
+                    t_int_thresh = _t_int_smooth
+                vals = t_int_thresh[t_mask]
+                if vals.size == 0:
+                    continue
+                core = (t_int_thresh >= np.percentile(vals, strat["val"])) & t_mask
+                # Calculate local DT for peak splitting
+                dt_ref = ndimage.distance_transform_edt(core, sampling=spacing)
+
+            # Early Stopping: If core is already too small for priority, skip lower strats
+            if np.sum(core) < min_seed_vol:
+                continue
+
+            # Island detection via connected components
+            labeled_core, n = ndimage.label(core)
+            for region in regionprops(labeled_core):
+                diag_stats["cores_evaluated"] += 1
+                if region.area < min_seed_vol:
+                    diag_stats["cores_too_small"] += 1
+                    continue
+
+                # Local Watershed Splitting for clumped peaks
+                frag_crop = region.image
+                frag_dt = ndimage.distance_transform_edt(frag_crop, sampling=spacing)
+                # Blend intensity into the split field when intensity_weight > 0.
+                #
+                #     field = dt * (1 + intensity_weight * normalised_intensity)
+                #
+                # This is the same functional form, meaning and range as
+                # `intensity_weight` in the separation step
+                # (cell_splitting._expansion_speed), so the parameter reads the
+                # same way in both places; 0.0 is pure DT, i.e. previous
+                # behaviour. It matters because an elongated core covering two
+                # touching nuclei has a single DT maximum, so the peak search
+                # finds one marker and the pair is never split. Response is a
+                # broad plateau: 0.25 to 5.0 gave identical results on the test
+                # stack, so the exact value is not critical.
+                _iw = float(intensity_weight)
+                if _iw > 0:
+                    _bb = region.bbox
+                    _isl = tile_slices(_bb)
+                    _fi = ndimage.gaussian_filter(
+                        np.asarray(t_int[_isl], dtype=np.float32) * frag_crop,
+                        tuple(0.5 / sp for sp in spacing))
+                    _v = _fi[frag_crop]
+                    if _v.size:
+                        _lo, _hi = float(_v.min()), float(_v.max())
+                        if _hi > _lo:
+                            frag_dt = frag_dt * (
+                                1.0 + _iw * ((_fi - _lo) / (_hi - _lo))
+                            ) * frag_crop
+
+                # exclude_border=False is REQUIRED here, not cosmetic.
+                # peak_local_max defaults exclude_border to min_distance and
+                # applies it to EVERY axis. int_peak_sep comes from the lateral
+                # spacing, so on anisotropic data it is large in voxel terms
+                # (2.5 um / 0.156 um = 16 px). A z stack a few slices deep is
+                # then entirely inside the excluded border and peak_local_max
+                # returns nothing: `len(peaks) > 1` was never true and the
+                # clump-splitting watershed below never executed on a single
+                # fragment. Measured on a 2 um z-step Hoechst stack: 0 peaks for
+                # every one of the 8 largest clumps, 2-6 peaks each once fixed.
+                peaks = peak_local_max(
+                    frag_dt, min_distance=int_peak_sep, labels=frag_crop,
+                    exclude_border=False
+                )
+
+                if len(peaks) > 1:
+                    markers = np.zeros(frag_crop.shape, dtype=np.int32)
+                    for idx, pk in enumerate(peaks):
+                        markers[tuple(int(v) for v in pk)] = idx + 1
+                    ws = watershed(-frag_dt, markers, mask=frag_crop)
+                    for wid in range(1, len(peaks) + 1):
+                        m_ws = ws == wid
+                        if m_ws.sum() >= min_seed_vol:
+                            process_frag_logic(m_ws, region.bbox[:ndim])
+                else:
+                    process_frag_logic(region.image, region.bbox[:ndim])
+
+            del core
+            if 'dt_ref' in locals() and dt_ref is not dt_obj:
+                del dt_ref
+
+        del t_mask, t_int, dt_obj
+        if t_idx % 5 == 0:
+            gc.collect()
+
+
+    return label_candidates, diag_stats
+
+
+#: Per-worker handles, set once by the pool initializer. The images are reopened
+#: inside each process rather than pickled per task: they are memmaps, so this
+#: costs one mapping per worker and no data movement at all, where sending them
+#: with every label would copy each bounding box through a pipe.
+_WORKER_IMAGES: Dict[str, Any] = {}
+
+
+def _soma_worker_init(seg_info, int_info) -> None:
+    """Open the two images in this worker and pin BLAS to one thread.
+
+    Single-threaded BLAS both to stop `workers x cores` oversubscription and so
+    every worker computes identically. Verified that PCA on the Nx2 and Nx3
+    matrices this step builds returns bit-identical eigenvalues at one thread
+    and at four, so pinning does not move the aspect-ratio verdict.
+    """
+    for _v in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS",
+               "VECLIB_MAXIMUM_THREADS", "NUMEXPR_NUM_THREADS"):
+        os.environ[_v] = "1"
+    _WORKER_IMAGES["seg"] = np.memmap(seg_info[0], dtype=seg_info[2],
+                                      mode="r", shape=seg_info[1])
+    _WORKER_IMAGES["int"] = np.memmap(int_info[0], dtype=int_info[2],
+                                      mode="r", shape=int_info[1])
+
+
+def _soma_worker(task):
+    """Generate one label's candidates inside a pool worker."""
+    lbl, sl, params = task
+    try:
+        return lbl, _generate_label_candidates(
+            lbl, sl, _WORKER_IMAGES["seg"], _WORKER_IMAGES["int"],
+            show_tile_bar=False, **params
+        ), None
+    except Exception as exc:  # pragma: no cover - surfaced by the caller
+        return lbl, None, f"{type(exc).__name__}: {exc}"
+
+
+def _empty_seed_mask(segmentation_mask, memmap_dir, memmap_final_mask,
+                     memmap_output_path):
+    """An all-zero seed mask, on disk when the caller asked for disk.
+
+    Same decision the populated path makes, so the empty case does not quietly
+    become the one place that allocates the whole volume in RAM.
+    """
+    if memmap_dir is not None and memmap_final_mask:
+        os.makedirs(memmap_dir, exist_ok=True)
+        path = memmap_output_path or os.path.join(memmap_dir,
+                                                  "final_seed_mask.mmp")
+        out = np.memmap(path, dtype="int32", mode="w+",
+                        shape=segmentation_mask.shape)
+        out[:] = 0
+        out.flush()
+        return out
+    return np.zeros_like(segmentation_mask, dtype=np.int32)
+
+
 def extract_soma_masks(
     segmentation_mask: np.ndarray,
     intensity_image: np.ndarray,
@@ -289,7 +666,14 @@ def extract_soma_masks(
         absolute_min_thickness_um: Hard lower bound for soma thickness.
         absolute_max_thickness_um: Hard upper bound for soma thickness.
         memmap_dir: Directory to save the final memmap result.
-        memmap_voxel_threshold: Voxel count to trigger tiling logic.
+        memmap_voxel_threshold: Voxel count above which a clump is reported as
+            "huge". DISPLAY ONLY -- it controls whether the per-tile progress
+            bar and its RAM readout are shown, nothing else. Tiling is
+            unconditional: `generate_tiles` is called for every label. The name
+            and the previous description ("Voxel count to trigger tiling
+            logic") both predate that and were misleading; note also that
+            `fluorescence_strategy` passes this parameter to step 4, which does
+            not accept it, and never passes it here.
         memmap_final_mask: If True, saves result as a file in memmap_dir.
 
     Returns:
@@ -329,7 +713,11 @@ def extract_soma_masks(
     slices = ndimage.find_objects(segmentation_mask)
     valid_labels = [i + 1 for i, s in enumerate(slices) if s is not None]
     if not valid_labels:
-        return np.zeros_like(segmentation_mask, dtype=np.int32)
+        # A memmap when one is available, not `np.zeros_like`. The empty case
+        # allocated the whole volume as int32 in RAM -- the largest single
+        # allocation in the step, to return nothing.
+        return _empty_seed_mask(segmentation_mask, memmap_dir, memmap_final_mask,
+                                memmap_output_path)
 
     # 2. Absolute Mode Initialization & Profiling
     print(f"  Absolute Mode Enforced: Processing {len(valid_labels)} labels...")
@@ -360,6 +748,13 @@ def extract_soma_masks(
         final_seed_mask[:] = 0
         print(f"  Initialized output memmap at: {mmp_path}")
     else:
+        # Explicitly opted out of a memmap, so this is the caller's choice; it
+        # is still a full-volume int32 allocation and says so.
+        _ram_gb = 4 * int(np.prod(segmentation_mask.shape)) / (1024 ** 3)
+        if _ram_gb > 1.0:
+            print(f"  [resources] memmap_final_mask=False: holding the "
+                  f"{_ram_gb:.2f} GB output mask in RAM. Pass a memmap_dir to "
+                  f"stream it to disk instead.")
         final_seed_mask = np.zeros_like(segmentation_mask, dtype=np.int32)
 
     next_label_id = 1
@@ -379,333 +774,199 @@ def extract_soma_masks(
     strategies.sort(key=lambda x: x["score"], reverse=True)
 
     # 5. Processing Loop (Label-First)
-    main_pbar = tqdm(valid_labels, desc="Total Labels", unit="label", dynamic_ncols=True)
+    main_pbar = tqdm(total=len(valid_labels), desc="Total Labels", unit="label",
+                     dynamic_ncols=True)
 
-    for lbl_idx, lbl in enumerate(main_pbar):
-        sl = slices[lbl - 1]
-        num_voxels = np.prod([s.stop - s.start for s in sl])
-        is_huge = num_voxels > memmap_voxel_threshold
+    # --- Resource plan -------------------------------------------------
+    # The tile shape is PINNED. `max_dt_val` is computed PER TILE and every DT
+    # strategy thresholds at `max_dt_val * ratio`, so the tile extent sets every
+    # threshold; a detection is also attributed to the tile whose target region
+    # contains its centroid. Scaling it with the budget would make the somata
+    # found depend on the machine. So the geometry is fixed and only the number
+    # of tiles in flight is budgeted.
+    #
+    # Passed explicitly rather than left as `tile_size=None`. The default inside
+    # `generate_tiles` happens to be the same tuple, but a default that must
+    # never change is not a default -- it is a pinned constant, and it should
+    # say so at the call site.
+    if tile_size is None:
+        tile_size = resource_budget.pinned(
+            'soma_tile_shape_3d' if ndim == 3 else 'soma_tile_shape_2d')
 
-        # Tile clump if it exceeds threshold
-        tiles = generate_tiles(
-            sl, tile_size,
-            padding=int(absolute_max_thickness_um / min(spacing) + 2)
-        )
-        label_candidates = []
+    _budget = resource_budget.open_budget("step 3 soma extraction")
+    _plan = _budget.report(_budget.plan_pinned(
+        segmentation_mask.shape,
+        'soma_tile_shape_3d' if ndim == 3 else 'soma_tile_shape_2d',
+        "edt_3d" if ndim == 3 else "edt_2d",
+        name="soma tile (pinned geometry, budgeted concurrency)",
+    ))
 
-        # Per-label deduplication list (Fix 1 from previous iteration):
-        # prevents two seeds from the same merged object being placed too close.
-        # Cross-label deduplication is handled by the pixel-overlap check.
-        label_placed_peaks: List = []
+    # Parallel generation needs both images on disk so each worker can map them
+    # instead of receiving bounding boxes through a pipe. When either is a plain
+    # in-RAM array -- a direct caller, or a test -- generation stays in-process.
+    def _memmap_info(arr):
+        fn = getattr(arr, "filename", None)
+        if fn and os.path.exists(fn):
+            return (fn, tuple(arr.shape), np.dtype(arr.dtype))
+        return None
 
-        tile_pbar = tqdm(
-            tiles, desc=f"  ↳ Clump {lbl}", leave=False, unit="tile", disable=not is_huge
-        )
+    _seg_info = _memmap_info(segmentation_mask)
+    _int_info = _memmap_info(intensity_image)
+    _gen_workers = _plan.workers if (_seg_info and _int_info) else 1
+    _gen_workers = max(1, min(_gen_workers, len(valid_labels)))
+    if _gen_workers > 1 and not _plan.fits:
+        # One pinned tile already exceeds the ceiling; adding concurrency would
+        # multiply an allocation that is too large to begin with.
+        _gen_workers = 1
 
-        for t_idx, t in enumerate(tile_pbar):
-            pad_sl = tile_slices(t["pad"])
-            t_mask = segmentation_mask[pad_sl] == lbl
-            if not np.any(t_mask):
-                continue
+    # Window size bounds how many labels' candidate lists are held at once.
+    # Four per worker keeps the pool fed without letting generation run far
+    # ahead of the much cheaper placement loop and accumulate coordinate arrays.
+    _gen_window = max(1, _gen_workers * 4)
+    print(f"  [resources] candidate generation on {_gen_workers} worker(s), "
+          f"window {_gen_window} labels; placement sequential")
 
-            t_int = intensity_image[pad_sl]
-            offset = np.array([sl_.start for sl_ in pad_sl])
-            dt_obj = ndimage.distance_transform_edt(t_mask, sampling=spacing)
-            max_dt_val = np.max(dt_obj)
+    # Generation runs in parallel; PLACEMENT does not, and must not.
+    #
+    # Everything expensive in this step -- the per-tile distance transforms, the
+    # percentile thresholds, the connected components, the splitting watershed,
+    # the PCA -- happens while building a label's candidate list, and that work
+    # touches nothing but the label's own bounding box in two read-only images.
+    # Placement is the opposite: `_placed_grid` holds only PRIOR-label peaks, so
+    # whichever clump is reached first places its soma and a nearby candidate
+    # from another clump is shrunk by `_shrink_to_clear` or dropped. That makes
+    # the placement loop order-defining, not merely order-sensitive, and it
+    # stays exactly as it was -- sequential, ascending label id.
+    #
+    # Labels are therefore generated in ordered windows and placed in the same
+    # order they always were. `pool.map` preserves input order, so the candidate
+    # lists arrive in ascending label order and each list is internally in tile
+    # then strategy order; the stable sort below breaks ties identically to the
+    # single-threaded run.
+    _gen_params = dict(
+        spacing=spacing, ndim=ndim, strategies=strategies, tile_size=tile_size,
+        min_seed_vol=min_seed_vol,
+        absolute_min_thickness_um=absolute_min_thickness_um,
+        absolute_max_thickness_um=absolute_max_thickness_um,
+        max_allowed_core_aspect_ratio=max_allowed_core_aspect_ratio,
+        intensity_smooth_um=intensity_smooth_um,
+        intensity_weight=intensity_weight, int_peak_sep=int_peak_sep,
+        memmap_voxel_threshold=memmap_voxel_threshold,
+    )
 
-            def process_frag_logic(mask_arr, sub_off):
-                """Checks morphological validity and converts to global coords."""
-                local_coords = np.argwhere(mask_arr)
-                tile_coords = local_coords + sub_off
-                g_coords = tile_coords + offset
+    _pool = None
+    if _gen_workers > 1:
+        try:
+            _pool = mp.Pool(
+                processes=_gen_workers, initializer=_soma_worker_init,
+                initargs=(_seg_info, _int_info),
+            )
+        except Exception as exc:
+            print(f"  [resources] worker pool unavailable ({exc}); "
+                  "generating sequentially.")
+            _pool = None
 
-                # Thickness: max inscribed radius in the full object (Fix 1)
-                dt_vals = dt_obj[tuple(tile_coords.T)]
-                max_thick = np.max(dt_vals)
+    try:
+        for _w0 in range(0, len(valid_labels), _gen_window):
+            _batch = valid_labels[_w0:_w0 + _gen_window]
 
-                # Lower bound is a hard rejection: the fragment is too thin regardless
-                # of how it is sub-sampled, so discard immediately.
-                if max_thick < absolute_min_thickness_um:
-                    diag_stats["thickness_rejected"] += 1
-                    return
+            if _pool is None:
+                _results = [
+                    (lb, _generate_label_candidates(
+                        lb, slices[lb - 1], segmentation_mask, intensity_image,
+                        **_gen_params), None)
+                    for lb in _batch
+                ]
+            else:
+                _results = _pool.map(
+                    _soma_worker,
+                    [(lb, slices[lb - 1], _gen_params) for lb in _batch],
+                )
 
-                # Upper bound: rather than discarding the whole fragment, attempt to
-                # recover a sub-kernel — the voxels whose inscribed-sphere radius is
-                # within the accepted thickness window.  This preserves somas that have
-                # already been selected from a neighbouring strategy while still
-                # honouring the morphological constraint at the kernel level.
-                if max_thick > absolute_max_thickness_um:
-                    # Keep the inner core, discard the periphery
-                    min_allowed_dt = max_thick - absolute_max_thickness_um
-                    within_upper = dt_vals >= min_allowed_dt
-                    
-                    if not np.any(within_upper):
-                        diag_stats["thickness_rejected"] += 1
-                        return
-                    
-                    sub_dt_vals = dt_vals[within_upper]
-                    
-                    # Effective thickness is the internal radius from the new boundary to the peak
-                    effective_thickness = np.max(sub_dt_vals) - np.min(sub_dt_vals)
-                    if effective_thickness < absolute_min_thickness_um:
-                        diag_stats["thickness_rejected"] += 1
-                        return
-                        
-                    # Narrow all coordinate arrays to the valid sub-kernel voxels.
-                    local_coords = local_coords[within_upper]
-                    tile_coords  = tile_coords[within_upper]
-                    g_coords     = g_coords[within_upper]
-                    dt_vals      = sub_dt_vals
-                    max_thick    = np.max(sub_dt_vals)  # keeps the true peak value intact
-                    sub_min      = local_coords.min(axis=0)
-                    sub_shape    = local_coords.max(axis=0) - sub_min + 1
-                    mask_arr     = np.zeros(sub_shape, dtype=bool)
-                    mask_arr[tuple((local_coords - sub_min).T)] = True
-                    local_coords = local_coords - sub_min
-
-                # DT peak voxel — nucleus geometric centre regardless of strategy
-                peak_idx = int(np.argmax(dt_vals))
-                peak_coord_g = g_coords[peak_idx]          # global voxel coords
-
-                # Per-coord intensity, retained so an Int candidate can later be
-                # shrunk by its OWN brightness (family-preserving push-apart).
-                int_vals = t_int[tuple(tile_coords.T)]
-
-                # Elongation check (3D). A near-zero minor axis (a 1-voxel-thick
-                # line) is the degenerate, maximally-elongated case -> treated as
-                # elongated by _core_is_elongated.
-                if mask_arr.sum() > 10 and _core_is_elongated(
-                    local_coords, spacing, max_allowed_core_aspect_ratio, ndim
-                ):
-                    # Recovery: shave the low-DT tails, then keep the LARGEST
-                    # connected fragment, recompute the peak, and RE-CHECK size +
-                    # aspect (same threshold). A survivor that is still elongated
-                    # (a real process with no compact body) is rejected.
-                    core_threshold = max_thick - (absolute_min_thickness_um * 0.5)
-                    valid_core = dt_vals >= core_threshold
-                    ok, keep, pk = _finalize_core(
-                        g_coords[valid_core], dt_vals[valid_core], spacing,
-                        min_seed_vol, max_allowed_core_aspect_ratio, ndim
+            for lbl, _payload, _err in _results:
+                if _err is not None:
+                    raise RuntimeError(
+                        f"soma candidate generation failed on label {lbl}: {_err}"
                     )
-                    if not ok:
-                        diag_stats["aspect_ratio_rejected"] += 1
-                        return
-                    # Re-align every per-coord array to the recovered core.
-                    vc = valid_core
-                    g_coords = g_coords[vc][keep]
-                    dt_vals  = dt_vals[vc][keep]
-                    int_vals = int_vals[vc][keep]
-                    peak_coord_g = pk
-                    mask_arr = np.ones(g_coords.shape[0], dtype=bool)  # vol == len(coords)
+                label_candidates, _diag_delta = _payload
+                for _k, _v in _diag_delta.items():
+                    diag_stats[_k] += _v
+                main_pbar.update(1)
 
-                # Tiling check: use mean centroid (unchanged)
-                cent = np.mean(g_coords, axis=0)
-                if tile_target_contains(t["target"], cent):
-                    rank_vals = int_vals if strat["type"] == "Int" else dt_vals
-                    label_candidates.append(
-                        {
-                            "coords": g_coords.astype(np.int32),
-                            "peak_coord": peak_coord_g,
-                            "vol": int(mask_arr.sum()),
-                            "score": strat["score"],
-                            "strat_name": f"{strat['type']}_{strat['val']}",
-                            "frag_max_thick": max_thick,
-                            "family": strat["type"],
-                            "dt_vals": np.asarray(dt_vals, np.float32),
-                            "rank_vals": np.asarray(rank_vals, np.float32),
-                        }
-                    )
+                # Per-label deduplication list: prevents two seeds from the same
+                # merged object being placed too close. Cross-label
+                # deduplication is handled by the pixel-overlap check.
+                label_placed_peaks: List = []
 
-            # Strategy Loop with Early Stopping
-            _t_int_smooth = None  # per-tile cache of the smoothed intensity
-            for strat in strategies:
-                if is_huge:
-                    tile_pbar.set_postfix(
-                        {
-                            "Strat": f"{strat['type']}{strat['val']}",
-                            "Cands": len(label_candidates),
-                            "RAM": f"{get_ram_usage():.1f}G",
-                        }
-                    )
+                # 6. Placement (Greedy based on Priority and Spatial Separation)
+                if label_candidates:
+                    # Sort by Priority Score descending, then Volume descending
+                    label_candidates.sort(key=lambda x: (x["score"], x["vol"]), reverse=True)
+                    this_label_peaks = []  # committed to the global grid after this label
+                    for cand in label_candidates:
+                        coords = cand["coords"]
+                        peak_phys = cand["peak_coord"] * np.array(spacing)
 
-                if strat["type"] == "DT":
-                    thresh = max_dt_val * strat["val"]
-                    if thresh <= 0:
-                        continue
-                    core = (dt_obj >= thresh) & t_mask
-                    dt_ref = dt_obj
-                else:
-                    # Intensity percentile strategy
-                    #
-                    # Threshold a SMOOTHED copy when intensity_smooth_um > 0.
-                    # Percentile thresholding inside a nucleus selects speckle
-                    # texture, so the surviving core is a dendritic web rather than a
-                    # blob: measured on a Hoechst stack, 72% of placed seeds had a
-                    # bounding-box fill below 0.30, and the p85 core of one object was
-                    # 1357 voxels spread over 35 disconnected fragments, nearly all of
-                    # which then died on min_fragment_size. Smoothing is applied in
-                    # PHYSICAL units so anisotropic z is honoured, and is cached once
-                    # per tile. 0.0 um reproduces the previous behaviour exactly.
-                    t_int_thresh = t_int
-                    _sm_um = float(intensity_smooth_um)
-                    if _sm_um > 0:
-                        if _t_int_smooth is None:
-                            _t_int_smooth = ndimage.gaussian_filter(
-                                t_int.astype(np.float32),
-                                tuple(_sm_um / sp for sp in spacing),
+                        # Within-label proximity gate
+                        if label_placed_peaks:
+                            dists = np.linalg.norm(
+                                np.array(label_placed_peaks) - peak_phys, axis=1
                             )
-                        t_int_thresh = _t_int_smooth
-                    vals = t_int_thresh[t_mask]
-                    if vals.size == 0:
-                        continue
-                    core = (t_int_thresh >= np.percentile(vals, strat["val"])) & t_mask
-                    # Calculate local DT for peak splitting
-                    dt_ref = ndimage.distance_transform_edt(core, sampling=spacing)
+                            min_dist = np.min(dists)
+                            if min_dist < min_physical_peak_separation:
+                                diag_stats["spatial_overlap_rejected"] += 1
+                                continue
+                            else:
+                                # --- THE TRAP: We are placing multiple somas in one label! ---
+                                print(
+                                    f"\n  [TRAP] Label {lbl} got MULTIPLE somas!"
+                                    f"\n    -> New Edge/Extra Soma: Strategy {cand.get('strat_name', 'Unknown')}, Vol {cand['vol']}, Thick {cand.get('frag_max_thick', 0):.1f}"
+                                    f"\n    -> Distance to nearest existing soma: {min_dist:.1f} µm (Limit is {min_physical_peak_separation:.1f} µm)"
+                                )
 
-                # Early Stopping: If core is already too small for priority, skip lower strats
-                if np.sum(core) < min_seed_vol:
-                    continue
+                        # Cross-label separation (bug #2): grid holds only prior-label
+                        # peaks, so any hit is a different cell. Shrink the newcomer
+                        # asymmetrically within its own strategy family to a tighter core
+                        # whose peak clears by min_physical_peak_separation; drop if none.
+                        if _placed_grid.min_dist(peak_phys) < min_physical_peak_separation:
+                            res = _shrink_to_clear(
+                                coords, cand['dt_vals'], cand['rank_vals'], np.array(spacing),
+                                _placed_grid, min_physical_peak_separation,
+                                min_seed_vol, max_allowed_core_aspect_ratio, ndim
+                            )
+                            if res is None:
+                                diag_stats["pushed_and_dropped"] += 1
+                                continue
+                            coords, peak_phys = res
+                            coords = coords.astype(np.int32)
 
-                # Island detection via connected components
-                labeled_core, n = ndimage.label(core)
-                for region in regionprops(labeled_core):
-                    diag_stats["cores_evaluated"] += 1
-                    if region.area < min_seed_vol:
-                        diag_stats["cores_too_small"] += 1
-                        continue
+                        # Pixel Overlap Check (cross-label deduplication)
+                        idx_tuple = tuple(coords.T)
+                        if np.any(final_seed_mask[idx_tuple] > 0):
+                            diag_stats["spatial_overlap_rejected"] += 1
+                            continue
 
-                    # Local Watershed Splitting for clumped peaks
-                    frag_crop = region.image
-                    frag_dt = ndimage.distance_transform_edt(frag_crop, sampling=spacing)
-                    # Blend intensity into the split field when intensity_weight > 0.
-                    #
-                    #     field = dt * (1 + intensity_weight * normalised_intensity)
-                    #
-                    # This is the same functional form, meaning and range as
-                    # `intensity_weight` in the separation step
-                    # (cell_splitting._expansion_speed), so the parameter reads the
-                    # same way in both places; 0.0 is pure DT, i.e. previous
-                    # behaviour. It matters because an elongated core covering two
-                    # touching nuclei has a single DT maximum, so the peak search
-                    # finds one marker and the pair is never split. Response is a
-                    # broad plateau: 0.25 to 5.0 gave identical results on the test
-                    # stack, so the exact value is not critical.
-                    _iw = float(intensity_weight)
-                    if _iw > 0:
-                        _bb = region.bbox
-                        _isl = tile_slices(_bb)
-                        _fi = ndimage.gaussian_filter(
-                            np.asarray(t_int[_isl], dtype=np.float32) * frag_crop,
-                            tuple(0.5 / sp for sp in spacing))
-                        _v = _fi[frag_crop]
-                        if _v.size:
-                            _lo, _hi = float(_v.min()), float(_v.max())
-                            if _hi > _lo:
-                                frag_dt = frag_dt * (
-                                    1.0 + _iw * ((_fi - _lo) / (_hi - _lo))
-                                ) * frag_crop
+                        # Place Seed
+                        final_seed_mask[idx_tuple] = next_label_id
+                        next_label_id += 1
+                        label_placed_peaks.append(peak_phys)
+                        this_label_peaks.append(peak_phys)
 
-                    # exclude_border=False is REQUIRED here, not cosmetic.
-                    # peak_local_max defaults exclude_border to min_distance and
-                    # applies it to EVERY axis. int_peak_sep comes from the lateral
-                    # spacing, so on anisotropic data it is large in voxel terms
-                    # (2.5 um / 0.156 um = 16 px). A z stack a few slices deep is
-                    # then entirely inside the excluded border and peak_local_max
-                    # returns nothing: `len(peaks) > 1` was never true and the
-                    # clump-splitting watershed below never executed on a single
-                    # fragment. Measured on a 2 um z-step Hoechst stack: 0 peaks for
-                    # every one of the 8 largest clumps, 2-6 peaks each once fixed.
-                    peaks = peak_local_max(
-                        frag_dt, min_distance=int_peak_sep, labels=frag_crop,
-                        exclude_border=False
-                    )
+                    for _p in this_label_peaks:
+                        _placed_grid.add(_p)
 
-                    if len(peaks) > 1:
-                        markers = np.zeros(frag_crop.shape, dtype=np.int32)
-                        for idx, pk in enumerate(peaks):
-                            markers[tuple(int(v) for v in pk)] = idx + 1
-                        ws = watershed(-frag_dt, markers, mask=frag_crop)
-                        for wid in range(1, len(peaks) + 1):
-                            m_ws = ws == wid
-                            if m_ws.sum() >= min_seed_vol:
-                                process_frag_logic(m_ws, region.bbox[:ndim])
-                    else:
-                        process_frag_logic(region.image, region.bbox[:ndim])
+                # Main Progress Update
+                main_pbar.set_postfix(
+                    {"Seeds": next_label_id - 1, "RAM": f"{get_ram_usage():.1f}G"}
+                )
+                label_candidates.clear()
 
-                del core
-                if 'dt_ref' in locals() and dt_ref is not dt_obj:
-                    del dt_ref
 
-            del t_mask, t_int, dt_obj
-            if t_idx % 5 == 0:
-                gc.collect()
-
-        # 6. Placement (Greedy based on Priority and Spatial Separation)
-        if label_candidates:
-            # Sort by Priority Score descending, then Volume descending
-            label_candidates.sort(key=lambda x: (x["score"], x["vol"]), reverse=True)
-            this_label_peaks = []  # committed to the global grid after this label
-            for cand in label_candidates:
-                coords = cand["coords"]
-                peak_phys = cand["peak_coord"] * np.array(spacing)
-
-                # Within-label proximity gate
-                if label_placed_peaks:
-                    dists = np.linalg.norm(
-                        np.array(label_placed_peaks) - peak_phys, axis=1
-                    )
-                    min_dist = np.min(dists)
-                    if min_dist < min_physical_peak_separation:
-                        diag_stats["spatial_overlap_rejected"] += 1
-                        continue
-                    else:
-                        # --- THE TRAP: We are placing multiple somas in one label! ---
-                        print(
-                            f"\n  [TRAP] Label {lbl} got MULTIPLE somas!"
-                            f"\n    -> New Edge/Extra Soma: Strategy {cand.get('strat_name', 'Unknown')}, Vol {cand['vol']}, Thick {cand.get('frag_max_thick', 0):.1f}"
-                            f"\n    -> Distance to nearest existing soma: {min_dist:.1f} µm (Limit is {min_physical_peak_separation:.1f} µm)"
-                        )
-
-                # Cross-label separation (bug #2): grid holds only prior-label
-                # peaks, so any hit is a different cell. Shrink the newcomer
-                # asymmetrically within its own strategy family to a tighter core
-                # whose peak clears by min_physical_peak_separation; drop if none.
-                if _placed_grid.min_dist(peak_phys) < min_physical_peak_separation:
-                    res = _shrink_to_clear(
-                        coords, cand['dt_vals'], cand['rank_vals'], np.array(spacing),
-                        _placed_grid, min_physical_peak_separation,
-                        min_seed_vol, max_allowed_core_aspect_ratio, ndim
-                    )
-                    if res is None:
-                        diag_stats["pushed_and_dropped"] += 1
-                        continue
-                    coords, peak_phys = res
-                    coords = coords.astype(np.int32)
-
-                # Pixel Overlap Check (cross-label deduplication)
-                idx_tuple = tuple(coords.T)
-                if np.any(final_seed_mask[idx_tuple] > 0):
-                    diag_stats["spatial_overlap_rejected"] += 1
-                    continue
-
-                # Place Seed
-                final_seed_mask[idx_tuple] = next_label_id
-                next_label_id += 1
-                label_placed_peaks.append(peak_phys)
-                this_label_peaks.append(peak_phys)
-
-            for _p in this_label_peaks:
-                _placed_grid.add(_p)
-
-        # Main Progress Update
-        main_pbar.set_postfix(
-            {"Seeds": next_label_id - 1, "RAM": f"{get_ram_usage():.1f}G"}
-        )
-        if 'label_candidates' in locals():
-            label_candidates.clear()
-            del label_candidates
-        if lbl_idx % 20 == 0:
-            gc.collect()
+    finally:
+        if _pool is not None:
+            _pool.terminate()
+            _pool.join()
+        gc.collect()
 
     t_total = time.time() - t_start_global
     print("\n" + "=" * 60)

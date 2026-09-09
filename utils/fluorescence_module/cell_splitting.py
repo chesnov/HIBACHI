@@ -11,6 +11,7 @@ from tqdm import tqdm
 
 # Import shared helpers
 try:
+    from . import resource_budget
     from .dim_utils import (
         adjacency_footprint,
         binary_structure,
@@ -18,6 +19,7 @@ try:
         structuring_element,
     )
 except ImportError:  # pragma: no cover - direct script execution
+    import resource_budget
     from dim_utils import (
         adjacency_footprint,
         binary_structure,
@@ -540,12 +542,38 @@ def _separate_multi_soma_cells_chunk(
 
     # 1. Copy Single Cells (Pass-through)
     # If a cell is not flagged as multi-soma, we preserve it exactly.
-    for lbl in unique_labels:
-        if lbl not in multi_soma_cell_labels_list:
-            chunk_result[segmentation_mask == lbl] = lbl
-            seeds = np.unique(soma_mask[segmentation_mask == lbl])
-            if seeds.size > 0:
-                label_to_seeds_map[lbl] = set(seeds[seeds > 0])
+    #
+    # One pass over the chunk instead of three per label. The previous form ran
+    # `segmentation_mask == lbl` twice and `soma_mask[...]` once for EVERY label
+    # present, so a chunk holding a few thousand labels swept its own voxels
+    # several thousand times -- with a (128, 512, 512) chunk that is on the
+    # order of 1e11 element comparisons per chunk. A boolean lookup indexed by
+    # the label image gets the same voxels in one read.
+    #
+    # The result is identical, including two details worth naming: a kept label
+    # present in the chunk always gets an entry in `label_to_seeds_map`, even
+    # when no soma sits under it (the old `seeds.size > 0` test counted the 0
+    # that `np.unique` always returns, so it was true for every present label),
+    # and the set holds the same numpy scalars it always did.
+    _keep_labels = [l for l in unique_labels
+                    if l not in multi_soma_cell_labels_list]
+    if _keep_labels:
+        _keep_lut = np.zeros(int(unique_labels.max()) + 1, dtype=bool)
+        _keep_lut[np.asarray(_keep_labels, dtype=np.int64)] = True
+        # Background is 0 and `_keep_lut[0]` is False, so it is excluded here
+        # exactly as `unique_labels` excluded it above.
+        _keep_sel = _keep_lut[segmentation_mask]
+        chunk_result[_keep_sel] = segmentation_mask[_keep_sel]
+
+        for _l in _keep_labels:
+            label_to_seeds_map[_l] = set()
+        _soma_sel = _keep_sel & (soma_mask > 0)
+        if np.any(_soma_sel):
+            _pl = segmentation_mask[_soma_sel]
+            _ps = soma_mask[_soma_sel]
+            _pairs = np.unique(np.stack((_pl, _ps), axis=1), axis=0)
+            for _l, _sd in _pairs:
+                label_to_seeds_map[_l].add(_sd)
 
     present_multi_soma = [
         l for l in multi_soma_cell_labels_list if l in unique_labels
@@ -564,7 +592,16 @@ def _separate_multi_soma_cells_chunk(
     # 2. Process Multi-Soma Objects
     for cell_label in present_multi_soma:
         cell_mask_full = (segmentation_mask == cell_label)
-        slices = ndimage.find_objects(cell_mask_full)
+        # `.view(np.uint8)` rather than the bare boolean: scipy's find_objects
+        # derives its label count from `input.max()`, and on numpy >= 2.3 a
+        # `np.bool_` is no longer accepted where an integer is expected, so this
+        # raises `TypeError: 'numpy.bool' object cannot be interpreted as an
+        # integer`. The pinned numpy (2.2.6) still tolerates it, so this is a
+        # forward-compatibility fix, not a live bug -- but it is one dtype away
+        # from breaking the entire separation step on the next numpy bump. A
+        # view, not a copy, and find_objects returns the identical bounding box
+        # for a mask of 1s as for a mask of Trues.
+        slices = ndimage.find_objects(cell_mask_full.view(np.uint8))
         if not slices:
             continue
 
@@ -1092,6 +1129,64 @@ def _reassign_disconnected_islands(
 # Main Coordinator
 # =============================================================================
 
+def _streaming_block_shape(budget, ndim: int):
+    """Block shape for the post-stitch streaming passes, sized by the budget.
+
+    Safe to scale, unlike the chunk geometry. `streaming_stats.iter_blocks`
+    grows every block by one voxel on each side and the owned regions tile the
+    volume exactly once, so every aggregate is accumulated from the same voxels
+    and the same forward neighbour pairs whatever the block size -- only the
+    number of blocks changes. Verified by comparing the aggregates and the
+    finished output across block shapes.
+
+    The default it replaces was a flat ``(128, 128, 128)``: 2 M voxels, roughly
+    24 MB of working set, chosen to be safe on the smallest machine and
+    therefore leaving a workstation reading the volume in very small pieces.
+
+    A quarter of the step's allowance, not all of it: several of these passes
+    hold aggregates that scale with the LABEL count alongside the block, and
+    those are the part that grows on a densely over-seeded mask.
+    """
+    base = (128, 128, 128) if ndim == 3 else (2048, 2048)
+    per_element = resource_budget.cost_bytes_per_voxel("label_statistics")
+    allowance = max(int(0.25 * resource_budget.GB), budget.plannable_bytes // 4)
+    best = base
+    for factor in range(1, 17):
+        cand = tuple(int(v * factor) for v in base)
+        padded = 1
+        for v in cand:
+            padded *= (v + 2)
+        if per_element * padded > allowance:
+            break
+        best = cand
+    return best
+
+
+def _copy_to_memmap(source, memmap_dir: str, name: str) -> np.ndarray:
+    """A copy of `source` on disk rather than in RAM.
+
+    Used by the two early-return paths. `segmentation_mask.copy()` allocated the
+    whole int32 label volume in memory to hand back something the caller
+    immediately writes into a memmap of its own -- and the "no multi-soma cells
+    found" path is the COMMON case on a clean image, so this was the usual
+    behaviour rather than an edge case.
+
+    Copied block by block: `dst[:] = src[:]` between two memmaps is buffered by
+    numpy, but going through explicit blocks keeps the peak bounded and stated
+    rather than left to the iterator's internal buffer size.
+    """
+    os.makedirs(memmap_dir, exist_ok=True)
+    path = os.path.join(memmap_dir, name)
+    dst = np.memmap(path, dtype=np.int32, mode='w+', shape=tuple(source.shape))
+    lead = int(source.shape[0])
+    step = max(1, min(lead, 64))
+    for start in range(0, lead, step):
+        stop = min(start + step, lead)
+        dst[start:stop] = source[start:stop]
+    dst.flush()
+    return dst
+
+
 def separate_multi_soma_cells(
     segmentation_mask: np.ndarray,
     intensity_volume: np.ndarray,
@@ -1131,7 +1226,13 @@ def separate_multi_soma_cells(
     # 64 with no stated reason. Unified at the larger, since too much overlap
     # costs redundant computation while too little defers decisions unnecessarily.
     if chunk_shape is None:
-        chunk_shape = (128, 512, 512) if ndim == 3 else (1024, 1024)
+        # PINNED. The chunk geometry decides which cells are judged inside a
+        # chunk (extent <= overlap + 1) and which are deferred to the global
+        # merge pass, and the stitcher resolves conflicts only where chunks
+        # overlap -- so two machines with different chunk shapes would take
+        # different merge decisions. Concurrency is what the budget scales.
+        chunk_shape = resource_budget.pinned(
+            'split_chunk_shape_3d' if ndim == 3 else 'split_chunk_shape_2d')
     chunk_shape = tuple(int(c) for c in chunk_shape)
     if len(chunk_shape) != ndim:
         chunk_shape = (chunk_shape[-ndim:] if len(chunk_shape) > ndim
@@ -1139,9 +1240,26 @@ def separate_multi_soma_cells(
 
     flush_print(f"[SepMultiSoma] Starting ({ndim}D, chunked + seed-aware)...")
 
+    # Resource plan. The chunk geometry is PINNED (see below); what the budget
+    # sizes here is the streaming block used by every aggregate and rewrite pass
+    # after the stitch, and it reports whether one chunk fits at all.
+    _budget = resource_budget.open_budget("step 4 cell separation")
+    _stats_block = tuple(kwargs.get('stats_block_shape', ())) or \
+        _streaming_block_shape(_budget, ndim)
+
     # [PROFILE|CONSERVE] Input inventory for end-to-end foreground accounting.
-    _fg_in = int(np.count_nonzero(segmentation_mask))
-    _nobj_in = int(np.unique(segmentation_mask[segmentation_mask > 0]).size)
+    #
+    # `np.unique(segmentation_mask[segmentation_mask > 0])` used to build this,
+    # which is a boolean mask over the whole volume plus a copy of every
+    # foreground voxel -- in RAM, for a diagnostic line. One bounded sweep gives
+    # both numbers, and `label_count.sum()` is the same total `count_nonzero`
+    # returned because the owned regions tile the volume exactly once.
+    _stats_in = accumulate_label_statistics(
+        segmentation_mask, None, block_shape=_stats_block
+    )
+    _fg_in = int(_stats_in.label_count.sum())
+    _nobj_in = int(_stats_in.labels.size)
+    del _stats_in
     flush_print(
         f"  [PROFILE|CONSERVE] INPUT: foreground_voxels={_fg_in} | objects={_nobj_in}"
     )
@@ -1186,7 +1304,9 @@ def separate_multi_soma_cells(
 
     if not multi_soma_labels:
         flush_print("  No multi-soma cells found. Returning original.")
-        return segmentation_mask.copy()
+        return _copy_to_memmap(
+            segmentation_mask, kwargs.get("memmap_dir", "ramiseg_temp_memmap"),
+            "passthrough.mmp")
 
     # 2. Process Chunks
     memmap_dir = kwargs.get("memmap_dir", "ramiseg_temp_memmap")
@@ -1209,7 +1329,8 @@ def separate_multi_soma_cells(
     if not chunk_slices:
         flush_print("  [SepMultiSoma] *** no chunks generated; returning input "
                     "unchanged ***")
-        return segmentation_mask.copy()
+        return _copy_to_memmap(segmentation_mask, memmap_dir,
+                               "passthrough.mmp")
     chunk_data = {}  # Stores (path, shape, seed_map)
 
     chunk_grid = (
@@ -1413,14 +1534,43 @@ def separate_multi_soma_cells(
             path = chunk_data[i]['path']
             res = np.load(path)
 
+            # Apply `label_map` as ONE lookup pass instead of a full-array
+            # comparison per label. The old loop cost O(labels x chunk).
+            #
+            # It cannot be a plain lookup table, though, and the reason is easy
+            # to miss: the old loop wrote into `res` while iterating, so if
+            # `u -> T` fired and a LATER `u'` in the ascending sweep happened to
+            # equal T, the pixels just written as T were remapped a second time
+            # by `u' -> label_map[u']`. That chaining is part of the behaviour,
+            # not an accident of it, so it is reproduced exactly -- but on the
+            # handful of VALUES rather than on the voxels, which is free.
+            #
+            # `groups` tracks which original values currently share a value; the
+            # sweep moves whole groups, and the resulting original -> final map
+            # is applied once at the end.
             uniques = np.unique(res)
-            for u in uniques:
-                if u == 0:
-                    continue
-                if u in label_map:
-                    target = label_map[u]
-                    if target != u:
-                        res[res == u] = target
+            _orig = [int(u) for u in uniques if u != 0]
+            if _orig:
+                _groups: Dict[int, List[int]] = {v: [v] for v in _orig}
+                for u in sorted(_groups.keys() | set(_orig)):
+                    if u not in _groups:
+                        continue
+                    if u in label_map:
+                        target = int(label_map[u])
+                        if target != u:
+                            moved = _groups.pop(u)
+                            _groups.setdefault(target, []).extend(moved)
+                _final = {}
+                for cur, members in _groups.items():
+                    for v in members:
+                        if v != cur:
+                            _final[v] = cur
+                if _final:
+                    _hi = max(int(res.max()), max(_final), max(_final.values()))
+                    _lut = np.arange(_hi + 1, dtype=res.dtype)
+                    for _old_v, _new_v in _final.items():
+                        _lut[_old_v] = _new_v
+                    res = _lut[res]
 
             mask_nz = res > 0
             canvas_view = final_mask[sl]
@@ -1598,17 +1748,28 @@ def separate_multi_soma_cells(
             final_mask[sl] = canvas_view
             os.remove(path)
 
-        # Convert to array for final steps (usually fits in RAM if chunks worked)
-        ret = np.array(final_mask)
-        del final_mask
-        if os.path.exists(final_path):
-            os.remove(final_path)
+        # The stitched volume STAYS a memmap.
+        #
+        # This was `ret = np.array(final_mask)`, whose own comment conceded
+        # "usually fits in RAM if chunks worked". It materialised the entire
+        # int32 label volume, which is the hard ceiling on this step: on a 64 GB
+        # machine that is roughly 0.6 Gvoxel against the ~4.5e12 of a brain-wide
+        # stack at 20x. Every pass below it -- `global_merge_pass`,
+        # `_reassign_disconnected_islands`, `merge_undersized_streaming`,
+        # `apply_label_mapping` -- already works block by block and writes in
+        # place, so they take the memmap unchanged; the array was only ever
+        # created because nothing had told them not to expect one.
+        #
+        # The file is deliberately NOT removed here. It is the return value, and
+        # the caller copies it into the project's segmentation artifact before
+        # deleting `memmap_dir` in its own `finally`. Removing it now would be
+        # returning a mapping over a deleted file.
+        ret = final_mask
 
         # Aggregates for every pass below: label sizes, intensity sums, and the
         # adjacency graph with each interface's bounding box. One bounded-memory
         # sweep replaces the whole-volume `np.unique` / `bincount` / `find_objects`
         # calls the refinement passes used to make.
-        _stats_block = tuple(kwargs.get('stats_block_shape', (128, 128, 128)))
         _stats = accumulate_label_statistics(
             ret, intensity_volume, block_shape=_stats_block
         )
@@ -1663,12 +1824,19 @@ def separate_multi_soma_cells(
             **_merge_params
         )
         if _merged:
-            _fg_merge = int(np.count_nonzero(ret))
+            # Same substitution as the input inventory: the old line built a
+            # whole-volume boolean mask and copied every foreground voxel out of
+            # a memmap to count distinct labels.
+            _stats_merge = accumulate_label_statistics(
+                ret, None, block_shape=_stats_block
+            )
+            _fg_merge = int(_stats_merge.label_count.sum())
             flush_print(
                 f"  [PROFILE|CONSERVE] POST-GLOBALMERGE: foreground_voxels={_fg_merge} "
-                f"| objects={int(np.unique(ret[ret > 0]).size)} "
+                f"| objects={int(_stats_merge.labels.size)} "
                 f"| delta_vs_stitch={_fg_merge - _fg_stitch}"
             )
+            del _stats_merge
 
         ret = _reassign_disconnected_islands(ret, soma_mask)
 
@@ -1830,4 +1998,3 @@ def _soma_first_chunk_order_2d(*args, **kwargs):
 def _min_soma_separation_2d(*args, **kwargs):
     """2D alias; the implementation is rank-agnostic."""
     return _min_soma_separation(*args, **kwargs)
-

@@ -412,7 +412,14 @@ def list_all(mode: Optional[str] = None) -> List[LibraryEntry]:
     """
     entries = list_builtins() + list_library()
     if mode is not None:
-        entries = [e for e in entries if e.mode == mode]
+        # Normalised on BOTH sides. Every LibraryEntry.mode is already the
+        # unified string (mode_of normalises before returning), but `mode` here
+        # comes off a project folder on disk, and a project written by an older
+        # build still says 'fluorescence_2d'. Comparing raw strings therefore
+        # matched nothing at all and the picker offered zero configs -- for
+        # exactly the older projects most likely to want a new one.
+        wanted = normalise_mode(mode)
+        entries = [e for e in entries if normalise_mode(e.mode) == wanted]
     return entries
 
 

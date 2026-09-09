@@ -84,6 +84,18 @@ class ProjectViewWindow(QMainWindow):
          lambda self: self.open_config_library_manager,
          "Browse, import, duplicate, rename and export the configs in your "
          "cross-project library (and see any that failed to load)."),
+        # Deliberately NOT called "Settings", "Preferences", "Options" or
+        # "Configure". Those are exactly the words Qt's Cocoa plugin pattern
+        # matches when it relocates an action into the macOS application menu --
+        # the same trap documented at the `setMenuRole` call in `initUI`, which
+        # once made an entire menu vanish. `NoRole` is set there and covers
+        # this, but a name that never triggers the guess is one less thing
+        # depending on that call surviving a refactor.
+        ("resource_limits", "Resource Limits\u2026", "machine",
+         lambda self: self.open_resource_limits,
+         "Set how much memory and how many processor cores this application "
+         "may use. Higher limits process large datasets faster; results are "
+         "identical at any setting."),
     )
 
 
@@ -159,6 +171,12 @@ class ProjectViewWindow(QMainWindow):
             "selection": bar.addMenu("&Selection"),
             "analysis": bar.addMenu("&Analysis"),
             "library": bar.addMenu("&Library"),
+            # Per-INSTALL settings, not per-project: what this computer is
+            # allowed to spend. Kept out of &Library, which holds configs --
+            # those travel with a project and are part of a result's
+            # provenance, whereas a resource ceiling is a property of the
+            # machine and deliberately never enters a config.
+            "machine": bar.addMenu("&Machine"),
         }
         for key, label, menu_key, slot, tip in self._ACTION_SPECS:
             action = menus[menu_key].addAction(label)
@@ -1686,7 +1704,8 @@ class ProjectViewWindow(QMainWindow):
             f"Apply to the {total} checked image folder(s)?\n\n"
             f"• Processing parameters will be replaced.\n"
             f"• Image dimensions are always preserved.\n"
-            f"• Folders with a different mode will be skipped.\n"
+            f"• Folders whose acquisition differs in rank from the template "
+            f"(a 2D config onto a z-stack, or vice versa) will be skipped.\n"
             f"• Any already-processed results whose parameters change will be "
             f"CLEARED, so those images reopen unprocessed (they were computed "
             f"with the old parameters).\n\n"
@@ -1778,7 +1797,7 @@ class ProjectViewWindow(QMainWindow):
         summary = (
             f"Config template applied.\n\n"
             f"Updated : {results['success']}\n"
-            f"Skipped : {results['skipped']}  (different mode or invalid)\n"
+            f"Skipped : {results['skipped']}  (2D/3D mismatch or invalid)\n"
             f"Failed  : {results['failed']}\n"
             f"Results cleared : {results.get('cleared', 0)}  "
             f"(parameters changed — these images reopen unprocessed)\n"
@@ -1806,8 +1825,16 @@ class ProjectViewWindow(QMainWindow):
         Reads each folder's mode via ``get_image_details``; returns the single
         shared mode when they agree (ignoring 'unknown'/'error'), else None so the
         picker falls back to showing all configs.
+
+        Modes are NORMALISED before being compared. Without that, a selection
+        mixing an older folder ('fluorescence_2d') with a current one
+        ('fluorescence') looked like two different modes and returned None, and
+        a selection of only older folders returned a legacy string that matched
+        no library entry -- so the picker showed nothing to choose from. Both
+        are the same pipeline; only the name on disk differs.
         """
         from .project_selection import split_leaf_key
+        from ..fluorescence_module.config_migration import normalise_mode
         modes = set()
         for key in folders:
             folder, _roi = split_leaf_key(key)
@@ -1816,7 +1843,7 @@ class ProjectViewWindow(QMainWindow):
             except Exception:
                 m = None
             if m and m not in ('unknown', 'error'):
-                modes.add(m)
+                modes.add(normalise_mode(m))
         return next(iter(modes)) if len(modes) == 1 else None
 
     def _pick_template(self, folder_mode):
@@ -1894,6 +1921,24 @@ class ProjectViewWindow(QMainWindow):
         # Otherwise the user picked a discovered entry by its label.
         idx = labels.index(choice)
         return entries[idx].path
+
+    def open_resource_limits(self) -> None:
+        """Open the resource ceiling dialog.
+
+        Nothing needs to be reloaded afterwards. Every processing step reads
+        the saved setting when it starts, via `resource_budget.open_budget`, so
+        a change applies to the next step that runs -- including the next step
+        of a batch already in progress.
+        """
+        try:
+            from .resource_settings_dialog import ResourceSettingsDialog
+        except ImportError as exc:
+            QMessageBox.warning(
+                self, "Unavailable",
+                f"The resource settings dialog could not be loaded:\n{exc}"
+            )
+            return
+        ResourceSettingsDialog(self).exec_()
 
     def open_config_library_manager(self) -> None:
         """Open the Config Library manager dialog."""

@@ -216,7 +216,15 @@ def apply_template_config_to_project(
                 return results
         template = recon.merged
 
+    from ..fluorescence_module.config_migration import normalise_mode
+    from .metadata import config_ndim
+
     effective_filter_mode = target_mode or template.get('mode')
+    # Rank is what actually makes two parameter sets non-interchangeable now
+    # that there is one mode: a 2D template's sizes and distances mean
+    # something different in a z-stack. Same guard the region path already
+    # uses in roi_sharing.apply_template_to_regions.
+    template_ndim = config_ndim(template)
 
     # The human-facing name of the config being applied = the template's file
     # stem (e.g. a library preset "iMG_22Jul26.yaml" -> "iMG_22Jul26"). Stamped
@@ -235,8 +243,29 @@ def apply_template_config_to_project(
 
         folder_mode = details.get('mode', 'unknown')
 
-        # Mode filtering — only apply to folders that match the template's mode
-        if effective_filter_mode and folder_mode not in ('unknown', effective_filter_mode):
+        # Mode filtering — only apply to folders that match the template's mode.
+        #
+        # Both sides are NORMALISED. A project written by an older build still
+        # carries 'fluorescence_2d', which is this same pipeline under its old
+        # name; comparing the raw strings skipped every such folder as
+        # "different mode", so a diverged older project could not be brought
+        # onto a new config in bulk at all. (Opening one image and reconciling
+        # by hand worked, because that path goes through mode_of, which has
+        # normalised all along -- which is why the two disagreed.)
+        if effective_filter_mode and normalise_mode(folder_mode) not in (
+                'unknown', normalise_mode(effective_filter_mode)):
+            results['skipped'] += 1
+            continue
+
+        # With the modes collapsed the check above can no longer separate a 2D
+        # config from a 3D one, so the protection it used to provide is made
+        # explicit here rather than being allowed to lapse silently.
+        try:
+            with open(os.path.join(folder_path, details['yaml_file']), 'r') as fh:
+                folder_ndim = config_ndim(yaml.safe_load(fh) or {})
+        except Exception:
+            folder_ndim = None
+        if template_ndim and folder_ndim and template_ndim != folder_ndim:
             results['skipped'] += 1
             continue
 

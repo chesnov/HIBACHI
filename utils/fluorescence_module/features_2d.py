@@ -18,7 +18,7 @@ import os
 import sys
 import tempfile
 import multiprocessing as mp
-from typing import Tuple, List, Dict, Optional, Any
+from typing import Tuple, List, Dict, Optional, Any, Sequence
 
 import numpy as np
 
@@ -53,14 +53,204 @@ def flush_print(*args: Any, **kwargs: Any) -> None:
     sys.stdout.flush()
 
 
+# --------------------------------------------------------------------------
+# Bounded-memory helpers
+# --------------------------------------------------------------------------
+def _unique_labels_streaming(arr, block_rows: int = 0):
+    """Sorted positive labels of `arr`, without copying the whole volume.
+
+    `np.unique(arr)` flattens first, and flattening a memmap materialises every
+    voxel as an in-RAM copy -- an int32 label volume's worth, to obtain a list
+    of ids. Taking the unique values of one leading-axis slab at a time and
+    unioning gives the identical sorted array, because a union of per-block
+    unique sets is the unique set of the whole.
+    """
+    if block_rows <= 0:
+        # A slab of a few hundred MB regardless of cross-section, floored at one
+        # row so a very wide plane still makes progress.
+        per_row = max(1, int(np.prod(arr.shape[1:])) * int(arr.dtype.itemsize))
+        block_rows = max(1, min(int(arr.shape[0]), (256 << 20) // per_row))
+    found = None
+    for start in range(0, int(arr.shape[0]), int(block_rows)):
+        blk = np.asarray(arr[start:start + int(block_rows)])
+        u = np.unique(blk)
+        found = u if found is None else np.union1d(found, u)
+    if found is None:
+        return np.zeros(0, dtype=np.int64)
+    return found[found > 0]
+
+
+class _SurfaceStore:
+    """Every object's boundary points, concatenated in one on-disk array.
+
+    Replaces the list-of-arrays module global that the distance workers used to
+    read. That list had two costs, and the second is the one that bit hardest:
+
+      * every object's boundary coordinates were resident in RAM at once, and
+      * on macOS and Windows, where multiprocessing uses 'spawn' rather than
+        'fork', the whole list was PICKLED INTO EVERY WORKER -- so the memory
+        was multiplied by `n_jobs` rather than shared.
+
+    One memmap plus an offsets array fixes both: workers map the same file
+    read-only and slice it, so nothing is copied and nothing is pickled but the
+    offsets. The points themselves are byte-identical, so every KD-tree, every
+    query and every resulting distance is unchanged.
+    """
+
+    def __init__(self, path: str, shape: Tuple[int, int], offsets: np.ndarray):
+        self.path = path
+        self.shape = (int(shape[0]), int(shape[1]))
+        self.offsets = np.asarray(offsets, dtype=np.int64)
+        self._mm = None
+
+    @property
+    def n_objects(self) -> int:
+        return int(self.offsets.size - 1)
+
+    def _open(self):
+        if self._mm is None:
+            if self.shape[0] == 0:
+                self._mm = np.zeros(self.shape, dtype=np.int64)
+            else:
+                self._mm = np.memmap(self.path, dtype=np.int64, mode='r',
+                                     shape=self.shape)
+        return self._mm
+
+    def points(self, i: int) -> np.ndarray:
+        mm = self._open()
+        return np.asarray(mm[self.offsets[i]:self.offsets[i + 1]])
+
+    def close(self) -> None:
+        self._mm = None
+
+    def remove(self) -> None:
+        self.close()
+        try:
+            if self.path and os.path.exists(self.path):
+                os.remove(self.path)
+        except OSError:
+            pass
+
+    @staticmethod
+    def build(chunks: List[np.ndarray], ndim: int, temp_dir: str,
+              tag: str) -> "_SurfaceStore":
+        """Write the per-object point arrays out in order."""
+        counts = [int(c.shape[0]) for c in chunks]
+        offsets = np.zeros(len(counts) + 1, dtype=np.int64)
+        if counts:
+            offsets[1:] = np.cumsum(np.asarray(counts, dtype=np.int64))
+        total = int(offsets[-1])
+        path = os.path.join(temp_dir, f"{tag}_{os.getpid()}.dat")
+        if total > 0:
+            mm = np.memmap(path, dtype=np.int64, mode='w+',
+                           shape=(total, ndim))
+            for k, c in enumerate(chunks):
+                if c.shape[0]:
+                    mm[offsets[k]:offsets[k + 1]] = c
+            mm.flush()
+            del mm
+        return _SurfaceStore(path, (total, ndim), offsets)
+
+
+class _DistanceMatrixOnDisk:
+    """The full N x N distance matrix, kept on disk and read a row at a time.
+
+    The matrix is genuinely wanted -- it is exported as `distances_matrix_*.csv`
+    -- but it was being handled three times over in RAM: `np.array(dist_mat_mm)`
+    materialised it, the DataFrame wrapped that, and
+    `dist_df.values.copy()` in `analyze_segmentation` made a second full copy to
+    mask the diagonal. At 50k objects that is two 10 GB float32 arrays for a
+    file that is written straight back out to disk.
+
+    This exposes only what the two consumers actually use -- `empty`, `index`,
+    `columns`, a streaming `to_csv`, and the per-row minimum -- and never holds
+    more than a block of rows. `to_csv` formats each block with pandas rather
+    than by hand, so the bytes are the same as `DataFrame.to_csv` would have
+    produced.
+    """
+
+    def __init__(self, path: str, labels: Sequence[int],
+                 block_rows: int = 512):
+        self.path = path
+        self.index = pd.Index(list(labels))
+        self.columns = pd.Index(list(labels))
+        self.n = len(self.index)
+        self.block_rows = max(1, int(block_rows))
+        self._mm = None
+
+    @property
+    def empty(self) -> bool:
+        return self.n == 0
+
+    def _open(self):
+        if self._mm is None:
+            self._mm = np.memmap(self.path, dtype='float32', mode='r',
+                                 shape=(self.n, self.n))
+        return self._mm
+
+    def row_minima(self):
+        """``(shortest distance, index of the winner)`` for every row.
+
+        The diagonal is masked with inf per row, which is what
+        `np.fill_diagonal(temp_mat, np.inf)` did to the full copy. `nanmin` and
+        `nanargmin` are kept rather than `min`/`argmin` so the values match the
+        previous code exactly even if a NaN ever reaches the matrix.
+        """
+        mm = self._open()
+        best = np.empty(self.n, dtype=np.float32)
+        who = np.empty(self.n, dtype=np.int64)
+        for start in range(0, self.n, self.block_rows):
+            stop = min(start + self.block_rows, self.n)
+            blk = np.array(mm[start:stop], dtype=np.float32)
+            for r in range(stop - start):
+                blk[r, start + r] = np.inf
+            best[start:stop] = np.nanmin(blk, axis=1)
+            who[start:stop] = np.nanargmin(blk, axis=1)
+        return best, who
+
+    def to_csv(self, path_or_buf, index: bool = True, **kwargs) -> None:
+        """Write the matrix in row blocks, formatted by pandas."""
+        mm = self._open()
+        first = True
+        with open(path_or_buf, "w", newline="") as fh:
+            for start in range(0, self.n, self.block_rows):
+                stop = min(start + self.block_rows, self.n)
+                frame = pd.DataFrame(
+                    np.array(mm[start:stop], dtype=np.float32),
+                    index=self.index[start:stop], columns=self.columns,
+                )
+                frame.to_csv(fh, index=index, header=first, **kwargs)
+                first = False
+
+    def close(self) -> None:
+        self._mm = None
+
+    def remove(self) -> None:
+        self.close()
+        try:
+            if self.path and os.path.exists(self.path):
+                os.remove(self.path)
+        except OSError:
+            pass
+
+
 # --- Multiprocessing Shared Cache ---
 # Used to share contour coordinates with worker processes without pickling.
-_ALL_CONTOURS: List[np.ndarray] = []
+#: The point store the distance workers read. A `_SurfaceStore` (one
+#: on-disk array) rather than a list of per-object arrays: see that
+#: class for why the list form cost RAM twice over.
+_ALL_CONTOURS: Optional["_SurfaceStore"] = None
 
-def _init_shared_contours(contours: List[np.ndarray]) -> None:
-    """Initializer for spawn-based multiprocessing (macOS/Windows)."""
+def _init_shared_contours(store: "_SurfaceStore") -> None:
+    """Pool initializer. Only the offsets travel; the points are mapped.
+
+    Under 'spawn' this used to pickle every object's coordinates into
+    every worker. A `_SurfaceStore` pickles as a path, a shape and an
+    offsets array, and each worker maps the same file read-only.
+    """
     global _ALL_CONTOURS
-    _ALL_CONTOURS = contours
+    _ALL_CONTOURS = store
+    _ALL_CONTOURS.close()   # drop any mapping inherited across a fork
 
 
 # =============================================================================
@@ -80,7 +270,7 @@ def _calculate_row_distances_worker_2d(args: Tuple) -> Tuple[int, np.ndarray]:
     i, n_proc, spacing_arr = args
     row_dists = np.full(n_proc - (i + 1), np.inf, dtype=np.float32)
 
-    p1 = _ALL_CONTOURS[i]
+    p1 = _ALL_CONTOURS.points(i)
     if p1.shape[0] == 0:
         return i, row_dists
 
@@ -88,7 +278,7 @@ def _calculate_row_distances_worker_2d(args: Tuple) -> Tuple[int, np.ndarray]:
     tree = cKDTree(p1 * spacing_arr)
 
     for idx, j in enumerate(range(i + 1, n_proc)):
-        p2 = _ALL_CONTOURS[j]
+        p2 = _ALL_CONTOURS.points(j)
         if p2.shape[0] > 0:
             # Query point cloud of object J against the tree of object I
             dists, _ = tree.query(p2 * spacing_arr, k=1)
@@ -103,7 +293,7 @@ def _extract_winning_points_worker_2d(args: Tuple) -> Dict[str, Any]:
     Only triggered for the N object pairs that represent closest contacts.
     """
     label_i, label_j, idx_i, idx_j, spacing_arr = args
-    p1, p2 = _ALL_CONTOURS[idx_i], _ALL_CONTOURS[idx_j]
+    p1, p2 = _ALL_CONTOURS.points(idx_i), _ALL_CONTOURS.points(idx_j)
 
     tree = cKDTree(p1 * spacing_arr)
     dists, indices = tree.query(p2 * spacing_arr, k=1)
@@ -138,8 +328,9 @@ def shortest_distance_2d(
         n_jobs = max(1, mp.cpu_count() - 1)
     spacing_arr = np.array(spacing)
 
-    labels = np.unique(segmented_array)
-    labels = labels[labels > 0]
+    # Streamed, not `np.unique(segmented_array)`: that flattens first, and
+    # flattening a memmap copies the entire label image into RAM.
+    labels = _unique_labels_streaming(segmented_array)
     n_labels = len(labels)
 
     flush_print(f"\n[PROFILE DIST] Starting distance calculation for {n_labels} labels.")
@@ -147,7 +338,7 @@ def shortest_distance_2d(
         return pd.DataFrame(), pd.DataFrame()
 
     # --- Stage 1: Contour Cache ---
-    _ALL_CONTOURS = []
+    _contour_chunks: List[np.ndarray] = []
     locations = ndi.find_objects(segmented_array)
     actual_labels = []
 
@@ -159,7 +350,8 @@ def shortest_distance_2d(
         eroded = ndi.binary_erosion(mask, structure=ndi.generate_binary_structure(2, 1))
         y, x = np.where(mask ^ eroded)
         if len(y) > 0:
-            _ALL_CONTOURS.append(np.column_stack((y + sl[0].start, x + sl[1].start)))
+            _contour_chunks.append(
+                np.column_stack((y + sl[0].start, x + sl[1].start)))
             actual_labels.append(lbl)
 
     n_valid = len(actual_labels)
@@ -167,7 +359,7 @@ def shortest_distance_2d(
 
     # Fast exit if objects shrunk to 0 during erosion
     if n_valid <= 1:
-        _ALL_CONTOURS = []
+        _contour_chunks = []
         return pd.DataFrame(), pd.DataFrame()
 
     # --- Stage 2: Pass 1 (Memory-Mapped Distance Matrix) ---
@@ -183,6 +375,12 @@ def shortest_distance_2d(
     target_dir = temp_dir
     mmap_path = os.path.join(target_dir, f"dist_mat_2d_{os.getpid()}.dat")
     
+    # Write the point clouds out once, then drop the in-RAM chunks. From here
+    # on the coordinates live in one file that every worker maps.
+    _ALL_CONTOURS = _SurfaceStore.build(_contour_chunks, 2, target_dir,
+                                        "contours")
+    _contour_chunks = []
+
     dist_mat_mm = np.memmap(mmap_path, dtype='float32', mode='w+', shape=(n_valid, n_valid))
     dist_mat_mm[:] = np.inf
     np.fill_diagonal(dist_mat_mm, 0)
@@ -215,13 +413,18 @@ def shortest_distance_2d(
                                total=len(winning_pairs), desc="    Distance Pass 2/2"))
 
     # Convert binary matrix to Pandas and cleanup
-    dist_df = pd.DataFrame(np.array(dist_mat_mm), index=actual_labels, columns=actual_labels)
+    # Disk-backed view rather than a materialised N x N array; see
+    # `_DistanceMatrixOnDisk`.
+    # Disk-backed view rather than a materialised N x N array. The file is
+    # deliberately left in place -- it IS the matrix, and its two consumers (the
+    # per-row minimum and the CSV export) read it a block at a time.
+    # `_DistanceMatrixOnDisk.remove()` deletes it.
     points_df = pd.DataFrame(points_list)
 
-    _ALL_CONTOURS = []
+    _ALL_CONTOURS.remove()
+    _ALL_CONTOURS = None
     del dist_mat_mm
-    if os.path.exists(mmap_path):
-        os.remove(mmap_path)
+    dist_df = _DistanceMatrixOnDisk(mmap_path, actual_labels)
 
     return dist_df, points_df
 
@@ -465,7 +668,9 @@ def calculate_ramification_with_skan_2d(
         skel_out = np.memmap(skeleton_export_path, dtype=np.int32, mode='w+', shape=original_shape)
     else: skel_out = np.zeros(original_shape, dtype=np.int32)
         
-    labels = np.unique(segmented_array); labels = labels[labels > 0]
+    # Streamed rather than `np.unique(segmented_array)`, which flattens the
+    # whole label volume into RAM to list its ids.
+    labels = _unique_labels_streaming(segmented_array)
     locations = ndi.find_objects(segmented_array)
     stats_list, detailed_dfs = [], []
 
@@ -590,7 +795,9 @@ def calculate_morphology_2d(segmented_array, spacing, calculate_solidity: bool =
 
 def calculate_intensity_2d(segmented_array, intensity_image):
     """Calculates intensity statistics including Median for 3D Parity."""
-    labels = np.unique(segmented_array); labels = labels[labels > 0]
+    # Streamed rather than `np.unique(segmented_array)`, which flattens the
+    # whole label volume into RAM to list its ids.
+    labels = _unique_labels_streaming(segmented_array)
     locs = ndi.find_objects(segmented_array); res = []
     for lbl in tqdm(labels, desc="    Intensity"):
         idx = int(lbl) - 1
@@ -668,9 +875,12 @@ def analyze_segmentation_2d(
     if calculate_distances:
         dist_df, pts_df = shortest_distance_2d(segmented_array, spacing_yx, temp_dir, n_jobs)
         if not dist_df.empty:
-            temp_mat = dist_df.values.copy(); np.fill_diagonal(temp_mat, np.inf)
-            min_dist = np.nanmin(temp_mat, axis=1)
-            neighbor_indices = np.nanargmin(temp_mat, axis=1)
+            # `dist_df.values.copy()` was a SECOND full N x N array in RAM,
+            # alongside the one the DataFrame already held, purely to mask the
+            # diagonal before reducing. The reduction is per row, so it streams:
+            # `row_minima` masks each row's own entry and returns the same
+            # `nanmin` / `nanargmin` results a block at a time.
+            min_dist, neighbor_indices = dist_df.row_minima()
             closest_neighs = dist_df.columns[neighbor_indices]
             
             dist_metrics = pd.DataFrame({

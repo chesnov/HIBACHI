@@ -26,9 +26,55 @@ from tqdm import tqdm
 DASK_SCHEDULER = 'threads'
 
 try:
-    from .dim_utils import binary_structure, normalise_spacing, planes_of
+    from . import resource_budget
+    from .dim_utils import (
+        binary_structure,
+        chunk_read_write_slices,
+        normalise_spacing,
+        planes_of,
+        write_offset_in_read,
+    )
 except ImportError:  # pragma: no cover - direct script execution
-    from dim_utils import binary_structure, normalise_spacing, planes_of
+    import resource_budget
+    from dim_utils import (
+        binary_structure,
+        chunk_read_write_slices,
+        normalise_spacing,
+        planes_of,
+        write_offset_in_read,
+    )
+
+
+def _edt_halo(reach_um: float, spacing: Sequence[float]) -> Tuple[int, ...]:
+    """
+    Per-axis halo, in voxels, that makes a TILED EDT decide identically.
+
+    Both EDT sites in this module consume their distance map only through a
+    comparison against a physical threshold. That is what makes tiling exact,
+    and the argument is short enough to state in full:
+
+      Restricting the transform to a tile can only REMOVE background pixels
+      from consideration, so the tiled distance is always >= the true one --
+      it can never wrongly report a pixel as close to the edge. And when the
+      true distance is below `reach_um`, the nearest background pixel lies
+      within `reach_um` microns, hence within `reach_um / spacing[k]` voxels
+      along axis k; with a halo that deep it is inside the read tile, so the
+      tiled distance EQUALS the true one there. Pixels the tile over-estimates
+      are exactly the pixels whose true distance already exceeded the
+      threshold, where both answers compare False.
+
+    So the thresholded decision is bit-identical while the memory is bounded.
+    Verified against whole-array EDTs over anisotropic 2D and 3D cases.
+
+    Per-axis rather than scalar because a physical reach is a different voxel
+    count on each axis: 30um is 100 pixels at 0.3um in-plane and 15 at 2um in
+    Z. A scalar halo would pay the largest of those on every axis.
+
+    The `+ 2` mirrors the margin the leading-axis version of this always
+    carried, and covers the `<=` variants of the comparison as well as the `<`.
+    """
+    return tuple(int(math.ceil(float(reach_um) / float(sp))) + 2
+                 for sp in spacing)
 
 
 #: Physical radius, in microns, protecting bright cores from edge trimming.
@@ -119,10 +165,25 @@ def relabel_and_filter_fragments(
     print(f"  [Refine] Global Labeling & Size Filtering (Min: {min_size_voxels} voxels)...")
 
     # 1. Setup Dask Array (Out-of-Core)
-    # Use reasonable chunks to fit in laptop RAM (e.g. ~100MB chunks)
-    # (128, 256, 256) of int32 is roughly 32MB per chunk, very safe for laptops.
+    #
+    # PINNED, and the values are exactly what they always were. This feeds
+    # `dask_image.ndmeasure.label`, which numbers each block independently and
+    # then resolves equivalences -- so the partition is chunk-independent but
+    # the IDs are not, and step 3 iterates clumps in ascending label order
+    # against a peak grid that keeps only prior-label peaks. Renumbering
+    # therefore changes which somata survive, not merely what they are called.
+    # The speedup comes from the scheduler's thread count instead, which cannot
+    # affect any result.
     ndim = int(labels_memmap.ndim)
-    chunk_size = (128, 256, 256) if ndim == 3 else (2048, 2048)
+    budget = resource_budget.open_budget("step 2.4 relabel + size filter")
+    chunk_size = resource_budget.pinned(
+        'relabel_chunk_shape_3d' if ndim == 3 else 'relabel_chunk_shape_2d')
+    _per_chunk = resource_budget.cost_bytes_per_voxel("copy_int32")
+    for _v in chunk_size:
+        _per_chunk *= _v
+    dask_workers = max(1, min(budget.cores,
+                              int(budget.plannable_bytes // max(1, int(_per_chunk)))))
+    print(f"    [resources] {dask_workers} dask worker(s) x {chunk_size} chunk")
     d_seg = da.from_array(labels_memmap, chunks=chunk_size)
     
     # 2. Binarize (Virtual)
@@ -146,7 +207,8 @@ def relabel_and_filter_fragments(
 
     # Compute total features to set up histogram
     # This triggers the first pass of the graph
-    num_features = num_features_dask.compute()
+    num_features = num_features_dask.compute(
+        scheduler=DASK_SCHEDULER, num_workers=dask_workers)
     
     if num_features == 0:
         print("    No objects found.")
@@ -162,7 +224,8 @@ def relabel_and_filter_fragments(
     counts, _ = da.histogram(
         labeled_dask, bins=num_features + 1, range=[-0.5, num_features + 0.5]
     )
-    counts_val = counts.compute()
+    counts_val = counts.compute(
+        scheduler=DASK_SCHEDULER, num_workers=dask_workers)
 
     # 5. Identify Valid Labels
     # Create a boolean mask of IDs to keep based on total global volume
@@ -190,10 +253,11 @@ def relabel_and_filter_fragments(
     with ProgressBar(dt=5):
         # lock=True ensures thread safety when writing to the memmap
         da.store(
-            final_dask.astype(np.int32), 
-            labels_memmap, 
-            lock=True, 
-            scheduler=DASK_SCHEDULER
+            final_dask.astype(np.int32),
+            labels_memmap,
+            lock=True,
+            scheduler=DASK_SCHEDULER,
+            num_workers=dask_workers,
         )
 
     labels_memmap.flush()
@@ -344,8 +408,15 @@ def _find_largest_hull_component_slice_graph(hull_memmap: np.memmap) -> None:
 
         labeled, n = ndimage.label(hull_slice, structure=structure_2d)
 
+        # One bincount instead of a full-plane comparison per label. The old
+        # `np.count_nonzero(labeled == lid)` inside the loop scanned the whole
+        # plane once for EVERY component, so a fragmented hull -- exactly what a
+        # raised `otsu_scale_factor` produces -- cost O(components x plane).
+        # `bincount` gets the same counts in a single pass, and the values are
+        # integer counts, so they are identical rather than merely close.
+        _counts = np.bincount(labeled.ravel(), minlength=n + 1)
         for lid in range(1, n + 1):
-            _register((z, lid), int(np.count_nonzero(labeled == lid)))
+            _register((z, lid), int(_counts[lid]))
 
         if prev_labeled is not None:
             # Pixels where both slices are foreground share a Z-face — the
@@ -387,16 +458,20 @@ def _find_largest_hull_component_slice_graph(hull_memmap: np.memmap) -> None:
             continue
 
         labeled, n = ndimage.label(hull_slice, structure=structure_2d)
-        modified = False
 
+        # Same collapse as pass 1, plus the removal itself: build a per-label
+        # keep/drop lookup once and index it with the label image, rather than
+        # comparing the whole plane against each doomed label in turn. The set
+        # of removed pixels and the count are identical -- this is a lookup
+        # table over the same decision, not a different decision.
+        _counts = np.bincount(labeled.ravel(), minlength=n + 1)
+        _drop = np.zeros(n + 1, dtype=bool)
         for lid in range(1, n + 1):
             if _find((z, lid)) != largest_root:
-                mask = (labeled == lid)
-                hull_slice[mask] = False
-                removed += int(np.count_nonzero(mask))
-                modified = True
-
-        if modified:
+                _drop[lid] = True
+                removed += int(_counts[lid])
+        if _drop.any():
+            hull_slice[_drop[labeled]] = False
             hull_memmap[z] = hull_slice
 
     print(f"    [SliceGraph] Done. Removed {removed} artifact voxels.")
@@ -531,75 +606,78 @@ def generate_tight_hull_stack(
     return hull_memmap
 
 
-def _trim_zero_data_edges_3d(
+def _trim_zero_data_edges(
     labels_memmap: np.memmap,
     volume: np.ndarray,
     spacing: Sequence[float],
     distance_threshold: float
 ) -> None:
     """
-    Removes artifacts at the boundary of Missing Tiles (Pixel Value 0) in 3D.
+    Removes artifacts at the boundary of Missing Tiles (Pixel Value 0).
     Detects 'True Zero' regions and hard-deletes segmentations near them.
+
+    Tiled on EVERY axis with a physically-derived halo (see `_edt_halo`), not
+    just along the leading one. The old form took the full cross-section in
+    each chunk -- and the whole array at rank 2 -- so its peak scaled with plane
+    size: `distance_transform_edt` returns float64 and allocates an index
+    workspace besides, which on a 24615x18462 cross-section is several GB per
+    call whatever the chunk depth. Tiling in-plane bounds it, and the halo
+    makes the thresholded decision identical.
     """
     ndim = int(labels_memmap.ndim)
     spacing = normalise_spacing(spacing, ndim)
     print(f"  [ZeroTrim] Removing Missing Tile Artifacts ({ndim}D)...")
-    total_z = labels_memmap.shape[0] if ndim == 3 else 1
 
-    # Chunked over the leading axis in 3D; a single window in 2D. The margin
-    # covers the reach the thresholded decision needs -- a voxel is only within
-    # `distance_threshold` of a void if that void is within the same reach -- so
-    # the chunked EDT answers identically to a whole-array one.
-    margin = (int(distance_threshold / spacing[0]) + 5) if ndim == 3 else 0
-    chunk_size = 32 if ndim == 3 else 1
+    # The reach the decision actually needs. Both clauses below are counted:
+    # the `< distance_threshold` test and the `<= avg_px * 1.5` fallback that
+    # fires when the threshold is smaller than a pixel. A halo sized for the
+    # larger of the two covers both.
+    avg_px = float(np.mean(spacing))
+    reach = float(distance_threshold)
+    if distance_threshold > 0 and distance_threshold < avg_px:
+        reach = max(reach, avg_px * 1.5)
+    halo = _edt_halo(reach, spacing)
+
+    budget = resource_budget.open_budget("step 2.3a zero-edge trim")
+    base = (32, 512, 512) if ndim == 3 else (2048, 2048)
+    plan = budget.report(budget.plan_scaled_block(
+        labels_memmap.shape, base, "edt_3d" if ndim == 3 else "edt_2d",
+        overlap=max(halo), max_workers=1,
+        name=f"zero-edge EDT (halo {halo} voxels)",
+    ))
+
     deleted_voxels = 0
-    
-    for start_z in tqdm(range(0, total_z, chunk_size), desc="    Zero-Edge Trim"):
-        end_z = min(start_z + chunk_size, total_z)
-        r_start = max(0, start_z - margin)
-        r_end = min(total_z, end_z + margin)
-        
-        if ndim == 3:
-            vol_chunk = volume[r_start:r_end]
-            lbl_chunk = labels_memmap[r_start:r_end]
-        else:
-            vol_chunk = np.asarray(volume)
-            lbl_chunk = np.asarray(labels_memmap)
-        
+    _tiles = list(chunk_read_write_slices(
+        labels_memmap.shape, plan.block_shape, overlap=halo))
+    for read_sl, write_sl in tqdm(_tiles, desc="    Zero-Edge Trim"):
+        vol_chunk = np.asarray(volume[read_sl])
+
         # 1. Identify 'True Zero' (with epsilon)
         is_zero = (vol_chunk < 1e-4)
         if not np.any(is_zero):
             continue
-        
+
         # 2. EDT from Void
         dist_from_void = distance_transform_edt(~is_zero, sampling=spacing)
-        
+
         # 3. Hard Delete
-        if ndim == 3:
-            rel_start = start_z - r_start
-            center_dist = dist_from_void[rel_start:rel_start + (end_z - start_z)]
-            center_lbl = lbl_chunk[rel_start:rel_start + (end_z - start_z)]
-        else:
-            center_dist = dist_from_void
-            center_lbl = lbl_chunk
-        
+        crop = write_offset_in_read(read_sl, write_sl)
+        center_dist = dist_from_void[crop]
+        center_lbl = np.asarray(labels_memmap[write_sl])
+
         mask_distance = (center_dist < distance_threshold)
-        
+
         # Ensure immediate boundary is caught if threshold is small
         if distance_threshold > 0:
-            avg_px = np.mean(spacing)
             if distance_threshold < avg_px:
                 mask_distance |= (center_dist <= (avg_px * 1.5))
 
         to_delete = (center_lbl > 0) & mask_distance
-        
+
         count = np.sum(to_delete)
         if count > 0:
             center_lbl[to_delete] = 0
-            if ndim == 3:
-                labels_memmap[start_z:end_z] = center_lbl
-            else:
-                labels_memmap[...] = center_lbl
+            labels_memmap[write_sl] = center_lbl
             deleted_voxels += count
 
     labels_memmap.flush()
@@ -653,13 +731,39 @@ def trim_edges_with_core_protection(
     # form; at rank 2 that computes a 1-D transform of row 0 and leaves the rest
     # of the map at zero, which makes almost everything look adjacent to the
     # hull edge and silently disables trimming.
+    # In-plane transform per plane at either rank -- but TILED in-plane rather
+    # than a plane at a time. The per-plane form was already a large
+    # improvement on the 3D-chunked EDT it replaced (the comment above records
+    # that history), yet it still scales with plane AREA: scipy returns float64
+    # and allocates an index workspace, so a 24615x18462 cross-section costs
+    # several GB per call and an 8 GB machine cannot make it.
+    #
+    # `_edt_halo` explains why tiling leaves the answer unchanged: the map is
+    # consumed only through `effective_dist < distance_threshold`, tiling can
+    # only over-estimate, and it cannot over-estimate anywhere the comparison
+    # would have been True. `np.minimum` against the Z distance below preserves
+    # that, since it can only lower a value that was already correct.
+    _halo_yx = _edt_halo(distance_threshold, spacing_yx)
+    _plane_shape = tuple(labels_memmap.shape[-2:])
+    _edt_budget = resource_budget.open_budget("step 2.3d distance map")
+    _plan = _edt_budget.report(_edt_budget.plan_scaled_block(
+        _plane_shape, (2048, 2048), "edt_2d",
+        overlap=max(_halo_yx), max_workers=1,
+        name=f"in-plane EDT (halo {_halo_yx} px)",
+    ))
+    _inplane_tiles = list(chunk_read_write_slices(
+        _plane_shape, _plan.block_shape, overlap=_halo_yx))
+
     for _z, _hp in tqdm(list(planes_of(np.asarray(hull_memmap))),
                         desc="    Distance Transform"):
-        _dt = distance_transform_edt(_hp, sampling=spacing_yx).astype(np.float32)
-        if ndim == 3:
-            dist_memmap[_z] = _dt
-        else:
-            dist_memmap[...] = _dt
+        for _r, _w in _inplane_tiles:
+            _sub = distance_transform_edt(
+                _hp[_r], sampling=spacing_yx).astype(np.float32)
+            _crop = write_offset_in_read(_r, _w)
+            if ndim == 3:
+                dist_memmap[(_z,) + _w] = _sub[_crop]
+            else:
+                dist_memmap[_w] = _sub[_crop]
 
     dist_memmap.flush()
 
@@ -670,31 +774,40 @@ def trim_edges_with_core_protection(
 
     print(f"    Applying Protection (Dilate Bright Cores {protection_iter}x)...")
 
-    scan_chunk_size = 64
     scan_overlap = protection_iter + 2
     deleted_voxels = 0
     struct_protect = binary_structure(ndim, 1)
 
-    # Chunked over the leading axis in 3D; a single window in 2D. The overlap
-    # exceeds the dilation's reach, so the chunked result equals whole-array.
-    _lead = total_z if ndim == 3 else 1
-    _step = scan_chunk_size if ndim == 3 else 1
-    for z in tqdm(range(0, _lead, _step), desc="    Processing"):
-        end_z = min(z + _step, _lead)
-        r_start = max(0, z - scan_overlap) if ndim == 3 else 0
-        r_end = min(_lead, end_z + scan_overlap) if ndim == 3 else 1
+    # ONE traversal for both ranks, tiled on every axis.
+    #
+    # The old form chunked the leading axis at a fixed 64 planes in 3D and took
+    # the WHOLE image in 2D, so at rank 2 `core_mask`, the dilation output and
+    # `effective_dist` were all image-sized -- about 2.5 GB of temporaries on a
+    # 20038^2 image, where the 3D path was bounded. That asymmetry is gone, and
+    # the extent now comes from the budget rather than from a constant.
+    #
+    # Tiling stays exact because the halo exceeds the dilation's reach:
+    # `binary_dilation` with `iterations=protection_iter` cannot move
+    # information further than `protection_iter` voxels, and only the owned
+    # region is written. That was already the justification for the 3D chunking;
+    # it holds per-axis for the same reason.
+    _scan_budget = resource_budget.open_budget("step 2.3d core protection")
+    _scan_base = (64, 512, 512) if ndim == 3 else (2048, 2048)
+    _scan_plan = _scan_budget.report(_scan_budget.plan_scaled_block(
+        labels_memmap.shape, _scan_base, "binary_morphology",
+        overlap=scan_overlap, max_workers=1,
+        name=f"core protection (halo {scan_overlap} voxels)",
+    ))
 
-        if ndim == 3:
-            lbl_chunk = labels_memmap[r_start:r_end]
-            vol_chunk = volume_memmap[r_start:r_end]
-            dist_chunk = dist_memmap[r_start:r_end]
-        else:
-            lbl_chunk = np.asarray(labels_memmap)
-            vol_chunk = np.asarray(volume_memmap)
-            dist_chunk = np.asarray(dist_memmap)
-
+    _tiles = list(chunk_read_write_slices(
+        labels_memmap.shape, _scan_plan.block_shape, overlap=scan_overlap))
+    for read_sl, write_sl in tqdm(_tiles, desc="    Processing"):
+        lbl_chunk = np.asarray(labels_memmap[read_sl])
         if not np.any(lbl_chunk):
             continue
+
+        vol_chunk = np.asarray(volume_memmap[read_sl])
+        dist_chunk = np.asarray(dist_memmap[read_sl])
 
         core_mask = (lbl_chunk > 0) & (vol_chunk > global_brightness_cutoff)
 
@@ -713,7 +826,7 @@ def trim_edges_with_core_protection(
             #
             # 3D ONLY, legitimately: a 2D image has no Z faces to be near, so
             # there is no 2D counterpart being omitted.
-            z_indices = np.arange(r_start, r_end)
+            z_indices = np.arange(read_sl[0].start, read_sl[0].stop)
             z_dist = np.minimum(z_indices * spacing[0],
                                 (total_z - 1 - z_indices) * spacing[0])
             effective_dist = np.minimum(dist_chunk, z_dist[:, None, None])
@@ -724,20 +837,14 @@ def trim_edges_with_core_protection(
                     (effective_dist < distance_threshold) & \
                     (~protected_mask)
 
-        if ndim == 3:
-            w_start = z - r_start
-            center_delete = to_delete[w_start:w_start + (end_z - z)]
-            center_lbls = labels_memmap[z:end_z]
-            count = np.count_nonzero(center_delete)
-            if count > 0:
-                deleted_voxels += count
-                center_lbls[center_delete] = 0
-                labels_memmap[z:end_z] = center_lbls
-        else:
-            count = np.count_nonzero(to_delete)
-            if count > 0:
-                deleted_voxels += count
-                labels_memmap[to_delete] = 0
+        crop = write_offset_in_read(read_sl, write_sl)
+        center_delete = to_delete[crop]
+        count = np.count_nonzero(center_delete)
+        if count > 0:
+            deleted_voxels += count
+            center_lbls = np.asarray(labels_memmap[write_sl])
+            center_lbls[center_delete] = 0
+            labels_memmap[write_sl] = center_lbls
 
     labels_memmap.flush()
     print(f"    Deleted {deleted_voxels} artifact voxels.")
@@ -801,7 +908,7 @@ def apply_hull_trimming(
         if edge_trim_distance_threshold > 0:
             
             # A. Zero Edge Trim
-            _trim_zero_data_edges_3d(
+            _trim_zero_data_edges(
                 trimmed_labels_memmap, original_volume, spacing,
                 edge_trim_distance_threshold
             )
@@ -844,28 +951,64 @@ def apply_hull_trimming(
             )
 
             # E. Generate Boundary for Viz
-            eroded_hull = np.zeros_like(hull_memmap, dtype=bool)
+            #
+            # Written to a memmap, not built in RAM. The old form allocated
+            # `eroded_hull = np.zeros_like(hull_memmap, dtype=bool)` and then
+            # `np.asarray(hull_memmap) ^ eroded_hull` -- two full-volume boolean
+            # arrays resident at once, at BOTH ranks, purely to hand the caller
+            # something it immediately copies into a memmap of its own. On a
+            # brain-wide volume that is the largest single allocation in this
+            # step and it exists only for a visualisation layer.
+            #
+            # The caller does `edge_memmap[:] = hull_boundary_mask[:]`, which is
+            # a buffered memmap-to-memmap copy, so returning a memmap needs no
+            # change in `fluorescence_strategy`. Erosion is tiled with a
+            # one-voxel halo, which is the structuring element's entire reach,
+            # so the boundary is identical to the whole-array one.
+            # In `final_output_temp_dir`, NOT the workflow scratch directory:
+            # this file is returned to the caller, and the scratch directory is
+            # deleted in `finally` before the caller can copy it. The output
+            # directory is the one whose lifetime the caller already owns -- it
+            # is returned alongside as `temp_trimmed_dir`.
+            boundary_path = os.path.join(final_output_temp_dir,
+                                         'hull_boundary.dat')
+            hull_boundary_for_return = np.memmap(
+                boundary_path, dtype=bool, mode='w+', shape=original_shape
+            )
             struct = np.ones((3,) * ndim, dtype=bool)
-
-            if ndim == 3:
-                for z in range(0, original_shape[0], 32):
-                    end_z = min(z + 32, original_shape[0])
-                    r0, r1 = max(0, z - 1), min(original_shape[0], end_z + 1)
-                    h_c = hull_memmap[r0:r1]
-                    e_c = ndimage.binary_erosion(h_c, structure=struct,
-                                                 iterations=1)
-                    eroded_hull[z:end_z] = e_c[(z - r0):(z - r0) + (end_z - z)]
-            else:
-                eroded_hull[...] = ndimage.binary_erosion(
-                    np.asarray(hull_memmap), structure=struct, iterations=1
-                )
-
-            hull_boundary_for_return = (np.asarray(hull_memmap) ^ eroded_hull)
+            _b_budget = resource_budget.open_budget("step 2.3e hull boundary")
+            _b_base = (32, 512, 512) if ndim == 3 else (2048, 2048)
+            _b_plan = _b_budget.report(_b_budget.plan_scaled_block(
+                original_shape, _b_base, "binary_morphology",
+                overlap=1, max_workers=1, name="hull boundary erosion",
+            ))
+            for _r, _w in tqdm(list(chunk_read_write_slices(
+                    original_shape, _b_plan.block_shape, overlap=1)),
+                    desc="    Hull Boundary"):
+                _h = np.asarray(hull_memmap[_r])
+                _e = ndimage.binary_erosion(_h, structure=struct, iterations=1)
+                _crop = write_offset_in_read(_r, _w)
+                hull_boundary_for_return[_w] = _h[_crop] ^ _e[_crop]
+            hull_boundary_for_return.flush()
 
         else:
             print("  Edge Trim Disabled (Dist=0).")
             hull_memmap = None
-            hull_boundary_for_return = np.zeros(original_shape, dtype=bool)
+            # A memmap of zeros rather than `np.zeros(original_shape)`: the
+            # all-false case allocated the full volume in RAM just as the
+            # computed case did.
+            # In `final_output_temp_dir`, NOT the workflow scratch directory:
+            # this file is returned to the caller, and the scratch directory is
+            # deleted in `finally` before the caller can copy it. The output
+            # directory is the one whose lifetime the caller already owns -- it
+            # is returned alongside as `temp_trimmed_dir`.
+            boundary_path = os.path.join(final_output_temp_dir,
+                                         'hull_boundary.dat')
+            hull_boundary_for_return = np.memmap(
+                boundary_path, dtype=bool, mode='w+', shape=original_shape
+            )
+            hull_boundary_for_return[:] = False
+            hull_boundary_for_return.flush()
 
         # 4. FINAL CLEANUP
         if min_size_voxels > 0:
@@ -888,9 +1031,11 @@ def apply_hull_trimming(
         if 'hull_memmap' in locals():
             hull_memmap = _safe_close_memmap(hull_memmap)
         # Targeted deletion of large 3D arrays
-        for var in ['hull_boundary_for_return', 'eroded_hull', 'core_mask', 'protected_mask']:
-            if var in locals():
-                del locals()[var]
+        # `hull_boundary_for_return` is NOT dropped here: it is the value being
+        # returned, and it is now a memmap rather than an in-RAM array, so
+        # there is nothing to reclaim. (`del locals()[...]` never deleted
+        # anything anyway -- `locals()` is a snapshot in a function scope.)
+        gc.collect()
         gc.collect()
         if workflow_temp_dir and os.path.exists(workflow_temp_dir):
             try:
@@ -905,7 +1050,9 @@ def apply_hull_trimming(
 #: Rank-neutral names. The `_stack` / `_3d` suffixes described the only
 #: implementation that existed, not a property of the function.
 generate_tight_hull = generate_tight_hull_stack
-_trim_zero_data_edges = _trim_zero_data_edges_3d
+#: The `_3d` name is the alias now, not the definition. It handled both ranks
+#: internally and only the name still claimed otherwise.
+_trim_zero_data_edges_3d = _trim_zero_data_edges
 
 
 def generate_tight_hull_2d(image, cell_mask, hull_closing_radius: int = 10,
@@ -951,8 +1098,8 @@ def relabel_and_filter_fragments_2d(labels_memmap, min_size_pixels: int):
 
 def _trim_zero_data_edges_2d(labels_memmap, image, spacing, distance_threshold):
     """2D entry point; forwards to the rank-agnostic implementation."""
-    return _trim_zero_data_edges_3d(labels_memmap, image, spacing,
-                                    distance_threshold)
+    return _trim_zero_data_edges(labels_memmap, image, spacing,
+                                 distance_threshold)
 
 
 def apply_hull_trimming_2d(raw_labels_path, original_image, spacing,

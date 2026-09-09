@@ -238,6 +238,20 @@ class FluorescenceStrategy(ProcessingStrategy):
         if image_stack is None:
             return False
         print(f"Executing Step 1: Raw {self.mode_name} segmentation...")
+
+        # The machine and the ceiling, once per run, at the top of the log.
+        #
+        # Every step opens its own budget -- nothing is plumbed through from
+        # here -- so a resource change applies to the next step that starts,
+        # even mid-batch. What this line adds is the record: two machines that
+        # disagree about how long a dataset took, or one run that used more
+        # memory than the last, are both answered by the numbers printed here,
+        # and without them the budget's effect is invisible in a log.
+        try:
+            from .resource_budget import describe_environment
+            print(describe_environment())
+        except Exception as exc:      # never block a run over a log line
+            print(f"  [resources] environment unavailable: {exc}")
         
         files = self.get_checkpoint_files()
         persistent_raw_dat_path = files.get("raw_segmentation")
@@ -453,8 +467,15 @@ class FluorescenceStrategy(ProcessingStrategy):
                 edge_mask_path, dtype=bool, mode='w+', shape=self.image_shape
             )
             if hull_boundary_mask is not None:
+                # A memmap now, not an in-RAM array: step 2 used to build the
+                # boundary as two full-volume boolean arrays purely to hand
+                # them over here. The assignment is unchanged -- numpy buffers a
+                # memmap-to-memmap copy -- but the source has to be CLOSED
+                # afterwards, or on Windows the mapping keeps a handle on a file
+                # inside the step's temp directory and the cleanup below fails.
                 edge_memmap[:] = hull_boundary_mask[:]
             self._close_memmap(edge_memmap)
+            self._close_memmap(hull_boundary_mask)
 
             if viewer is not None:
                 trimmed_display = np.memmap(
@@ -695,9 +716,13 @@ class FluorescenceStrategy(ProcessingStrategy):
                 # been reconciled.
                 "speed_power": float(params.get("speed_power", 1.5)),
                 "memmap_dir": temp_chunk_dir,
-                "memmap_voxel_threshold": int(
-                    params.get("memmap_voxel_threshold", 25_000_000)
-                )
+                # `memmap_voxel_threshold` was passed here and is NOT a
+                # parameter of `separate_multi_soma_cells`: it landed in
+                # `**kwargs`, was forwarded to the chunk worker, and read by
+                # nothing. The only function that accepts it is
+                # `soma_extraction.extract_soma_masks` (step 3), which was never
+                # given it -- and there it controls nothing but whether a
+                # progress bar is drawn. Removed rather than rerouted.
             }
 
             final_separated_cells = separate_multi_soma_cells(
@@ -709,8 +734,16 @@ class FluorescenceStrategy(ProcessingStrategy):
                 final_seg_path, dtype=np.int32, mode='w+',
                 shape=self.image_shape
             )
+            # `final_separated_cells` is a memmap over a file in
+            # `temp_chunk_dir`. Step 4 used to materialise the whole label
+            # volume in RAM to return it, which was the pipeline's hard ceiling
+            # on volume size; it now hands back the stitched file itself. This
+            # copy is unchanged, but the source must be closed before the
+            # `finally` below removes that directory.
             final_memmap[:] = final_separated_cells[:]
             self._close_memmap(final_memmap)
+            self._close_memmap(final_separated_cells)
+            final_separated_cells = None
 
             if viewer is not None:
                 final_display = np.memmap(
@@ -733,8 +766,10 @@ class FluorescenceStrategy(ProcessingStrategy):
             # over an artifact a later edit may delete, which on Windows makes
             # the delete fail outright.
             self._close_memmap(intensity_ref)
-            if 'final_separated_cells' in locals():
-                del final_separated_cells
+            # Already closed above on the success path; this covers an
+            # exception between the call and the copy.
+            if final_separated_cells is not None:
+                self._close_memmap(final_separated_cells)
 
             if os.path.exists(temp_chunk_dir):
                 shutil.rmtree(temp_chunk_dir, ignore_errors=True)

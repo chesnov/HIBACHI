@@ -555,6 +555,20 @@ PINNED: Dict[str, Tuple[Any, str]] = {
         "between the ranks is inherited from the pre-merge tracks and is "
         "deliberately NOT unified: doing so would renumber one rank's labels.",
     ),
+    "relabel_chunk_shape_3d": (
+        (128, 256, 256),
+        "Step 2's fragment filter feeds this to dask_image.ndmeasure.label, so "
+        "the same renumbering argument as dask_chunk_shape_3d applies: the "
+        "partition is chunk-independent, the IDs are not, and step 3's peak "
+        "grid resolves cross-label soma conflicts in ascending label order. "
+        "Note the value differs from dask_chunk_shape_3d -- step 1 and step 2 "
+        "chose different shapes and both are baked into existing results, so "
+        "they are pinned separately rather than unified.",
+    ),
+    "relabel_chunk_shape_2d": (
+        (2048, 2048),
+        "As relabel_chunk_shape_3d, at rank 2.",
+    ),
     "threshold_sample_stride_inplane_max": (
         16,
         "Step 1 estimates its percentile thresholds from a strided sample. "
