@@ -1,5 +1,6 @@
 import os
 import sys
+import threading
 import gc
 import copy
 import json
@@ -138,15 +139,72 @@ class UnsupportedModeError(ValueError):
 
 class OutputStream(QObject):
     """
-    Redirects stdout/stderr to a Qt Signal for display in the GUI log widget.
+    Captures stdout/stderr for the GUI log widget, and does NOT touch the GUI.
+
+    This used to emit one Qt signal per `write`, connected straight to the
+    widget's insert-and-scroll. `print` issues two writes per line (the text,
+    then the newline), and step 4 emits on the order of a million lines on a
+    real 2D volume, so that was ~2 M queued cross-thread events each causing a
+    text insert and an `ensureCursorVisible()` relayout on the GUI thread. The
+    window stopped responding for the duration of the step, and no amount of
+    work on the pipeline side fixed it because the cost was in the sink.
+
+    Now `write` only appends to a buffer under a lock -- cheap, and safe from
+    any thread -- and the window drains it on a timer. `flush` is a real flush
+    of the passthrough rather than a no-op.
+
+    `passthrough` is the stream stdout was pointing at before the redirect, so
+    the lines still reach the launcher's pipe and therefore `hibachi-child.log`.
+    Previously the redirect swallowed them and the only copy was in the widget,
+    which is also the thing that gets cleared between steps.
+
+    `max_chars` bounds what is held while the GUI is behind: past the cap the
+    OLDEST buffered text is dropped, with a marker, because a run that printed
+    a million lines is not going to be read from the top.
     """
-    text_written = pyqtSignal(str)
+    def __init__(self, passthrough: Any = None, max_chars: int = 1_000_000):
+        super().__init__()
+        self._passthrough = passthrough
+        self._max_chars = int(max_chars)
+        self._buf: List[str] = []
+        self._chars = 0
+        self._dropped = 0
+        self._lock = threading.Lock()
 
     def write(self, text: str) -> None:
-        self.text_written.emit(str(text))
+        text = str(text)
+        if self._passthrough is not None:
+            try:
+                self._passthrough.write(text)
+            except Exception:
+                pass
+        with self._lock:
+            self._buf.append(text)
+            self._chars += len(text)
+            while self._chars > self._max_chars and len(self._buf) > 1:
+                self._chars -= len(self._buf.pop(0))
+                self._dropped += 1
+
+    def drain(self) -> str:
+        """Everything buffered since the last call, as one string."""
+        with self._lock:
+            if not self._buf:
+                return ""
+            out = "".join(self._buf)
+            dropped = self._dropped
+            self._buf.clear()
+            self._chars = 0
+            self._dropped = 0
+        if dropped:
+            out = f"[... {dropped} earlier log chunks dropped ...]\n" + out
+        return out
 
     def flush(self) -> None:
-        pass
+        if self._passthrough is not None:
+            try:
+                self._passthrough.flush()
+            except Exception:
+                pass
 
 
 # =============================================================================
@@ -400,6 +458,12 @@ class DynamicGUIManager(QObject):
         self.original_stdout = sys.stdout
         self.original_stderr = sys.stderr
         self.output_stream: Optional[OutputStream] = None
+        # The log is drained on a timer rather than written to on every print;
+        # see OutputStream. 10 Hz is fast enough to read and slow enough that
+        # the GUI thread spends almost none of its time on it.
+        self._log_timer = QTimer(self)
+        self._log_timer.setInterval(100)
+        self._log_timer.timeout.connect(self._drain_log)
         
         # Initialize Persistent Log Widget
         self.log_widget: Optional[QTextEdit] = None
@@ -467,6 +531,9 @@ class DynamicGUIManager(QObject):
         """Creates a permanent log widget that isn't destroyed between steps."""
         self.log_widget = QTextEdit()
         self.log_widget.setReadOnly(True)
+        # Bounded scrollback. Without this the document grows without limit and
+        # every insert gets slower, so a long step degrades as it runs.
+        self.log_widget.document().setMaximumBlockCount(5000)
         self.log_widget.setMinimumHeight(150)
         self.log_widget.setMaximumHeight(200)
         self.log_widget.setStyleSheet("font-family: 'Courier New', Courier, monospace; font-size: 11px;")
@@ -1832,6 +1899,10 @@ class DynamicGUIManager(QObject):
             # _on_step_finished won't run now (signals are detached), so restore
             # the streams here or stdout stays pointed at a dead log widget.
             try:
+                self._log_timer.stop()
+            except Exception:
+                pass
+            try:
                 sys.stdout = self.original_stdout
                 sys.stderr = self.original_stderr
             except Exception:
@@ -2659,10 +2730,10 @@ class DynamicGUIManager(QObject):
         self.process_started.emit()
 
         # Redirect Stdout
-        self.output_stream = OutputStream()
-        self.output_stream.text_written.connect(self._append_log)
+        self.output_stream = OutputStream(passthrough=self.original_stdout)
         sys.stdout = self.output_stream
         sys.stderr = self.output_stream
+        self._log_timer.start()
 
         # Start Worker
         # Record existing children first so _stop_worker_safely can later kill
@@ -2682,23 +2753,51 @@ class DynamicGUIManager(QObject):
         self.worker.finished_signal.connect(self._on_step_finished)
         self.worker.start()
 
+    def _drain_log(self) -> None:
+        """Moves whatever the pipeline has printed into the log widget.
+
+        Called on a timer, on the GUI thread, so one insert covers a hundred
+        milliseconds of output instead of one insert per `print`.
+        """
+        stream = self.output_stream
+        if stream is None:
+            return
+        text = stream.drain()
+        if not text:
+            return
+        self._append_log(text)
+
     def _append_log(self, text: str) -> None:
         """Appends text to the GUI log widget."""
         if not self.log_widget:
             return
-        
+
         try:
             # C++ check: might raise RuntimeError if wrapped object deleted
+            bar = self.log_widget.verticalScrollBar()
+            at_bottom = bar.value() >= bar.maximum() - 4
             cursor = self.log_widget.textCursor()
             cursor.movePosition(QTextCursor.End)
             cursor.insertText(text)
-            self.log_widget.setTextCursor(cursor)
-            self.log_widget.ensureCursorVisible()
+            # Only follow the tail if the user was already at the tail.
+            # `ensureCursorVisible` forces a relayout, and doing it while
+            # someone is scrolled up also yanks the view away from them.
+            if at_bottom:
+                self.log_widget.setTextCursor(cursor)
+                bar.setValue(bar.maximum())
         except RuntimeError:
             self.log_widget = None
 
     def _on_step_finished(self, success: bool) -> None:
         """Callback when the worker thread finishes."""
+        # Drain what the step printed last before detaching the stream, or the
+        # tail of the log -- which is where the summary lines are -- is lost.
+        try:
+            self._log_timer.stop()
+            self._drain_log()
+        except Exception:
+            pass
+
         # Restore Stdout immediately
         sys.stdout = self.original_stdout
         sys.stderr = self.original_stderr

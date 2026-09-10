@@ -204,6 +204,24 @@ def _cached_structuring_element(ndim: int, radius: int) -> np.ndarray:
 _PROFILE_WATERSHED = False
 
 
+#: The PER-ITEM diagnostic lines: one per seed, one per scored interface, one
+#: per graph edge, one per kept orphan, and the geodesic measurements per
+#: conflicting pair in the stitcher. Same reasoning as `_PROFILE_WATERSHED` --
+#: they change no result -- but the volume is the problem rather than the
+#: computation. A real 2D run is ~600 seeds, ~1,450 scored interfaces and
+#: ~1,700 edges PER CHUNK, so 380 chunks is on the order of 1.4 million lines,
+#: every one of which becomes a queued Qt signal and a relayout of the log
+#: widget on the GUI thread. That is what makes the window stop responding
+#: during step 4, and it does so whether the chunks run one at a time or
+#: several at once.
+#:
+#: What survives when this is False is one summary line per cell and per chunk
+#: carrying the counts and the flagged cases, plus every line that announces a
+#: DECISION rather than a measurement. Set to True when investigating a
+#: specific cell; expect the GUI to crawl.
+_PROFILE_PER_ITEM = False
+
+
 def _dilate_local(mask: np.ndarray, footprint: np.ndarray) -> np.ndarray:
     """`binary_dilation(mask, footprint)`, evaluated only where it can be True.
 
@@ -531,16 +549,23 @@ def _calculate_interface_metrics(
         metrics['should_merge_decision'] = True
 
     # [PROFILING] Log all three checks and their raw values.
-    bright_cut_warn = " *** BRIGHT CUT ***" if not cell_mean_ratio_passed else ""
-    flush_print(f"  [PROFILE|INTERFACE] "
-                f"mean_interface={mean_interface_intensity:.1f} | "
-                f"soma_ref={avg_soma_intensity_for_interface:.1f} | "
-                f"soma_ratio={ratio_soma:.4f} (thr={min_path_intensity_ratio_heuristic}, "
-                f"passed={soma_ratio_passed}) | "
-                f"cell_mean_ratio={ratio_cell_mean:.4f} (thr={max_interface_to_cell_mean_ratio}, "
-                f"passed={cell_mean_ratio_passed}){bright_cut_warn} | "
-                f"lid_passed={lid_passed} | "
-                f"=> should_merge={metrics['should_merge_decision']}")
+    # Recorded rather than printed: the caller tallies how many interfaces in a
+    # cell were flagged, which is what the per-interface line was read for in
+    # bulk. Only `should_merge_decision` is consulted by either caller (the
+    # worker's merge_map and `global_merge_pass`), so an extra key is inert.
+    metrics['bright_cut'] = not cell_mean_ratio_passed
+    if _PROFILE_PER_ITEM:
+        bright_cut_warn = " *** BRIGHT CUT ***" if not cell_mean_ratio_passed else ""
+        flush_print(
+            f"  [PROFILE|INTERFACE] "
+            f"mean_interface={mean_interface_intensity:.1f} | "
+            f"soma_ref={avg_soma_intensity_for_interface:.1f} | "
+            f"soma_ratio={ratio_soma:.4f} (thr={min_path_intensity_ratio_heuristic}, "
+            f"passed={soma_ratio_passed}) | "
+            f"cell_mean_ratio={ratio_cell_mean:.4f} (thr={max_interface_to_cell_mean_ratio}, "
+            f"passed={cell_mean_ratio_passed}){bright_cut_warn} | "
+            f"lid_passed={lid_passed} | "
+            f"=> should_merge={metrics['should_merge_decision']}")
 
     return metrics
 
@@ -1063,6 +1088,7 @@ def _separate_multi_soma_cells_chunk(
                 s_id: int(np.sum(local_soma == s_id)) for s_id in seeds_in_crop
             }
             max_marker_count = max(marker_counts.values())
+            _n_dim = _n_tiny = 0
             for s_id in seeds_in_crop:
                 n_markers   = marker_counts[s_id]
                 soma_int    = soma_props[s_id]['mean_intensity']
@@ -1073,11 +1099,22 @@ def _separate_multi_soma_cells_chunk(
                     flags.append(f"DIM (int_ratio={int_ratio:.2f})")
                 if size_ratio < 0.3:
                     flags.append(f"TINY (size_ratio={size_ratio:.2f})")
-                flag_str = " *** " + ", ".join(flags) + " ***" if flags else ""
-                flush_print(f"  [PROFILE|SEED] seed={s_id} | markers={n_markers} | "
-                            f"soma_intensity={soma_int:.1f} | "
-                            f"int_frac_of_brightest={int_ratio:.2f} | "
-                            f"size_frac_of_largest={size_ratio:.2f}{flag_str}")
+                if int_ratio < 0.6:
+                    _n_dim += 1
+                if size_ratio < 0.3:
+                    _n_tiny += 1
+                if _PROFILE_PER_ITEM:
+                    flag_str = (" *** " + ", ".join(flags) + " ***") if flags else ""
+                    flush_print(f"  [PROFILE|SEED] seed={s_id} | markers={n_markers} | "
+                                f"soma_intensity={soma_int:.1f} | "
+                                f"int_frac_of_brightest={int_ratio:.2f} | "
+                                f"size_frac_of_largest={size_ratio:.2f}{flag_str}")
+            flush_print(
+                f"  [PROFILE|SEED] cell={cell_label}: seeds={len(seeds_in_crop)} | "
+                f"dim={_n_dim} | tiny={_n_tiny} | "
+                f"brightest_soma={max_soma_int:.1f} | "
+                f"largest_marker_count={max_marker_count}"
+            )
 
         # Somata belonging to an inherited marker sit outside this chunk, so their
         # intensity is taken from the global table the coordinator already computes.
@@ -1239,14 +1276,19 @@ def _separate_multi_soma_cells_chunk(
         keep_edges  = [(k, v) for k, v in edges.items() if not v['should_merge_decision']]
         flush_print(f"  [PROFILE|GRAPH] cell={cell_label}: "
                     f"total_edges={len(edges)} | merge_edges={len(merge_edges)} | keep_edges={len(keep_edges)}")
-        for edge_key, edge_val in merge_edges:
-            flush_print(f"    [PROFILE|GRAPH] MERGE: {edge_key}")
-        for edge_key, edge_val in keep_edges:
-            _why = edge_val.get('reason')
-            flush_print(
-                f"    [PROFILE|GRAPH] KEEP:  {edge_key}"
-                + (f" ({_why})" if _why else "")
-            )
+        _n_bright = sum(1 for _, v in edges.items() if v.get('bright_cut'))
+        _n_unscored = sum(1 for _, v in edges.items() if v.get('reason'))
+        flush_print(f"  [PROFILE|GRAPH] cell={cell_label}: "
+                    f"bright_cut_flagged={_n_bright} | not_scored={_n_unscored}")
+        if _PROFILE_PER_ITEM:
+            for edge_key, edge_val in merge_edges:
+                flush_print(f"    [PROFILE|GRAPH] MERGE: {edge_key}")
+            for edge_key, edge_val in keep_edges:
+                _why = edge_val.get('reason')
+                flush_print(
+                    f"    [PROFILE|GRAPH] KEEP:  {edge_key}"
+                    + (f" ({_why})" if _why else "")
+                )
 
         merge_map = {i: i for i in range(n_identities + 2)}
         for (id_a, id_b), metrics in edges.items():
@@ -1264,14 +1306,23 @@ def _separate_multi_soma_cells_chunk(
             merged_id = merge_map[old_id]
             final_local_mask[ws_local == old_id] = merged_id
 
-        # [PROFILING] Show the effective merge_map so we can detect runaway merging.
-        flush_print(f"  [PROFILE|GRAPH] merge_map (ws_id -> final_id): {dict(list(merge_map.items())[:20])}")
+        # [PROFILING] Runaway merging shows up as a basin count that collapsed.
+        # The full label and voxel-count arrays are hundreds of entries wide on
+        # real data -- one line of several kilobytes per cell per chunk -- so
+        # they are behind the per-item flag and the counts are not.
         final_ids, final_counts = np.unique(final_local_mask[final_local_mask > 0], return_counts=True)
-        flush_print(f"  [PROFILE|GRAPH] post-merge labels={final_ids} | voxel_counts={final_counts}")
+        flush_print(f"  [PROFILE|GRAPH] cell={cell_label}: basins_in={n_identities} "
+                    f"| basins_out={final_ids.size} | "
+                    f"smallest={int(final_counts.min()) if final_counts.size else 0} "
+                    f"| largest={int(final_counts.max()) if final_counts.size else 0}")
+        if _PROFILE_PER_ITEM:
+            flush_print(f"  [PROFILE|GRAPH] merge_map (ws_id -> final_id): {dict(list(merge_map.items())[:20])}")
+            flush_print(f"  [PROFILE|GRAPH] post-merge labels={final_ids} | voxel_counts={final_counts}")
 
         # C. Seed-Aware Orphan Reassignment
         # Ensure every fragment actually contains a seed. If not, merge it.
         unique_result_ids = np.unique(final_local_mask[final_local_mask > 0])
+        _kept_orphans = _kept_orphan_voxels = 0
         dilation_struct = adjacency_footprint(ndim)
         cc_struct = binary_structure(ndim)  # full connectivity incl. diagonals
 
@@ -1312,11 +1363,21 @@ def _separate_multi_soma_cells_chunk(
                         # post-stitch, in `merge_undersized_streaming`, where it MERGES
                         # rather than deletes and where fragment sizes are true (a
                         # chunk-clipped fragment looks arbitrarily small here).
-                        flush_print(
-                            f"  [PROFILE|ORPHAN] worker KEEP orphan: cell={cell_label} "
-                            f"uid={uid} orphan_size={int(np.sum(frag_mask))} "
-                            f"(isolated satellite; never deleted)"
-                        )
+                        _kept_orphans += 1
+                        _kept_orphan_voxels += int(np.sum(frag_mask))
+                        if _PROFILE_PER_ITEM:
+                            flush_print(
+                                f"  [PROFILE|ORPHAN] worker KEEP orphan: cell={cell_label} "
+                                f"uid={uid} orphan_size={int(np.sum(frag_mask))} "
+                                f"(isolated satellite; never deleted)"
+                            )
+
+        if _kept_orphans:
+            flush_print(
+                f"  [PROFILE|ORPHAN] cell={cell_label}: kept_isolated="
+                f"{_kept_orphans} | voxels={_kept_orphan_voxels} "
+                f"(satellites of their own cell; never deleted)"
+            )
 
         # D. Map to Global IDs
         # Relabel locally to be sequential (1..N) before assigning global IDs
@@ -1876,6 +1937,7 @@ def separate_multi_soma_cells(
         _ready: List[Tuple[int, int]] = [(_pos[c], c) for c in chunk_order
                                          if not _preds[c]]
         heapq.heapify(_ready)
+        _completed = 0
 
         with tqdm(total=len(chunk_order), desc="Processing Chunks") as _pbar:
             with ThreadPoolExecutor(max_workers=_workers,
@@ -1896,7 +1958,15 @@ def separate_multi_soma_cells(
                             if _remaining[_s] == 0:
                                 heapq.heappush(_ready, (_pos[_s], _s))
                         _pbar.update(1)
-                    gc.collect()
+                        _completed += 1
+                    # A full collection stops every thread, this one included,
+                    # and it was cheap when it ran once per chunk in a sweep.
+                    # With several chunks in flight it is both more expensive
+                    # and more disruptive -- the GUI thread is stopped too --
+                    # so it runs periodically instead. `del` above already
+                    # drops the arrays; this is only for cycles.
+                    if _completed % 16 == 0:
+                        gc.collect()
 
         # Put `chunk_data` back into sweep order. The stitcher builds
         # `global_seed_lookup` by iterating it and calling `update`, and unlike
@@ -2172,7 +2242,8 @@ def separate_multi_soma_cells(
                         int_c  = (norm_int_sub[local_domain] * max_dt_sub * stitch_intensity_weight).mean()
                         ratio_c = int_c / (geom_c + 1e-9)
                         contrib_warn = " *** WARN: intensity nearly absent from speed! ***" if ratio_c < 0.1 else ""
-                        flush_print(f"    [PROFILE|STITCH|GEO] speed: geometry={geom_c:.3f} "
+                        if _PROFILE_PER_ITEM:
+                            flush_print(f"    [PROFILE|STITCH|GEO] speed: geometry={geom_c:.3f} "
                                     f"intensity_term={int_c:.3f} ratio={ratio_c:.2f} | "
                                     f"p1={p1_s:.1f} p99={p99_s:.1f}{contrib_warn}")
 
@@ -2184,10 +2255,12 @@ def separate_multi_soma_cells(
                         is_valley = conflict_mean < min(e_safe_mean, i_safe_mean) * 0.85
                         safe_contrast = abs(e_safe_mean - i_safe_mean) / (max(e_safe_mean, i_safe_mean) + 1e-6)
                         contrast_warn = " *** LOW CONTRAST: geodesic cut may be geometric ***" if safe_contrast < 0.05 else ""
-                        flush_print(f"    [PROFILE|STITCH|GEO] INTENSITY MAP: "
+                        if _PROFILE_PER_ITEM:
+                            flush_print(f"    [PROFILE|STITCH|GEO] INTENSITY MAP: "
                                     f"e_safe_mean={e_safe_mean:.1f} | conflict_mean={conflict_mean:.1f} | "
                                     f"i_safe_mean={i_safe_mean:.1f} | domain_mean={domain_mean:.1f}")
-                        flush_print(f"    [PROFILE|STITCH|GEO] conflict_is_valley={is_valley} "
+                        if _PROFILE_PER_ITEM:
+                            flush_print(f"    [PROFILE|STITCH|GEO] conflict_is_valley={is_valley} "
                                     f"(conflict={conflict_mean:.0f} vs safe_min={min(e_safe_mean,i_safe_mean):.0f}) | "
                                     f"safe_zone_contrast={safe_contrast:.3f}{contrast_warn}")
                         if not is_valley:
@@ -2232,7 +2305,8 @@ def separate_multi_soma_cells(
                     # [PROFILING] Log how many conflict voxels were assigned to each label.
                     n_to_e = int(np.sum((ws_local == 1) & local_conflict))
                     n_to_i = int(np.sum((ws_local == 2) & local_conflict))
-                    flush_print(f"    [PROFILE|STITCH|GEO] pair=({e_lab},{i_lab}) | "
+                    if _PROFILE_PER_ITEM:
+                        flush_print(f"    [PROFILE|STITCH|GEO] pair=({e_lab},{i_lab}) | "
                                 f"conflict_voxels={int(np.sum(local_conflict))} | "
                                 f"geodesic => e_lab={n_to_e} voxels, i_lab={n_to_i} voxels | "
                                 f"e_safe_size={int(np.sum(local_e_safe))} i_safe_size={int(np.sum(local_i_safe))}")
