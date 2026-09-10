@@ -1692,53 +1692,101 @@ def separate_multi_soma_cells(
         len(chunk_slices), chunk_grid, chunk_slices, soma_locs, relevant_somas
     )
 
-    # ---- TEMPORARY DIAGNOSTIC: remove once the scheduling question is settled.
+    # ---- CHUNK DEPENDENCY GRAPH -------------------------------------------
     #
-    # The chunk sweep is sequential. How much of it COULD run at once, without
-    # changing any result, is fixed by `chunk_order` and the chunk geometry:
-    # chunk i must wait for every chunk that comes earlier in the order AND
-    # whose extent overlaps its own, because the earlier one may have written
-    # into `prior_mask` where i is about to read, and first writer wins.
-    # Everything else is independent -- label offsets come from the chunk index,
-    # not from completion order.
+    # The sweep does not have to be sequential. What one chunk needs from
+    # another is `prior_mask` and `prior_seed_map`, and chunk i can only be
+    # affected by a chunk that comes EARLIER in `chunk_order` and whose extent
+    # OVERLAPS its own: only an overlapping chunk can have written into the
+    # region i is about to read, and first-writer-wins makes that write
+    # order-sensitive. Everything else about a chunk is independent -- its label
+    # offset is `(i + 1) * 1_000_000`, derived from the index rather than from
+    # when it ran, and its output goes to its own `.npy`.
+    #
+    # Two chunks that overlap are therefore joined by an edge and can never run
+    # at once; two chunks that do not overlap write disjoint byte ranges of the
+    # `prior_mask` memmap. The race that would otherwise make this unsafe is
+    # excluded by the same relation that defines the graph.
+    #
+    # `prior_seed_map` is shared and grown by every worker. That is safe because
+    # the only keys ever READ from it are the labels a chunk finds in
+    # `prior_mask` inside a multi-soma cell's own extent, and those are always
+    # offset labels, unique to the chunk that produced them -- a cell in
+    # `multi_soma_cell_labels_list` is never in `_keep_labels`, so it is never
+    # written through the pass-through path. The pass-through entries, which are
+    # ORIGINAL labels and so do collide between chunks, are never queried here.
+    # They are queried by the stitcher, which is why `chunk_data` is put back
+    # into `chunk_order` before it is handed over (see below).
     #
     # Extents overlap out to `ceil(chunk / stride) - 1` grid steps per axis,
-    # which is 1 for any overlap below half a chunk but is derived here rather
-    # than assumed. Depth is the length of the longest dependency chain, so
-    # n_chunks / depth is the speedup a perfect scheduler could reach.
+    # which is 1 for any overlap below half a chunk but is derived rather than
+    # assumed, because a large overlap makes the graph wider than the immediate
+    # neighbourhood and a scheduler that missed those edges would be wrong.
     _strides = tuple(max(1, chunk_shape[_k] - overlap) for _k in range(ndim))
     _reach = tuple(max(1, -(-chunk_shape[_k] // _strides[_k]) - 1)
                    for _k in range(ndim))
-    _pos = {c: k for k, c in enumerate(chunk_order)}
-    _level: Dict[int, int] = {}
     _grid = tuple(int(g) for g in chunk_grid)
-    for _c in chunk_order:
-        _coord = np.unravel_index(_c, _grid)
-        _best = -1
+    _pos = {c: k for k, c in enumerate(chunk_order)}
+
+    def _overlapping(index: int) -> List[int]:
         import itertools as _it
-        for _d in _it.product(*(range(-_reach[_k], _reach[_k] + 1)
-                                for _k in range(ndim))):
-            if all(_v == 0 for _v in _d):
+        coord = np.unravel_index(index, _grid)
+        out = []
+        for delta in _it.product(*(range(-_reach[_k], _reach[_k] + 1)
+                                   for _k in range(ndim))):
+            if all(_v == 0 for _v in delta):
                 continue
-            _nb = tuple(int(_coord[_k]) + _d[_k] for _k in range(ndim))
-            if any(not (0 <= _nb[_k] < _grid[_k]) for _k in range(ndim)):
+            nb = tuple(int(coord[_k]) + delta[_k] for _k in range(ndim))
+            if any(not (0 <= nb[_k] < _grid[_k]) for _k in range(ndim)):
                 continue
-            _j = int(np.ravel_multi_index(_nb, _grid))
+            out.append(int(np.ravel_multi_index(nb, _grid)))
+        return out
+
+    _preds: Dict[int, Set[int]] = {c: set() for c in chunk_order}
+    _succs: Dict[int, List[int]] = {c: [] for c in chunk_order}
+    _level: Dict[int, int] = {}
+    for _c in chunk_order:
+        _best = -1
+        for _j in _overlapping(_c):
             if _pos.get(_j, len(chunk_order)) < _pos[_c]:
+                _preds[_c].add(_j)
+                _succs[_j].append(_c)
                 _best = max(_best, _level[_j])
         _level[_c] = _best + 1
-    _depth = max(_level.values()) + 1
+    _depth = (max(_level.values()) + 1) if _level else 1
     _width: Dict[int, int] = {}
     for _l in _level.values():
         _width[_l] = _width.get(_l, 0) + 1
-    flush_print(
-        f"  [PROFILE|DAG] chunks={len(chunk_slices)} | grid={_grid} | "
-        f"overlap_reach={_reach} | dependency_depth={_depth} | "
-        f"max_concurrent={max(_width.values())} | "
-        f"mean_concurrent={len(chunk_order) / _depth:.1f} | "
-        f"ideal_speedup={len(chunk_order) / _depth:.1f}x"
+
+    # Concurrency from the budget, geometry from `PINNED`: exactly the split
+    # `plan_pinned` exists for. The chunk extent cannot move between machines --
+    # it decides which cells are judged in-chunk -- but how many of those chunks
+    # are in flight is a memory question and nothing else.
+    _plan = _budget.plan_pinned(
+        segmentation_mask.shape,
+        'split_chunk_shape_3d' if ndim == 3 else 'split_chunk_shape_2d',
+        'cell_separation_chunk',
+        overlap=overlap,
+        name="step 4 chunk workers",
     )
-    # ---- end temporary diagnostic
+    _workers = max(1, min(int(_plan.workers), len(chunk_order)))
+
+    # The per-cell crop cache is now a PER-WORKER allowance, so the share set
+    # above has to be divided by the number of workers or the step's ceiling
+    # would be multiplied by it. Which side of the cap a crop falls on decides
+    # whether it is read through the memmap or copied once; the values are the
+    # same either way (see the use site), so this is a memory decision only.
+    kwargs['local_cache_bytes'] = int(
+        _budget.plannable_bytes // (4 * max(1, _workers))
+    )
+
+    flush_print(
+        f"  [SepMultiSoma] chunk graph: {len(chunk_slices)} chunks | "
+        f"grid={_grid} | overlap_reach={_reach} | dependency_depth={_depth} | "
+        f"max_concurrent={max(_width.values())} | "
+        f"ideal_speedup={len(chunk_order) / _depth:.1f}x | "
+        f"workers={_workers} ({_plan.note})"
+    )
 
     # Running record of what has been decided so far, so a chunk can pick up its
     # neighbours' cuts and continue them. Labels only -- the .npy files, the
@@ -1757,7 +1805,22 @@ def separate_multi_soma_cells(
     )
 
     try:
-        for i in tqdm(chunk_order, desc="Processing Chunks"):
+        import heapq
+        import threading
+        from concurrent.futures import (
+            FIRST_COMPLETED, ThreadPoolExecutor, wait as _futures_wait,
+        )
+
+        _commit_lock = threading.Lock()
+
+        def _run_chunk(i: int) -> None:
+            """One chunk, start to committed. Body unchanged from the sweep.
+
+            Every array this reads is either read-only for the whole step
+            (`segmentation_mask`, `intensity_volume`, `soma_mask`) or is
+            `prior_mask` inside this chunk's own extent, which by construction
+            no concurrently-running chunk can touch.
+            """
             # A chunk boundary is the safe place to stop: the previous chunk's
             # result is written and flushed, and the step's own artifact is
             # discarded by the caller, so nothing half-written survives.
@@ -1785,18 +1848,64 @@ def separate_multi_soma_cells(
             path = os.path.join(memmap_dir, f"chunk_{i}_{os.getpid()}.npy")
             np.save(path, res)
 
-            chunk_data[i] = {'path': path, 'shape': res.shape, 'seed_map': seed_map}
-            prior_seed_map.update(seed_map)
-
             # First writer wins, so a decision already taken stays put and the
-            # markers handed to later chunks do not shift under them.
+            # markers handed to later chunks do not shift under them. Every
+            # chunk that could contest these voxels is an edge in the graph and
+            # so has already finished, or has not started.
             prior_view = prior_mask[sl]
             _fill = (prior_view == 0) & (res > 0)
             prior_view[_fill] = res[_fill]
             prior_mask[sl] = prior_view
 
+            # Both shared dictionaries are published before the future
+            # completes, so a successor released by that completion sees them.
+            with _commit_lock:
+                chunk_data[i] = {'path': path, 'shape': res.shape,
+                                 'seed_map': seed_map}
+                prior_seed_map.update(seed_map)
+
             del res, prior_view, _fill  # Free RAM immediately
-            gc.collect()
+
+        # Ready set ordered by position in `chunk_order`, so that when more
+        # chunks are runnable than there are workers the ones the sweep would
+        # have reached first go first. It changes nothing about the result --
+        # any order consistent with the graph gives the same answer -- but it
+        # keeps the soma-first intent of `_soma_first_chunk_order` visible in
+        # what actually runs.
+        _remaining = {c: len(_preds[c]) for c in chunk_order}
+        _ready: List[Tuple[int, int]] = [(_pos[c], c) for c in chunk_order
+                                         if not _preds[c]]
+        heapq.heapify(_ready)
+
+        with tqdm(total=len(chunk_order), desc="Processing Chunks") as _pbar:
+            with ThreadPoolExecutor(max_workers=_workers,
+                                    thread_name_prefix="hibachi-split") as _ex:
+                _inflight: Dict[Any, int] = {}
+                while _ready or _inflight:
+                    resource_budget.check_cancelled()
+                    while _ready and len(_inflight) < _workers:
+                        _, _c = heapq.heappop(_ready)
+                        _inflight[_ex.submit(_run_chunk, _c)] = _c
+                    _done, _ = _futures_wait(list(_inflight),
+                                             return_when=FIRST_COMPLETED)
+                    for _fut in _done:
+                        _c = _inflight.pop(_fut)
+                        _fut.result()          # re-raise anything the worker hit
+                        for _s in _succs[_c]:
+                            _remaining[_s] -= 1
+                            if _remaining[_s] == 0:
+                                heapq.heappush(_ready, (_pos[_s], _s))
+                        _pbar.update(1)
+                    gc.collect()
+
+        # Put `chunk_data` back into sweep order. The stitcher builds
+        # `global_seed_lookup` by iterating it and calling `update`, and unlike
+        # `prior_seed_map` that lookup IS queried for pass-through labels, which
+        # are original ids and so collide between chunks -- the surviving value
+        # is the last one written. Insertion order is completion order here, so
+        # without this the stitcher's view of a colliding label would depend on
+        # which thread finished first.
+        chunk_data = {i: chunk_data[i] for i in chunk_order if i in chunk_data}
 
         del prior_mask
         if os.path.exists(prior_path):

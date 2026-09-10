@@ -646,6 +646,16 @@ _COST: Dict[str, float] = {
     "label_statistics": 10.0,
     # A plain copy between two same-dtype arrays, e.g. writing a checkpoint.
     "copy_int32": 8.0,
+    # One step-4 chunk in flight, per voxel of the chunk. The chunk-level
+    # arrays are the labels (int32, 4), the intensity crop (uint16, 2), the
+    # soma crop (int32, 4), the copy of the prior mask (int32, 4) and the
+    # result (int32, 4) = 18. Inside it, one cell's crop can span the whole
+    # chunk, and that path holds the cell mask (bool, 1), the markers (int32,
+    # 4), the watershed labels and the merged copy (int32, 4+4), and five
+    # float64 fields -- the two distance transforms, the speed field, the
+    # normalised intensity and the landscape (8 x 5 = 40) = 53. The per-cell
+    # crop cache is budgeted separately by the caller and is not counted here.
+    "cell_separation_chunk": 72.0,
 }
 
 
