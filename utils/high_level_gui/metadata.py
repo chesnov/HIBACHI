@@ -702,7 +702,14 @@ class MetadataExtractor:
                 imagej=True,
                 photometric='minisblack',
                 resolution=(res_x, res_y),
-                metadata={'unit': 'micron', 'spacing': spacing}
+                # 'axes' is not cosmetic: without it tifffile's ImageJ writer labels a
+                # 3D array's first axis as CHANNELS, so a 13-slice stack lands on disk
+                # declaring 13 channels. Nothing in the viewer notices -- the array is
+                # the same shape either way -- but probe_tiff_axes reads Z by letter,
+                # finds none, and project_scaffolding then writes a 2D dimension block
+                # with no z. Same fix as _stream_tiff_channel in metadata.py.
+                metadata={'axes': 'ZYX' if ch_data.ndim == 3 else 'YX',
+                          'unit': 'micron', 'spacing': spacing}
             )
             # Confirm rather than assume: imwrite can leave a zero-length file if
             # the volume runs out of space mid-write, and a 0-byte .tif would pass

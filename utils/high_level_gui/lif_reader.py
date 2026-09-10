@@ -437,7 +437,14 @@ def extract_scene_channel(
         dest_path, shape=shape, dtype=dtype, imagej=True,
         resolution=(1.0 / meta["x"] if meta["x"] > 0 else 1.0,
                     1.0 / meta["y"] if meta["y"] > 0 else 1.0),
-        metadata={"unit": "micron", "spacing": meta["z"]},
+        # 'axes' is not cosmetic: without it tifffile's ImageJ writer labels a
+        # 3D array's first axis as CHANNELS, so a 13-slice stack lands on disk
+        # declaring 13 channels. Nothing in the viewer notices -- the array is
+        # the same shape either way -- but probe_tiff_axes reads Z by letter,
+        # finds none, and project_scaffolding then writes a 2D dimension block
+        # with no z. Same fix as _stream_tiff_channel in metadata.py.
+        metadata={"axes": "ZYX" if im.z_slices > 1 else "YX",
+                  "unit": "micron", "spacing": meta["z"]},
     )
     from .slide_reader import SetupCancelled
 
