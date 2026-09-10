@@ -204,19 +204,6 @@ def _cached_structuring_element(ndim: int, radius: int) -> np.ndarray:
 _PROFILE_WATERSHED = False
 
 
-#: The `[PROFILE|WINDOW]` lines in `_build_adjacency_graph_for_cell`: for every
-#: scored pair, the size of the two candidate pair windows and of the one
-#: actually used, against the cell's bounding box. Neither candidate window is
-#: smaller in general -- the union wins on small labels and at array faces, the
-#: interface window wins when the labels are large or far apart -- so the code
-#: takes the smaller and this reports what that came to on real cells rather
-#: than on an assumption about their shape.
-#:
-#: Pure logging: it reads sizes the function has already computed and changes
-#: nothing. Off by default because it is one line per pair.
-_PROFILE_WINDOW = False
-
-
 def _dilate_local(mask: np.ndarray, footprint: np.ndarray) -> np.ndarray:
     """`binary_dilation(mask, footprint)`, evaluated only where it can be True.
 
@@ -331,13 +318,6 @@ def _intersect_box(
             return None
         out.append(slice(lo, hi))
     return tuple(out)
-
-
-def _box_size(box: Tuple[slice, ...]) -> int:
-    n = 1
-    for s in box:
-        n *= (s.stop - s.start)
-    return int(n)
 
 
 def _label_boxes(
@@ -666,8 +646,7 @@ def _build_adjacency_graph_for_cell(
       labels and where an interface is pressed against an array face, the
       interface window wins when the labels are large or interleaved or far
       apart -- and which case a real cell falls into is not something to
-      assume. Hence the intersection. `_PROFILE_WINDOW` reports all three sizes
-      per pair if you want to see what the data actually did.
+      assume. Hence the intersection.
 
     * Every pad is taken from the FOOTPRINT ACTUALLY APPLIED, never from a
       radius argument, for the reason `_dilate_local` gives: `structuring_element`
@@ -816,20 +795,9 @@ def _build_adjacency_graph_for_cell(
                 # default; run it on the union window rather than skip, so the
                 # dictionary that comes back is the one that came back before.
                 window = win_union
-                win_iface = None
             else:
                 win_iface = _grow_box(iface_box, pad_zone, vol_shape)
                 window = _intersect_box(win_union, win_iface) or win_union
-
-            if _PROFILE_WINDOW:
-                flush_print(
-                    f"  [PROFILE|WINDOW] pair=({lbl_A},{lbl_B}) | "
-                    f"cell_bbox={_box_size(tuple(slice(0, s) for s in vol_shape))} | "
-                    f"bbox_A={_box_size(box_A)} | bbox_B={_box_size(box_B)} | "
-                    f"union+1={_box_size(win_union)} | "
-                    f"iface+r={_box_size(win_iface) if win_iface else -1} | "
-                    f"used={_box_size(window)}"
-                )
 
             seg_win = current_cell_segments_mask_local[window]
             edges[edge_key] = _calculate_interface_metrics(
@@ -1723,6 +1691,54 @@ def separate_multi_soma_cells(
     chunk_order = _soma_first_chunk_order(
         len(chunk_slices), chunk_grid, chunk_slices, soma_locs, relevant_somas
     )
+
+    # ---- TEMPORARY DIAGNOSTIC: remove once the scheduling question is settled.
+    #
+    # The chunk sweep is sequential. How much of it COULD run at once, without
+    # changing any result, is fixed by `chunk_order` and the chunk geometry:
+    # chunk i must wait for every chunk that comes earlier in the order AND
+    # whose extent overlaps its own, because the earlier one may have written
+    # into `prior_mask` where i is about to read, and first writer wins.
+    # Everything else is independent -- label offsets come from the chunk index,
+    # not from completion order.
+    #
+    # Extents overlap out to `ceil(chunk / stride) - 1` grid steps per axis,
+    # which is 1 for any overlap below half a chunk but is derived here rather
+    # than assumed. Depth is the length of the longest dependency chain, so
+    # n_chunks / depth is the speedup a perfect scheduler could reach.
+    _strides = tuple(max(1, chunk_shape[_k] - overlap) for _k in range(ndim))
+    _reach = tuple(max(1, -(-chunk_shape[_k] // _strides[_k]) - 1)
+                   for _k in range(ndim))
+    _pos = {c: k for k, c in enumerate(chunk_order)}
+    _level: Dict[int, int] = {}
+    _grid = tuple(int(g) for g in chunk_grid)
+    for _c in chunk_order:
+        _coord = np.unravel_index(_c, _grid)
+        _best = -1
+        import itertools as _it
+        for _d in _it.product(*(range(-_reach[_k], _reach[_k] + 1)
+                                for _k in range(ndim))):
+            if all(_v == 0 for _v in _d):
+                continue
+            _nb = tuple(int(_coord[_k]) + _d[_k] for _k in range(ndim))
+            if any(not (0 <= _nb[_k] < _grid[_k]) for _k in range(ndim)):
+                continue
+            _j = int(np.ravel_multi_index(_nb, _grid))
+            if _pos.get(_j, len(chunk_order)) < _pos[_c]:
+                _best = max(_best, _level[_j])
+        _level[_c] = _best + 1
+    _depth = max(_level.values()) + 1
+    _width: Dict[int, int] = {}
+    for _l in _level.values():
+        _width[_l] = _width.get(_l, 0) + 1
+    flush_print(
+        f"  [PROFILE|DAG] chunks={len(chunk_slices)} | grid={_grid} | "
+        f"overlap_reach={_reach} | dependency_depth={_depth} | "
+        f"max_concurrent={max(_width.values())} | "
+        f"mean_concurrent={len(chunk_order) / _depth:.1f} | "
+        f"ideal_speedup={len(chunk_order) / _depth:.1f}x"
+    )
+    # ---- end temporary diagnostic
 
     # Running record of what has been decided so far, so a chunk can pick up its
     # neighbours' cuts and continue them. Labels only -- the .npy files, the
