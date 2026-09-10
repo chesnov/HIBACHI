@@ -224,7 +224,9 @@ def _layer_list_dock(viewer):
 
 _PANEL_BTN_HEIGHT = 26        # standard row height inside the control panel
 _PANEL_PRIMARY_HEIGHT = 30    # slightly taller for the primary Process action
-_LAYER_LIST_MIN_HEIGHT = 160  # floor for napari's layer list, in pixels
+_LAYER_LIST_MIN_HEIGHT = 160  # preferred floor for napari's layer list, in px
+_LAYER_LIST_MIN_FLOOR = 80    # never go below this, however short the screen
+_LAYER_LIST_FRACTION = 0.18   # ...but never claim more than this share of it
 
 
 def _compactify(btn: QPushButton, height: int = _PANEL_BTN_HEIGHT) -> QPushButton:
@@ -311,20 +313,86 @@ def _lock_panel_height(container: QWidget, dock=None, slack: int = 6) -> None:
     QTimer.singleShot(300, lambda: _apply(True))
 
 
+def _available_height(widget=None) -> int:
+    """Available height of the screen the window is really on, in logical px.
+
+    primaryScreen() is the wrong question on a laptop-plus-external setup: the
+    viewer often opens on the secondary display, and we would size the layer
+    list against a monitor it is not on. Ask the widget for its own screen and
+    only fall back to the primary one.
+
+    Logical pixels are the right unit here -- they are the same coordinate
+    space as setMinimumHeight -- but note they SHRINK with display scaling: a
+    1920x1080 panel at 150% reports 720, minus taskbar ~672. That is why the
+    caller must not compare this against a fixed cliff.
+    """
+    screen = None
+    if widget is not None:
+        try:
+            screen = widget.screen()            # Qt >= 5.14
+        except Exception:
+            screen = None
+        if screen is None:
+            try:
+                screen = QApplication.screenAt(widget.geometry().center())
+            except Exception:
+                screen = None
+    if screen is None:
+        try:
+            screen = QApplication.primaryScreen()
+        except Exception:
+            screen = None
+    try:
+        return int(screen.availableGeometry().height()) if screen else 0
+    except Exception:
+        return 0
+
+
 def _give_layer_list_room(viewer, panel_dock=None) -> None:
     """Give napari's layer list a floor on its height, and dock our panel
-    directly beneath it so the grouping reads top-to-bottom."""
+    directly beneath it so the grouping reads top-to-bottom.
+
+    WHY THE FLOOR IS PROPORTIONAL AND UNCONDITIONAL
+    This used to read `if screen_h > 700: setMinimumHeight(160)`, which is a
+    cliff: one pixel either side of it decided between a comfortable layer list
+    and a collapsed one. Because availableGeometry() is in LOGICAL pixels, any
+    display scaling pushes a machine over the edge -- a 1080p laptop at 150%
+    reports ~672 and lost the floor entirely, which is why the panel looked
+    fine on an unscaled desktop monitor and squished nearly everywhere else.
+
+    Below the cliff nothing held the list open, and _lock_panel_height (which
+    deliberately caps our own dock so surplus space flows to the layer list)
+    left it free to collapse to roughly one row.
+
+    So: always set a floor, but scale it to the screen and cap it at the
+    preferred 160 px. A short display still gets a usable list without the
+    minimum forcing the window taller than the screen.
+
+    Applied again on later event-loop turns because the window has not always
+    been shown -- and therefore not always been assigned to its final screen --
+    by the time this runs.
+    """
     layer_list = _layer_list_dock(viewer)
     if layer_list is None:
         return
-    try:
-        # Only enforce the floor when the screen can actually afford it, so this
-        # never makes the viewer unusable on a small laptop display.
-        screen_h = QApplication.primaryScreen().availableGeometry().height()
-        if screen_h > 700:
-            layer_list.setMinimumHeight(_LAYER_LIST_MIN_HEIGHT)
-    except Exception:
-        pass
+
+    def _apply() -> None:
+        try:
+            window = getattr(viewer.window, "_qt_window", None)
+            avail_h = _available_height(window)
+            if avail_h <= 0:
+                floor = _LAYER_LIST_MIN_HEIGHT
+            else:
+                floor = max(_LAYER_LIST_MIN_FLOOR,
+                            min(_LAYER_LIST_MIN_HEIGHT,
+                                int(avail_h * _LAYER_LIST_FRACTION)))
+            layer_list.setMinimumHeight(floor)
+        except Exception:
+            log.debug("could not set a floor on the layer list", exc_info=True)
+
+    _apply()
+    QTimer.singleShot(0, _apply)
+    QTimer.singleShot(300, _apply)
 
     if panel_dock is not None:
         try:

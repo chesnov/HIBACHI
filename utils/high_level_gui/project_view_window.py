@@ -5,7 +5,7 @@ import os
 import shutil
 import yaml  # type: ignore
 from PyQt5.QtGui import QCloseEvent, QIcon  # type: ignore
-from PyQt5.QtCore import Qt, QEvent  # type: ignore
+from PyQt5.QtCore import Qt, QEvent, QTimer  # type: ignore
 from PyQt5.QtWidgets import (  # type: ignore
     QAction, QApplication, QFileDialog, QMessageBox, QMainWindow, QVBoxLayout,
     QHBoxLayout, QPushButton, QWidget, QLabel, QInputDialog
@@ -119,6 +119,72 @@ class ProjectViewWindow(QMainWindow):
         self.initUI()
         self.setAttribute(Qt.WA_QuitOnClose)
 
+    def _fit_to_available_screen(self, width_cap: int = 900,
+                                 margin_x: int = 60) -> None:
+        """Size and place the window inside the usable area of its own screen.
+
+        WHY NOT setGeometry(avail.x() + 60, avail.y(), width, avail.height())
+        Two separate off-screen bugs came out of that single call:
+
+        1. setGeometry() positions the CLIENT AREA, not the frame. Asking for
+           y = avail.y() -- the very top of the work area -- puts the client
+           area there and pushes the title bar, with its minimise and close
+           buttons, ABOVE the screen. Reported on Windows as a window that
+           could not be closed. move(), used below, positions the frame
+           instead, which is the behaviour wanted here.
+
+        2. The height was the client height, so the total window came to
+           avail.height() PLUS the title bar and borders, overflowing the
+           bottom of the work area. On macOS the work area already excludes
+           the Dock, so the surplus rendered underneath it.
+
+        Neither showed up on every Linux desktop because many window managers
+        constrain new windows into the work area themselves, quietly repairing
+        the request. Windows and macOS honour it as given.
+
+        The frame size is unknown until the window is shown -- before that,
+        frameGeometry() == geometry() -- so this runs once now for a sensible
+        first paint and again after showing, when the real chrome can be
+        measured and any remaining overflow clamped away.
+        """
+        try:
+            screen = None
+            try:
+                screen = self.screen()              # Qt >= 5.14
+            except Exception:
+                screen = None
+            if screen is None:
+                screen = QApplication.primaryScreen()
+            if screen is None:
+                self.resize(860, 560)
+                return
+            avail = screen.availableGeometry()
+
+            # Chrome overhead: 0 before the window is shown, real afterwards.
+            frame = self.frameGeometry()
+            chrome_h = max(0, frame.height() - self.height())
+            chrome_w = max(0, frame.width() - self.width())
+
+            width = max(400, min(width_cap, avail.width() - chrome_w))
+            height = max(300, avail.height() - chrome_h)
+            self.resize(width, height)
+
+            # move() places the FRAME, so the title bar lands inside the work
+            # area rather than above it.
+            x = avail.x() + max(0, min(margin_x,
+                                       avail.width() - chrome_w - width))
+            self.move(x, avail.y())
+
+            # Whatever the chrome estimate missed, pull back inside.
+            frame = self.frameGeometry()
+            overflow = frame.bottom() - avail.bottom()
+            if overflow > 0:
+                self.resize(width, max(300, self.height() - overflow))
+            if frame.top() < avail.top():
+                self.move(x, avail.y() + (avail.top() - frame.top()))
+        except Exception:
+            self.resize(860, 560)
+
     def initUI(self) -> None:
         self.setWindowTitle("Image Segmentation Project")
         _icon = app_icon_path()
@@ -126,12 +192,13 @@ class ProjectViewWindow(QMainWindow):
             self.setWindowIcon(QIcon(_icon))
         # Open occupying the full vertical span of the screen (moderate width),
         # since the project tree is tall — avoids the squished default height.
-        try:
-            avail = QApplication.primaryScreen().availableGeometry()
-            width = min(900, avail.width())
-            self.setGeometry(avail.x() + 60, avail.y(), width, avail.height())
-        except Exception:
-            self.setGeometry(100, 100, 860, 560)
+        # _fit_to_available_screen, not setGeometry: see the note on that
+        # function for why the old one-liner put the title bar off-screen.
+        self._fit_to_available_screen()
+        # The window frame is only measurable once the window has been shown,
+        # so re-fit on the next event-loop turns to correct the first guess.
+        QTimer.singleShot(0, self._fit_to_available_screen)
+        QTimer.singleShot(300, self._fit_to_available_screen)
 
         central_widget = QWidget()
         layout = QVBoxLayout()

@@ -99,22 +99,7 @@ class ChannelSelectDialog(QDialog):
         scroll.setWidgetResizable(True)
         scroll.setWidget(host)
         scroll.setFrameShape(QScrollArea.NoFrame)
-        # Height matters as much as the width set above. A QScrollArea's own
-        # sizeHint ignores the widget inside it, so with no minimum height and
-        # no stretch factor this list opened a few pixels tall: it is the only
-        # widget here with an Expanding policy, and every line the word-wrapped
-        # header and consequence label claim comes straight out of it. Since
-        # their wrapped height depends on font metrics, the same dialog looked
-        # fine on one machine and unusable on the next.
-        #
-        # Ask for enough rows to be readable, derived from the actual font
-        # rather than a magic pixel count, capped so a 30-channel sample does
-        # not open a full-screen dialog. The stretch factor makes this widget
-        # (not the labels) absorb any resizing.
-        row_h = max(18, self.fontMetrics().height() + 8)
-        visible_rows = max(4, min(len(self._boxes), 12))
-        scroll.setMinimumHeight(row_h * visible_rows + 8)
-        outer.addWidget(scroll, 1)
+        outer.addWidget(scroll)
 
         # Bulk toggles only make sense when more than one row is selectable.
         selectable = [b for b, _ in self._boxes if b.isEnabled()]
