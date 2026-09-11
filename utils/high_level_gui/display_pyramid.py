@@ -371,40 +371,52 @@ def is_current(tif_path: str) -> bool:
 
 
 def contrast_limits_for(data) -> Optional[Tuple[float, float]]:
-    """Display range for an image, computed from the SMALLEST array available.
+    """Display range for a RAW image: the full range its dtype can hold.
 
-    napari picks contrast limits itself when none are given, and to do that it
-    has to scan pixel data: for a plain array it samples whole planes, which on
-    a 928-megapixel plane over a slow drive is most of the time it takes to
-    open an image, and for a multiscale layer it reads a different array than
-    the non-multiscale path did -- which is why the slider handles land
-    somewhere new the moment a pyramid appears.
+    The raw layer is meant to look like the data. Anything derived from the
+    pixels -- percentiles, min/max, or napari's own guess -- is a decision
+    about how bright the image should appear, and on a fluorescence frame
+    that is mostly background it is a large one: a high percentile sits far
+    below the true maximum, so the tissue gets stretched up towards white and
+    a dim image renders as a bright one. This used to take the 1st and 99.8th
+    percentile, which is why raw images looked brighter than they are.
 
-    Passing limits explicitly removes both effects. `data` may be a level list
-    (the coarsest level is used, ~23 MB) or a single array (a strided sample of
-    its middle plane). Percentiles rather than min/max: one hot pixel or a
-    saturated speck would otherwise stretch the range and render everything
-    else black.
+    The dtype's range is the one ceiling that does not depend on what is in
+    the picture, so the same specimen imaged twice looks the same, and a value
+    of 1000 in a uint16 image renders as 1000/65535 of full scale -- which is
+    what it is.
 
-    Returns None if nothing can be read, in which case the caller should let
-    napari do what it did before rather than guess.
+    NOTE what this means in practice: a camera that digitises to 12 bits and
+    stores into uint16 never exceeds 4095, so it will render at about a
+    sixteenth of full scale and look very dark. That is the honest rendering
+    of those numbers, but if it is not the one you want, the ceiling wants to
+    come from the acquisition bit depth instead. Only the LIF reader currently
+    records that (`lif_reader.ImageMeta.bit_depth`) and it is not carried
+    through to the viewer, so there is nothing to read here yet.
+
+    Returns None for a float image, which has no native range, and for
+    anything unreadable -- in which case the caller lets napari decide, as it
+    did before. Integer and boolean images, which is everything the readers
+    produce, never take that path.
+
+    Side benefit, and the reason the previous version existed at all: this
+    reads no pixel data whatsoever. napari picks limits by scanning -- whole
+    planes for a plain array, a different array again for a multiscale layer,
+    which is why the slider handles moved when a pyramid appeared. On a
+    928-megapixel plane over a slow drive that scan was most of the time it
+    took to open an image.
     """
     try:
         array = data[-1] if isinstance(data, (list, tuple)) else data
-        sample = np.asarray(array)
-        if sample.ndim == 3:
-            sample = sample[sample.shape[0] // 2]
-        # Cap the sample regardless of where it came from: without a pyramid
-        # this is a full plane, and reading all of one is what we are avoiding.
-        stride = max(1, int(np.ceil(np.sqrt(sample.size / 4_000_000))))
-        sample = sample[::stride, ::stride]
-        low = float(np.percentile(sample, 1.0))
-        high = float(np.percentile(sample, 99.8))
+        dtype = np.dtype(getattr(array, "dtype", None))
     except Exception:
         return None
-    if not np.isfinite(low) or not np.isfinite(high) or high <= low:
-        return None
-    return (low, high)
+    if dtype == np.bool_:
+        return (0.0, 1.0)
+    if np.issubdtype(dtype, np.integer):
+        info = np.iinfo(dtype)
+        return (float(info.min), float(info.max))
+    return None
 
 
 def open_levels(tif_path: str) -> Optional[List[np.ndarray]]:
