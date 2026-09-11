@@ -314,6 +314,44 @@ def open_corrected(path: Optional[str], shape: Sequence[int],
     return array
 
 
+def z_levels(data) -> np.ndarray:
+    """Signal level of each z-plane of a stack, one value per plane.
+
+    `correct_illumination` calls this to scale every plane of a stack to a
+    common brightness. It was referenced but never defined, so turning
+    "Correct Depth Attenuation" on for a 3D project raised `NameError` at the
+    call site; the path is guarded by `is_3d and correct_z`, which is why a 2D
+    project never reached it.
+
+    The 95th percentile, not a mean, and the same `_ENVELOPE_PERCENTILE` the
+    XY path uses for a block's signal level. A plane holding less tissue has a
+    lower mean without being any dimmer, so scaling means would stretch sparse
+    planes and invent signal where there is none; a percentile of the bright
+    pixels measures how bright the tissue that IS there appears. That is also
+    what the parameter promises: "each plane's level is measured from its own
+    bright pixels, so a plane holding less tissue is not mistaken for a dimmer
+    one."
+
+    Read plane by plane, so peak memory is one plane whatever the stack size,
+    matching the promise `correct_illumination` makes about itself.
+
+    A plane with nothing in it returns 0.0. The caller excludes zeros from the
+    median it scales towards and leaves those planes at a scale of 1.0, so an
+    empty plane neither drags the target down nor gets divided by zero.
+
+    NOTE that `np.percentile` sorts, so this is one sort per plane before the
+    XY surfaces are estimated. Fine for a stack whose planes fit comfortably
+    in memory, which is the same assumption the rest of this function makes.
+    """
+    depth = int(data.shape[0])
+    out = np.zeros(depth, dtype=np.float64)
+    for z in range(depth):
+        plane = np.asarray(data[z], dtype=np.float32).ravel()
+        if plane.size:
+            out[z] = float(np.percentile(plane, _ENVELOPE_PERCENTILE))
+    return out
+
+
 def correct_illumination(
     volume,
     spacing: Sequence[float],
