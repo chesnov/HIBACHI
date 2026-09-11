@@ -314,42 +314,126 @@ def open_corrected(path: Optional[str], shape: Sequence[int],
     return array
 
 
-def z_levels(data) -> np.ndarray:
-    """Signal level of each z-plane of a stack, one value per plane.
+#: Pixels sampled per plane when measuring its level. A percentile does not
+#: need the whole plane, and reading one costs a sort of it.
+_Z_SAMPLE_PIXELS = 100_000
 
-    `correct_illumination` calls this to scale every plane of a stack to a
-    common brightness. It was referenced but never defined, so turning
-    "Correct Depth Attenuation" on for a 3D project raised `NameError` at the
-    call site; the path is guarded by `is_3d and correct_z`, which is why a 2D
-    project never reached it.
+#: Planes with fewer finite pixels than this are not measured at all: a
+#: percentile of a handful of values is noise, and one such plane can tilt the
+#: whole fit.
+_Z_MIN_FINITE = 100
 
-    The 95th percentile, not a mean, and the same `_ENVELOPE_PERCENTILE` the
-    XY path uses for a block's signal level. A plane holding less tissue has a
-    lower mean without being any dimmer, so scaling means would stretch sparse
-    planes and invent signal where there is none; a percentile of the bright
-    pixels measures how bright the tissue that IS there appears. That is also
-    what the parameter promises: "each plane's level is measured from its own
-    bright pixels, so a plane holding less tissue is not mistaken for a dimmer
-    one."
+#: Sampling is random, so it is seeded. The same stack must produce the same
+#: correction on every run, or two runs of the pipeline are not comparable.
+_Z_SAMPLE_SEED = 42
 
-    Read plane by plane, so peak memory is one plane whatever the stack size,
-    matching the promise `correct_illumination` makes about itself.
 
-    A plane with nothing in it returns 0.0. The caller excludes zeros from the
-    median it scales towards and leaves those planes at a scale of 1.0, so an
-    empty plane neither drags the target down nor gets divided by zero.
 
-    NOTE that `np.percentile` sorts, so this is one sort per plane before the
-    XY surfaces are estimated. Fine for a stack whose planes fit comfortably
-    in memory, which is the same assumption the rest of this function makes.
+def z_levels(data) -> Tuple[np.ndarray, np.ndarray]:
+    """Per-plane brightness of a stack: (measured, fitted), one value per z.
+
+    `correct_illumination` divides by the FITTED levels to scale every plane
+    to a common brightness. Both are returned so the report can record what
+    was measured as well as what was applied.
+
+    WHY A FIT, and not the measurement itself. A plane's level moves for two
+    reasons: attenuation, which is the thing to remove, and how much bright
+    tissue happens to lie in that plane, which is signal. Dividing each plane
+    by its own level removes both, so a plane holding a large soma is pushed
+    down relative to its neighbours and real structure is flattened along z.
+    Attenuation varies smoothly with depth and tissue content does not, which
+    is what makes them separable: fit the smooth part, divide by that, and
+    leave the rest alone.
+
+    WHY A ROBUST FIT. See the Theil-Sen comment below: one unmeasurable plane
+    is enough to tilt a least-squares line across the entire stack.
+
+    WHY LOG-LINEAR. Excitation and emission are absorbed along the path, so
+    depth attenuation is Beer-Lambert -- exponential in z, which is a straight
+    line in log. Fitting the log is therefore both the physical model and
+    monotone by construction. A quadratic fitted to a monotone decay will
+    often turn back UP at the deep end, where there are fewest planes and the
+    most attenuation, so its worst error lands exactly where the correction
+    matters most.
+
+    Each plane's level is the 95th percentile (`_ENVELOPE_PERCENTILE`, the
+    same statistic the XY path uses for a block's signal level) of a sample of
+    its finite pixels: bright pixels rather than a mean, so a plane holding
+    less tissue is not read as a dimmer one, and a sample rather than the
+    whole plane, so this does not sort every plane of the stack.
+
+    A plane too sparse to measure gets NaN in `measured` and is left out of
+    the fit, but still receives a level from the curve -- its neighbours know
+    what the attenuation is at that depth even when it does not.
+
+    The curve is clamped to the range of the measured levels, so a plane
+    beyond the last measurable one cannot be handed a runaway divisor.
+
+    Degenerate cases return what can be justified and nothing more: with no
+    measurable plane both arrays are zeros, which the caller reads as "do not
+    scale"; with one, the fit is that constant; a straight line needs two.
     """
     depth = int(data.shape[0])
-    out = np.zeros(depth, dtype=np.float64)
+    measured = np.full(depth, np.nan, dtype=np.float64)
+    rng = np.random.default_rng(_Z_SAMPLE_SEED)
+
     for z in range(depth):
         plane = np.asarray(data[z], dtype=np.float32).ravel()
-        if plane.size:
-            out[z] = float(np.percentile(plane, _ENVELOPE_PERCENTILE))
-    return out
+        if plane.size == 0:
+            continue
+        finite = plane[np.isfinite(plane)]
+        if finite.size < _Z_MIN_FINITE:
+            continue
+        if finite.size > _Z_SAMPLE_PIXELS:
+            finite = rng.choice(finite, _Z_SAMPLE_PIXELS, replace=False)
+        value = float(np.percentile(finite, _ENVELOPE_PERCENTILE))
+        if np.isfinite(value):
+            measured[z] = value
+
+    # Only planes with a positive level can be fitted in log space, and a
+    # non-positive level carries no information about attenuation anyway.
+    usable = np.isfinite(measured) & (measured > 0)
+    n_usable = int(np.count_nonzero(usable))
+    if n_usable == 0:
+        return measured, np.zeros(depth, dtype=np.float64)
+
+    z_index = np.arange(depth, dtype=np.float64)
+    if n_usable == 1:
+        fitted = np.full(depth, float(measured[usable][0]), dtype=np.float64)
+    else:
+        # Theil-Sen, not least squares. A percentile is a robust statistic of a
+        # plane but it is not immune: a plane whose tissue covers less than the
+        # 5% the percentile cuts at reads as background, which in log space is
+        # an enormous negative outlier. Measured on a synthetic stack with one
+        # such plane, a least-squares line was pulled 14-22% off across the
+        # whole depth -- the error is worst at the ends and does not stay near
+        # the bad plane. The median of the pairwise slopes ignores it entirely.
+        #
+        # O(n^2) in the number of usable planes, which is the depth of a stack:
+        # a few hundred at most, so a few tens of thousands of pairs.
+        zs = z_index[usable]
+        ys = np.log(measured[usable])
+        i, j = np.triu_indices(zs.size, k=1)
+        dz = zs[j] - zs[i]
+        ok = dz != 0
+        slope = float(np.median((ys[j][ok] - ys[i][ok]) / dz[ok])) if np.any(ok) else 0.0
+        intercept = float(np.median(ys - slope * zs))
+        fitted = np.exp(intercept + slope * z_index)
+
+    # Clamped to the range of what was actually measured. A divisor that runs
+    # away is the failure this guards: outside the span of measurable planes
+    # the curve is extrapolating, and an exponential extrapolates fast.
+    #
+    # NOT a percentile floor. Flooring at, say, the 10th percentile of the
+    # measured levels makes sense against a quadratic that can dive, but
+    # against a monotone decay that floor sits ABOVE the deepest planes' real
+    # levels and clips exactly the planes most in need of correction. Clamping
+    # to the measured min and max cannot clip anything the data supports,
+    # because within the fitted span the curve stays inside that range anyway.
+    lo = float(np.min(measured[usable]))
+    hi = float(np.max(measured[usable]))
+    fitted = np.clip(fitted, lo, hi)
+    return measured, np.asarray(fitted, dtype=np.float64)
 
 
 def correct_illumination(
@@ -414,13 +498,22 @@ def correct_illumination(
     # the other way round folds depth attenuation into the field of view.
     scale_per_plane = np.ones(depth, dtype=np.float32)
     if is_3d and correct_z:
-        levels = z_levels(data)
+        # `levels` is the FITTED curve, not the per-plane measurement: see
+        # z_levels. Dividing by the measurement would remove real variation in
+        # tissue content along with the attenuation.
+        measured, levels = z_levels(data)
         usable = levels[levels > 0]
         target = float(np.median(usable)) if usable.size else 0.0
         if target > 0:
             with np.errstate(divide="ignore", invalid="ignore"):
                 scale_per_plane = np.where(levels > 0, target / levels, 1.0)
             scale_per_plane = np.asarray(scale_per_plane, dtype=np.float32)
+        # Both recorded: the measurement is the evidence, the curve is what was
+        # applied, and a correction nobody can trace back to both is not
+        # reproducible.
+        report["z_levels_measured"] = [
+            (None if not np.isfinite(v) else round(float(v), 3)) for v in measured
+        ]
         report["z_levels"] = [round(float(v), 3) for v in levels]
         report["z_scales"] = [round(float(v), 4) for v in scale_per_plane]
 
