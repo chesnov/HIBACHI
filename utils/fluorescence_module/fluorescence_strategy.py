@@ -14,6 +14,7 @@ import yaml  # type: ignore
 import tifffile as tiff
 
 from ..high_level_gui.processing_strategies import ProcessingStrategy, StepDefinition
+from ..high_level_gui.display_pyramid import contrast_limits_for
 
 # Attempt imports of specific 3D segmentation modules
 try:
@@ -997,10 +998,26 @@ class FluorescenceStrategy(ProcessingStrategy):
             # halve the shape and misinterpret every value.
             corrected_path = files.get("corrected_image")
             if corrected_path and os.path.exists(corrected_path):
+                _corrected_dtype = self._artifact_itemsize_dtype(corrected_path)
+                # Explicit contrast limits, the same ones the raw layer gets.
+                # `add_image` without them makes napari invent a range from the
+                # data, which normalises this layer to ITSELF -- so the
+                # corrected stack looked about as bright as the raw one however
+                # much or little the correction had done, and toggling between
+                # the two compared nothing. The correction pins its maximum to
+                # the raw maximum (see illumination.correct_illumination), so on
+                # a shared absolute scale the two are directly comparable.
+                #
+                # `blending='additive'` is kept, but note it sums with whatever
+                # is visible beneath: to judge this layer, hide the raw one.
+                _limits = contrast_limits_for(
+                    np.zeros((1, 1), dtype=_corrected_dtype)
+                )
                 load_and_add(
                     "corrected_image", "Illumination corrected",
-                    dtype=self._artifact_itemsize_dtype(corrected_path),
+                    dtype=_corrected_dtype,
                     layer_type='image', colormap='gray', blending='additive',
+                    **({"contrast_limits": _limits} if _limits else {}),
                 )
             load_and_add("raw_segmentation", "Raw Intermediate Segmentation")
         if checkpoint_step >= 2:

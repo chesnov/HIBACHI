@@ -327,12 +327,20 @@ _Z_MIN_PIXELS = 100
 _Z_SAMPLE_SEED = 42
 
 
-def z_levels(data) -> Tuple[np.ndarray, np.ndarray]:
-    """Per-plane tissue brightness of a stack: (measured, used), one per z.
+def z_levels(data) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Per-plane statistics of a stack: (measured, used, peak), one per z.
 
     `correct_illumination` divides by `used` to bring every plane to a common
-    brightness. Both are returned so the report records what was measured as
-    well as what was applied, and so an unmeasurable plane is visible as such.
+    brightness. `measured` is returned alongside it so the report records what
+    was measured as well as what was applied, and so an unmeasurable plane is
+    visible as such.
+
+    `peak` is each plane's true maximum, over every pixel rather than the
+    sample. The caller needs it to choose one global factor that puts the
+    corrected maximum exactly at the raw maximum: that way the correction
+    spends the range it is given, nothing saturates, and the corrected stack
+    can be displayed on the same scale as the raw one and compared against it.
+    It costs nothing to collect -- the plane is already read.
 
     WHAT IS MEASURED, and why it is not a percentile of the plane. A plane's
     brightness moves for two reasons: how brightly the tissue in it appears,
@@ -427,6 +435,7 @@ def z_levels(data) -> Tuple[np.ndarray, np.ndarray]:
     """
     depth = int(data.shape[0])
     measured = np.full(depth, np.nan, dtype=np.float64)
+    peak = np.zeros(depth, dtype=np.float64)
     rng = np.random.default_rng(_Z_SAMPLE_SEED)
 
     for z in range(depth):
@@ -434,6 +443,8 @@ def z_levels(data) -> Tuple[np.ndarray, np.ndarray]:
         if plane.size == 0:
             continue
         sample = plane[np.isfinite(plane)]
+        if sample.size:
+            peak[z] = float(sample.max())
         if sample.size < _Z_MIN_PIXELS:
             continue
         if sample.size > _Z_SAMPLE_PIXELS:
@@ -455,11 +466,11 @@ def z_levels(data) -> Tuple[np.ndarray, np.ndarray]:
 
     usable = np.isfinite(measured) & (measured > 0)
     if not np.any(usable):
-        return measured, np.zeros(depth, dtype=np.float64)
+        return measured, np.zeros(depth, dtype=np.float64), peak
 
     z_index = np.arange(depth, dtype=np.float64)
     used = np.interp(z_index, z_index[usable], measured[usable])
-    return measured, np.asarray(used, dtype=np.float64)
+    return measured, np.asarray(used, dtype=np.float64), peak
 
 
 def correct_illumination(
@@ -528,12 +539,36 @@ def correct_illumination(
         # It is safe to divide by directly because it is measured from each
         # plane's foreground only, so it does not move when a plane simply
         # holds less tissue. See z_levels.
-        measured, levels = z_levels(data)
+        measured, levels, peak = z_levels(data)
         usable = levels[levels > 0]
         target = float(np.median(usable)) if usable.size else 0.0
         if target > 0:
             with np.errstate(divide="ignore", invalid="ignore"):
                 scale_per_plane = np.where(levels > 0, target / levels, 1.0)
+            scale_per_plane = np.asarray(scale_per_plane, dtype=np.float64)
+
+            # Equalising to the median moves half the planes up and half down,
+            # which is what makes a dim plane brighter and an over-bright one
+            # dimmer. But it also moves the brightest pixel in the stack, and
+            # the direction depends on which plane it happened to be in: the
+            # corrected image would sit on a different scale from the raw one
+            # and could not be compared with it by eye, and if it moved up it
+            # would saturate against the dtype ceiling and lose the top of the
+            # range outright.
+            #
+            # So one global factor afterwards, putting the corrected maximum
+            # exactly where the raw maximum was. Global, so it changes no
+            # RELATIVE brightness between planes -- the equalisation is
+            # untouched -- and it is the largest factor that cannot clip,
+            # because it is derived from the true per-pixel maxima rather than
+            # from the levels.
+            raw_peak = float(peak.max()) if peak.size else 0.0
+            scaled_peak = float(np.max(peak * scale_per_plane)) if peak.size else 0.0
+            if raw_peak > 0 and scaled_peak > 0:
+                headroom = raw_peak / scaled_peak
+                scale_per_plane = scale_per_plane * headroom
+                report["z_peak_match"] = round(float(headroom), 4)
+                report["z_raw_peak"] = round(raw_peak, 1)
             scale_per_plane = np.asarray(scale_per_plane, dtype=np.float32)
         # Both recorded: the measurement is the evidence, the curve is what was
         # applied, and a correction nobody can trace back to both is not
