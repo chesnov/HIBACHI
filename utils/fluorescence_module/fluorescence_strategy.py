@@ -336,8 +336,25 @@ class FluorescenceStrategy(ProcessingStrategy):
                 # DType Max"), so handing the pipeline float32 silently
                 # redefines every one of them: 0.055 of 65535 is not 0.055 of
                 # 1.0. It also halves what the image costs to keep.
+                # NATIVE byte order, even when the source is big-endian.
+                # The artifact is a headerless `.dat`, so every reader infers
+                # its dtype from the file SIZE -- which gives the item size and
+                # cannot give the byte order. `load_corrected_image` is handed a
+                # preferred dtype and so recovers it, but the viewer's
+                # `_artifact_itemsize_dtype` is not, and returned native
+                # `uint16` for a big-endian file: every value came back
+                # byte-swapped. On a '>u2' project that turned a background of
+                # 250 into 33,625 and tissue of 3,400 into 32,769, collapsing a
+                # 13.6x contrast to 0.97x -- the "Illumination corrected" layer
+                # rendered as a uniformly bright slab with no structure, while
+                # the pipeline itself read the same file correctly.
+                #
+                # Writing native makes the size-based inference complete, so
+                # every reader agrees without being told anything. The item
+                # size and the value range are unchanged, so the "fraction of
+                # the dtype range" reasoning below still holds.
                 corrected_dtype = np.dtype(
-                    getattr(image_stack, "dtype", np.float32))
+                    getattr(image_stack, "dtype", np.float32)).newbyteorder("=")
                 corrected = np.memmap(
                     corrected_path, dtype=corrected_dtype, mode="w+",
                     shape=self.image_shape,
