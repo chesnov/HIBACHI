@@ -326,8 +326,23 @@ class FluorescenceStrategy(ProcessingStrategy):
             segmentation_input = image_stack
             block_um = float(params.get("illumination_block_um", 0.0) or 0.0)
             max_gain = float(params.get("illumination_max_gain", 1.0) or 1.0)
-            correct_z = bool(params.get("illumination_correct_z", False))
-            if block_um > 0 or correct_z:
+
+            # Depth correction is not optional and has no parameter. It used to
+            # be a checkbox defaulting to off, which meant depth attenuation was
+            # normally left in; and when it was switched on it still made no
+            # difference, because Stage 1.1 of step 1 standardised every plane
+            # by its own noise sigma and that exactly cancels a per-plane
+            # scaling. Stage 1.1 now uses volume-wide statistics, so the
+            # correction reaches the threshold -- and there is no version of
+            # this pipeline in which leaving it off was a behaviour anyone
+            # chose, so there is nothing to preserve.
+            #
+            # `correct_illumination` ignores it at rank 2 (there is no depth in
+            # one plane), so the gate below is what keeps a 2D project with no
+            # XY correction from writing an artifact that would be identical to
+            # its input.
+            correct_z = True
+            if block_um > 0 or len(self.image_shape) == 3:
                 from .illumination import correct_illumination
 
                 corrected_path = files.get("corrected_image")
