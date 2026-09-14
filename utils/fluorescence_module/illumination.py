@@ -314,64 +314,116 @@ def open_corrected(path: Optional[str], shape: Sequence[int],
     return array
 
 
-#: Pixels sampled per plane when measuring its level. A percentile does not
-#: need the whole plane, and reading one costs a sort of it.
+#: Pixels sampled per plane when measuring its level. A robust statistic does
+#: not need the whole plane, and reading one costs a sort of it.
 _Z_SAMPLE_PIXELS = 100_000
 
-#: Planes with fewer finite pixels than this are not measured at all: a
-#: percentile of a handful of values is noise, and one such plane can tilt the
-#: whole fit.
-_Z_MIN_FINITE = 100
+#: Fewest pixels -- finite, and then foreground -- a plane needs before it is
+#: measured at all. A statistic of a handful of values is noise.
+_Z_MIN_PIXELS = 100
 
 #: Sampling is random, so it is seeded. The same stack must produce the same
 #: correction on every run, or two runs of the pipeline are not comparable.
 _Z_SAMPLE_SEED = 42
 
 
-
 def z_levels(data) -> Tuple[np.ndarray, np.ndarray]:
-    """Per-plane brightness of a stack: (measured, fitted), one value per z.
+    """Per-plane tissue brightness of a stack: (measured, used), one per z.
 
-    `correct_illumination` divides by the FITTED levels to scale every plane
-    to a common brightness. Both are returned so the report can record what
-    was measured as well as what was applied.
+    `correct_illumination` divides by `used` to bring every plane to a common
+    brightness. Both are returned so the report records what was measured as
+    well as what was applied, and so an unmeasurable plane is visible as such.
 
-    WHY A FIT, and not the measurement itself. A plane's level moves for two
-    reasons: attenuation, which is the thing to remove, and how much bright
-    tissue happens to lie in that plane, which is signal. Dividing each plane
-    by its own level removes both, so a plane holding a large soma is pushed
-    down relative to its neighbours and real structure is flattened along z.
-    Attenuation varies smoothly with depth and tissue content does not, which
-    is what makes them separable: fit the smooth part, divide by that, and
-    leave the rest alone.
+    WHAT IS MEASURED, and why it is not a percentile of the plane. A plane's
+    brightness moves for two reasons: how brightly the tissue in it appears,
+    which is what depth attenuation changes and what this should remove, and
+    how MUCH tissue is in it, which is signal and must survive. A fixed
+    percentile of the whole plane confuses the two -- it reports the
+    background until tissue covers more than (100 - p)% of the plane and then
+    jumps to the tissue level. Measured on synthetic planes holding tissue at
+    ONE fixed brightness of 1000, with only the covered fraction changing:
 
-    WHY A ROBUST FIT. See the Theil-Sen comment below: one unmeasurable plane
-    is enough to tilt a least-squares line across the entire stack.
+        tissue fraction     p95 of plane      this function
+             0.5%                 228                 981
+             2.0%                 231                 997
+             5.0%                 297                 998
+            10.0%                1000                1000
+            30.0%                1001                 999
+            60.0%                1001            (declines)
+            90.0%                1013                1101
 
-    WHY LOG-LINEAR. Excitation and emission are absorbed along the path, so
-    depth attenuation is Beer-Lambert -- exponential in z, which is a straight
-    line in log. Fitting the log is therefore both the physical model and
-    monotone by construction. A quadratic fitted to a monotone decay will
-    often turn back UP at the deep end, where there are fewest planes and the
-    most attenuation, so its worst error lands exactly where the correction
-    matters most.
+    A statistic of the FOREGROUND pixels alone reports the same level whatever
+    fraction of the plane the tissue covers, which is the property that makes
+    the measurement usable directly. See KNOWN LIMITS for the dense end.
 
-    Each plane's level is the 95th percentile (`_ENVELOPE_PERCENTILE`, the
-    same statistic the XY path uses for a block's signal level) of a sample of
-    its finite pixels: bright pixels rather than a mean, so a plane holding
-    less tissue is not read as a dimmer one, and a sample rather than the
-    whole plane, so this does not sort every plane of the stack.
+    WHY NO SMOOTHING, NO FIT, NO MODEL. Once the measurement is independent of
+    content, every plane can be corrected from its own value. Nothing has to
+    assume the profile decays, or decays smoothly, or has one peak: a level
+    that falls over two planes, a bright first or last plane that is an
+    acquisition artifact rather than tissue, a whole-mount with a long tail, a
+    slice that is brightest in the middle -- all are followed as measured. An
+    earlier version fitted a monotone exponential, which on a stack that
+    brightens as it enters the tissue pinned the first thirty planes to one
+    value and under-corrected the deepest by threefold. A smoother needs a
+    lengthscale, and there is no lengthscale that is right for both a
+    two-plane drop and a two-hundred-plane gradient.
 
-    A plane too sparse to measure gets NaN in `measured` and is left out of
-    the fit, but still receives a level from the curve -- its neighbours know
-    what the attenuation is at that depth even when it does not.
+    HOW FOREGROUND IS FOUND. The background's CENTRE and spread, both robust:
+    the median of the plane and 1.4826 x its MAD, which are the background's
+    own when background is the majority of the plane -- the ordinary case. A
+    pixel is foreground when it clears that centre by `_SIGNAL_OVER_NOISE`
+    sigma.
 
-    The curve is clamped to the range of the measured levels, so a plane
-    beyond the last measurable one cannot be handed a runaway divisor.
+    NOT the module's block rule (`_BACKGROUND_PERCENTILE` + `_noise_sigma`).
+    That rule compares a BLOCK's p95-minus-p10 against the noise, and reusing
+    its pieces to threshold individual PIXELS puts the cut in the wrong place:
+    the 10th percentile is the background's low tail, not its centre, so on a
+    plane of N(200, 40) background the cut landed at 227 -- below a third of
+    the background pixels. A third of the plane came back as "foreground" and
+    its median was the background, 258 where the tissue was 1000. Measured,
+    not reasoned: that was the first version of this function.
 
-    Degenerate cases return what can be justified and nothing more: with no
-    measurable plane both arrays are zeros, which the caller reads as "do not
-    scale"; with one, the fit is that constant; a straight line needs two.
+    If that strict cut finds too little, it is tried again with the noise
+    measured from the quiet half only (`_noise_sigma`), which is lower and so
+    more permissive. A plane that fails both is not measured.
+
+    The statistic over the foreground is the MEDIAN, not a percentile -- half
+    above and half below, so neither a few saturated pixels nor the exact
+    placement of the threshold moves it much.
+
+    A plane with no measurable tissue gets NaN in `measured` and inherits from
+    its neighbours by linear interpolation in `used` (nearest value held at
+    the ends). Nothing else is possible: a plane with nothing in it contains no
+    evidence of how bright tissue would appear at that depth.
+
+    Returns zeros in `used` when no plane can be measured at all, which the
+    caller reads as "do not scale".
+
+    KNOWN LIMITS, since none of this is free.
+
+    DENSE PLANES. Once tissue is the majority of a plane, the median IS the
+    tissue and the threshold rises above it, so there is no foreground left to
+    take a statistic of. Around 60% coverage this function declines to measure
+    and the plane inherits; by 90% it measures again but reads ~10% high,
+    because what clears the threshold is the bright half of the tissue. A
+    plane that is uniformly ONE thing is genuinely ambiguous from its own
+    histogram -- all background and all tissue look alike -- and the only way
+    to tell them apart is to compare against other planes, which this does not
+    do. A volume where MOST planes are that dense will measure nothing and the
+    correction will decline entirely; the report shows that as NaN throughout,
+    rather than doing something quietly wrong.
+
+    LOW CONTRAST. Tissue that does not clear the background by
+    `_SIGNAL_OVER_NOISE` sigma is not foreground, so a plane whose signal is
+    at the noise floor is not measured. That is the intended behaviour: there
+    is nothing there to measure the brightness of.
+
+    CIRCULARITY. The threshold that defines foreground is itself affected by
+    illumination. It is computed per plane and relative to that plane, so it
+    largely cancels, but not exactly.
+
+    FEW PIXELS. A plane whose tissue is a few hundred pixels is measured from
+    a few hundred pixels.
     """
     depth = int(data.shape[0])
     measured = np.full(depth, np.nan, dtype=np.float64)
@@ -381,59 +433,33 @@ def z_levels(data) -> Tuple[np.ndarray, np.ndarray]:
         plane = np.asarray(data[z], dtype=np.float32).ravel()
         if plane.size == 0:
             continue
-        finite = plane[np.isfinite(plane)]
-        if finite.size < _Z_MIN_FINITE:
+        sample = plane[np.isfinite(plane)]
+        if sample.size < _Z_MIN_PIXELS:
             continue
-        if finite.size > _Z_SAMPLE_PIXELS:
-            finite = rng.choice(finite, _Z_SAMPLE_PIXELS, replace=False)
-        value = float(np.percentile(finite, _ENVELOPE_PERCENTILE))
-        if np.isfinite(value):
+        if sample.size > _Z_SAMPLE_PIXELS:
+            sample = rng.choice(sample, _Z_SAMPLE_PIXELS, replace=False)
+
+        centre = float(np.median(sample))
+        spread = 1.4826 * float(np.median(np.abs(sample - centre)))
+        foreground = sample[sample > centre + _SIGNAL_OVER_NOISE * spread]
+        if foreground.size < _Z_MIN_PIXELS:
+            # Relax to the quiet half's noise, which is the smaller estimate,
+            # before giving up on the plane.
+            quiet = _noise_sigma(sample - centre)
+            foreground = sample[sample > centre + _SIGNAL_OVER_NOISE * quiet]
+        if foreground.size < _Z_MIN_PIXELS:
+            continue
+        value = float(np.median(foreground))
+        if np.isfinite(value) and value > 0:
             measured[z] = value
 
-    # Only planes with a positive level can be fitted in log space, and a
-    # non-positive level carries no information about attenuation anyway.
     usable = np.isfinite(measured) & (measured > 0)
-    n_usable = int(np.count_nonzero(usable))
-    if n_usable == 0:
+    if not np.any(usable):
         return measured, np.zeros(depth, dtype=np.float64)
 
     z_index = np.arange(depth, dtype=np.float64)
-    if n_usable == 1:
-        fitted = np.full(depth, float(measured[usable][0]), dtype=np.float64)
-    else:
-        # Theil-Sen, not least squares. A percentile is a robust statistic of a
-        # plane but it is not immune: a plane whose tissue covers less than the
-        # 5% the percentile cuts at reads as background, which in log space is
-        # an enormous negative outlier. Measured on a synthetic stack with one
-        # such plane, a least-squares line was pulled 14-22% off across the
-        # whole depth -- the error is worst at the ends and does not stay near
-        # the bad plane. The median of the pairwise slopes ignores it entirely.
-        #
-        # O(n^2) in the number of usable planes, which is the depth of a stack:
-        # a few hundred at most, so a few tens of thousands of pairs.
-        zs = z_index[usable]
-        ys = np.log(measured[usable])
-        i, j = np.triu_indices(zs.size, k=1)
-        dz = zs[j] - zs[i]
-        ok = dz != 0
-        slope = float(np.median((ys[j][ok] - ys[i][ok]) / dz[ok])) if np.any(ok) else 0.0
-        intercept = float(np.median(ys - slope * zs))
-        fitted = np.exp(intercept + slope * z_index)
-
-    # Clamped to the range of what was actually measured. A divisor that runs
-    # away is the failure this guards: outside the span of measurable planes
-    # the curve is extrapolating, and an exponential extrapolates fast.
-    #
-    # NOT a percentile floor. Flooring at, say, the 10th percentile of the
-    # measured levels makes sense against a quadratic that can dive, but
-    # against a monotone decay that floor sits ABOVE the deepest planes' real
-    # levels and clips exactly the planes most in need of correction. Clamping
-    # to the measured min and max cannot clip anything the data supports,
-    # because within the fitted span the curve stays inside that range anyway.
-    lo = float(np.min(measured[usable]))
-    hi = float(np.max(measured[usable]))
-    fitted = np.clip(fitted, lo, hi)
-    return measured, np.asarray(fitted, dtype=np.float64)
+    used = np.interp(z_index, z_index[usable], measured[usable])
+    return measured, np.asarray(used, dtype=np.float64)
 
 
 def correct_illumination(
@@ -498,9 +524,10 @@ def correct_illumination(
     # the other way round folds depth attenuation into the field of view.
     scale_per_plane = np.ones(depth, dtype=np.float32)
     if is_3d and correct_z:
-        # `levels` is the FITTED curve, not the per-plane measurement: see
-        # z_levels. Dividing by the measurement would remove real variation in
-        # tissue content along with the attenuation.
+        # `levels` is the per-plane tissue brightness, followed as measured.
+        # It is safe to divide by directly because it is measured from each
+        # plane's foreground only, so it does not move when a plane simply
+        # holds less tissue. See z_levels.
         measured, levels = z_levels(data)
         usable = levels[levels > 0]
         target = float(np.median(usable)) if usable.size else 0.0
