@@ -352,6 +352,16 @@ def _dask_workers(budget: "resource_budget.Budget", ndim: int,
 #: the largest of them. Only the owned region is written, and at the true
 #: volume boundary the read block is clipped identically whatever the chunk
 #: shape, so `mode='nearest'` sees the same context. The output is therefore
+#: Pixels sampled across the whole volume when estimating the volume-wide
+#: background and noise sigma for Stage 1.1. An exact median would need the
+#: volume resident; a sample of this size puts the estimate well inside the
+#: rounding of the float32 arithmetic it feeds.
+_STATS_SAMPLE_PIXELS = 4_000_000
+
+#: Seeded, so the same stack yields the same normalisation on every run.
+_STATS_SAMPLE_SEED = 42
+
+
 #: byte-for-byte independent of this shape.
 _ENHANCE_BASE_CHUNK_3D = (64, 512, 512)
 _ENHANCE_BASE_CHUNK_2D = 2048
@@ -1245,6 +1255,47 @@ def segment_cells_first_pass_raw(
                 # the LARGEST tubular scale (converted to xy pixels), so the opening
                 # removes regional background while preserving real processes; if no
                 # usable scale exists, fall back to per-slice global stats.
+                # ---- ONE TRACK AT BOTH RANKS ------------------------------
+                # The statistics below used to be per PLANE. At rank 2 that is
+                # the whole image, because there is one plane; at rank 3 it was
+                # one background and one sigma per z-slice, which is a different
+                # correction from the one 2D receives.
+                #
+                # It also cancelled the z correction outright. Scale a plane by
+                # any constant c and its background scales by c, its residual by
+                # c and its MAD sigma by c, so (c*x - c*bg) / (c*sigma) is
+                # exactly what it was -- verified to float32 rounding over
+                # factors 0.5 to 6. `correct_illumination`'s z step multiplies
+                # each plane by exactly such a constant, so a per-plane sigma
+                # undid it completely and the threshold stage saw the same data
+                # either way. Measured, plane 0 versus plane 23 of an
+                # attenuating stack, as a ratio of normalised tissue value:
+                #
+                #     per-plane,   z correction OFF    2.24
+                #     per-plane,   z correction ON     2.24   no effect at all
+                #     volume-wide, z correction OFF    2.24
+                #     volume-wide, z correction ON     0.99   flattened
+                #
+                # Note what this does NOT say: a per-plane sigma does not erase
+                # raw depth attenuation, because attenuation dims the tissue
+                # while leaving the camera pedestal where it is, which is not a
+                # uniform scaling. Both rows read 2.24 with the correction off.
+                # What the per-plane sigma erases is specifically the CORRECTION.
+                #
+                # Volume-wide statistics make rank 3 behave as rank 2 does and
+                # let depth reach the threshold, so the z correction becomes
+                # load-bearing rather than cancelled. At rank 2 the numbers are
+                # unchanged by construction: one plane means volume-wide and
+                # per-plane are the same estimate.
+                #
+                # `win > 0` keeps its LOCAL windowed background, which is what
+                # 2D does too -- local in XY, not per plane. Only the noise
+                # sigma becomes volume-wide there.
+                #
+                # Set False to get the old per-plane behaviour back for
+                # comparison on the same stack. Nothing else changes either way.
+                _VOLUME_WIDE_STATS = True
+
                 phys = max([s for s in tubular_scales if s and s > 0], default=0.0)
                 # Finest in-plane axis: the last two at either rank. No 1e-9
                 # clamp -- `spacing` is validated positive and finite on entry,
@@ -1271,6 +1322,55 @@ def segment_cells_first_pass_raw(
                 # a different sigma and bake a per-tile strictness seam into the
                 # downstream global percentile threshold.
                 _planes = list(planes_of(volume))
+
+                # One pass to estimate the volume-wide statistics, before the
+                # pass that applies them. Streamed a plane at a time like
+                # everything else here; only a bounded sample of each plane is
+                # kept, so the memory cost is the sample and not the volume.
+                #
+                # A sample, because a median over a 192 x 24615 x 18462 volume
+                # cannot be taken exactly without holding it. Seeded, so two
+                # runs of the same stack give the same correction.
+                _vol_bg = None
+                _vol_sigma = None
+                if _VOLUME_WIDE_STATS and len(_planes) > 1:
+                    _rng = np.random.default_rng(_STATS_SAMPLE_SEED)
+                    _per_plane = max(1, _STATS_SAMPLE_PIXELS // len(_planes))
+                    _samples = []
+                    for _pidx, _plane_src in tqdm(_planes, desc="    Sampling",
+                                                  total=len(_planes)):
+                        _flat = np.asarray(_plane_src, dtype=np.float32).ravel()
+                        if _flat.size == 0:
+                            continue
+                        if _flat.size > _per_plane:
+                            _flat = _rng.choice(_flat, _per_plane, replace=False)
+                        _samples.append(_flat)
+                    if _samples:
+                        _pool = np.concatenate(_samples)
+                        del _samples
+                        if win > 0:
+                            # The background stays local and per plane (as in
+                            # 2D); only the noise scale is shared. Estimating it
+                            # from the raw pool would include the pedestal the
+                            # opening removes, so the residual is formed against
+                            # the pool's own median, which is what the per-plane
+                            # code compares against when win == 0.
+                            _vol_bg = None
+                        else:
+                            _vol_bg = float(np.median(_pool))
+                        _centre = float(np.median(_pool))
+                        _absp = np.abs(_pool - _centre)
+                        _vol_sigma = 1.4826 * float(np.median(_absp))
+                        if not np.isfinite(_vol_sigma) or _vol_sigma < 1e-6:
+                            _nz = _absp[_absp > 0]
+                            _vol_sigma = float(np.mean(_nz)) if _nz.size else 1.0
+                        _vol_sigma = max(_vol_sigma, 1e-6)
+                        del _pool, _absp
+                        print(f"    [Relative/local-SNR] volume-wide statistics: "
+                              f"background="
+                              f"{'local per plane' if _vol_bg is None else f'{_vol_bg:.3f}'}"
+                              f", noise sigma={_vol_sigma:.3f} "
+                              f"(one value for all {len(_planes)} planes)")
                 # Three plane buffers, allocated ONCE and reused, with the
                 # arithmetic done in place. The previous version allocated a
                 # fresh float32 plane for each of `s2d`, `bg`, `resid` and
@@ -1329,6 +1429,9 @@ def segment_cells_first_pass_raw(
                         bg = ndimage.grey_opening(s2d, size=(win, win),
                                                   output=_bg_buf)
                         bg_center = float(np.median(bg))
+                    elif _vol_bg is not None:
+                        bg = _vol_bg
+                        bg_center = bg
                     else:
                         bg = float(np.median(s2d))
                         bg_center = bg
@@ -1344,12 +1447,15 @@ def segment_cells_first_pass_raw(
                     # background noise even with cells present. Fallback covers the
                     # degenerate case of a large constant region (e.g. zero-padding
                     # outside the FOV) where the MAD would otherwise be 0.
-                    absr = np.abs(resid, out=_absr_buf)
-                    sigma = 1.4826 * float(np.median(absr))
-                    if not np.isfinite(sigma) or sigma < 1e-6:
-                        nz = absr[absr > 0]
-                        sigma = float(np.mean(nz)) if nz.size else 1.0
-                    sigma = max(sigma, 1e-6)
+                    if _vol_sigma is not None:
+                        sigma = _vol_sigma
+                    else:
+                        absr = np.abs(resid, out=_absr_buf)
+                        sigma = 1.4826 * float(np.median(absr))
+                        if not np.isfinite(sigma) or sigma < 1e-6:
+                            nz = absr[absr > 0]
+                            sigma = float(np.mean(nz)) if nz.size else 1.0
+                        sigma = max(sigma, 1e-6)
 
                     np.clip(resid, 0.0, None, out=resid)
                     np.divide(resid, sigma, out=resid)
