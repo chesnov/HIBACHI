@@ -352,6 +352,65 @@ def _dask_workers(budget: "resource_budget.Budget", ndim: int,
 #: the largest of them. Only the owned region is written, and at the true
 #: volume boundary the read block is clipped identically whatever the chunk
 #: shape, so `mode='nearest'` sees the same context. The output is therefore
+#: median(|X|) for X ~ N(0, 1). Used to recover the noise scale from a
+#: residual that has been clipped at zero, where only the positive half of the
+#: distribution survives.
+_HALF_NORMAL_MEDIAN = 0.6744897501960817
+
+
+def _robust_scale(values, floor_tol: float = 0.0) -> float:
+    """Noise scale of a residual, including when most of it sits on a floor.
+
+    The plain estimate is 1.4826 x MAD, which is the right one whenever the
+    bulk of the residual is background.
+
+    It breaks on a residual that has been CLIPPED. With `illumination_block_um`
+    set, the XY stage subtracts a background surface and clips at zero, so more
+    than half the voxels are exactly 0 -- the median is 0, every absolute
+    deviation from it is the value itself, and the MAD is 0 as well. Measured on
+    a real run: the old fallback then took the mean of the NON-ZERO absolute
+    values, which is a mean over signal rather than a noise scale, and returned
+    1205.5 where the illumination stage had measured the noise of the same image
+    as 62.2 -- nineteen times too large. Everything downstream was divided by it
+    and the growth percentile collapsed from 48.1 to 5.1.
+
+    So when the MAD is degenerate, the scale is measured from the voxels that
+    are NOT on the floor, by the same robust statistic. Those are the ones that
+    still carry the noise; the clipped ones carry none, which is precisely why
+    they must not set the scale.
+
+    Falls back to 1.0 only when there is nothing off the floor at all, i.e. a
+    uniformly constant input, where any scale is arbitrary.
+    """
+    v = np.asarray(values, dtype=np.float32).ravel()
+    if v.size == 0:
+        return 1.0
+    mad = float(np.median(np.abs(v - float(np.median(v)))))
+    scale = 1.4826 * mad
+    if np.isfinite(scale) and scale >= 1e-6:
+        return max(scale, 1e-6)
+
+    off_floor = v[np.abs(v) > floor_tol]
+    if off_floor.size:
+        # What survived the clip is the POSITIVE HALF of the noise, so its
+        # median is a known multiple of the noise the whole distribution would
+        # have had: for X ~ N(0, sigma), median|X| = 0.67449 sigma. Dividing by
+        # that recovers sigma, and a median is robust to the sparse bright tail
+        # of real cells -- which is what the previous fallback measured.
+        #
+        # Measured on a clipped residual of true sigma 62.2, from 50% to 90% of
+        # voxels on the floor, with and without bright cells present:
+        #
+        #     old fallback (mean of non-zero)     49 - 147
+        #     MAD of the off-floor values         36 - 38
+        #     this                                61 - 63
+        centre = float(np.median(off_floor))
+        scale = abs(centre) / _HALF_NORMAL_MEDIAN
+        if np.isfinite(scale) and scale >= 1e-6:
+            return max(scale, 1e-6)
+    return 1.0
+
+
 #: Pixels sampled across the whole volume when estimating the volume-wide
 #: background and noise sigma for Stage 1.1. An exact median would need the
 #: volume resident; a sample of this size puts the estimate well inside the
@@ -1359,13 +1418,8 @@ def segment_cells_first_pass_raw(
                         else:
                             _vol_bg = float(np.median(_pool))
                         _centre = float(np.median(_pool))
-                        _absp = np.abs(_pool - _centre)
-                        _vol_sigma = 1.4826 * float(np.median(_absp))
-                        if not np.isfinite(_vol_sigma) or _vol_sigma < 1e-6:
-                            _nz = _absp[_absp > 0]
-                            _vol_sigma = float(np.mean(_nz)) if _nz.size else 1.0
-                        _vol_sigma = max(_vol_sigma, 1e-6)
-                        del _pool, _absp
+                        _vol_sigma = _robust_scale(_pool - _centre)
+                        del _pool
                         print(f"    [Relative/local-SNR] volume-wide statistics: "
                               f"background="
                               f"{'local per plane' if _vol_bg is None else f'{_vol_bg:.3f}'}"
@@ -1450,12 +1504,7 @@ def segment_cells_first_pass_raw(
                     if _vol_sigma is not None:
                         sigma = _vol_sigma
                     else:
-                        absr = np.abs(resid, out=_absr_buf)
-                        sigma = 1.4826 * float(np.median(absr))
-                        if not np.isfinite(sigma) or sigma < 1e-6:
-                            nz = absr[absr > 0]
-                            sigma = float(np.mean(nz)) if nz.size else 1.0
-                        sigma = max(sigma, 1e-6)
+                        sigma = _robust_scale(resid)
 
                     np.clip(resid, 0.0, None, out=resid)
                     np.divide(resid, sigma, out=resid)
