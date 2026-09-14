@@ -326,6 +326,57 @@ _Z_MIN_PIXELS = 100
 #: correction on every run, or two runs of the pipeline are not comparable.
 _Z_SAMPLE_SEED = 42
 
+#: How far above the background the reported LEVEL must sit, in units of the
+#: plane's own noise, before the plane counts as measured.
+#:
+#: A single pixel only has to clear `_SIGNAL_OVER_NOISE` sigma to be called
+#: foreground. But if the only pixels clearing it are the background's own
+#: upper tail, the median of that tail hugs the threshold -- so the LEVEL
+#: sitting barely above the cut is the signature of a plane with no tissue
+#: left. Requiring twice the per-pixel margin separates the two.
+#:
+#: This replaced a test on the SIZE of the foreground against a Gaussian tail
+#: fraction, which does not work: a background clipped at zero, as a real
+#: camera's is, has a much heavier upper tail than a Gaussian, so the test
+#: never fired. Measured in noise units instead, which needs no assumption
+#: about the shape of the background.
+#:
+#: This is a DETECTION THRESHOLD and it trades the two failures against each
+#: other; there is no assumption-free value. Too low and a noise tail is taken
+#: for tissue, which is the bug it exists to fix. Too high and a genuinely dim
+#: plane is discarded and filled from the fit, so a real drop goes uncorrected.
+#: Both observed, on the two cases that matter:
+#:
+#:     tissue at 1000 over background 218 +- 123   5.9 sigma   must be KEPT
+#:     noise tail measuring 700, same background   3.9 sigma   must be DROPPED
+#:
+#: 5.0 sits between them. A plane closer to the floor than that cannot be
+#: told apart from the tail by any statistic of the plane alone.
+_Z_LEVEL_OVER_NOISE = 5.0
+
+#: Anchor for the peak-matching factor. NOT the maximum: a saturated raw image
+#: has a maximum of exactly the dtype ceiling, which says nothing about where
+#: the signal actually tops out, and anchoring to it scales the whole stack by
+#: an arbitrary amount. Measured on a real run, the max was 65535 and the
+#: factor came out 0.88 -- a 12% darkening with no justification.
+_Z_PEAK_PERCENTILE = 99.9
+
+#: Fit the measured levels, or follow them plane by plane.
+#:
+#: Following them is exact wherever the measurement is trustworthy, and makes
+#: no assumption about the shape of the profile -- a two-plane drop, a bright
+#: edge plane, any number of peaks. But it cannot correct a plane whose tissue
+#: has fallen below the noise floor, because such a plane contains no evidence
+#: of how bright tissue would be at that depth: its measurement collapses onto
+#: the background tail and reads several times too high.
+#:
+#: The fit exists for those planes. It is taken over the planes that ARE
+#: measurable and extrapolated to the ones that are not, which is a narrower
+#: job than the smoothing it used to do -- it is not asked to decide what is
+#: content and what is attenuation, only to continue a trend past the point
+#: where the signal ran out.
+_Z_FIT = True
+
 
 def z_levels(data) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Per-plane statistics of a stack: (measured, used, peak), one per z.
@@ -444,7 +495,7 @@ def z_levels(data) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
             continue
         sample = plane[np.isfinite(plane)]
         if sample.size:
-            peak[z] = float(sample.max())
+            peak[z] = float(np.percentile(sample, _Z_PEAK_PERCENTILE))
         if sample.size < _Z_MIN_PIXELS:
             continue
         if sample.size > _Z_SAMPLE_PIXELS:
@@ -460,7 +511,19 @@ def z_levels(data) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
             foreground = sample[sample > centre + _SIGNAL_OVER_NOISE * quiet]
         if foreground.size < _Z_MIN_PIXELS:
             continue
+
         value = float(np.median(foreground))
+
+        # Is that tissue, or the background's own upper tail? Past the depth
+        # where tissue drops below the threshold, what clears it is noise, and
+        # noise does not attenuate -- so the measurement stops falling and
+        # levels off several times above the truth. Seen on a real stack:
+        # background 217, noise sigma 123, and the deepest twenty planes all
+        # measured 700-740 and then ticked back UP. A level that does not clear
+        # the background by `_Z_LEVEL_OVER_NOISE` sigma is not tissue; the
+        # plane is left unmeasured and the fit supplies its level.
+        if spread > 0 and (value - centre) < _Z_LEVEL_OVER_NOISE * spread:
+            continue
         if np.isfinite(value) and value > 0:
             measured[z] = value
 
@@ -470,6 +533,35 @@ def z_levels(data) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
 
     z_index = np.arange(depth, dtype=np.float64)
     used = np.interp(z_index, z_index[usable], measured[usable])
+
+    if _Z_FIT and int(np.count_nonzero(usable)) >= 2:
+        # Log-linear, because attenuation is Beer-Lambert -- exponential in
+        # depth, a straight line in log, and monotone by construction.
+        #
+        # Theil-Sen, the median of the pairwise slopes, not least squares. One
+        # plane that reads the noise tail is an enormous outlier in log space;
+        # measured on a synthetic stack, a least-squares line was pulled 14-22%
+        # off across the WHOLE depth by a single such plane, worst at the ends.
+        # Theil-Sen ignores it. O(n^2) in the number of measurable planes,
+        # which is a stack depth: tens of thousands of pairs at most.
+        zs = z_index[usable]
+        ys = np.log(measured[usable])
+        i, j = np.triu_indices(zs.size, k=1)
+        dz = zs[j] - zs[i]
+        ok = dz != 0
+        if np.any(ok):
+            slope = float(np.median((ys[j][ok] - ys[i][ok]) / dz[ok]))
+            intercept = float(np.median(ys - slope * zs))
+            curve = np.exp(intercept + slope * z_index)
+            # The fit REPLACES nothing that was measured. Where a plane was
+            # measurable its own value is used -- that is the whole point of a
+            # content-independent measurement, and a monotone curve cannot
+            # represent the rise as a stack enters the tissue anyway. The curve
+            # only fills the planes that had no measurable tissue, which the
+            # interpolation above could otherwise only fill by holding the
+            # nearest value flat.
+            used = np.where(usable, measured, curve)
+
     return measured, np.asarray(used, dtype=np.float64), peak
 
 
@@ -576,6 +668,12 @@ def correct_illumination(
         report["z_levels_measured"] = [
             (None if not np.isfinite(v) else round(float(v), 3)) for v in measured
         ]
+        # How many planes had no measurable tissue, so their level came from the
+        # fit rather than from themselves. A high count on a stack you expected
+        # to be bright throughout is the signal that the detection threshold,
+        # not the correction, is what wants looking at.
+        report["z_planes_unmeasured"] = int(np.sum(~np.isfinite(measured)))
+        report["z_fit_used"] = bool(_Z_FIT)
         report["z_levels"] = [round(float(v), 3) for v in levels]
         report["z_scales"] = [round(float(v), 4) for v in scale_per_plane]
 
