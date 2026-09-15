@@ -17,6 +17,7 @@ import dask_image.ndfilters
 import dask_image.ndmeasure
 from dask.diagnostics import ProgressBar
 from scipy import ndimage
+from scipy.special import ndtri
 from scipy.ndimage import generate_binary_structure
 from skimage.filters import frangi, sato  # type: ignore
 from tqdm import tqdm
@@ -352,62 +353,87 @@ def _dask_workers(budget: "resource_budget.Budget", ndim: int,
 #: the largest of them. Only the owned region is written, and at the true
 #: volume boundary the read block is clipped identically whatever the chunk
 #: shape, so `mode='nearest'` sees the same context. The output is therefore
-#: median(|X|) for X ~ N(0, 1). Used to recover the noise scale from a
-#: residual that has been clipped at zero, where only the positive half of the
-#: distribution survives.
-_HALF_NORMAL_MEDIAN = 0.6744897501960817
+#: Quantile of the surviving (off-floor) values used to recover the noise
+#: scale. Low enough to sit inside the noise rather than in the signal, high
+#: enough not to be set by a handful of voxels.
+_FLOOR_PROBE_QUANTILE = 0.25
+
+#: Above this fraction on the floor there is too little of the distribution
+#: left to say anything about its width.
+_FLOOR_MAX_FRACTION = 0.98
+
+#: At or above this fraction sitting on one value, the MAD is not describing a
+#: noise distribution and must not be used -- even when it is not exactly zero.
+#: With exactly half the voxels clipped the MAD is set by the single boundary
+#: element: measured 0.10 where the true noise was 62.2, which passed a
+#: "greater than zero" test and would have divided the whole volume by it.
+_FLOOR_MIN_FRACTION = 0.25
 
 
 def _robust_scale(values, floor_tol: float = 0.0) -> float:
     """Noise scale of a residual, including when most of it sits on a floor.
 
-    The plain estimate is 1.4826 x MAD, which is the right one whenever the
-    bulk of the residual is background.
+    The plain estimate is 1.4826 x MAD, which is right whenever the bulk of the
+    residual is background.
 
-    It breaks on a residual that has been CLIPPED. With `illumination_block_um`
-    set, the XY stage subtracts a background surface and clips at zero, so more
-    than half the voxels are exactly 0 -- the median is 0, every absolute
-    deviation from it is the value itself, and the MAD is 0 as well. Measured on
-    a real run: the old fallback then took the mean of the NON-ZERO absolute
-    values, which is a mean over signal rather than a noise scale, and returned
-    1205.5 where the illumination stage had measured the noise of the same image
-    as 62.2 -- nineteen times too large. Everything downstream was divided by it
-    and the growth percentile collapsed from 48.1 to 5.1.
+    It breaks on a CLIPPED residual. With `illumination_block_um` set, the
+    illumination stage subtracts a background surface and clips at zero, so the
+    majority of voxels are exactly 0. The median is then 0, every deviation
+    from it is the value itself, and the MAD is 0 too. Two fallbacks have
+    already failed here, both measured against an illumination stage that
+    reported the true noise of the same image as 62.2:
 
-    So when the MAD is degenerate, the scale is measured from the voxels that
-    are NOT on the floor, by the same robust statistic. Those are the ones that
-    still carry the noise; the clipped ones carry none, which is precisely why
-    they must not set the scale.
+        mean of the non-zero absolute values          1205.5
+        median of the off-floor values / 0.6745        471.5
 
-    Falls back to 1.0 only when there is nothing off the floor at all, i.e. a
-    uniformly constant input, where any scale is arbitrary.
+    The first averages signal. The second assumed the off-floor voxels were the
+    positive half of zero-mean noise, but the background has ALREADY been
+    subtracted, so the pooled median is 0, subtracting it changes nothing, and
+    the off-floor values are the whole image -- tissue included.
+
+    What clipping does leave behind is the FRACTION on the floor. If a fraction
+    p of a N(0, sigma) distribution was clipped away, the surviving values are
+    its upper 1-p, so the q-th quantile of what survives is the
+    (p + q(1-p))-th quantile of the original, and
+
+        sigma = value / Phi^-1(p + q(1-p))
+
+    recovers the width from any one surviving quantile. `q` is taken low
+    (`_FLOOR_PROBE_QUANTILE`) so the probe sits in the noise rather than in the
+    tissue at the top of the distribution.
+
+    Falls back to 1.0 when there is nothing off the floor, or when so much was
+    clipped that the remainder says nothing about the width.
+
+    KNOWN LIMIT: the probe quantile has to sit in the noise, so this fails once
+    the tissue occupies more of the surviving distribution than the probe. At a
+    58% floor it held to within 1% for tissue up to 15% of the volume and broke
+    at 40% (reading 3241 for a true 62.2). A volume that is 40% tissue has
+    little background left to measure.
     """
     v = np.asarray(values, dtype=np.float32).ravel()
     if v.size == 0:
         return 1.0
-    mad = float(np.median(np.abs(v - float(np.median(v)))))
-    scale = 1.4826 * mad
-    if np.isfinite(scale) and scale >= 1e-6:
-        return max(scale, 1e-6)
 
-    off_floor = v[np.abs(v) > floor_tol]
-    if off_floor.size:
-        # What survived the clip is the POSITIVE HALF of the noise, so its
-        # median is a known multiple of the noise the whole distribution would
-        # have had: for X ~ N(0, sigma), median|X| = 0.67449 sigma. Dividing by
-        # that recovers sigma, and a median is robust to the sparse bright tail
-        # of real cells -- which is what the previous fallback measured.
-        #
-        # Measured on a clipped residual of true sigma 62.2, from 50% to 90% of
-        # voxels on the floor, with and without bright cells present:
-        #
-        #     old fallback (mean of non-zero)     49 - 147
-        #     MAD of the off-floor values         36 - 38
-        #     this                                61 - 63
-        centre = float(np.median(off_floor))
-        scale = abs(centre) / _HALF_NORMAL_MEDIAN
+    on_floor = int(np.count_nonzero(v <= floor_tol))
+    p = on_floor / float(v.size)
+
+    if p < _FLOOR_MIN_FRACTION:
+        mad = float(np.median(np.abs(v - float(np.median(v)))))
+        scale = 1.4826 * mad
         if np.isfinite(scale) and scale >= 1e-6:
             return max(scale, 1e-6)
+
+    off_floor = v[v > floor_tol]
+    if off_floor.size == 0 or p >= _FLOOR_MAX_FRACTION:
+        return 1.0
+
+    probe = float(np.quantile(off_floor, _FLOOR_PROBE_QUANTILE))
+    # Position of that probe in the ORIGINAL, unclipped distribution.
+    original_q = p + _FLOOR_PROBE_QUANTILE * (1.0 - p)
+    z = float(ndtri(min(max(original_q, 1e-6), 1.0 - 1e-6)))
+    if z > 1e-6 and np.isfinite(probe) and probe > 0:
+        return max(probe / z, 1e-6)
     return 1.0
 
 
