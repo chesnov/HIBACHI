@@ -633,7 +633,26 @@ def correct_illumination(
         # holds less tissue. See z_levels.
         measured, levels, peak = z_levels(data)
         usable = levels[levels > 0]
-        target = float(np.median(usable)) if usable.size else 0.0
+        # The BRIGHTEST plane's level, not the median.
+        #
+        # The median equalises towards the middle, so half the planes are
+        # scaled down -- on a specimen that is bright at the top and dim at
+        # depth, that darkens the good planes and only lifts the worst few.
+        # Nothing looks corrected because the part you were already happy with
+        # got worse. Measured on a real stack, levels 2113 at the top falling
+        # to 700 at the bottom: against the median the top planes took 0.87 and
+        # only the deepest exceeded 1.5.
+        #
+        # Against the maximum, no plane is ever darkened: the brightest plane
+        # is the reference and keeps a scale of 1, and every other plane is
+        # brought UP to it. That is what "correct the attenuation" means when
+        # the attenuation is what makes depth dimmer than the surface.
+        #
+        # The cost is real and cannot be avoided: scaling a plane amplifies its
+        # noise with its signal, so a plane lifted 3x is 3x noisier and its
+        # signal-to-noise is exactly what it was. Depth that was too dim to
+        # measure does not become measurable, it becomes bright and noisy.
+        target = float(np.max(usable)) if usable.size else 0.0
         if target > 0:
             with np.errstate(divide="ignore", invalid="ignore"):
                 scale_per_plane = np.where(levels > 0, target / levels, 1.0)
@@ -654,13 +673,39 @@ def correct_illumination(
             # untouched -- and it is the largest factor that cannot clip,
             # because it is derived from the true per-pixel maxima rather than
             # from the levels.
-            raw_peak = float(peak.max()) if peak.size else 0.0
+            # Only ever <= 1, and only when the dtype would otherwise clip.
+            #
+            # This used to pin the corrected maximum exactly to the raw maximum,
+            # which was right while planes were equalised to the MEDIAN. Against
+            # the maximum it is self-defeating: lifting the dim planes raises the
+            # overall peak by construction, so pinning it back down scales
+            # everything -- including the reference plane, which is supposed to
+            # be untouched. Measured: a factor of 0.8925 turned scales of
+            # 1.00-2.94 into 0.89-2.63 and darkened the very planes that were
+            # already correct.
+            #
+            # So the peak is no longer matched, only protected. The brightest
+            # plane keeps its scale of 1 and nothing is darkened unless the
+            # amplified deep planes would actually saturate, in which case
+            # everything is pulled down by the smallest factor that avoids it.
+            # The raw and corrected layers therefore sit on the same absolute
+            # display scale as before, with the corrected one reaching higher,
+            # which is what a correction that brightens is supposed to look
+            # like.
+            # The dtype the correction will be written back in, which is the
+            # input's -- the same one `_apply` clips against further down.
+            _out_dtype = np.dtype(getattr(volume, "dtype", np.float32))
+            ceiling = 0.0
+            if np.issubdtype(_out_dtype, np.integer):
+                ceiling = float(np.iinfo(_out_dtype).max)
             scaled_peak = float(np.max(peak * scale_per_plane)) if peak.size else 0.0
-            if raw_peak > 0 and scaled_peak > 0:
-                headroom = raw_peak / scaled_peak
+            headroom = 1.0
+            if ceiling > 0 and scaled_peak > ceiling:
+                headroom = ceiling / scaled_peak
                 scale_per_plane = scale_per_plane * headroom
-                report["z_peak_match"] = round(float(headroom), 4)
-                report["z_raw_peak"] = round(raw_peak, 1)
+            report["z_peak_match"] = round(float(headroom), 4)
+            report["z_raw_peak"] = round(float(peak.max()) if peak.size else 0.0, 1)
+            report["z_scaled_peak"] = round(scaled_peak * headroom, 1)
             scale_per_plane = np.asarray(scale_per_plane, dtype=np.float32)
         # Both recorded: the measurement is the evidence, the curve is what was
         # applied, and a correction nobody can trace back to both is not

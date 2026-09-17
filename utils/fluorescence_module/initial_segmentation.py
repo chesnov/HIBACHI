@@ -1597,7 +1597,7 @@ def segment_cells_first_pass_raw(
                     _size = (win_z, win, win)
                     print(f"    [Relative/local-SNR] 3D background window "
                           f"{win_z} x {win} x {win} voxels "
-                          f"({6.0 * phys:.1f} um in every direction), "
+                          f"({window_um:.1f} um in every direction), "
                           f"slabs of {_step} planes + {_halo} halo")
                     for _start in tqdm(range(0, _depth, _step),
                                        desc="    Standardizing",
@@ -1632,8 +1632,12 @@ def segment_cells_first_pass_raw(
                 _plane_shape = None
                 _s_buf = _bg_buf = _absr_buf = None
                 _plane_bytes = None
-                for _pidx, _plane_src in tqdm(_planes, desc="    Standardizing",
-                                              total=len(_planes)):
+                # `_planes` is emptied by the slab path above, so this loop is
+                # skipped entirely rather than drawing a second empty progress
+                # bar for zero iterations.
+                for _pidx, _plane_src in (
+                        tqdm(_planes, desc="    Standardizing",
+                             total=len(_planes)) if _planes else ()):
                     if _plane_shape != _plane_src.shape:
                         _plane_shape = _plane_src.shape
                         _s_buf = np.empty(_plane_shape, dtype=np.float32)
