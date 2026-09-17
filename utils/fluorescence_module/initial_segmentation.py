@@ -437,6 +437,24 @@ def _robust_scale(values, floor_tol: float = 0.0) -> float:
     return 1.0
 
 
+#: Physical size of the local-background window, in microns, in every
+#: direction. The opening that estimates the pedestal removes whatever is
+#: SMALLER than its window, so this has to be comfortably larger than the
+#: largest thing that must survive -- a cell body is tens of microns, so a
+#: window of a few tens preserves it while still following background that
+#: varies over hundreds. It is the same order as the illumination stage's own
+#: `block_um`, which is the same quantity measured for the same reason.
+#:
+#: A length rather than a voxel count, so the correction does not change when
+#: the same specimen is sampled more finely, and does not depend on the rank of
+#: the data or on whether the vesselness filters are configured.
+_BACKGROUND_WINDOW_UM = 50.0
+
+#: Ceiling in voxels per axis. A window of tens of microns on very finely
+#: sampled data would otherwise become hundreds of pixels across, at which
+#: point the opening is slow and is no longer local to anything.
+_BACKGROUND_WINDOW_MAX_PX = 151
+
 #: Pixels sampled across the whole volume when estimating the volume-wide
 #: background and noise sigma for Stage 1.1. An exact median would need the
 #: volume resident; a sample of this size puts the estimate well inside the
@@ -1381,41 +1399,52 @@ def segment_cells_first_pass_raw(
                 # comparison on the same stack. Nothing else changes either way.
                 _VOLUME_WIDE_STATS = True
 
+                # ---- THE BACKGROUND WINDOW ------------------------------
+                # A fixed PHYSICAL size, converted to voxels per axis.
+                #
+                # It used to be derived from `tubular_scales`, as six times the
+                # largest one, and to collapse to NO window at all when no scale
+                # was set -- `win = 0`, which fell back to a single global
+                # background for the whole plane. That made the entire local
+                # background estimate conditional on the vesselness filters
+                # being configured, which is wrong twice over: the filters are
+                # optional, and a background pedestal exists whether or not
+                # anything is being enhanced. On a run with `Scale sigma=0.0`
+                # there was no local background subtraction anywhere.
+                #
+                # `_BACKGROUND_WINDOW_UM` replaces that. It is a length in
+                # microns, so the same tissue gives the same correction at any
+                # pixel size, any z step, any rank, and with the filters on or
+                # off. When tubular scales ARE configured the window is widened
+                # to cover them if they ask for more, so a run that previously
+                # got a wider window still gets it.
+                #
+                # Converted PER AXIS, which on anisotropic data is very
+                # different numbers for the same distance: at 0.276 um pixels
+                # and a 2 um step, 50 um is 181 pixels in plane but only 25
+                # planes deep. An isotropic voxel window would reach 181 planes
+                # -- 362 um -- and open away the specimen itself.
+                #
+                # A z extent of 1 means one plane, i.e. the old 2D behaviour,
+                # which is what a 2D image gets and what a stack whose z step
+                # is coarser than the window gets.
                 phys = max([s for s in tubular_scales if s and s > 0], default=0.0)
+                window_um = max(_BACKGROUND_WINDOW_UM, 6.0 * phys)
+
+                def _axis_window(step_um: float) -> int:
+                    if not (step_um > 0):
+                        return 1
+                    n = int(round(window_um / step_um))
+                    n = max(1, min(n, _BACKGROUND_WINDOW_MAX_PX))
+                    return n if n % 2 == 1 else n + 1
+
                 # Finest in-plane axis: the last two at either rank. No 1e-9
                 # clamp -- `spacing` is validated positive and finite on entry,
                 # so a guard here would only mask a bad value.
                 xy_spacing = min_inplane_spacing(spacing)
-                if phys > 0:
-                    win = int(np.clip(round(6.0 * phys / xy_spacing) * 2 + 1, 15, 151))
-                else:
-                    win = 0
-
-                # ---- THE BACKGROUND WINDOW IS NOW 3D ----------------------
-                # It used to be `size=(win, win)` on one slice, so the pedestal
-                # under a voxel was estimated only from voxels in its own plane.
-                # For a stack that is wrong in the same way a per-plane sigma
-                # was: structured background extends through depth, and an
-                # opening that cannot see through depth cannot follow it.
-                #
-                # The z extent is the same PHYSICAL distance as the in-plane
-                # one, converted with the z spacing, so the window is a fixed
-                # size in microns rather than in voxels. On anisotropic data
-                # that is far fewer planes than pixels -- with 0.276 um pixels
-                # and a 2 um step it is 87 x 87 in plane and 13 deep for the
-                # same physical extent -- which is the point: an isotropic
-                # voxel window would reach 87 planes, hundreds of microns, and
-                # open away the tissue itself.
-                #
-                # 1 means one plane, i.e. exactly the old behaviour, which is
-                # what a 2D image gets and what a stack with a z step coarser
-                # than the window gets.
-                win_z = 1
-                if win > 0 and volume.ndim == 3:
-                    z_spacing = float(spacing[0])
-                    if z_spacing > 0:
-                        win_z = int(np.clip(
-                            round(6.0 * phys / z_spacing) * 2 + 1, 1, 151))
+                win = _axis_window(xy_spacing)
+                win_z = (_axis_window(float(spacing[0]))
+                         if volume.ndim == 3 else 1)
 
                 bg_report: List[float] = []
                 sc_report: List[float] = []
@@ -1555,8 +1584,17 @@ def segment_cells_first_pass_raw(
 
                 if _halo > 0:
                     _depth = len(_planes)
-                    _step = max(1, _fit - 2 * _halo)
-                    _fp = np.ones((win_z, win, win), dtype=bool)
+                    if 2 * _halo + 1 >= _depth:
+                        # The window reaches further than the stack is deep, so
+                        # one slab IS the whole volume and the halo is moot.
+                        # Without this the step below would be 1 and the whole
+                        # volume would be re-opened once per plane: at a 0.3 um
+                        # z step a 50 um window is 151 planes, so a 300-plane
+                        # halo on a 200-plane stack is not a corner case.
+                        _step = _depth
+                    else:
+                        _step = max(1, _fit - 2 * _halo)
+                    _size = (win_z, win, win)
                     print(f"    [Relative/local-SNR] 3D background window "
                           f"{win_z} x {win} x {win} voxels "
                           f"({6.0 * phys:.1f} um in every direction), "
@@ -1568,7 +1606,7 @@ def segment_cells_first_pass_raw(
                         _lo = max(0, _start - _halo)
                         _hi = min(_depth, _stop + _halo)
                         _slab = np.asarray(volume[_lo:_hi], dtype=np.float32)
-                        _bg = ndimage.grey_opening(_slab, footprint=_fp)
+                        _bg = ndimage.grey_opening(_slab, size=_size)
                         np.subtract(_slab, _bg, out=_slab)
                         del _bg
                         if _vol_sigma is not None:
