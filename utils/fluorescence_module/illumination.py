@@ -55,8 +55,8 @@ import numpy as np
 #: within a handful of pixels are noise.
 _MIN_BLOCK_PX = 8
 
-#: Percentile taken within a block as its local signal level, and the one
-#: taken as its background.
+#: Percentile taken within a block as its signal level, and the one taken over
+#: the WHOLE image as the floor everything is measured above.
 _ENVELOPE_PERCENTILE = 95.0
 _BACKGROUND_PERCENTILE = 10.0
 
@@ -189,6 +189,9 @@ def _block_surfaces(data, block, max_gain: float, report: dict):
 
     low = np.zeros(grid, dtype=np.float32)
     high = np.zeros(grid, dtype=np.float32)
+    # Voxel noise WITHIN each block, so the "does this block hold anything"
+    # test below compares a block's signal against a real noise level.
+    spread = np.zeros(grid, dtype=np.float32)
 
     # Walked one slab of blocks at a time along axis 0, so only that slab is
     # resident: the percentiles need the voxels, and the whole image as float32
@@ -203,25 +206,74 @@ def _block_surfaces(data, block, max_gain: float, report: dict):
             if tile.size:
                 low[idx] = float(np.percentile(tile, _BACKGROUND_PERCENTILE))
                 high[idx] = float(np.percentile(tile, _ENVELOPE_PERCENTILE))
+                centre = float(np.median(tile))
+                spread[idx] = 1.4826 * float(np.median(np.abs(tile - centre)))
         del slab
 
     report["blocks"] = [int(g) for g in grid]
     report["block_px"] = [int(b) for b in block]
 
-    background = gaussian_filter(low, 1.0, mode="nearest")
-    report["background_min"] = round(float(background.min()), 2)
-    report["background_max"] = round(float(background.max()), 2)
+    # ---- THE FLOOR IS GLOBAL, NOT PER BLOCK -----------------------------
+    # The background used to be each block's own low percentile, smoothed. That
+    # is right when every block contains some empty field -- sparse cells on a
+    # dark background, which is what a 2D frame of this data looks like -- and
+    # wrong when a block sits entirely INSIDE the specimen, which is what
+    # happens through the middle of a solid object in 3D. Measured on blocks
+    # wholly within a squashed sphere of tissue about 2000 bright:
+    #
+    #     block p10 = 867    block p95 = 1316    p95 - p10 = 449
+    #
+    # The low percentile IS the tissue there, so subtracting it removed most of
+    # the tissue (1598 -> 737 on a real test) and the "signal" driving the gain
+    # was the tissue's internal texture rather than its brightness. Depth
+    # attenuation was invisible to it: a 2.35x top-to-bottom ratio came out at
+    # 2.36.
+    #
+    # Nor can a bigger block fix it. For a block's low percentile to be
+    # background it must be larger than the specimen; for the gain to resolve
+    # depth it must be smaller than the attenuation lengthscale. On a specimen
+    # filling most of the field those cannot both hold -- at 40 um the grid was
+    # [1, 1, 1].
+    #
+    # So the floor is one number for the whole image: the low percentile of the
+    # block lows, which is the darkest part of the field and therefore the
+    # camera offset plus stray light. Blocks measure their brightness ABOVE it,
+    # which inside solid tissue is the tissue's brightness -- the thing
+    # attenuation changes.
+    #
+    # What this gives up is real: local background variation, patchy
+    # nonspecific staining for instance, is no longer removed. That was a
+    # genuine benefit of the per-block floor on 2D data, and it is the price of
+    # a correction that works through a solid object.
+    floor = float(np.percentile(low, _BACKGROUND_PERCENTILE)) if low.size else 0.0
+    background = np.full(grid, floor, dtype=np.float32)
+    report["background_floor"] = round(floor, 2)
+    report["background_min"] = round(floor, 2)
+    report["background_max"] = round(floor, 2)
 
     if max_gain <= 1.0:
         report["gain_skipped"] = "maximum gain is 1, so only the background was removed"
         return background, None
 
-    # Noise from the block residuals rather than from a full-resolution
-    # difference, so this needs no second pass over the image. `low` is the
-    # background level and the quiet half of (high - low) is what a block with
-    # nothing in it shows.
-    noise = _noise_sigma(high - low)
-    signal = np.clip(high - low, 0.0, None)
+    # Noise is the MEDIAN of the within-block MADs.
+    #
+    # NOT `_noise_sigma(high - low)`, which is what this was and which measures
+    # the wrong quantity: (high - low) is each block's SPREAD, so the MAD of
+    # those is a spread of spreads. On blocks of pure background with a voxel
+    # noise of 50 it returned 0.70, making the test below `signal > 2.1` while
+    # an empty block's own signal is about 2.93 sigma = 146. Every block passed:
+    # a real run reported `signal_coverage: 1.0` on a volume that is mostly
+    # empty, the gain was fitted to empty background, and `gain_max` pinned
+    # itself to the cap -- so background noise was amplified tenfold. That is
+    # the correction going wrong exactly where there is nothing to correct.
+    #
+    # A within-block MAD is the voxel noise of that block, and the median over
+    # blocks is robust to the ones full of tissue, so this recovers 50.00 on
+    # the same test. It costs nothing: the tile is already in hand.
+    noise = float(np.median(spread[spread > 0])) if np.any(spread > 0) else 1.0
+    noise = max(noise, 1e-6)
+    # Brightness above the global floor, not contrast within the block.
+    signal = np.clip(high - floor, 0.0, None)
     has_signal = signal > (_SIGNAL_OVER_NOISE * noise)
     coverage = float(has_signal.mean()) if has_signal.size else 0.0
     report["noise_sigma"] = round(noise, 2)
