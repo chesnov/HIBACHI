@@ -327,22 +327,14 @@ class FluorescenceStrategy(ProcessingStrategy):
             block_um = float(params.get("illumination_block_um", 0.0) or 0.0)
             max_gain = float(params.get("illumination_max_gain", 1.0) or 1.0)
 
-            # Depth correction is not optional and has no parameter. It used to
-            # be a checkbox defaulting to off, which meant depth attenuation was
-            # normally left in; and when it was switched on it still made no
-            # difference, because Stage 1.1 of step 1 standardised every plane
-            # by its own noise sigma and that exactly cancels a per-plane
-            # scaling. Stage 1.1 now uses volume-wide statistics, so the
-            # correction reaches the threshold -- and there is no version of
-            # this pipeline in which leaving it off was a behaviour anyone
-            # chose, so there is nothing to preserve.
-            #
-            # `correct_illumination` ignores it at rank 2 (there is no depth in
-            # one plane), so the gate below is what keeps a 2D project with no
-            # XY correction from writing an artifact that would be identical to
-            # its input.
-            correct_z = True
-            if block_um > 0 or len(self.image_shape) == 3:
+            # `block_um` alone decides whether there is a correction and what
+            # it does. Depth is not a separate stage and has no parameter of its
+            # own: `correct_illumination` tiles the image in blocks of that
+            # physical size along EVERY axis, so at rank 3 depth attenuation is
+            # corrected by the same blocks that correct in-plane shading. There
+            # used to be a `correct_z` flag and a per-plane scaling stage behind
+            # it; both are gone.
+            if block_um > 0:
                 from .illumination import correct_illumination
 
                 corrected_path = files.get("corrected_image")
@@ -376,7 +368,7 @@ class FluorescenceStrategy(ProcessingStrategy):
                 )
                 _, illum_report = correct_illumination(
                     image_stack, self.spacing_checked,
-                    block_um=block_um, max_gain=max_gain, correct_z=correct_z,
+                    block_um=block_um, max_gain=max_gain,
                     out=corrected,
                 )
                 if illum_report.get("applied"):

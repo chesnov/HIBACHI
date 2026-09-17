@@ -89,53 +89,126 @@ def _noise_sigma(residual) -> float:
     return max(1e-6, 1.4826 * mad)
 
 
-def _block_surfaces(reference, block_px: int, max_gain: float, report: dict):
-    """(background, gain) surfaces from block percentiles, or (background, None).
+def _block_grid(shape, block) -> Tuple[Tuple[int, ...], Tuple[slice, ...]]:
+    """Number of blocks per axis, and a helper to slice block `idx` out."""
+    return tuple(max(1, int(shape[k]) // int(block[k]))
+                 for k in range(len(shape)))
 
-    `block_px` sets everything. A LOW percentile within a block is its
-    background and a HIGH percentile its signal level, so the block must be
-    large enough to contain background but small enough that illumination is
-    roughly constant across it. Too large and its "background" percentile sits
-    inside tissue: at 1477 px the estimated background spanned 79x, which is a
-    picture of the cells, not of the illumination.
+
+def _block_slices(shape, block, grid, idx) -> Tuple[slice, ...]:
+    """Slices of block `idx`. The last block on each axis takes the remainder."""
+    out = []
+    for k in range(len(shape)):
+        start = idx[k] * int(block[k])
+        stop = int(shape[k]) if idx[k] == grid[k] - 1 else (idx[k] + 1) * int(block[k])
+        out.append(slice(start, stop))
+    return tuple(out)
+
+
+def _sample_grid(values, shape, region: Optional[Tuple[slice, ...]] = None):
+    """Linear upsampling of a per-block array to full resolution.
+
+    Replaces `skimage.transform.resize(..., order=1, mode="edge")` and matches
+    its coordinate convention -- output centres map to
+    `(i + 0.5) * in/out - 0.5`, clamped at the edges -- but samples only a
+    REGION of the output, so the correction can be applied to the volume a slab
+    at a time without materialising a surface the size of the whole image.
+
+    `region` is a tuple of slices into the full output. Sampling a region gives
+    exactly the values the full-resolution surface would have there, so slabs
+    carry no seams: every output voxel's coordinate is computed from its GLOBAL
+    index.
+    """
+    from scipy.ndimage import map_coordinates  # type: ignore
+
+    values = np.asarray(values, dtype=np.float32)
+    nd = len(shape)
+    if region is None:
+        region = tuple(slice(0, int(shape[k])) for k in range(nd))
+
+    coords = []
+    for k in range(nd):
+        out_n = int(shape[k])
+        in_n = int(values.shape[k])
+        idx = np.arange(region[k].start, region[k].stop, dtype=np.float64)
+        if out_n == in_n:
+            c = idx
+        else:
+            c = (idx + 0.5) * (in_n / out_n) - 0.5
+        np.clip(c, 0.0, in_n - 1.0, out=c)
+        coords.append(c)
+
+    mesh = np.meshgrid(*coords, indexing="ij")
+    sampled = map_coordinates(values, np.asarray(mesh), order=1, mode="nearest")
+    return np.asarray(sampled, dtype=np.float32)
+
+
+def _block_surfaces(data, block, max_gain: float, report: dict):
+    """(background_grid, gain_grid) from block percentiles, or (grid, None).
+
+    RANK-AGNOSTIC. The image is tiled into blocks along EVERY axis and the same
+    two percentiles are taken in each: a low one is that block's background and
+    a high one its signal level. In 2D that is a grid of squares over the
+    image; in 3D a grid of boxes over the volume, so depth attenuation is
+    corrected by the same code that corrects in-plane shading, as one more
+    direction in which the illumination varies. There is no branch on the
+    number of axes anywhere in this function, and no separate stage for depth.
+    
+    It used to tile only the last two axes and average the volume down to one
+    plane first, which is what made depth a special case needing its own
+    per-plane scaling stage.
+
+    `block` sets everything, one size per axis. A block must be large enough to
+    contain background but small enough that illumination is roughly constant
+    across it. Too large and its "background" percentile sits inside tissue: at
+    1477 px the estimated background spanned 79x, which is a picture of the
+    cells, not of the illumination.
 
     A block whose signal does not clear the measured noise is DISCARDED, not
     recorded as zero -- counting empty blocks is what makes a divided
     correction explode on a sparse image. Those blocks inherit a neighbour's
     factor, so a region with nothing in it is left alone.
 
-    Returns None for the gain when too little of the frame holds signal to
+    Returns grids, not full-resolution surfaces: the caller upsamples them a
+    slab at a time through `_sample_grid`. A surface the size of a 400-megavoxel
+    volume is 1.6 GB per surface, and there are two.
+
+    Returns None for the gain when too little of the image holds signal to
     define one: decline rather than guess.
     """
+    import itertools
+
     from scipy.ndimage import (  # type: ignore
         distance_transform_edt, gaussian_filter,
     )
-    from skimage.transform import resize  # type: ignore
 
-    plane = np.asarray(reference, dtype=np.float32)
-    height, width = plane.shape
-    block = max(_MIN_BLOCK_PX, int(block_px))
-    rows = max(1, height // block)
-    cols = max(1, width // block)
+    shape = tuple(int(v) for v in data.shape)
+    nd = len(shape)
+    block = tuple(max(_MIN_BLOCK_PX, int(b)) for b in block)
+    grid = _block_grid(shape, block)
 
-    low = np.zeros((rows, cols), dtype=np.float32)
-    high = np.zeros((rows, cols), dtype=np.float32)
-    for r in range(rows):
-        for c in range(cols):
-            r1 = height if r == rows - 1 else (r + 1) * block
-            c1 = width if c == cols - 1 else (c + 1) * block
-            tile = plane[r * block:r1, c * block:c1]
+    low = np.zeros(grid, dtype=np.float32)
+    high = np.zeros(grid, dtype=np.float32)
+
+    # Walked one slab of blocks at a time along axis 0, so only that slab is
+    # resident: the percentiles need the voxels, and the whole image as float32
+    # is what this is avoiding.
+    for i0 in range(grid[0]):
+        sl0 = _block_slices(shape, block, grid, (i0,) + (0,) * (nd - 1))[0]
+        slab = np.asarray(data[sl0], dtype=np.float32)
+        for rest in itertools.product(*[range(grid[k]) for k in range(1, nd)]):
+            idx = (i0,) + rest
+            sub = _block_slices(shape, block, grid, idx)
+            tile = slab[(slice(None),) + sub[1:]]
             if tile.size:
-                low[r, c] = float(np.percentile(tile, _BACKGROUND_PERCENTILE))
-                high[r, c] = float(np.percentile(tile, _ENVELOPE_PERCENTILE))
+                low[idx] = float(np.percentile(tile, _BACKGROUND_PERCENTILE))
+                high[idx] = float(np.percentile(tile, _ENVELOPE_PERCENTILE))
+        del slab
 
-    report["blocks"] = [int(rows), int(cols)]
-    report["block_px"] = int(block)
+    report["blocks"] = [int(g) for g in grid]
+    report["block_px"] = [int(b) for b in block]
 
-    background = resize(gaussian_filter(low, 1.0, mode="nearest"), plane.shape,
-                        order=1, mode="edge", preserve_range=True,
-                        anti_aliasing=False)
-    background = np.asarray(background, dtype=np.float32)
+    background = gaussian_filter(low, 1.0, mode="nearest")
     report["background_min"] = round(float(background.min()), 2)
     report["background_max"] = round(float(background.max()), 2)
 
@@ -143,7 +216,11 @@ def _block_surfaces(reference, block_px: int, max_gain: float, report: dict):
         report["gain_skipped"] = "maximum gain is 1, so only the background was removed"
         return background, None
 
-    noise = _noise_sigma(plane - background)
+    # Noise from the block residuals rather than from a full-resolution
+    # difference, so this needs no second pass over the image. `low` is the
+    # background level and the quiet half of (high - low) is what a block with
+    # nothing in it shows.
+    noise = _noise_sigma(high - low)
     signal = np.clip(high - low, 0.0, None)
     has_signal = signal > (_SIGNAL_OVER_NOISE * noise)
     coverage = float(has_signal.mean()) if has_signal.size else 0.0
@@ -162,14 +239,12 @@ def _block_surfaces(reference, block_px: int, max_gain: float, report: dict):
         # cells has a low high-percentile because it is sparse, not because it
         # is dim. So this number is an upper bound on the illumination
         # variation, badly inflated wherever density varies -- on a frame with
-        # a 4x brightness ramp it read 46x. It is worth seeing, because a small
-        # value means density is even and the estimate is trustworthy, but it
-        # must not be used to pick the cap.
+        # a 4x brightness ramp it read 46x.
         report["signal_spread_upper_bound"] = round(spread, 2)
 
     if coverage < _ENVELOPE_MIN_COVERAGE:
         report["gain_declined"] = (
-            f"only {coverage * 100:.0f}% of the frame holds signal above the "
+            f"only {coverage * 100:.0f}% of the image holds signal above the "
             f"noise ({noise:.1f}), too little to tell uneven illumination from "
             f"empty space -- the foreground was left unscaled"
         )
@@ -190,10 +265,7 @@ def _block_surfaces(reference, block_px: int, max_gain: float, report: dict):
     np.clip(gain, 1.0 / float(max_gain), float(max_gain), out=gain)
     report["gain_min"] = round(float(gain.min()), 3)
     report["gain_max"] = round(float(gain.max()), 3)
-
-    surface = resize(gain, plane.shape, order=1, mode="edge",
-                     preserve_range=True, anti_aliasing=False)
-    return background, np.asarray(surface, dtype=np.float32)
+    return background, np.asarray(gain, dtype=np.float32)
 
 
 # --------------------------------------------------------------------------- #
@@ -314,446 +386,93 @@ def open_corrected(path: Optional[str], shape: Sequence[int],
     return array
 
 
-#: Pixels sampled per plane when measuring its level. A robust statistic does
-#: not need the whole plane, and reading one costs a sort of it.
-_Z_SAMPLE_PIXELS = 100_000
-
-#: Fewest pixels -- finite, and then foreground -- a plane needs before it is
-#: measured at all. A statistic of a handful of values is noise.
-_Z_MIN_PIXELS = 100
-
-#: Sampling is random, so it is seeded. The same stack must produce the same
-#: correction on every run, or two runs of the pipeline are not comparable.
-_Z_SAMPLE_SEED = 42
-
-#: How far above the background the reported LEVEL must sit, in units of the
-#: plane's own noise, before the plane counts as measured.
-#:
-#: A single pixel only has to clear `_SIGNAL_OVER_NOISE` sigma to be called
-#: foreground. But if the only pixels clearing it are the background's own
-#: upper tail, the median of that tail hugs the threshold -- so the LEVEL
-#: sitting barely above the cut is the signature of a plane with no tissue
-#: left. Requiring twice the per-pixel margin separates the two.
-#:
-#: This replaced a test on the SIZE of the foreground against a Gaussian tail
-#: fraction, which does not work: a background clipped at zero, as a real
-#: camera's is, has a much heavier upper tail than a Gaussian, so the test
-#: never fired. Measured in noise units instead, which needs no assumption
-#: about the shape of the background.
-#:
-#: This is a DETECTION THRESHOLD and it trades the two failures against each
-#: other; there is no assumption-free value. Too low and a noise tail is taken
-#: for tissue, which is the bug it exists to fix. Too high and a genuinely dim
-#: plane is discarded and filled from the fit, so a real drop goes uncorrected.
-#: Both observed, on the two cases that matter:
-#:
-#:     tissue at 1000 over background 218 +- 123   5.9 sigma   must be KEPT
-#:     noise tail measuring 700, same background   3.9 sigma   must be DROPPED
-#:
-#: 5.0 sits between them. A plane closer to the floor than that cannot be
-#: told apart from the tail by any statistic of the plane alone.
-_Z_LEVEL_OVER_NOISE = 5.0
-
-#: Anchor for the peak-matching factor. NOT the maximum: a saturated raw image
-#: has a maximum of exactly the dtype ceiling, which says nothing about where
-#: the signal actually tops out, and anchoring to it scales the whole stack by
-#: an arbitrary amount. Measured on a real run, the max was 65535 and the
-#: factor came out 0.88 -- a 12% darkening with no justification.
-_Z_PEAK_PERCENTILE = 99.9
-
-#: Fit the measured levels, or follow them plane by plane.
-#:
-#: Following them is exact wherever the measurement is trustworthy, and makes
-#: no assumption about the shape of the profile -- a two-plane drop, a bright
-#: edge plane, any number of peaks. But it cannot correct a plane whose tissue
-#: has fallen below the noise floor, because such a plane contains no evidence
-#: of how bright tissue would be at that depth: its measurement collapses onto
-#: the background tail and reads several times too high.
-#:
-#: The fit exists for those planes. It is taken over the planes that ARE
-#: measurable and extrapolated to the ones that are not, which is a narrower
-#: job than the smoothing it used to do -- it is not asked to decide what is
-#: content and what is attenuation, only to continue a trend past the point
-#: where the signal ran out.
-_Z_FIT = True
-
-
-def z_levels(data) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Per-plane statistics of a stack: (measured, used, peak), one per z.
-
-    `correct_illumination` divides by `used` to bring every plane to a common
-    brightness. `measured` is returned alongside it so the report records what
-    was measured as well as what was applied, and so an unmeasurable plane is
-    visible as such.
-
-    `peak` is each plane's true maximum, over every pixel rather than the
-    sample. The caller needs it to choose one global factor that puts the
-    corrected maximum exactly at the raw maximum: that way the correction
-    spends the range it is given, nothing saturates, and the corrected stack
-    can be displayed on the same scale as the raw one and compared against it.
-    It costs nothing to collect -- the plane is already read.
-
-    WHAT IS MEASURED, and why it is not a percentile of the plane. A plane's
-    brightness moves for two reasons: how brightly the tissue in it appears,
-    which is what depth attenuation changes and what this should remove, and
-    how MUCH tissue is in it, which is signal and must survive. A fixed
-    percentile of the whole plane confuses the two -- it reports the
-    background until tissue covers more than (100 - p)% of the plane and then
-    jumps to the tissue level. Measured on synthetic planes holding tissue at
-    ONE fixed brightness of 1000, with only the covered fraction changing:
-
-        tissue fraction     p95 of plane      this function
-             0.5%                 228                 981
-             2.0%                 231                 997
-             5.0%                 297                 998
-            10.0%                1000                1000
-            30.0%                1001                 999
-            60.0%                1001            (declines)
-            90.0%                1013                1101
-
-    A statistic of the FOREGROUND pixels alone reports the same level whatever
-    fraction of the plane the tissue covers, which is the property that makes
-    the measurement usable directly. See KNOWN LIMITS for the dense end.
-
-    WHY NO SMOOTHING, NO FIT, NO MODEL. Once the measurement is independent of
-    content, every plane can be corrected from its own value. Nothing has to
-    assume the profile decays, or decays smoothly, or has one peak: a level
-    that falls over two planes, a bright first or last plane that is an
-    acquisition artifact rather than tissue, a whole-mount with a long tail, a
-    slice that is brightest in the middle -- all are followed as measured. An
-    earlier version fitted a monotone exponential, which on a stack that
-    brightens as it enters the tissue pinned the first thirty planes to one
-    value and under-corrected the deepest by threefold. A smoother needs a
-    lengthscale, and there is no lengthscale that is right for both a
-    two-plane drop and a two-hundred-plane gradient.
-
-    HOW FOREGROUND IS FOUND. The background's CENTRE and spread, both robust:
-    the median of the plane and 1.4826 x its MAD, which are the background's
-    own when background is the majority of the plane -- the ordinary case. A
-    pixel is foreground when it clears that centre by `_SIGNAL_OVER_NOISE`
-    sigma.
-
-    NOT the module's block rule (`_BACKGROUND_PERCENTILE` + `_noise_sigma`).
-    That rule compares a BLOCK's p95-minus-p10 against the noise, and reusing
-    its pieces to threshold individual PIXELS puts the cut in the wrong place:
-    the 10th percentile is the background's low tail, not its centre, so on a
-    plane of N(200, 40) background the cut landed at 227 -- below a third of
-    the background pixels. A third of the plane came back as "foreground" and
-    its median was the background, 258 where the tissue was 1000. Measured,
-    not reasoned: that was the first version of this function.
-
-    If that strict cut finds too little, it is tried again with the noise
-    measured from the quiet half only (`_noise_sigma`), which is lower and so
-    more permissive. A plane that fails both is not measured.
-
-    The statistic over the foreground is the MEDIAN, not a percentile -- half
-    above and half below, so neither a few saturated pixels nor the exact
-    placement of the threshold moves it much.
-
-    A plane with no measurable tissue gets NaN in `measured` and inherits from
-    its neighbours by linear interpolation in `used` (nearest value held at
-    the ends). Nothing else is possible: a plane with nothing in it contains no
-    evidence of how bright tissue would appear at that depth.
-
-    Returns zeros in `used` when no plane can be measured at all, which the
-    caller reads as "do not scale".
-
-    KNOWN LIMITS, since none of this is free.
-
-    DENSE PLANES. Once tissue is the majority of a plane, the median IS the
-    tissue and the threshold rises above it, so there is no foreground left to
-    take a statistic of. Around 60% coverage this function declines to measure
-    and the plane inherits; by 90% it measures again but reads ~10% high,
-    because what clears the threshold is the bright half of the tissue. A
-    plane that is uniformly ONE thing is genuinely ambiguous from its own
-    histogram -- all background and all tissue look alike -- and the only way
-    to tell them apart is to compare against other planes, which this does not
-    do. A volume where MOST planes are that dense will measure nothing and the
-    correction will decline entirely; the report shows that as NaN throughout,
-    rather than doing something quietly wrong.
-
-    LOW CONTRAST. Tissue that does not clear the background by
-    `_SIGNAL_OVER_NOISE` sigma is not foreground, so a plane whose signal is
-    at the noise floor is not measured. That is the intended behaviour: there
-    is nothing there to measure the brightness of.
-
-    CIRCULARITY. The threshold that defines foreground is itself affected by
-    illumination. It is computed per plane and relative to that plane, so it
-    largely cancels, but not exactly.
-
-    FEW PIXELS. A plane whose tissue is a few hundred pixels is measured from
-    a few hundred pixels.
-    """
-    depth = int(data.shape[0])
-    measured = np.full(depth, np.nan, dtype=np.float64)
-    peak = np.zeros(depth, dtype=np.float64)
-    rng = np.random.default_rng(_Z_SAMPLE_SEED)
-
-    for z in range(depth):
-        plane = np.asarray(data[z], dtype=np.float32).ravel()
-        if plane.size == 0:
-            continue
-        sample = plane[np.isfinite(plane)]
-        if sample.size:
-            peak[z] = float(np.percentile(sample, _Z_PEAK_PERCENTILE))
-        if sample.size < _Z_MIN_PIXELS:
-            continue
-        if sample.size > _Z_SAMPLE_PIXELS:
-            sample = rng.choice(sample, _Z_SAMPLE_PIXELS, replace=False)
-
-        centre = float(np.median(sample))
-        spread = 1.4826 * float(np.median(np.abs(sample - centre)))
-        foreground = sample[sample > centre + _SIGNAL_OVER_NOISE * spread]
-        if foreground.size < _Z_MIN_PIXELS:
-            # Relax to the quiet half's noise, which is the smaller estimate,
-            # before giving up on the plane.
-            quiet = _noise_sigma(sample - centre)
-            foreground = sample[sample > centre + _SIGNAL_OVER_NOISE * quiet]
-        if foreground.size < _Z_MIN_PIXELS:
-            continue
-
-        value = float(np.median(foreground))
-
-        # Is that tissue, or the background's own upper tail? Past the depth
-        # where tissue drops below the threshold, what clears it is noise, and
-        # noise does not attenuate -- so the measurement stops falling and
-        # levels off several times above the truth. Seen on a real stack:
-        # background 217, noise sigma 123, and the deepest twenty planes all
-        # measured 700-740 and then ticked back UP. A level that does not clear
-        # the background by `_Z_LEVEL_OVER_NOISE` sigma is not tissue; the
-        # plane is left unmeasured and the fit supplies its level.
-        if spread > 0 and (value - centre) < _Z_LEVEL_OVER_NOISE * spread:
-            continue
-        if np.isfinite(value) and value > 0:
-            measured[z] = value
-
-    usable = np.isfinite(measured) & (measured > 0)
-    if not np.any(usable):
-        return measured, np.zeros(depth, dtype=np.float64), peak
-
-    z_index = np.arange(depth, dtype=np.float64)
-    used = np.interp(z_index, z_index[usable], measured[usable])
-
-    if _Z_FIT and int(np.count_nonzero(usable)) >= 2:
-        # Log-linear, because attenuation is Beer-Lambert -- exponential in
-        # depth, a straight line in log, and monotone by construction.
-        #
-        # Theil-Sen, the median of the pairwise slopes, not least squares. One
-        # plane that reads the noise tail is an enormous outlier in log space;
-        # measured on a synthetic stack, a least-squares line was pulled 14-22%
-        # off across the WHOLE depth by a single such plane, worst at the ends.
-        # Theil-Sen ignores it. O(n^2) in the number of measurable planes,
-        # which is a stack depth: tens of thousands of pairs at most.
-        zs = z_index[usable]
-        ys = np.log(measured[usable])
-        i, j = np.triu_indices(zs.size, k=1)
-        dz = zs[j] - zs[i]
-        ok = dz != 0
-        if np.any(ok):
-            slope = float(np.median((ys[j][ok] - ys[i][ok]) / dz[ok]))
-            intercept = float(np.median(ys - slope * zs))
-            curve = np.exp(intercept + slope * z_index)
-            # The fit REPLACES nothing that was measured. Where a plane was
-            # measurable its own value is used -- that is the whole point of a
-            # content-independent measurement, and a monotone curve cannot
-            # represent the rise as a stack enters the tissue anyway. The curve
-            # only fills the planes that had no measurable tissue, which the
-            # interpolation above could otherwise only fill by holding the
-            # nearest value flat.
-            used = np.where(usable, measured, curve)
-
-    return measured, np.asarray(used, dtype=np.float64), peak
-
-
 def correct_illumination(
     volume,
     spacing: Sequence[float],
     block_um: float = 0.0,
     max_gain: float = 1.0,
-    correct_z: bool = False,
     out=None,
     progress=None,
 ) -> Tuple[Optional[np.ndarray], dict]:
-    """Write an illumination-corrected copy of `volume`. Returns (out, report).
+    """Even out illumination across an image. ONE function, ANY number of axes.
 
-    `block_um` is the size of the block both surfaces are measured in, in
-    MICRONS, and 0 disables the whole XY correction. It has to be large enough
-    that a block contains background as well as objects, and small enough that
-    illumination is roughly constant across it.
+    Tiles the image into blocks of a fixed PHYSICAL size along every axis,
+    takes a low percentile in each block as its background and a high one as
+    its signal level, then subtracts the background and divides by the bounded
+    signal level. Nothing here asks how many axes the input has.
 
-    `max_gain` caps how much the foreground may be evened out. 1 means
-    background subtraction only. Whatever the estimate says, no region is
-    scaled by more than this, so a misjudged surface cannot amplify a corner
-    into noise -- and the report says how far the signal actually varies, so
-    the cap can be set from the image rather than guessed.
+    That is the point of this version. It used to tile only the last two axes,
+    average a stack down to a single plane in order to do so, and then carry a
+    SEPARATE per-plane scaling stage to deal with depth -- a stage with no 2D
+    counterpart, its own level estimator, its own fit, its own noise-floor
+    test and its own failure modes. Depth is not a special direction: a plane
+    dim because the excitation was absorbed on the way in is dim for the same
+    reason a corner of a field of view is dim, and one grid of blocks over the
+    whole image corrects both. At rank 2 the grid is squares over an image; at
+    rank 3 it is boxes over a volume; the code is the same code.
 
-    `correct_z` scales each plane of a stack to a common level. Ignored for a
-    2D image, which has no depth.
+    `block_um` is the block edge in microns, converted per axis with that
+    axis's own spacing -- the same physical size in every direction, so on
+    anisotropic data it is very different numbers of voxels: at 0.276 um pixels
+    and a 1 um z step, 60 um is 217 pixels in plane and 60 planes deep. A block
+    must hold background but be small enough that illumination is roughly even
+    across it. 0 disables the correction.
+
+    `max_gain` caps how much the foreground may be evened out; 1 means
+    background subtraction only.
 
     `out` is an array to write into -- normally a memmap over the artifact
-    file, so the corrected image is persistent and can be reopened. Written
-    plane by plane, so peak memory is one plane whatever the image size.
+    file, so the corrected image is persistent and can be reopened. Written a
+    slab at a time, and the surfaces are kept at block resolution and upsampled
+    per slab rather than materialised at full size, so peak memory is a slab
+    whatever the image size.
 
     The report records what was measured and applied, for the run's provenance:
     a corrected image nobody can trace back to a correction factor is not
     reproducible.
     """
     data = volume
-    ndim = int(np.asarray(data.shape).size)
-    if ndim not in (2, 3):
-        raise ValueError(f"illumination correction needs a 2D or 3D image, got {ndim}D")
+    shape = tuple(int(v) for v in data.shape)
+    nd = len(shape)
 
     spacing_arr = np.asarray(spacing, dtype=np.float64)
-    if spacing_arr.size < ndim:
+    if spacing_arr.size < nd:
         raise ValueError("spacing must have one entry per axis")
-    # In-plane spacing is the LAST TWO entries at either rank -- spacing[-2:],
-    # never spacing[1:], which silently drops Y in 2D (convention 4).
-    in_plane = spacing_arr[-2:]
-    pixel_um = float(np.mean(in_plane)) if np.all(in_plane > 0) else 1.0
+    spacing_arr = spacing_arr[-nd:]
+    if not np.all(spacing_arr > 0):
+        raise ValueError("spacing must be positive on every axis")
 
     report: dict = {
-        "ndim": ndim,
+        "ndim": nd,
         "block_um": float(block_um),
         "max_gain": float(max_gain),
-        "correct_z": bool(correct_z and ndim == 3),
-        "pixel_um": pixel_um,
+        "spacing": [round(float(v), 6) for v in spacing_arr],
         "dtype": str(np.dtype(getattr(volume, "dtype", np.float32))),
     }
 
-    is_3d = ndim == 3
-    depth = int(data.shape[0]) if is_3d else 1
+    if not (block_um and block_um > 0):
+        report["applied"] = False
+        report["skipped"] = "block size is 0, so no correction was requested"
+        return None, report
 
-    # ---- Z first: the XY field is estimated from a projection, and doing it
-    # the other way round folds depth attenuation into the field of view.
-    scale_per_plane = np.ones(depth, dtype=np.float32)
-    if is_3d and correct_z:
-        # `levels` is the per-plane tissue brightness, followed as measured.
-        # It is safe to divide by directly because it is measured from each
-        # plane's foreground only, so it does not move when a plane simply
-        # holds less tissue. See z_levels.
-        measured, levels, peak = z_levels(data)
-        usable = levels[levels > 0]
-        # The BRIGHTEST plane's level, not the median.
-        #
-        # The median equalises towards the middle, so half the planes are
-        # scaled down -- on a specimen that is bright at the top and dim at
-        # depth, that darkens the good planes and only lifts the worst few.
-        # Nothing looks corrected because the part you were already happy with
-        # got worse. Measured on a real stack, levels 2113 at the top falling
-        # to 700 at the bottom: against the median the top planes took 0.87 and
-        # only the deepest exceeded 1.5.
-        #
-        # Against the maximum, no plane is ever darkened: the brightest plane
-        # is the reference and keeps a scale of 1, and every other plane is
-        # brought UP to it. That is what "correct the attenuation" means when
-        # the attenuation is what makes depth dimmer than the surface.
-        #
-        # The cost is real and cannot be avoided: scaling a plane amplifies its
-        # noise with its signal, so a plane lifted 3x is 3x noisier and its
-        # signal-to-noise is exactly what it was. Depth that was too dim to
-        # measure does not become measurable, it becomes bright and noisy.
-        target = float(np.max(usable)) if usable.size else 0.0
-        if target > 0:
-            with np.errstate(divide="ignore", invalid="ignore"):
-                scale_per_plane = np.where(levels > 0, target / levels, 1.0)
-            scale_per_plane = np.asarray(scale_per_plane, dtype=np.float64)
+    # One physical size, converted per axis. This is the only place the axes
+    # differ from one another, and they differ by how finely they are sampled,
+    # not by being depth rather than width.
+    block = tuple(max(_MIN_BLOCK_PX,
+                      min(int(shape[k]),
+                          int(round(float(block_um) / float(spacing_arr[k])))))
+                  for k in range(nd))
 
-            # Equalising to the median moves half the planes up and half down,
-            # which is what makes a dim plane brighter and an over-bright one
-            # dimmer. But it also moves the brightest pixel in the stack, and
-            # the direction depends on which plane it happened to be in: the
-            # corrected image would sit on a different scale from the raw one
-            # and could not be compared with it by eye, and if it moved up it
-            # would saturate against the dtype ceiling and lose the top of the
-            # range outright.
-            #
-            # So one global factor afterwards, putting the corrected maximum
-            # exactly where the raw maximum was. Global, so it changes no
-            # RELATIVE brightness between planes -- the equalisation is
-            # untouched -- and it is the largest factor that cannot clip,
-            # because it is derived from the true per-pixel maxima rather than
-            # from the levels.
-            # Only ever <= 1, and only when the dtype would otherwise clip.
-            #
-            # This used to pin the corrected maximum exactly to the raw maximum,
-            # which was right while planes were equalised to the MEDIAN. Against
-            # the maximum it is self-defeating: lifting the dim planes raises the
-            # overall peak by construction, so pinning it back down scales
-            # everything -- including the reference plane, which is supposed to
-            # be untouched. Measured: a factor of 0.8925 turned scales of
-            # 1.00-2.94 into 0.89-2.63 and darkened the very planes that were
-            # already correct.
-            #
-            # So the peak is no longer matched, only protected. The brightest
-            # plane keeps its scale of 1 and nothing is darkened unless the
-            # amplified deep planes would actually saturate, in which case
-            # everything is pulled down by the smallest factor that avoids it.
-            # The raw and corrected layers therefore sit on the same absolute
-            # display scale as before, with the corrected one reaching higher,
-            # which is what a correction that brightens is supposed to look
-            # like.
-            # The dtype the correction will be written back in, which is the
-            # input's -- the same one `_apply` clips against further down.
-            _out_dtype = np.dtype(getattr(volume, "dtype", np.float32))
-            ceiling = 0.0
-            if np.issubdtype(_out_dtype, np.integer):
-                ceiling = float(np.iinfo(_out_dtype).max)
-            scaled_peak = float(np.max(peak * scale_per_plane)) if peak.size else 0.0
-            headroom = 1.0
-            if ceiling > 0 and scaled_peak > ceiling:
-                headroom = ceiling / scaled_peak
-                scale_per_plane = scale_per_plane * headroom
-            report["z_peak_match"] = round(float(headroom), 4)
-            report["z_raw_peak"] = round(float(peak.max()) if peak.size else 0.0, 1)
-            report["z_scaled_peak"] = round(scaled_peak * headroom, 1)
-            scale_per_plane = np.asarray(scale_per_plane, dtype=np.float32)
-        # Both recorded: the measurement is the evidence, the curve is what was
-        # applied, and a correction nobody can trace back to both is not
-        # reproducible.
-        report["z_levels_measured"] = [
-            (None if not np.isfinite(v) else round(float(v), 3)) for v in measured
-        ]
-        # How many planes had no measurable tissue, so their level came from the
-        # fit rather than from themselves. A high count on a stack you expected
-        # to be bright throughout is the signal that the detection threshold,
-        # not the correction, is what wants looking at.
-        report["z_planes_unmeasured"] = int(np.sum(~np.isfinite(measured)))
-        report["z_fit_used"] = bool(_Z_FIT)
-        report["z_levels"] = [round(float(v), 3) for v in levels]
-        report["z_scales"] = [round(float(v), 4) for v in scale_per_plane]
-
-    # ---- XY field, from a z-corrected mean projection so one field serves
-    # every plane. The field of view does not change with depth; measuring it
-    # per plane would only add noise.
-    # ---- XY background, from a z-corrected mean projection so one surface
-    # serves every plane. The field of view does not change with depth;
-    # estimating it per plane would only add noise.
-    # ---- Background and gain, from a z-corrected mean projection so one pair
-    # of surfaces serves every plane. The field of view does not change with
-    # depth; estimating it per plane would only add noise.
-    background = None
-    gain_surface = None
-    if block_um and block_um > 0:
-        if is_3d:
-            accum = np.zeros(data.shape[-2:], dtype=np.float64)
-            for z in range(depth):
-                accum += np.asarray(data[z], dtype=np.float32) * scale_per_plane[z]
-            reference = accum / max(1, depth)
-        else:
-            reference = np.asarray(data, dtype=np.float32)
-        block_px = max(_MIN_BLOCK_PX,
-                       int(round(float(block_um) / max(1e-6, pixel_um))))
-        background, gain_surface = _block_surfaces(
-            reference, block_px, float(max_gain), report)
-
-    if background is None and not report["correct_z"]:
+    background_grid, gain_grid = _block_surfaces(
+        data, block, float(max_gain), report)
+    if background_grid is None:
         report["applied"] = False
         return None, report
     report["applied"] = True
 
     dtype = np.dtype(getattr(data, "dtype", np.float32))
     if out is None:
-        out = np.empty(data.shape, dtype=dtype)
+        out = np.empty(shape, dtype=dtype)
 
     # Written in the INPUT's dtype. The pipeline expresses an absolute
     # threshold as a fraction of the dtype range -- "scaling by DType Max" --
@@ -763,32 +482,37 @@ def correct_illumination(
     is_integer = np.issubdtype(dtype, np.integer)
     info = np.iinfo(dtype) if is_integer else None
 
-    for z in range(depth):
-        plane = np.asarray(data[z] if is_3d else data, dtype=np.float32)
-        if scale_per_plane[z] != 1.0:
-            plane = plane * scale_per_plane[z]
-        if background is not None:
-            # Subtract, never divide, and clamp at zero: a background estimate
-            # above the signal means an empty region, not a negative one.
-            plane = plane - background
-            np.clip(plane, 0.0, None, out=plane)
-        if gain_surface is not None:
+    # Applied in slabs along axis 0, which is rank-agnostic: at rank 3 a slab
+    # is a group of planes, at rank 2 a group of rows, and the arithmetic is
+    # identical. The surfaces are sampled at the slab's GLOBAL coordinates, so
+    # slabs carry no seams.
+    step = max(1, min(shape[0], int(block[0])))
+    for start_i in range(0, shape[0], step):
+        stop_i = min(shape[0], start_i + step)
+        region = (slice(start_i, stop_i),) + tuple(
+            slice(0, shape[k]) for k in range(1, nd))
+        chunk = np.asarray(data[start_i:stop_i], dtype=np.float32)
+
+        # Subtract, never divide, and clamp at zero: a background estimate
+        # above the signal means an empty region, not a negative one.
+        chunk -= _sample_grid(background_grid, shape, region)
+        np.clip(chunk, 0.0, None, out=chunk)
+
+        if gain_grid is not None:
             # Divide by the local SIGNAL level, bounded, so one threshold is
-            # reachable across the frame. This assumes the true signal is
+            # reachable across the image. This assumes the true signal is
             # even -- from a single image, dim-because-unlit and
             # dim-because-less-antigen are indistinguishable -- which is why
             # the result is a segmentation input only and every measurement is
             # taken from the original image.
-            plane = plane / gain_surface
+            chunk /= _sample_grid(gain_grid, shape, region)
+
         if is_integer:
-            np.clip(plane, float(info.min), float(info.max), out=plane)
-            plane = np.rint(plane)
-        if is_3d:
-            out[z] = plane.astype(dtype, copy=False)
-        else:
-            out[...] = plane.astype(dtype, copy=False)
+            np.clip(chunk, float(info.min), float(info.max), out=chunk)
+            np.rint(chunk, out=chunk)
+        out[start_i:stop_i] = chunk.astype(dtype, copy=False)
         if progress is not None:
-            progress(z + 1, depth)
+            progress(stop_i, shape[0])
     if hasattr(out, "flush"):
         out.flush()
     return out, report
