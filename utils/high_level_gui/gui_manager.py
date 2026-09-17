@@ -387,6 +387,15 @@ class StepWorker(QThread):
 # 3. Main GUI Manager
 # =============================================================================
 
+#: Narrowest the parameter dock may be dragged, in pixels. A floor, not a
+#: preference: everything above it belongs to the image.
+_DOCK_MIN_WIDTH = 280
+
+#: Widest the dock will OPEN at. It can still be dragged wider; this only
+#: stops a step with a wide table from claiming half the window on arrival.
+_DOCK_PREFERRED_MAX_WIDTH = 460
+
+
 class DynamicGUIManager(QObject):
     """
     Manages the Napari GUI state, step navigation, and widget generation.
@@ -538,6 +547,9 @@ class DynamicGUIManager(QObject):
         self.log_widget.setMaximumHeight(200)
         self.log_widget.setStyleSheet("font-family: 'Courier New', Courier, monospace; font-size: 11px;")
 
+        # The log shares the right-hand column with the parameter dock, so it
+        # must not set a width floor of its own either.
+        self.log_widget.setMinimumWidth(_DOCK_MIN_WIDTH)
         self.viewer.window.add_dock_widget(
             self.log_widget, area="right", name="Process Log"
         )
@@ -3302,19 +3314,33 @@ class DynamicGUIManager(QObject):
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setWidget(widget)
-        # Open the dock wide enough to show the widest content (e.g. the
-        # multi-column scale table) without the user having to drag it wider.
-        # Use the *minimum* size hint (SetMinimumSize + the table's explicit
-        # minimum width make it reflect the real column widths, unlike
-        # QTableView.sizeHint). Capped so simple steps stay compact.
-        try:
-            want = max(widget.minimumSizeHint().width(), widget.sizeHint().width())
-        except Exception:
-            want = 0
-        scroll.setMinimumWidth(max(360, min(want + 36, 720)))
+
+        # A small MINIMUM, and a preferred INITIAL width applied afterwards.
+        #
+        # This used to set the minimum to the widest content, up to 720px. A
+        # minimum is a floor the user cannot get below, so a step with a
+        # multi-column table permanently claimed a fifth of the window and the
+        # image canvas could not be given it back however the splitter was
+        # dragged. The content's own minimum hint made it worse by including
+        # the table's summed header widths.
+        #
+        # What was wanted was "open at a sensible width", which is
+        # `resizeDocks`, not a minimum. The panel now opens wide enough to read
+        # and can be dragged down to `_DOCK_MIN_WIDTH` afterwards.
+        scroll.setMinimumWidth(_DOCK_MIN_WIDTH)
         dock = self.viewer.window.add_dock_widget(
             scroll, area="right", name=f"Step: {name}"
         )
+        try:
+            want = max(widget.sizeHint().width() + 36, _DOCK_MIN_WIDTH)
+            want = min(want, _DOCK_PREFERRED_MAX_WIDTH)
+            main = getattr(self.viewer.window, "_qt_window", None)
+            if main is not None:
+                main.resizeDocks([dock], [int(want)], Qt.Horizontal)
+        except Exception:
+            # Private napari attribute: if it moves, the dock simply opens at
+            # Qt's default width instead, which is a cosmetic loss only.
+            pass
         self.current_widgets[dock] = scroll
 
     def parameter_changed(

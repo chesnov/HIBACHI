@@ -8,6 +8,11 @@ from PyQt5.QtWidgets import (  # type: ignore
     QVBoxLayout, QHBoxLayout, QPushButton, QWidget, QLabel, QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView, QAbstractSpinBox
 )
 
+#: Narrowest the tubularity table may be squeezed, in pixels. Small on
+#: purpose: the table scrolls, and every pixel it demands is a pixel the image
+#: canvas does not get.
+_TABLE_MIN_WIDTH = 240
+
 
 
 class ScalesTableWidget(QWidget):
@@ -96,19 +101,25 @@ class ScalesTableWidget(QWidget):
         self.table = QTableWidget()
         self.table.setColumnCount(len(self._COLUMNS))
         self.table.setHorizontalHeaderLabels(headers)
-        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        # Columns take the width their contents need and the TABLE scrolls
+        # horizontally when there is not room for all of them.
+        #
+        # This used to stretch the columns to fill the table and then demand a
+        # minimum width equal to the sum of every header's width -- about 570px
+        # for these six columns. That is a hard floor: the table could never be
+        # narrower, so the dock could never be narrower either, and the panel
+        # took a fifth of the window away from the image no matter how it was
+        # dragged. Scrolling a six-column table sideways is a much smaller cost
+        # than losing that much canvas.
+        header = self.table.horizontalHeader()
+        header.setSectionResizeMode(QHeaderView.ResizeToContents)
+        header.setStretchLastSection(True)
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.table.setMinimumHeight(150)
-        # Demand enough width to show every column header. QTableView.sizeHint
-        # doesn't sum columns, so without this the dock opens too narrow and the
-        # (stretched) rightmost column gets clipped; this drives the dock wider
-        # and gives a horizontal scrollbar as a fallback if it's dragged narrow.
-        try:
-            fm = self.table.horizontalHeader().fontMetrics()
-            needed = sum(fm.horizontalAdvance(str(h)) + 30 for h in headers) + 28
-            self.table.setMinimumWidth(int(needed))
-        except Exception:
-            pass
+        self.table.setHorizontalScrollMode(QAbstractItemView.ScrollPerPixel)
+        # Enough to show a couple of columns; everything else is reachable by
+        # scrolling or by widening the dock.
+        self.table.setMinimumWidth(_TABLE_MIN_WIDTH)
         self.table.itemChanged.connect(self._emit_change)
         self.layout.addWidget(self.table)
         
