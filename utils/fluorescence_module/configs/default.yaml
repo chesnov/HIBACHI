@@ -1,10 +1,9 @@
 # =============================================================================
 # HIBACHI fluorescence processing config -- unified 2D/3D
 # -----------------------------------------------------------------------------
-# ONE mode. Rank is inferred from the data, not declared in the config: every
-# pipeline step now reads `arr.ndim` and adapts. `mode: fluorescence` covers
-# both, and the loader accepts the legacy `fluorescence_2d` string and rewrites
-# it, so existing projects keep opening.
+# Rank is inferred from the data: every
+# pipeline step reads `arr.ndim` and adapts. The loader accepts the legacy 
+# `fluorescence_2d` string and rewrites it, so existing projects keep opening.
 #
 # `dimensions` is the TOTAL physical extent of the image in microns, not the
 # per-voxel size (spacing = extent / axis length). Omit `z` for 2D data; its
@@ -18,8 +17,7 @@ execute_raw_segmentation:
       type: bool
       value: true
     scale_profiles_percentile:
-      label: 'Tubularity Profiles (Relative: low/high = detection/seed percentiles; high=100
-        disables seed)'
+      label: 'Tubularity Profiles (Relative [0.0 - 100.0])'
       type: scale_table
       value:
       - scale: 1.0
@@ -38,7 +36,7 @@ execute_raw_segmentation:
         smooth_sigma: 0.1
         connect_max_gap_physical: 0.0
     scale_profiles_absolute:
-      label: Tubularity Profiles (Absolute [0.0 - 1.0] + Per-Scale Filters)
+      label: Tubularity Profiles (Absolute [0.0 - 1.0])
       type: scale_table_absolute
       value:
       - scale: 0.0
@@ -55,16 +53,8 @@ execute_raw_segmentation:
         the frame. Within each block of this size a low percentile is taken as
         the background and subtracted; a high percentile is the local signal
         level, used by Max Illumination Gain below.
-        This size decides everything. A block must be large enough to contain
-        background as well as objects -- otherwise its "background" percentile
-        sits inside a cell -- and small enough that illumination is roughly
-        constant across it. Too large is the damaging direction: on one image a
-        block of 960 um produced a background surface spanning 79x, which was a
-        picture of the cells rather than of the illumination. Start at a few
-        times the spacing between objects, in the tens of microns for cells
-        tens of microns apart, and watch the reported background range: a
-        background that varies far more than the illumination plausibly does
-        means the blocks are too big.
+        A block must be large enough to contain
+        background as well as objects
       type: float
       value: 0.0
       min: 0.0
