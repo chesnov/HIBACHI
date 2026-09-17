@@ -113,7 +113,12 @@ class ScalesTableWidget(QWidget):
         # than losing that much canvas.
         header = self.table.horizontalHeader()
         header.setSectionResizeMode(QHeaderView.ResizeToContents)
-        header.setStretchLastSection(True)
+        # NOT setStretchLastSection(True). That makes the last column absorb
+        # whatever width is left over instead of sizing to its contents, so
+        # when the table is narrowed every column shrinks except the last one,
+        # which stays wide and holds the table open. It also silently overrides
+        # ResizeToContents for that column.
+        header.setStretchLastSection(False)
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.table.setMinimumHeight(150)
         self.table.setHorizontalScrollMode(QAbstractItemView.ScrollPerPixel)
