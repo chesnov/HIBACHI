@@ -694,6 +694,10 @@ class CrossChannelAnalyzerWindow(QMainWindow):
     # RECIPE EDITING METHODS
     # =========================================================================
 
+    # =========================================================================
+    # ADD STEP METHODS
+    # =========================================================================
+
     def get_checked_channels(self):
         return [self.channel_list.item(i).text() for i in range(self.channel_list.count()) 
                 if self.channel_list.item(i).checkState() == Qt.Checked]
@@ -762,6 +766,8 @@ class CrossChannelAnalyzerWindow(QMainWindow):
 
     def size_word(self):
         return "Area" if self.project_is_2d() else "Volume"
+
+    FULL_IMAGE_LABEL = "Full image"
 
     def _reload_regions(self, sample_name: str = "") -> None:
         """Repopulate the region picker for the selected sample."""
