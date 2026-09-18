@@ -814,6 +814,15 @@ class DynamicGUIManager(QObject):
                     verts, name=f"{session['name']}{self.SAVED_REGION_SUFFIX}",
                     shape_type="polygon", edge_color=colours[index % len(colours)],
                     face_color=[0, 0, 0, 0.0], edge_width=2, scale=scale,
+                    # Shapes default to 'translucent', which is depth_test=True:
+                    # the polygon still writes to the depth buffer even where it
+                    # is fully transparent, so in a 3D view everything BEHIND the
+                    # outline is culled. One polygon per z makes a box, and the
+                    # segmentation inside it disappeared until the outline was
+                    # hidden. 'translucent_no_depth' is the same blending with
+                    # depth_test=False, so the outline draws over the labels
+                    # without hiding them.
+                    blending="translucent_no_depth",
                 )
                 # Read-only: this shows what is committed to disk, and editing it
                 # would imply the change is saved, which it is not.
