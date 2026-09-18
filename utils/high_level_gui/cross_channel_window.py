@@ -11,11 +11,233 @@ import tifffile as tiff  # type: ignore
 import napari  # type: ignore
 from PyQt5.QtCore import Qt  # type: ignore
 from PyQt5.QtWidgets import (  # type: ignore
-    QApplication, QMessageBox, QMainWindow, QVBoxLayout, QHBoxLayout, QListWidget, QListWidgetItem, QPushButton, QWidget, QLabel, QInputDialog, QComboBox
+    QApplication, QMessageBox, QMainWindow, QVBoxLayout, QHBoxLayout, QListWidget, QListWidgetItem, QPushButton, QWidget, QLabel, QInputDialog, QComboBox,
+    QDialog, QDialogButtonBox, QCheckBox, QFormLayout, QGroupBox, QDoubleSpinBox
 )
 from .relational_engine import RelationalEngine
 
 from .metadata import get_sample_metadata
+
+
+PREVIOUS_RESULT = "PREVIOUS_RESULT"
+
+
+class _RelateDialog(QDialog):
+    """One dialog for one relation step, replacing a chain of prompts.
+
+    Building a single overlap step used to take four separate modal prompts:
+    checking two channels queued a step per channel, and each asked for a
+    partner and then which side was primary. Intersection took up to three of
+    its own (labelling mode, then ID preservation, then a follow-up asking
+    whether to add the overlap step that would recompute the same geometry).
+    None of those questions needed to be sequential -- they are all facets of
+    one decision -- so they are one form, with the consequences written out
+    underneath as they are chosen.
+
+    `kind` is "overlap" or "distance". Distance shows only the two combo boxes,
+    because there is nothing else to decide about it.
+    """
+
+    def __init__(self, parent, kind, choices, has_previous, size_word):
+        super().__init__(parent)
+        self.kind = kind
+        self._choices = list(choices)
+        if has_previous:
+            self._choices.append((PREVIOUS_RESULT, "Previous result"))
+
+        self.setWindowTitle("Overlap" if kind == "overlap" else "Distance")
+        outer = QVBoxLayout(self)
+
+        lead = ("Measure how much of one channel sits inside another."
+                if kind == "overlap" else
+                "Measure how far each object is from its nearest partner.")
+        _lead = QLabel(lead)
+        _lead.setWordWrap(True)
+        outer.addWidget(_lead)
+
+        form = QFormLayout()
+        self.cb_primary = QComboBox()
+        self.cb_partner = QComboBox()
+        for key, disp in self._choices:
+            self.cb_primary.addItem(disp, key)
+        form.addRow("Primary (one row per object):", self.cb_primary)
+        form.addRow("Partner:", self.cb_partner)
+        outer.addLayout(form)
+
+        if kind == "overlap":
+            box = QGroupBox("What to produce")
+            bl = QVBoxLayout(box)
+            self.chk_coverage = QCheckBox(
+                "Coverage percentages (per object, plus a per-sample summary)")
+            self.chk_coverage.setChecked(True)
+            self.chk_regions = QCheckBox(
+                "Size and shape of each overlap region")
+            self.chk_keep = QCheckBox(
+                "Keep the overlap as a mask for later steps in this recipe")
+            for w in (self.chk_coverage, self.chk_regions, self.chk_keep):
+                bl.addWidget(w)
+
+            # Labelling only matters if something downstream will use the mask,
+            # so it stays hidden until then instead of being asked up front.
+            self.cb_label = QComboBox()
+            self.lbl_label = QLabel("Label the overlap by:")
+            lf = QFormLayout()
+            lf.addRow(self.lbl_label, self.cb_label)
+            bl.addLayout(lf)
+            outer.addWidget(box)
+        else:
+            self.chk_coverage = self.chk_regions = self.chk_keep = None
+            self.cb_label = None
+
+        self.summary = QLabel()
+        self.summary.setWordWrap(True)
+        self.summary.setStyleSheet("color: #555; padding-top: 6px;")
+        outer.addWidget(self.summary)
+
+        self.buttons = QDialogButtonBox(
+            QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        self.buttons.accepted.connect(self.accept)
+        self.buttons.rejected.connect(self.reject)
+        outer.addWidget(self.buttons)
+
+        self.cb_primary.currentIndexChanged.connect(self._refresh_partners)
+        self.cb_partner.currentIndexChanged.connect(self._refresh)
+        if kind == "overlap":
+            for w in (self.chk_coverage, self.chk_regions, self.chk_keep):
+                w.toggled.connect(self._refresh)
+        self._refresh_partners()
+
+    # -- wiring ------------------------------------------------------------
+    def _refresh_partners(self):
+        """Partner list excludes whatever is currently primary.
+
+        Cheaper than letting both sides hold the same channel and then
+        explaining the error afterwards.
+        """
+        primary = self.cb_primary.currentData()
+        keep = self.cb_partner.currentData()
+        self.cb_partner.blockSignals(True)
+        self.cb_partner.clear()
+        for key, disp in self._choices:
+            if key != primary:
+                self.cb_partner.addItem(disp, key)
+        if keep is not None:
+            idx = self.cb_partner.findData(keep)
+            if idx >= 0:
+                self.cb_partner.setCurrentIndex(idx)
+        self.cb_partner.blockSignals(False)
+        self._refresh()
+
+    def _refresh(self):
+        a = self.cb_primary.currentText() or "?"
+        b = self.cb_partner.currentText() or "?"
+
+        if self.kind == "distance":
+            self.summary.setText(
+                f"Distance from each {a} object to its nearest {b}, edge to edge.")
+            self.buttons.button(QDialogButtonBox.Ok).setEnabled(
+                self.cb_partner.count() > 0)
+            return
+
+        if self.cb_label is not None:
+            cur = self.cb_label.currentIndex()
+            self.cb_label.clear()
+            self.cb_label.addItem("A number per overlap region", "connected")
+            self.cb_label.addItem("One ID for all overlap", "binary")
+            self.cb_label.addItem(f"{a}'s object IDs", "parent_a")
+            self.cb_label.addItem(f"{b}'s object IDs", "parent_b")
+            if cur >= 0:
+                self.cb_label.setCurrentIndex(cur)
+            visible = self.chk_keep.isChecked()
+            self.cb_label.setVisible(visible)
+            self.lbl_label.setVisible(visible)
+
+        lines = []
+        if self.chk_coverage.isChecked():
+            lines.append(f"\u2022 what % of {a} lies inside {b}, and the reverse")
+        if self.chk_regions.isChecked():
+            lines.append(f"\u2022 the size and shape of each {a}\u2229{b} region")
+        if self.chk_keep.isChecked():
+            lines.append(f"\u2022 {a}\u2229{b} becomes the input to the next step")
+        self.summary.setText("\n".join(lines) if lines
+                             else "Nothing selected \u2014 this step would do nothing.")
+        self.buttons.button(QDialogButtonBox.Ok).setEnabled(
+            bool(lines) and self.cb_partner.count() > 0)
+
+    # -- result ------------------------------------------------------------
+    def step(self):
+        """The recipe step, named so the list reads as what it does."""
+        a_key = self.cb_primary.currentData()
+        b_key = self.cb_partner.currentData()
+        a, b = self.cb_primary.currentText(), self.cb_partner.currentText()
+
+        if self.kind == "distance":
+            return {"type": "relate", "primary": a_key, "target": b_key,
+                    "measure_coverage": False, "measure_distance": True,
+                    "measure_regions": False, "keep_mask": False,
+                    "name": f"Distance: {a} \u2192 nearest {b}"}
+
+        label_mode = self.cb_label.currentData() or "connected"
+        parts = []
+        if self.chk_coverage.isChecked():
+            parts.append(f"% of {a} in {b}")
+        if self.chk_regions.isChecked():
+            parts.append("region sizes")
+        if self.chk_keep.isChecked():
+            parts.append("kept as mask")
+        return {
+            "type": "relate", "primary": a_key, "target": b_key,
+            "measure_coverage": self.chk_coverage.isChecked(),
+            "measure_distance": False,
+            "measure_regions": self.chk_regions.isChecked(),
+            "keep_mask": self.chk_keep.isChecked(),
+            "label_mode": label_mode,
+            # Asking to keep a parent's IDs IS asking to preserve them; it was a
+            # second modal prompt for a question the first one had answered.
+            "preserve_ids": label_mode in ("parent_a", "parent_b"),
+            "name": f"Overlap {a} & {b} \u2014 " + ", ".join(parts),
+        }
+
+
+class _FilterDialog(QDialog):
+    """Size filter: source and threshold in one form rather than two prompts."""
+
+    def __init__(self, parent, choices, has_previous, size_word, unit):
+        super().__init__(parent)
+        self.setWindowTitle("Size filter")
+        outer = QVBoxLayout(self)
+        form = QFormLayout()
+
+        self.cb_source = QComboBox()
+        if has_previous:
+            self.cb_source.addItem("Previous result", PREVIOUS_RESULT)
+        for key, disp in choices:
+            self.cb_source.addItem(disp, key)
+        form.addRow("Filter:", self.cb_source)
+
+        self.spin = QDoubleSpinBox()
+        self.spin.setRange(0.0, 1e9)
+        self.spin.setDecimals(2)
+        self.spin.setValue(10.0)
+        self.spin.setSuffix(f" {unit}")
+        form.addRow(f"Minimum {size_word.lower()}:", self.spin)
+        outer.addLayout(form)
+
+        bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        bb.accepted.connect(self.accept)
+        bb.rejected.connect(self.reject)
+        outer.addWidget(bb)
+        self.cb_source.setEnabled(self.cb_source.count() > 1)
+
+    def step(self, unit):
+        key = self.cb_source.currentData()
+        disp = self.cb_source.currentText()
+        # 'min_vol' is kept as the key for recipes already saved to disk.
+        return {"type": "filter", "min_vol": self.spin.value(),
+                "size_unit": unit,
+                "input": None if key == PREVIOUS_RESULT else key,
+                "name": f"Filter {disp}: keep \u2265 {self.spin.value():g} {unit}"}
+
 
 
 def _spacing_from_extents(meta, shape, where=""):
@@ -224,36 +446,33 @@ class CrossChannelAnalyzerWindow(QMainWindow):
         self.btn_synth = QPushButton("🎲 Spatial Null (randomise masks)")
         self.btn_synth.setStyleSheet("background-color: #8A2BE2; color: white;") # Purple
         
-        self.btn_intersect = QPushButton("+ Intersection")
+        # Four buttons, one per question the user can actually ask. Overlap and
+        # Intersection used to be separate buttons that both computed A AND B
+        # and both surfaced a mask, differing only in which outputs they kept --
+        # so they are one button whose dialog asks which outputs you want.
+        self.btn_overlap = QPushButton("+ Overlap")
+        self.btn_dist = QPushButton("+ Distance")
         self.btn_filter = QPushButton("+ Size Filter")
-        # Two buttons, because these are two different questions. They were one
-        # button labelled "Distance Analysis" that quietly measured overlap as
-        # well, so the only way to get a coverage percentage was to ask for a
-        # distance analysis -- and there was no way to ask for overlap alone.
-        self.btn_overlap = QPushButton("+ Overlap / Colocalisation")
-        self.btn_dist = QPushButton("+ Distance / Proximity")
         self.btn_overlap.setToolTip(
-            "How much of one channel sits inside another: per-object "
-            "percentages, plus a sample-level coverage figure in both "
-            "directions. Skips the distance transform."
+            "How much of one channel sits inside another. Choose any of: "
+            "coverage percentages, the size of each overlap region, or keeping "
+            "the overlap as a mask for later steps."
         )
         self.btn_dist.setToolTip(
             "How far each object is from its nearest partner, edge to edge, "
-            "with the nearest partner's ID and the connection lines drawn in "
-            "the preview."
+            "with the connection lines drawn in the preview."
         )
+        self.btn_filter.setToolTip("Drop objects below a size threshold.")
 
         self.btn_synth.clicked.connect(self.open_synthetic_dialog)
-        self.btn_intersect.clicked.connect(self.add_intersect_step)
+        self.btn_overlap.clicked.connect(lambda: self._add_relate_step("overlap"))
+        self.btn_dist.clicked.connect(lambda: self._add_relate_step("distance"))
         self.btn_filter.clicked.connect(self.add_filter_step)
-        self.btn_overlap.clicked.connect(lambda: self.add_analysis_step("overlap"))
-        self.btn_dist.clicked.connect(lambda: self.add_analysis_step("distance"))
 
         add_step_layout.addWidget(self.btn_synth)
-        add_step_layout.addWidget(self.btn_intersect)
-        add_step_layout.addWidget(self.btn_filter)
         add_step_layout.addWidget(self.btn_overlap)
         add_step_layout.addWidget(self.btn_dist)
+        add_step_layout.addWidget(self.btn_filter)
         mid_panel.addLayout(add_step_layout)
 
         # --- 4. EXECUTION PANEL ---
@@ -365,83 +584,37 @@ class CrossChannelAnalyzerWindow(QMainWindow):
             QMessageBox.critical(self, "Error",
                                  f"Failed to open the spatial null dialog:\n{e}")
 
-    def add_intersect_step(self):
+    def _channel_choices(self):
+        """(key, display) for every channel, checked ones first."""
         checked = self.get_checked_channels()
-        if not (len(checked) == 2 or (len(checked) == 1 and self.recipe_steps)):
-            QMessageBox.warning(self, "Error", "Select channels for intersection.")
+        allc = [self.channel_list.item(i).text()
+                for i in range(self.channel_list.count())]
+        ordered = checked + [c for c in allc if c not in checked]
+        return [(c, c) for c in ordered]
+
+    def _has_previous_result(self):
+        """True when an earlier step leaves a mask for this one to act on."""
+        return any(s.get('type') == 'filter'
+                   or (s.get('type') in ('relate', 'intersect')
+                       and s.get('keep_mask', s.get('type') == 'intersect'))
+                   for s in self.recipe_steps)
+
+    def _add_relate_step(self, kind):
+        """Overlap and distance both come from one form. See _RelateDialog."""
+        choices = self._channel_choices()
+        has_prev = self._has_previous_result()
+        if len(choices) + (1 if has_prev else 0) < 2:
+            QMessageBox.warning(self, "Not enough inputs",
+                                "This needs two things to compare: either two "
+                                "channels, or one channel and a result from an "
+                                "earlier step.")
             return
-
-        # NEW: Ask for Labeling Mode
-        modes = {
-            "Binary (All overlaps = ID 1)": "binary",
-            "Connected Components (Every fragment unique)": "connected",
-            "Inherit Parent A (Keep IDs of first channel)": "parent_a",
-            "Inherit Parent B (Keep IDs of second channel)": "parent_b"
-        }
-        
-        mode_display, ok = QInputDialog.getItem(
-            self, "Intersection Mode", 
-            "How should the resulting overlap mask be labeled?", 
-            list(modes.keys()), 0, False
-        )
-        
-        if not ok: return
-        label_mode = modes[mode_display]
-
-        # For parent modes, ask whether to preserve the original IDs for traceability
-        preserve_ids = False
-        if label_mode in ("parent_a", "parent_b"):
-            parent_label = "A (first channel)" if label_mode == "parent_a" else "B (second channel)"
-            id_choice, ok2 = QInputDialog.getItem(
-                self, "ID Preservation",
-                f"Inherit {parent_label} — should the result mask keep the\n"
-                f"original object IDs from that channel?\n\n"
-                f"• Keep original IDs — result IDs match the source mask exactly\n"
-                f"  (enables direct traceability to the original segmentation).\n"
-                f"• Reset to sequential — result is renumbered 1\u2026N as usual.",
-                ["Keep original IDs (preserve for traceability)",
-                 "Reset to sequential (default)"],
-                0, False
-            )
-            if not ok2: return
-            preserve_ids = id_choice.startswith("Keep")
-
-        id_suffix = " [IDs preserved]" if preserve_ids else ""
-
-        if len(checked) == 2:
-            step = {
-                "type": "intersect", "inputs": checked, "label_mode": label_mode,
-                "preserve_ids": preserve_ids,
-                "name": f"Overlap ({label_mode}){id_suffix}: {checked[0]} & {checked[1]}"
-            }
-        else:
-            step = {
-                "type": "intersect", "inputs": [checked[0], "PREVIOUS_RESULT"], "label_mode": label_mode,
-                "preserve_ids": preserve_ids,
-                "name": f"Overlap ({label_mode}){id_suffix}: {checked[0]} with previous"
-            }
-        
+        dlg = _RelateDialog(self, kind, choices, has_prev, self.size_word())
+        if dlg.exec_() != QDialog.Accepted:
+            return
+        step = dlg.step()
         self.recipe_steps.append(step)
         self.recipe_list.addItem(step["name"])
-
-        # An intersection builds the overlap MASK and measures the size and
-        # shape of each overlap fragment. It does not relate that back to
-        # either parent channel, so it yields no coverage percentage -- which
-        # is not obvious from a button called "Intersection", and was the usual
-        # way to end up with a recipe that produced no overlap numbers. Offer
-        # the step that does measure it.
-        if not self._has_measurement_step():
-            reply = QMessageBox.question(
-                self, "Quantify the overlap?",
-                "That step builds the overlap mask and measures each overlap "
-                "fragment's own size and shape.\n\n"
-                "It does not report how much of either channel is involved. "
-                "Add an Overlap / Colocalisation step now to get the coverage "
-                "percentages in both directions?",
-                QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes,
-            )
-            if reply == QMessageBox.Yes:
-                self.add_analysis_step("overlap")
 
     def project_is_2d(self):
         """True when this project's images are planes rather than stacks.
@@ -483,224 +656,20 @@ class CrossChannelAnalyzerWindow(QMainWindow):
         return "Area" if self.project_is_2d() else "Volume"
 
     def add_filter_step(self):
-        """Add a size filter, recording WHAT it filters.
-
-        A filter with a preceding mask-producing step applies to that result. With
-        nothing before it, it needs a channel, and that channel has to be recorded
-        in the step -- it cannot be inferred later from the checked boxes, because
-        `get_checked_channels` returns list order rather than click order, so
-        "the first checked channel" is not "the one the user meant". Leaving it
-        unrecorded also made the step a silent no-op in `run_recipe`, which only
-        acted when a previous result existed.
-        """
-        has_previous = any(st.get("type") in ("intersect", "filter")
-                           for st in self.recipe_steps)
-
-        source = None
-        if not has_previous:
-            checked = self.get_checked_channels()
-            if len(checked) == 1:
-                source = checked[0]
-            else:
-                options = self.get_checked_channels() or sorted(
-                    {c for d in self.pm.sample_registry.values() for c in d})
-                if not options:
-                    QMessageBox.warning(self, "No channels",
-                                        "No channels are available to filter.")
-                    return
-                pick, ok = QInputDialog.getItem(
-                    self, "Size Filter",
-                    "This filter has nothing before it in the recipe, so it needs "
-                    "a channel to filter.\n\nFilter which channel?",
-                    options, 0, False)
-                if not ok:
-                    return
-                source = pick
-
-        unit = self.size_unit()
-        val, ok = QInputDialog.getDouble(
-            self, "Size Filter", f"Minimum {self.size_word().lower()} ({unit}):",
-            10.0, 0, 1000000, 2)
-        if not ok:
+        """Size filter: one form for source and threshold."""
+        dlg = _FilterDialog(self, self._channel_choices(),
+                            self._has_previous_result(),
+                            self.size_word(), self.size_unit())
+        if dlg.exec_() != QDialog.Accepted:
             return
-
-        target = (source.split("_", 2)[-1] if source else "previous result")
-        # 'min_vol' is kept as the key for backward compatibility with recipes
-        # already saved to disk; 'input' and 'size_unit' are additions.
-        step = {"type": "filter", "min_vol": val, "size_unit": unit,
-                "input": source,
-                "name": f"Size filter ({target}): keep objects > {val:g} {unit}"}
+        if dlg.cb_source.count() == 0:
+            QMessageBox.warning(self, "No channels",
+                                "No channels are available to filter.")
+            return
+        step = dlg.step(self.size_unit())
         self.recipe_steps.append(step)
         self.recipe_list.addItem(step["name"])
 
-    # Wording for each kind of measurement step. Everything the two branches
-    # below differ by lives here, so the two flows cannot drift apart.
-    _MEASURE_WORDING = {
-        "overlap": {
-            "noun": "overlap analysis",
-            "no_channel": "Check at least one channel for overlap analysis.",
-            "need_two": "Need at least two channels for overlap analysis.",
-            "partner_title": "Select Partner Channel",
-            "partner_prompt": "Measure the overlap of  '{ch}'  with which channel?",
-            "role_title": "Select Primary Channel",
-            "role_prompt": (
-                "Which channel's objects should the rows be?\n\n"
-                "You get one row per PRIMARY object, carrying the percentage "
-                "of THAT object which lies inside the partner. The "
-                "sample-level summary reports both directions either way."
-            ),
-            "role_opt": "{a}  \u2192  primary  (% of each {a} object inside {b})",
-            "step_name": "Overlap: % of {a} inside {b}",
-            "step_name_prev": "Overlap: % of {a} inside previous result",
-            "step_name_prev_primary": "Overlap: % of previous result inside {a}",
-        },
-        "distance": {
-            "noun": "distance analysis",
-            "no_channel": "Check at least one channel for distance analysis.",
-            "need_two": "Need at least two channels for distance analysis.",
-            "partner_title": "Select Partner Channel",
-            "partner_prompt": "Measure distance FROM  '{ch}'  TO which channel?",
-            "role_title": "Select Primary Channel",
-            "role_prompt": "Which side should be the PRIMARY (objects distances are reported FOR)?",
-            "role_opt": "{a}  \u2192  primary  (measure FROM {a} TO {b})",
-            "step_name": "Distance: {a} \u2192 nearest {b}",
-            "step_name_prev": "Distance: {a} \u2192 nearest in previous result",
-            "step_name_prev_primary": "Distance: previous result \u2192 nearest {a}",
-        },
-    }
-
-    def add_analysis_step(self, measure="both"):
-        """Add a measurement step.
-
-        `measure` is "overlap", "distance" or "both", and is carried on the step
-        so the engine can ask for only what was requested. A recipe saved before
-        this split has no 'measure' key and the engine treats that as "both",
-        which is what the single button used to do.
-        """
-        words = self._MEASURE_WORDING.get(measure, self._MEASURE_WORDING["distance"])
-
-        checked = self.get_checked_channels()
-        if not checked:
-            QMessageBox.warning(self, "Error", words["no_channel"])
-            return
-
-        # Determine whether there is an accumulated pipeline result (intersection / filter)
-        # that could act as one side of the analysis.
-        has_previous_result = any(
-            s['type'] in ('intersect', 'filter') for s in self.recipe_steps
-        )
-
-        for ch in checked:
-            if has_previous_result:
-                # --- Case A: previous accumulated result exists ---
-                # Ask which role the checked channel plays.
-                role, ok = QInputDialog.getItem(
-                    self,
-                    words["role_title"],
-                    words["role_prompt"],
-                    [
-                        words["role_opt"].format(a=ch, b="the previous result"),
-                        words["role_opt"].format(a="Previous result", b=ch),
-                    ],
-                    0, False
-                )
-                if not ok:
-                    return
-
-                if role.startswith(ch):
-                    # ch is primary, previous result is the partner
-                    step = {
-                        "type":    "analyze",
-                        "measure": measure,
-                        "primary": ch,
-                        "target":  "PREVIOUS_RESULT",
-                        "name":    words["step_name_prev"].format(a=ch),
-                    }
-                else:
-                    # previous result is primary, ch is the partner
-                    step = {
-                        "type":    "analyze",
-                        "measure": measure,
-                        "target":  ch,
-                        "name":    words["step_name_prev_primary"].format(a=ch),
-                    }
-
-            else:
-                # --- Case B: simple two-channel analysis, no prior pipeline result ---
-                # The second channel must be chosen from the channel list.
-                other_channels = [
-                    self.channel_list.item(i).text()
-                    for i in range(self.channel_list.count())
-                    if self.channel_list.item(i).text() != ch
-                ]
-                if not other_channels:
-                    QMessageBox.warning(self, "Error", words["need_two"])
-                    return
-
-                partner, ok = QInputDialog.getItem(
-                    self,
-                    words["partner_title"],
-                    words["partner_prompt"].format(ch=ch),
-                    other_channels, 0, False
-                )
-                if not ok:
-                    return
-
-                # Ask which of the two is primary
-                role, ok = QInputDialog.getItem(
-                    self,
-                    words["role_title"],
-                    words["role_prompt"],
-                    [
-                        words["role_opt"].format(a=ch, b=partner),
-                        words["role_opt"].format(a=partner, b=ch),
-                    ],
-                    0, False
-                )
-                if not ok:
-                    return
-
-                if role.startswith(ch):
-                    primary_ch, partner_ch = ch, partner
-                else:
-                    primary_ch, partner_ch = partner, ch
-
-                step = {
-                    "type":    "analyze",
-                    "measure": measure,
-                    "primary": primary_ch,
-                    "target":  partner_ch,
-                    "name":    words["step_name"].format(a=primary_ch, b=partner_ch),
-                }
-
-            self.recipe_steps.append(step)
-            self.recipe_list.addItem(step["name"])
-
-    def _has_measurement_step(self):
-        """True when the recipe actually measures something.
-
-        Intersection and Size Filter only build masks. A recipe of nothing but
-        those runs to completion and writes no relational table at all, which
-        read as "the analyzer doesn't produce overlap numbers" rather than as a
-        missing step.
-        """
-        return any(s.get('type') == 'analyze' for s in self.recipe_steps)
-
-    def _confirm_missing_measurement(self):
-        """Warn before running a recipe that measures nothing. True to proceed."""
-        if self._has_measurement_step() or not self.recipe_steps:
-            return True
-        reply = QMessageBox.warning(
-            self, "No measurement step",
-            "This recipe builds masks but never measures a relationship, so it "
-            "will not produce a relational table or any overlap percentages.\n\n"
-            "Add an \"Overlap / Colocalisation\" step to quantify how much of "
-            "one channel sits inside another, or a \"Distance / Proximity\" "
-            "step for nearest-neighbour distances.\n\n"
-            "Run anyway (masks and their sizes only)?",
-            QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
-        )
-        return reply == QMessageBox.Yes
 
     FULL_IMAGE_LABEL = "Full image"
 
@@ -796,9 +765,6 @@ class CrossChannelAnalyzerWindow(QMainWindow):
     def preview_recipe(self):
         if not self.recipe_steps:
             QMessageBox.information(self, "Info", "Recipe is empty.")
-            return
-
-        if not self._confirm_missing_measurement():
             return
 
         # 1. Ask for a name to make this a "Single Run"
@@ -937,9 +903,6 @@ class CrossChannelAnalyzerWindow(QMainWindow):
 
     def run_batch_analysis(self):
         if not self.recipe_steps:
-            return
-
-        if not self._confirm_missing_measurement():
             return
 
         # 1. Ask for an Analysis Name (to create a subfolder)

@@ -240,6 +240,62 @@ class RelationalEngine:
         print(f"  [Intersect Metrics] Saved {len(metrics_df)} objects → {csv_path}")
     
     @staticmethod
+    def normalise_recipe(recipe: List[Dict]) -> List[Dict]:
+        """Rewrite every relation step into one canonical `relate` form.
+
+        There were three step types doing overlapping work -- `intersect` built
+        the mask, `analyze` measured coverage, and `analyze` also measured
+        distance -- so asking "how much of A is in B, and keep the mask" needed
+        two steps that each recomputed A AND B independently. They are one
+        operation with different outputs requested, so they are one step type
+        with flags:
+
+            measure_coverage   coverage percentages + the sample summary
+            measure_distance   nearest-partner distances
+            measure_regions    size and shape of each overlap region
+            keep_mask          the overlap becomes the input to later steps
+
+        Legacy recipes are mapped in here rather than in the executor, so
+        `recipe.yaml` files saved before the merge keep reproducing exactly and
+        only one code path ever runs:
+
+            intersect                 -> keep_mask + measure_regions
+            analyze (measure=overlap) -> measure_coverage
+            analyze (measure=distance)-> measure_distance
+            analyze (no measure key)  -> both, which is what it used to do
+        """
+        out: List[Dict] = []
+        for step in recipe:
+            stype = step.get('type')
+
+            if stype == 'intersect':
+                inputs = step.get('inputs') or []
+                new = dict(step)
+                new.update(
+                    type='relate',
+                    primary=inputs[0] if inputs else step.get('primary'),
+                    target=inputs[1] if len(inputs) > 1 else step.get('target'),
+                    measure_coverage=False, measure_distance=False,
+                    measure_regions=True, keep_mask=True,
+                )
+                out.append(new)
+
+            elif stype == 'analyze':
+                measure = str(step.get('measure', 'both')).lower()
+                new = dict(step)
+                new.update(
+                    type='relate',
+                    measure_coverage=measure in ('overlap', 'both'),
+                    measure_distance=measure in ('distance', 'both'),
+                    measure_regions=False, keep_mask=False,
+                )
+                out.append(new)
+
+            else:
+                out.append(dict(step))
+        return out
+
+    @staticmethod
     def run_recipe(sample_name, registry, recipe, out_dir, shape, spacing,
                    roi_name=None):
         """
@@ -283,6 +339,8 @@ class RelationalEngine:
 
         os.makedirs(out_dir, exist_ok=True)
 
+        recipe = RelationalEngine.normalise_recipe(recipe)
+
         for i, step in enumerate(recipe):
             step_type = step['type']
             step_out_path = os.path.join(out_dir, f"step_{i}_{step_type}.dat")
@@ -301,7 +359,7 @@ class RelationalEngine:
                 # analyze step to compare A against A, giving trivially-zero distances.
                 next_step = recipe[i + 1] if i + 1 < len(recipe) else {}
                 is_analyze_role_selector = (
-                    next_step.get('type') == 'analyze' and
+                    next_step.get('type') == 'relate' and
                     next_step.get('primary') == target_ch
                 )
                 if not is_analyze_role_selector:
@@ -310,50 +368,6 @@ class RelationalEngine:
 
                 if ch_path:
                     results_to_viz.append({"name": ch_name, "path": ch_path})
-
-            elif step_type == "intersect":
-                inputs = step['inputs']
-                path_a = _dat(sample_channels.get(inputs[0]))
-                name_a = name_registry.get(inputs[0], "A")
-
-                if inputs[1] == "PREVIOUS_RESULT":
-                    path_b = last_mask_path
-                    name_b = last_mask_name
-                else:
-                    path_b = _dat(sample_channels.get(inputs[1]))
-                    name_b = name_registry.get(inputs[1], "B")
-
-                if path_a and path_b:
-                    label_mode = step.get('label_mode', 'binary')
-                    preserve_ids = step.get('preserve_ids', False)
-                    last_mask_path, ids_preserved = RelationalEngine.intersect_masks(
-                        path_a, path_b, step_out_path, shape, label_mode, len(shape), preserve_ids
-                    )
-                    last_mask_name = f"{name_a}_in_{name_b}"
-                    
-                    # Relabel to sequential IDs unless the caller explicitly asked to keep
-                    # the original parent IDs for downstream traceability.
-                    if ids_preserved:
-                        # Build an identity mapping so metrics CSV still gets a parent_id column
-                        temp_mask = np.memmap(last_mask_path, dtype=np.int32, mode='r', shape=shape)
-                        unique_ids = np.unique(temp_mask)
-                        unique_ids = unique_ids[unique_ids > 0]
-                        mapping = {int(uid): int(uid) for uid in unique_ids}
-                        del temp_mask
-                    else:
-                        temp_mask = np.memmap(last_mask_path, dtype=np.int32, mode='r+', shape=shape)
-                        new_mask, mapping = RelationalEngine.relabel_sequentially(temp_mask)
-                        temp_mask[:] = new_mask[:]
-                        temp_mask.flush()
-                        del temp_mask
-                    
-                    parent_id_map = mapping
-                    results_to_viz.append({"name": last_mask_name, "path": last_mask_path})
-                    
-                    # ── Reuse existing feature pipeline to generate metrics CSV ──
-                    RelationalEngine._save_intersection_metrics_via_pipeline(
-                        last_mask_path, shape, spacing, last_mask_name, mapping, out_dir, sample_name, is_2d
-                    )
 
             elif step_type == "filter":
                 # A filter with nothing before it applies to the channel recorded
@@ -393,7 +407,7 @@ class RelationalEngine:
                     parent_id_map = mapping
                     results_to_viz.append({"name": last_mask_name, "path": last_mask_path})
 
-            elif step_type == "analyze":
+            elif step_type == "relate":
                 # Resolve primary and partner paths/names.
                 #
                 # Three cases, all handled by whether 'primary' is set and what 'target' holds:
@@ -430,49 +444,113 @@ class RelationalEngine:
                     partner_bio_name = name_registry.get(step['target'], "Partner")
                     partner_dat_path = _dat(sample_channels.get(step['target']))
                 if active_mask_path and partner_dat_path:
-                    # What this step measures. Overlap and distance are separate
-                    # questions and are now asked separately; a recipe saved
-                    # before that split carries no 'measure' key, and "both" is
-                    # what it used to do, so old recipe.yaml files reproduce
-                    # exactly as before.
-                    measure = str(step.get('measure', 'both')).lower()
-                    want_overlap = measure in ('overlap', 'both')
-                    want_distance = measure in ('distance', 'both')
+                    # Flags set by normalise_recipe, so legacy and current
+                    # recipes arrive here in the same shape.
+                    want_overlap = bool(step.get('measure_coverage', False))
+                    want_distance = bool(step.get('measure_distance', False))
+                    want_regions = bool(step.get('measure_regions', False))
+                    want_keep = bool(step.get('keep_mask', False))
                     # Opt-in per step; the full cross-product is the most
                     # expensive thing in the module and nothing downstream
                     # reads its CSV.
                     want_pairwise = bool(step.get('pairwise', False))
 
-                    print(f"  [Analyze] {active_mask_name} vs {partner_bio_name} "
-                          f"(measure={measure}"
+                    _asked = [n for n, f in (
+                        ("coverage", want_overlap), ("distance", want_distance),
+                        ("regions", want_regions), ("mask", want_keep),
+                    ) if f]
+                    print(f"  [Relate] {active_mask_name} vs {partner_bio_name}"
+                          f" ({', '.join(_asked) or 'nothing requested'}"
                           f"{', pairwise' if want_pairwise else ''})")
 
-                    # Execute proximity and overlap logic
-                    if is_2d:
-                        sp_2d = spacing if len(spacing)==2 else (spacing[1], spacing[2])
-                        primary_df, partner_df, inter_path, summary = calculate_interaction_metrics_2d(
-                            active_mask_path, partner_dat_path, out_dir, shape, sp_2d,
-                            active_mask_name, partner_bio_name,
-                            calculate_distance=want_distance,
-                            calculate_overlap=want_overlap,
-                            calculate_pairwise=want_pairwise,
-                        )
-                    else:
-                        primary_df, partner_df, inter_path, summary = calculate_interaction_metrics(
-                            active_mask_path, partner_dat_path, out_dir, shape, spacing,
-                            active_mask_name, partner_bio_name,
-                            calculate_distance=want_distance,
-                            calculate_overlap=want_overlap,
-                            calculate_pairwise=want_pairwise,
-                        )
+                    inter_path = None
+                    primary_df = pd.DataFrame()
+                    partner_df = pd.DataFrame()
+                    summary = {}
+
+                    if want_overlap or want_distance:
+                        if is_2d:
+                            sp_2d = spacing if len(spacing) == 2 else (spacing[1], spacing[2])
+                            primary_df, partner_df, inter_path, summary = calculate_interaction_metrics_2d(
+                                active_mask_path, partner_dat_path, out_dir, shape, sp_2d,
+                                active_mask_name, partner_bio_name,
+                                calculate_distance=want_distance,
+                                calculate_overlap=want_overlap,
+                                calculate_pairwise=want_pairwise,
+                            )
+                        else:
+                            primary_df, partner_df, inter_path, summary = calculate_interaction_metrics(
+                                active_mask_path, partner_dat_path, out_dir, shape, spacing,
+                                active_mask_name, partner_bio_name,
+                                calculate_distance=want_distance,
+                                calculate_overlap=want_overlap,
+                                calculate_pairwise=want_pairwise,
+                            )
 
                     if summary:
                         summary_rows.append({'sample_name': sample_name, **summary})
 
-                    # CRITICAL: Append the intersection mask to the viewer list
-                    if inter_path:
-                        results_to_viz.append({"name": f"Overlap ({partner_bio_name})", "path": inter_path})
+                    # ---- The overlap mask, if this step was asked for one ----
+                    if want_keep or want_regions:
+                        label_mode = step.get('label_mode', 'connected')
+                        preserve_ids = bool(step.get('preserve_ids', False))
+                        mask_path, mapping = None, {}
 
+                        if (inter_path and label_mode == 'connected'
+                                and not preserve_ids):
+                            # The coverage pass already wrote a uniquely
+                            # labelled intersection, so reuse it rather than
+                            # computing A AND B a second time. Only valid for
+                            # the default labelling; the parent-ID modes need
+                            # intersect_masks, which is what knows about them.
+                            mask_path = inter_path
+                            _m = np.memmap(mask_path, dtype=np.int32, mode='r', shape=shape)
+                            _u = np.unique(_m)
+                            mapping = {int(u): int(u) for u in _u[_u > 0]}
+                            del _m
+                        else:
+                            mask_path, ids_preserved = RelationalEngine.intersect_masks(
+                                active_mask_path, partner_dat_path, step_out_path,
+                                shape, label_mode, len(shape), preserve_ids
+                            )
+                            if ids_preserved:
+                                _m = np.memmap(mask_path, dtype=np.int32, mode='r', shape=shape)
+                                _u = np.unique(_m)
+                                mapping = {int(u): int(u) for u in _u[_u > 0]}
+                                del _m
+                            else:
+                                _m = np.memmap(mask_path, dtype=np.int32, mode='r+', shape=shape)
+                                _new, mapping = RelationalEngine.relabel_sequentially(_m)
+                                _m[:] = _new[:]
+                                _m.flush()
+                                del _m
+
+                        overlap_name = f"{active_mask_name}_in_{partner_bio_name}"
+                        results_to_viz.append({"name": overlap_name, "path": mask_path})
+
+                        if want_regions:
+                            RelationalEngine._save_intersection_metrics_via_pipeline(
+                                mask_path, shape, spacing, overlap_name, mapping,
+                                out_dir, sample_name, is_2d
+                            )
+
+                        if want_keep:
+                            # Only now does the overlap become what later steps
+                            # act on. A step that merely measured coverage must
+                            # leave the chain alone.
+                            last_mask_path = mask_path
+                            last_mask_name = overlap_name
+                            parent_id_map = mapping
+
+                    elif inter_path:
+                        results_to_viz.append(
+                            {"name": f"Overlap ({partner_bio_name})", "path": inter_path})
+
+                    if primary_df.empty:
+                        if not partner_df.empty:
+                            partner_df.to_csv(os.path.join(
+                                out_dir, f"coverage_stats_{partner_bio_name}.csv"), index=False)
+                        continue
                     # Rename the ID column for the final merge
                     id_col = f"id_{active_mask_name}"
 

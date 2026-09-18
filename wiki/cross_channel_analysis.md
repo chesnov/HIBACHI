@@ -27,102 +27,59 @@ the results, so an analysis can be repeated.
 
 ## Building a recipe
 
-Tick channels in the list, then add steps. Each step either produces a new mask
+Tick channels in the list, then add a step. There are four:
+**Overlap**, **Distance**, **Size Filter** and **Spatial Null**. Each opens one
+form; nothing is asked in a chain of follow-up prompts.
+
+Each step either produces a new mask
 or produces measurements.
 
 Steps that produce a mask leave it as the **previous result**, which the next step
 can consume instead of a channel. That is what lets you chain: intersect B with
 C, filter the result by size, then measure A against what survived.
 
-### Intersection
+### Overlap
 
-Takes two inputs — two channels, or one channel and the previous result — and
-keeps the voxels where both are present.
+One step, one form. You pick which side is **primary** (its objects are the
+rows) and which is the **partner**, then tick what you want out of it:
 
-**This builds a mask; it does not quantify the overlap.** You get the overlap
-region and, through the Step 5 feature pipeline, the size and shape of each
-overlap fragment — but nothing relating that back to either parent channel, so
-no coverage percentage. If what you want is "how much of A is inside B", add an
-**Overlap / Colocalisation** step; the analyzer offers to do that for you when
-you add an intersection to a recipe that measures nothing yet.
+*   **Coverage percentages** — what fraction of one channel sits inside the
+    other. Per object in `<sample>_relational_metrics.csv`, and per sample and
+    pair in `overlap_summary.csv`. Both directions are always reported, so the
+    primary choice only decides whose objects the rows are, not which number
+    you can get. This is a ratio of totals and cannot be recovered by averaging
+    the per-object column, which would weight a tiny object the same as a huge
+    one.
+*   **Size and shape of each overlap region** — treats each overlap patch as an
+    object in its own right and runs it through the Step 5 feature pipeline.
+*   **Keep the overlap as a mask for later steps** — only this makes the
+    overlap the input to whatever follows in the recipe. Choosing it reveals how
+    to label the result: a number per region, one ID for all of it, or inherit
+    one side's object IDs.
 
-You are asked how the result should be labelled:
+Overlap and Intersection used to be separate buttons. Both computed the same
+intersection and both showed a mask; they differed only in which outputs they
+kept, and asking for coverage *and* a reusable mask meant two steps that
+computed the geometry twice. They are one step now, and when coverage and a
+default-labelled mask are both requested the intersection is computed once and
+reused.
 
-| Mode | Result |
-| :--- | :--- |
-| **Binary** | Every overlap voxel gets ID 1. One object. |
-| **Connected Components** | Each separate overlapping fragment gets its own ID. |
-| **Inherit Parent A** | Overlap regions keep the IDs of the first input. |
-| **Inherit Parent B** | Overlap regions keep the IDs of the second input. |
+### Distance
 
-For the two parent modes you are then asked whether to **keep the original IDs**
-or **reset to sequential**. Keeping them means a result ID is the same number as
-the object it came from in the source channel, so a row in the output can be
-matched back to a row in that channel's `metrics_df`. Resetting renumbers 1…N,
-which is the default and what the other modes do.
-
-Either way, the output table carries a `parent_id_<name>` column recording the
-mapping.
-
-### Size filter
-
-Removes objects below a threshold — µm² in 2D, µm³ in 3D. Applies to the previous
-result if there is one; otherwise it asks which channel to filter, and records
-that channel in the step.
-
-Objects are renumbered after filtering, and the mapping is again kept as
-`parent_id_<name>`.
-
-### Overlap / Colocalisation
-
-Measures how much of one side sits inside the other. You choose which side is
-**primary** — the objects the per-object numbers are reported *for*. One row per
-primary object.
-
-This produces two different things, and the distinction matters:
-
-*   **Per primary object**, in `<sample>_relational_metrics.csv`: what fraction
-    of *that individual object* lies inside a partner
-    (`pct_of_this_<primary>_inside_<partner>`), how much overlap by extent,
-    whether it overlaps at all, and which partner accounts for most of it.
-*   **Per sample and channel pair**, in `overlap_summary.csv`: what fraction of
-    the *whole channel* lies inside the other, in both directions. This is a
-    ratio of totals, so it cannot be recovered by averaging the per-object
-    column — that would weight a tiny object the same as a huge one.
-
-Both directions are always reported in the summary, so the choice of primary
-only decides whose objects the rows are, not which number you can get.
-
-This step does not compute distances, and skips the distance transform
-entirely.
-
-### Distance / Proximity
-
-Measures how far each object is from its nearest partner, edge to edge. Again
-you choose which side is primary, and get one row per primary object:
+How far each primary object is from its nearest partner, edge to edge:
 `dist_um_<partner>`, the nearest partner's ID, and the closest-approach
-coordinates that the preview draws its connection lines from.
+coordinates the preview draws its connection lines from. Nothing else to
+decide, so the form is just the two channels.
 
-This step does not compute overlap.
+Overlap and distance are separate steps because they are separate
+measurements, not separate outputs of one. Add both for the same pair and they
+merge onto the same rows.
 
-Adding both steps for the same primary and partner merges them onto the same
-rows, which is what the old combined "Distance Analysis" button always did. A
-recipe saved before the split has no measurement recorded on its steps, and is
-run as *both* — so saved recipes reproduce exactly as before.
+### Either side can be an earlier result
 
-### Shape of a measurement step
-
-Three shapes, depending on what is in the recipe already. This applies to
-overlap and distance alike:
-
-*   Two channels, nothing before them: you pick the partner and which of the two
-    is primary.
-*   A previous result exists: you choose whether the checked channel is primary
-    and the previous result is the partner, or the reverse.
-*   Several channels checked: each gets its own step. Steps sharing a primary
-    merge into one table keyed on that primary's ID; steps with *different*
-    primaries describe different objects, so they are written to one file each
-    rather than forced together.
+When a previous step left a mask — a kept overlap, or a size filter — it
+appears in both dropdowns as "Previous result", so a chain like
+*A∩B kept as mask → distance from C to that* is two steps with one form each.
 
 ### Full pairwise distances
 
