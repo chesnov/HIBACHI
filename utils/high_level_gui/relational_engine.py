@@ -267,6 +267,17 @@ class RelationalEngine:
         last_mask_name = "Original" 
         results_to_viz = []
         final_metrics_df = None
+        # Per-object relational tables, keyed by their primary's ID column.
+        #
+        # There used to be a single accumulating frame, which assumed every
+        # analyze step in a recipe shared the same primary. Nothing enforced
+        # that -- checking two channels produces one step each and the primary
+        # is chosen per step -- and a second step with a different primary
+        # merged on an ID column that did not exist in the first step's frame,
+        # raising KeyError mid-batch. Keying by primary means the two tables
+        # stay separate (and both get written) instead of colliding.
+        final_tables: Dict[str, pd.DataFrame] = {}
+        summary_rows = []
         parent_id_map = {} 
         is_2d = (len(shape) == 2)
 
@@ -419,24 +430,44 @@ class RelationalEngine:
                     partner_bio_name = name_registry.get(step['target'], "Partner")
                     partner_dat_path = _dat(sample_channels.get(step['target']))
                 if active_mask_path and partner_dat_path:
+                    # What this step measures. Overlap and distance are separate
+                    # questions and are now asked separately; a recipe saved
+                    # before that split carries no 'measure' key, and "both" is
+                    # what it used to do, so old recipe.yaml files reproduce
+                    # exactly as before.
+                    measure = str(step.get('measure', 'both')).lower()
+                    want_overlap = measure in ('overlap', 'both')
+                    want_distance = measure in ('distance', 'both')
+                    # Opt-in per step; the full cross-product is the most
+                    # expensive thing in the module and nothing downstream
+                    # reads its CSV.
+                    want_pairwise = bool(step.get('pairwise', False))
+
+                    print(f"  [Analyze] {active_mask_name} vs {partner_bio_name} "
+                          f"(measure={measure}"
+                          f"{', pairwise' if want_pairwise else ''})")
+
                     # Execute proximity and overlap logic
                     if is_2d:
                         sp_2d = spacing if len(spacing)==2 else (spacing[1], spacing[2])
-                        primary_df, partner_df, inter_path = calculate_interaction_metrics_2d(
+                        primary_df, partner_df, inter_path, summary = calculate_interaction_metrics_2d(
                             active_mask_path, partner_dat_path, out_dir, shape, sp_2d,
-                            active_mask_name, partner_bio_name
+                            active_mask_name, partner_bio_name,
+                            calculate_distance=want_distance,
+                            calculate_overlap=want_overlap,
+                            calculate_pairwise=want_pairwise,
                         )
-                        print(f"  [DEBUG] primary_df shape: {primary_df.shape}")
-                        print(f"  [DEBUG] primary_df columns: {primary_df.columns.tolist()}")
-                        print(f"  [DEBUG] primary_df head:\n{primary_df.head()}")
-                        print(f"  [DEBUG] partner_df shape: {partner_df.shape}")
-                        print(f"  [DEBUG] active_mask_path: {active_mask_path}")
-                        print(f"  [DEBUG] partner_dat_path: {partner_dat_path}")
                     else:
-                        primary_df, partner_df, inter_path = calculate_interaction_metrics(
+                        primary_df, partner_df, inter_path, summary = calculate_interaction_metrics(
                             active_mask_path, partner_dat_path, out_dir, shape, spacing,
-                            active_mask_name, partner_bio_name
+                            active_mask_name, partner_bio_name,
+                            calculate_distance=want_distance,
+                            calculate_overlap=want_overlap,
+                            calculate_pairwise=want_pairwise,
                         )
+
+                    if summary:
+                        summary_rows.append({'sample_name': sample_name, **summary})
 
                     # CRITICAL: Append the intersection mask to the viewer list
                     if inter_path:
@@ -461,26 +492,67 @@ class RelationalEngine:
                                     index=False)
                             continue
 
-                    if final_metrics_df is None:
-                        final_metrics_df = primary_df.copy().rename(columns={'label': id_col})
+                    if id_col not in final_tables:
+                        table = primary_df.copy().rename(columns={'label': id_col})
                         # Insert parent ID mapping for biological traceability
                         if parent_id_map:
                             map_df = pd.DataFrame(list(parent_id_map.items()),
                                                  columns=[id_col, f"parent_id_{active_mask_name}"])
-                            final_metrics_df = pd.merge(map_df, final_metrics_df, on=id_col)
+                            table = pd.merge(map_df, table, on=id_col)
+                        final_tables[id_col] = table
                     else:
-                        # Join additional partners (e.g. Neurons AND Microglia) to the same table
-                        final_metrics_df = pd.merge(final_metrics_df, primary_df,
-                                                   left_on=id_col, right_on='label',
-                                                   how='outer').drop(columns=['label'])
+                        # Join additional partners (e.g. Neurons AND Microglia) to the same
+                        # table. Safe now that the lookup is keyed by primary, so this only
+                        # ever merges frames that genuinely share this primary's IDs.
+                        final_tables[id_col] = pd.merge(
+                            final_tables[id_col], primary_df,
+                            left_on=id_col, right_on='label',
+                            how='outer').drop(columns=['label'])
 
                     # Save the Coverage Summary (Partner-view)
                     if not partner_df.empty:
                         partner_df.to_csv(os.path.join(out_dir, f"coverage_stats_{partner_bio_name}.csv"), index=False)
 
         # 5. Final Result Persistence
-        if final_metrics_df is not None:
-            csv_path = os.path.join(out_dir, f"{sample_name}_relational_metrics.csv")
-            final_metrics_df.to_csv(csv_path, index=False)
+        #
+        # One primary is the overwhelmingly common case and keeps the historic
+        # filename. Several primaries in one recipe each get their own file,
+        # named for the primary, rather than being forced into one table on
+        # mismatched IDs.
+        if final_tables:
+            if len(final_tables) == 1:
+                final_metrics_df = next(iter(final_tables.values()))
+                final_metrics_df.to_csv(
+                    os.path.join(out_dir, f"{sample_name}_relational_metrics.csv"),
+                    index=False)
+            else:
+                print(f"  [Note] This recipe measured {len(final_tables)} different "
+                      f"primaries. Their rows describe different objects, so they "
+                      f"cannot share a table -- writing one file each.")
+                for id_col, table in final_tables.items():
+                    primary_label = id_col[3:] if id_col.startswith("id_") else id_col
+                    safe = "".join(ch if ch.isalnum() or ch in "-_" else "_"
+                                   for ch in str(primary_label))
+                    table.to_csv(
+                        os.path.join(
+                            out_dir,
+                            f"{sample_name}_relational_metrics_{safe}.csv"),
+                        index=False)
+                # Returned for the viewer's proximity bridges, which can only
+                # draw one primary's lines.
+                final_metrics_df = next(iter(final_tables.values()))
+
+        # 6. Sample-level Overlap Summary
+        #
+        # The per-object table answers "how much of THIS object is inside a
+        # partner". This answers "how much of the channel is", which is a ratio
+        # of totals and cannot be recovered by averaging those rows.
+        if summary_rows:
+            summary_path = os.path.join(out_dir, "overlap_summary.csv")
+            pd.DataFrame(summary_rows).to_csv(summary_path, index=False)
+            for row in summary_rows:
+                print(f"  [Overlap] {row['pct_of_primary_inside_partner']:.2f}% of "
+                      f"{row['primary']} lies inside {row['partner']}; "
+                      f"{row['pct_of_partner_inside_primary']:.2f}% the other way.")
 
         return results_to_viz, final_metrics_df

@@ -189,18 +189,45 @@ def calculate_interaction_metrics(
     primary_name: str,    # Descriptive name of derived mask (e.g. Neurons_in_Aggregates)
     partner_name: str,    # Descriptive name of reference channel (e.g. Microglia)
     calculate_distance: bool = True,
-    calculate_overlap: bool = True
-) -> Tuple[pd.DataFrame, pd.DataFrame, Optional[str]]:
+    calculate_overlap: bool = True,
+    calculate_pairwise: bool = False,
+) -> Tuple[pd.DataFrame, pd.DataFrame, Optional[str], Dict[str, Any]]:
     """
-    Calculates spatial relationships between Primary and Partner 2D objects.
-    
-    Metrics include: 
-    - Area of overlap
+    Calculates spatial relationships between Primary and Partner objects.
+
+    Metrics include:
+    - Extent of overlap (area in 2D, volume in 3D)
     - % of Primary inside Partner
     - % of Partner occupied by Primary
     - Edge-to-edge Euclidean distances
     - Source/Target Bridge coordinates for visualization
+
+    Which of those are produced
+    ---------------------------
+    `calculate_overlap` and `calculate_distance` are independent, and both are
+    honoured -- they used to be accepted and then ignored, because the only
+    caller left them at their defaults, so every analysis paid for both no
+    matter which one was wanted. Asking for overlap alone now skips the
+    distance transform and the pairwise pass entirely.
+
+    `calculate_pairwise` controls the FULL cross-product of edge-to-edge
+    distances (every primary against every partner), written to
+    `pairwise_distances_<partner>.csv`. It is off by default: it is the most
+    expensive thing here by a wide margin -- one KD-tree per primary object,
+    queried against every partner boundary -- and nothing in the pipeline reads
+    the file. The per-object nearest-partner distance that the relational table
+    actually uses comes from the much cheaper EDT under `calculate_distance`.
+    Turn it on when you want the raw pair list for your own statistics.
+
+    Returns
+    -------
+    (primary_df, partner_df, intersection_path, summary)
+        `summary` is a single flat dict of sample-level overlap totals for this
+        primary/partner pair -- the "what fraction of A is inside B" figure, as
+        opposed to the per-object fractions in `primary_df`. Empty when
+        `calculate_overlap` is False. See the accumulators below.
     """
+
     ndim = len(tuple(shape))
     if ndim not in (2, 3):
         raise ValueError(
@@ -266,6 +293,14 @@ def calculate_interaction_metrics(
     labels = labels[labels > 0]
     primary_results = []
 
+    # Sample-level accumulators for the overlap summary. Primary labels are
+    # disjoint, so summing each object's own extent gives |primary| exactly,
+    # and summing each object's overlap gives |primary AND partner| with no
+    # voxel counted twice.
+    total_primary_px = 0
+    total_overlap_px = 0
+    n_touching = 0
+
     for lbl in tqdm(labels, desc=f"    Scanning {partner_name}"):
         idx = lbl - 1
         if idx >= len(object_slices) or object_slices[idx] is None: continue
@@ -286,7 +321,12 @@ def calculate_interaction_metrics(
                 intersection_memmap[sl] = current_int_view
 
             total_px_p = np.count_nonzero(mask_p)
-            
+
+            total_primary_px += int(total_px_p)
+            total_overlap_px += int(overlap_px)
+            if overlap_px > 0:
+                n_touching += 1
+
             # Bi-directional Stat: Area of Primary inside Partner
             row[f'overlap_{extent}_with_{partner_name}_{unit}'] = overlap_px * unit_extent
             
@@ -393,13 +433,59 @@ def calculate_interaction_metrics(
 
         ref_df = ref_stats
 
-    # 8. Pairwise Distance Calculation
-    pairwise_df = calculate_pairwise_distances(
-        primary_memmap, reference_memmap, spacing, partner_name
-    )
-    if not pairwise_df.empty:
-        pairwise_out_path = os.path.join(output_dir, f"pairwise_distances_{partner_name}.csv")
-        pairwise_df.to_csv(pairwise_out_path, index=False)
+    # 8. Sample-level Overlap Summary (one row per primary/partner pair)
+    #
+    # This is the headline "what fraction of A sits inside B" number, and it is
+    # NOT derivable from primary_df by averaging: that would weight a tiny
+    # object the same as a huge one. It is a ratio of totals, so it has to be
+    # accumulated over voxels, which is what the loop above did.
+    #
+    # Both directions are reported, because "percentage overlap" names two
+    # different quantities and choosing one for the user is how the directional
+    # confusion started. Column names are deliberately generic (`primary` /
+    # `partner` rather than the channel names) so that rows for different pairs
+    # and different samples concatenate into one tidy table.
+    summary: Dict[str, Any] = {}
+    if calculate_overlap:
+        total_primary = total_primary_px * unit_extent
+        total_partner = float(sum(ref_areas.values())) * unit_extent
+        overlap_total = total_overlap_px * unit_extent
+        n_primary = int(len(labels))
+
+        summary = {
+            'primary': primary_name,
+            'partner': partner_name,
+            'n_primary': n_primary,
+            'n_partner': int(len(ref_areas)),
+            f'total_primary_{unit}': total_primary,
+            f'total_partner_{unit}': total_partner,
+            f'overlap_{unit}': overlap_total,
+            # Mask-based coverage coefficients. Denominators differ, which is
+            # the whole point: these two numbers are not each other.
+            'pct_of_primary_inside_partner': (
+                (overlap_total / total_primary * 100.0) if total_primary > 0 else 0.0
+            ),
+            'pct_of_partner_inside_primary': (
+                (overlap_total / total_partner * 100.0) if total_partner > 0 else 0.0
+            ),
+            'n_primary_touching_partner': n_touching,
+            'pct_of_primary_objects_touching_partner': (
+                (n_touching / n_primary * 100.0) if n_primary > 0 else 0.0
+            ),
+        }
+
+    # 9. Full Pairwise Distance Cross-Product (opt-in)
+    #
+    # Gated. This used to run unconditionally, outside the calculate_distance
+    # check, so an overlap-only analysis still paid for the single most
+    # expensive step in the module -- and for a CSV no other code reads.
+    if calculate_pairwise:
+        pairwise_df = calculate_pairwise_distances(
+            primary_memmap, reference_memmap, spacing, partner_name
+        )
+        if not pairwise_df.empty:
+            pairwise_out_path = os.path.join(output_dir, f"pairwise_distances_{partner_name}.csv")
+            pairwise_df.to_csv(pairwise_out_path, index=False)
 
     # Cleanup
     if intersection_memmap is not None:
@@ -410,7 +496,7 @@ def calculate_interaction_metrics(
     del dist_map, indices, primary_memmap, reference_memmap
     gc.collect()
 
-    return pd.DataFrame(primary_results), ref_df, intersection_path
+    return pd.DataFrame(primary_results), ref_df, intersection_path, summary
 
 
 # --------------------------------------------------------------------------
@@ -419,12 +505,14 @@ def calculate_interaction_metrics(
 def calculate_interaction_metrics_2d(primary_mask_path, reference_mask_path,
                                      output_dir, shape, spacing_yx, primary_name,
                                      partner_name, calculate_distance=True,
-                                     calculate_overlap=True):
+                                     calculate_overlap=True,
+                                     calculate_pairwise=False):
     """
     2D entry point, kept so existing callers keep working.
 
     `calculate_interaction_metrics` handles both ranks; this only translates the
     `spacing_yx` argument name. New code should call the rank-agnostic function.
+    Returns the same 4-tuple, summary included.
     """
     return calculate_interaction_metrics(
         primary_mask_path=primary_mask_path,
@@ -436,6 +524,7 @@ def calculate_interaction_metrics_2d(primary_mask_path, reference_mask_path,
         partner_name=partner_name,
         calculate_distance=calculate_distance,
         calculate_overlap=calculate_overlap,
+        calculate_pairwise=calculate_pairwise,
     )
 
 
@@ -454,4 +543,3 @@ def _extract_contours_2d(mask_memmap, labels, shape=None):
 def _inter_channel_dist_worker_2d(args):
     """2D alias; the implementation is rank-agnostic."""
     return _inter_channel_dist_worker(args)
-

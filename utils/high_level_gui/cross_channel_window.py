@@ -226,16 +226,33 @@ class CrossChannelAnalyzerWindow(QMainWindow):
         
         self.btn_intersect = QPushButton("+ Intersection")
         self.btn_filter = QPushButton("+ Size Filter")
-        self.btn_dist = QPushButton("+ Distance Analysis")
-        
+        # Two buttons, because these are two different questions. They were one
+        # button labelled "Distance Analysis" that quietly measured overlap as
+        # well, so the only way to get a coverage percentage was to ask for a
+        # distance analysis -- and there was no way to ask for overlap alone.
+        self.btn_overlap = QPushButton("+ Overlap / Colocalisation")
+        self.btn_dist = QPushButton("+ Distance / Proximity")
+        self.btn_overlap.setToolTip(
+            "How much of one channel sits inside another: per-object "
+            "percentages, plus a sample-level coverage figure in both "
+            "directions. Skips the distance transform."
+        )
+        self.btn_dist.setToolTip(
+            "How far each object is from its nearest partner, edge to edge, "
+            "with the nearest partner's ID and the connection lines drawn in "
+            "the preview."
+        )
+
         self.btn_synth.clicked.connect(self.open_synthetic_dialog)
         self.btn_intersect.clicked.connect(self.add_intersect_step)
         self.btn_filter.clicked.connect(self.add_filter_step)
-        self.btn_dist.clicked.connect(self.add_analysis_step)
-        
+        self.btn_overlap.clicked.connect(lambda: self.add_analysis_step("overlap"))
+        self.btn_dist.clicked.connect(lambda: self.add_analysis_step("distance"))
+
         add_step_layout.addWidget(self.btn_synth)
         add_step_layout.addWidget(self.btn_intersect)
         add_step_layout.addWidget(self.btn_filter)
+        add_step_layout.addWidget(self.btn_overlap)
         add_step_layout.addWidget(self.btn_dist)
         mid_panel.addLayout(add_step_layout)
 
@@ -407,6 +424,25 @@ class CrossChannelAnalyzerWindow(QMainWindow):
         self.recipe_steps.append(step)
         self.recipe_list.addItem(step["name"])
 
+        # An intersection builds the overlap MASK and measures the size and
+        # shape of each overlap fragment. It does not relate that back to
+        # either parent channel, so it yields no coverage percentage -- which
+        # is not obvious from a button called "Intersection", and was the usual
+        # way to end up with a recipe that produced no overlap numbers. Offer
+        # the step that does measure it.
+        if not self._has_measurement_step():
+            reply = QMessageBox.question(
+                self, "Quantify the overlap?",
+                "That step builds the overlap mask and measures each overlap "
+                "fragment's own size and shape.\n\n"
+                "It does not report how much of either channel is involved. "
+                "Add an Overlap / Colocalisation step now to get the coverage "
+                "percentages in both directions?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes,
+            )
+            if reply == QMessageBox.Yes:
+                self.add_analysis_step("overlap")
+
     def project_is_2d(self):
         """True when this project's images are planes rather than stacks.
 
@@ -497,10 +533,55 @@ class CrossChannelAnalyzerWindow(QMainWindow):
         self.recipe_steps.append(step)
         self.recipe_list.addItem(step["name"])
 
-    def add_analysis_step(self):
+    # Wording for each kind of measurement step. Everything the two branches
+    # below differ by lives here, so the two flows cannot drift apart.
+    _MEASURE_WORDING = {
+        "overlap": {
+            "noun": "overlap analysis",
+            "no_channel": "Check at least one channel for overlap analysis.",
+            "need_two": "Need at least two channels for overlap analysis.",
+            "partner_title": "Select Partner Channel",
+            "partner_prompt": "Measure the overlap of  '{ch}'  with which channel?",
+            "role_title": "Select Primary Channel",
+            "role_prompt": (
+                "Which channel's objects should the rows be?\n\n"
+                "You get one row per PRIMARY object, carrying the percentage "
+                "of THAT object which lies inside the partner. The "
+                "sample-level summary reports both directions either way."
+            ),
+            "role_opt": "{a}  \u2192  primary  (% of each {a} object inside {b})",
+            "step_name": "Overlap: % of {a} inside {b}",
+            "step_name_prev": "Overlap: % of {a} inside previous result",
+            "step_name_prev_primary": "Overlap: % of previous result inside {a}",
+        },
+        "distance": {
+            "noun": "distance analysis",
+            "no_channel": "Check at least one channel for distance analysis.",
+            "need_two": "Need at least two channels for distance analysis.",
+            "partner_title": "Select Partner Channel",
+            "partner_prompt": "Measure distance FROM  '{ch}'  TO which channel?",
+            "role_title": "Select Primary Channel",
+            "role_prompt": "Which side should be the PRIMARY (objects distances are reported FOR)?",
+            "role_opt": "{a}  \u2192  primary  (measure FROM {a} TO {b})",
+            "step_name": "Distance: {a} \u2192 nearest {b}",
+            "step_name_prev": "Distance: {a} \u2192 nearest in previous result",
+            "step_name_prev_primary": "Distance: previous result \u2192 nearest {a}",
+        },
+    }
+
+    def add_analysis_step(self, measure="both"):
+        """Add a measurement step.
+
+        `measure` is "overlap", "distance" or "both", and is carried on the step
+        so the engine can ask for only what was requested. A recipe saved before
+        this split has no 'measure' key and the engine treats that as "both",
+        which is what the single button used to do.
+        """
+        words = self._MEASURE_WORDING.get(measure, self._MEASURE_WORDING["distance"])
+
         checked = self.get_checked_channels()
         if not checked:
-            QMessageBox.warning(self, "Error", "Check at least one channel for distance analysis.")
+            QMessageBox.warning(self, "Error", words["no_channel"])
             return
 
         # Determine whether there is an accumulated pipeline result (intersection / filter)
@@ -515,11 +596,11 @@ class CrossChannelAnalyzerWindow(QMainWindow):
                 # Ask which role the checked channel plays.
                 role, ok = QInputDialog.getItem(
                     self,
-                    "Select Primary Channel",
-                    "Which side should be the PRIMARY (objects distances are reported FOR)?",
+                    words["role_title"],
+                    words["role_prompt"],
                     [
-                        f"{ch}  →  primary  (measure FROM {ch} TO the previous result)",
-                        f"Previous result  →  primary  (measure FROM previous result TO {ch})",
+                        words["role_opt"].format(a=ch, b="the previous result"),
+                        words["role_opt"].format(a="Previous result", b=ch),
                     ],
                     0, False
                 )
@@ -530,16 +611,18 @@ class CrossChannelAnalyzerWindow(QMainWindow):
                     # ch is primary, previous result is the partner
                     step = {
                         "type":    "analyze",
+                        "measure": measure,
                         "primary": ch,
                         "target":  "PREVIOUS_RESULT",
-                        "name":    f"Analyze {ch} → distance to previous result",
+                        "name":    words["step_name_prev"].format(a=ch),
                     }
                 else:
                     # previous result is primary, ch is the partner
                     step = {
-                        "type":   "analyze",
-                        "target": ch,
-                        "name":   f"Analyze previous result → distance to {ch}",
+                        "type":    "analyze",
+                        "measure": measure,
+                        "target":  ch,
+                        "name":    words["step_name_prev_primary"].format(a=ch),
                     }
 
             else:
@@ -551,13 +634,13 @@ class CrossChannelAnalyzerWindow(QMainWindow):
                     if self.channel_list.item(i).text() != ch
                 ]
                 if not other_channels:
-                    QMessageBox.warning(self, "Error", "Need at least two channels for distance analysis.")
+                    QMessageBox.warning(self, "Error", words["need_two"])
                     return
 
                 partner, ok = QInputDialog.getItem(
                     self,
-                    "Select Partner Channel",
-                    f"Measure distance FROM  '{ch}'  TO which channel?",
+                    words["partner_title"],
+                    words["partner_prompt"].format(ch=ch),
                     other_channels, 0, False
                 )
                 if not ok:
@@ -566,11 +649,11 @@ class CrossChannelAnalyzerWindow(QMainWindow):
                 # Ask which of the two is primary
                 role, ok = QInputDialog.getItem(
                     self,
-                    "Select Primary Channel",
-                    "Which side should be the PRIMARY (objects distances are reported FOR)?",
+                    words["role_title"],
+                    words["role_prompt"],
                     [
-                        f"{ch}  →  primary  (measure FROM {ch} TO {partner})",
-                        f"{partner}  →  primary  (measure FROM {partner} TO {ch})",
+                        words["role_opt"].format(a=ch, b=partner),
+                        words["role_opt"].format(a=partner, b=ch),
                     ],
                     0, False
                 )
@@ -584,13 +667,40 @@ class CrossChannelAnalyzerWindow(QMainWindow):
 
                 step = {
                     "type":    "analyze",
+                    "measure": measure,
                     "primary": primary_ch,
                     "target":  partner_ch,
-                    "name":    f"Analyze {primary_ch} → distance to {partner_ch}",
+                    "name":    words["step_name"].format(a=primary_ch, b=partner_ch),
                 }
 
             self.recipe_steps.append(step)
             self.recipe_list.addItem(step["name"])
+
+    def _has_measurement_step(self):
+        """True when the recipe actually measures something.
+
+        Intersection and Size Filter only build masks. A recipe of nothing but
+        those runs to completion and writes no relational table at all, which
+        read as "the analyzer doesn't produce overlap numbers" rather than as a
+        missing step.
+        """
+        return any(s.get('type') == 'analyze' for s in self.recipe_steps)
+
+    def _confirm_missing_measurement(self):
+        """Warn before running a recipe that measures nothing. True to proceed."""
+        if self._has_measurement_step() or not self.recipe_steps:
+            return True
+        reply = QMessageBox.warning(
+            self, "No measurement step",
+            "This recipe builds masks but never measures a relationship, so it "
+            "will not produce a relational table or any overlap percentages.\n\n"
+            "Add an \"Overlap / Colocalisation\" step to quantify how much of "
+            "one channel sits inside another, or a \"Distance / Proximity\" "
+            "step for nearest-neighbour distances.\n\n"
+            "Run anyway (masks and their sizes only)?",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+        )
+        return reply == QMessageBox.Yes
 
     FULL_IMAGE_LABEL = "Full image"
 
@@ -686,6 +796,9 @@ class CrossChannelAnalyzerWindow(QMainWindow):
     def preview_recipe(self):
         if not self.recipe_steps:
             QMessageBox.information(self, "Info", "Recipe is empty.")
+            return
+
+        if not self._confirm_missing_measurement():
             return
 
         # 1. Ask for a name to make this a "Single Run"
@@ -826,6 +939,9 @@ class CrossChannelAnalyzerWindow(QMainWindow):
         if not self.recipe_steps:
             return
 
+        if not self._confirm_missing_measurement():
+            return
+
         # 1. Ask for an Analysis Name (to create a subfolder)
         roi_name = self._selected_region()
         analysis_name, ok = QInputDialog.getText(self, "Batch Run", "Enter name for this analysis:")
@@ -893,8 +1009,9 @@ class CrossChannelAnalyzerWindow(QMainWindow):
             # "Successfully generated" for a batch that died.
             return
 
-        # 5. Create Master Summary Table
+        # 5. Create Master Summary Tables
         all_csvs = []
+        all_summaries = []
         for s_name in samples:
             leaf_dir = os.path.join(batch_out_dir, s_name) if not roi_name \
                 else os.path.join(batch_out_dir, s_name, _safe_name(roi_name))
@@ -906,11 +1023,24 @@ class CrossChannelAnalyzerWindow(QMainWindow):
                 df = pd.read_csv(csv_p)
                 df['sample_name'] = s_name
                 all_csvs.append(df)
-        
+
+            # The sample-level overlap figures already carry their own
+            # sample_name column, so they concatenate directly.
+            sum_p = os.path.join(leaf_dir, "overlap_summary.csv")
+            if os.path.exists(sum_p):
+                all_summaries.append(pd.read_csv(sum_p))
+
         if all_csvs:
             master_df = pd.concat(all_csvs, ignore_index=True)
             master_df.to_csv(os.path.join(batch_out_dir, "MASTER_RELATIONAL_RESULTS.csv"), index=False)
             print("Successfully generated MASTER_RELATIONAL_RESULTS.csv")
+
+        if all_summaries:
+            master_sum = pd.concat(all_summaries, ignore_index=True)
+            master_sum.to_csv(
+                os.path.join(batch_out_dir, "MASTER_OVERLAP_SUMMARY.csv"), index=False)
+            print("Successfully generated MASTER_OVERLAP_SUMMARY.csv "
+                  "(one row per sample and channel pair)")
 
 
 # ============================================================================

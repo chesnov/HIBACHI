@@ -3,9 +3,9 @@
 **Corresponding modules:**
 *   `utils/high_level_gui/cross_channel_window.py` — the window and recipe builder
 *   `utils/high_level_gui/relational_engine.py` — execution
-*   `utils/module_3d/interaction_analysis.py`,
-    `utils/module_2d/interaction_analysis_2d.py` — the distance and overlap
-    measurements
+*   `utils/fluorescence_module/interaction_analysis.py` — the distance and
+    overlap measurements, at both ranks (this was once two modules, one per
+    rank; they are merged, and the 2D entry points remain as thin aliases)
 
 ## What this does
 
@@ -37,8 +37,16 @@ C, filter the result by size, then measure A against what survived.
 ### Intersection
 
 Takes two inputs — two channels, or one channel and the previous result — and
-keeps the voxels where both are present. You are asked how the result should be
-labelled:
+keeps the voxels where both are present.
+
+**This builds a mask; it does not quantify the overlap.** You get the overlap
+region and, through the Step 5 feature pipeline, the size and shape of each
+overlap fragment — but nothing relating that back to either parent channel, so
+no coverage percentage. If what you want is "how much of A is inside B", add an
+**Overlap / Colocalisation** step; the analyzer offers to do that for you when
+you add an intersection to a recipe that measures nothing yet.
+
+You are asked how the result should be labelled:
 
 | Mode | Result |
 | :--- | :--- |
@@ -65,20 +73,64 @@ that channel in the step.
 Objects are renumbered after filtering, and the mapping is again kept as
 `parent_id_<name>`.
 
-### Distance analysis
+### Overlap / Colocalisation
 
-Measures one side against another and writes the measurement tables. You choose
-which side is **primary** — the objects the numbers are reported *for*. One row
-per primary object.
+Measures how much of one side sits inside the other. You choose which side is
+**primary** — the objects the per-object numbers are reported *for*. One row per
+primary object.
 
-Three shapes, depending on what is in the recipe already:
+This produces two different things, and the distinction matters:
+
+*   **Per primary object**, in `<sample>_relational_metrics.csv`: what fraction
+    of *that individual object* lies inside a partner
+    (`pct_of_this_<primary>_inside_<partner>`), how much overlap by extent,
+    whether it overlaps at all, and which partner accounts for most of it.
+*   **Per sample and channel pair**, in `overlap_summary.csv`: what fraction of
+    the *whole channel* lies inside the other, in both directions. This is a
+    ratio of totals, so it cannot be recovered by averaging the per-object
+    column — that would weight a tiny object the same as a huge one.
+
+Both directions are always reported in the summary, so the choice of primary
+only decides whose objects the rows are, not which number you can get.
+
+This step does not compute distances, and skips the distance transform
+entirely.
+
+### Distance / Proximity
+
+Measures how far each object is from its nearest partner, edge to edge. Again
+you choose which side is primary, and get one row per primary object:
+`dist_um_<partner>`, the nearest partner's ID, and the closest-approach
+coordinates that the preview draws its connection lines from.
+
+This step does not compute overlap.
+
+Adding both steps for the same primary and partner merges them onto the same
+rows, which is what the old combined "Distance Analysis" button always did. A
+recipe saved before the split has no measurement recorded on its steps, and is
+run as *both* — so saved recipes reproduce exactly as before.
+
+### Shape of a measurement step
+
+Three shapes, depending on what is in the recipe already. This applies to
+overlap and distance alike:
 
 *   Two channels, nothing before them: you pick the partner and which of the two
     is primary.
 *   A previous result exists: you choose whether the checked channel is primary
     and the previous result is the partner, or the reverse.
-*   Several channels checked: each gets its own analysis step, and they merge into
-    one table keyed on the primary object's ID.
+*   Several channels checked: each gets its own step. Steps sharing a primary
+    merge into one table keyed on that primary's ID; steps with *different*
+    primaries describe different objects, so they are written to one file each
+    rather than forced together.
+
+### Full pairwise distances
+
+Every primary against every partner, rather than just the nearest, written to
+`pairwise_distances_<partner>.csv`. **Off by default** — it is by far the most
+expensive measurement here, and nothing else in the pipeline reads the file.
+Set `pairwise: true` on an analyze step in `recipe.yaml` when you want the raw
+pair list for your own statistics.
 
 ### Spatial null
 
@@ -124,13 +176,20 @@ Everything lands under:
 <project_root>/RELATIONAL_ANALYSIS/<analysis_name>/
 ├── recipe.yaml                     the recipe that produced this
 ├── region.txt                      which region it ran on
-├── MASTER_RELATIONAL_RESULTS.csv   every sample's rows, concatenated
+├── MASTER_RELATIONAL_RESULTS.csv   every sample's per-object rows, concatenated
+├── MASTER_OVERLAP_SUMMARY.csv      every sample's sample-level overlap figures
 └── <sample>/
     ├── <sample>_relational_metrics.csv
+    ├── overlap_summary.csv
     ├── coverage_stats_<partner>.csv
+    ├── pairwise_distances_<partner>.csv   (only if asked for)
     ├── intersection_<partner>.dat
     └── (intermediate masks from each mask-producing step)
 ```
+
+When one recipe measures several different primaries, the per-object table is
+written once per primary as `<sample>_relational_metrics_<primary>.csv` instead
+of the single file above, since those rows describe different objects.
 
 A region run nests one level deeper, `<sample>/<region>/`, so an analysis of the
 full image and the same analysis of a region do not overwrite each other.
@@ -166,10 +225,34 @@ The same relationship from the other side:
 | `count_of_unique_<primary>_touching_this_<partner>` | How many primary objects touch it |
 | `list_of_<primary>_ids_touching_this_<partner>` | Which ones |
 
-### `MASTER_RELATIONAL_RESULTS.csv`
+### `overlap_summary.csv` — one row per sample and channel pair
 
-Every sample's per-object rows concatenated, with a `sample_name` column
-identifying each. This is the file to load for a cross-sample comparison.
+The sample-level answer to "what percentage of channel A is inside channel B".
+Written by every **Overlap** step. Column names are generic (`primary` /
+`partner` rather than the channel names) so rows for different pairs and
+different samples concatenate into one tidy table.
+
+| Column | Meaning |
+| :--- | :--- |
+| `sample_name`, `primary`, `partner` | Which pair, which way round |
+| `n_primary`, `n_partner` | Object counts on each side |
+| `total_primary_um3`, `total_partner_um3` | Total extent of each channel (`_um2` in 2D) |
+| `overlap_um3` | Extent of the intersection |
+| `pct_of_primary_inside_partner` | `overlap / total_primary` — coverage of A by B |
+| `pct_of_partner_inside_primary` | `overlap / total_partner` — coverage of B by A |
+| `n_primary_touching_partner` | How many primary objects overlap at all |
+| `pct_of_primary_objects_touching_partner` | That count as a fraction of `n_primary` |
+
+The last two are an *incidence* measure — what share of objects are involved —
+which is a different question from what share of the material is. Both are
+often wanted.
+
+### `MASTER_RELATIONAL_RESULTS.csv` and `MASTER_OVERLAP_SUMMARY.csv`
+
+The per-object rows and the sample-level overlap rows, each concatenated across
+every sample with a `sample_name` column. `MASTER_OVERLAP_SUMMARY.csv` is
+normally the one to load for a cross-sample comparison of overlap;
+`MASTER_RELATIONAL_RESULTS.csv` is for per-object distributions.
 
 ---
 
