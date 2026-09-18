@@ -296,6 +296,52 @@ class RelationalEngine:
         return out
 
     @staticmethod
+    def channel_name_registry(channel_keys):
+        """Short, unique, column-safe name per channel key.
+
+        These names end up in CSV headers (`pct_of_<partner>_occupied_by_
+        <primary>`), in derived mask filenames and in viewer layer names, so
+        they have to identify the channel and they have to differ from one
+        another.
+
+        The previous rule was `ch_key.split('_', 2)[-1]` -- the last chunk of
+        the folder name. That gives "Microglia" for `Channel_0_Microglia`, but
+        for any other layout it takes whatever the folder happens to end with.
+        On a project whose channel folders end in the config name, EVERY
+        channel resolved to the same word, producing headers like
+        `total_vol_of_default_inside_this_default` where primary and partner
+        were different channels with identical names.
+
+        So: take the marker suffix only when the folder really follows the
+        `Channel_<n>_<marker>` convention, fall back to the whole folder name
+        otherwise, and if two channels still collide, use the full key for the
+        colliding ones. A long header beats an ambiguous one.
+        """
+        keys = list(channel_keys)
+
+        def short(key):
+            parts = str(key).split('_')
+            if len(parts) >= 3 and parts[0].lower() == 'channel':
+                return '_'.join(parts[2:])
+            return str(key)
+
+        names = {k: short(k) for k in keys}
+        by_name = {}
+        for k, v in names.items():
+            by_name.setdefault(v, []).append(k)
+        for v, ks in by_name.items():
+            if len(ks) > 1:
+                for k in ks:
+                    names[k] = str(k)
+
+        def safe(text):
+            out = "".join(c if (c.isalnum() or c in "-_") else "_"
+                          for c in str(text)).strip("_")
+            return out or "channel"
+
+        return {k: safe(v) for k, v in names.items()}
+
+    @staticmethod
     def run_recipe(sample_name, registry, recipe, out_dir, shape, spacing,
                    roi_name=None):
         """
@@ -312,12 +358,8 @@ class RelationalEngine:
         sample_channels = registry.get(sample_name, {})
         
         # 1. Biological Name Mapping
-        name_registry = {}
-        for ch_key in sample_channels.keys():
-            # Update this line to use split('_', 2) to prevent naming collisions
-            parts = ch_key.split('_', 2) 
-            variety = parts[-1] if len(parts) > 2 else ch_key
-            name_registry[ch_key] = variety
+        name_registry = RelationalEngine.channel_name_registry(
+            sample_channels.keys())
 
         last_mask_path = None
         last_mask_name = "Original" 
@@ -526,6 +568,21 @@ class RelationalEngine:
                                 del _m
 
                         overlap_name = f"{active_mask_name}_in_{partner_bio_name}"
+
+                        # When the coverage pass wrote its own intersection and
+                        # this step then built a differently-labelled mask, the
+                        # first one is a superseded intermediate. Leaving it on
+                        # disk put TWO derived layers in the viewer for one
+                        # step -- `intersection_<partner>` and
+                        # `step_<i>_relate` -- differing only in labelling, with
+                        # nothing to say which was the step's actual result.
+                        if inter_path and os.path.abspath(inter_path) != os.path.abspath(mask_path):
+                            try:
+                                os.remove(inter_path)
+                            except OSError:
+                                pass
+                            inter_path = None
+
                         results_to_viz.append({"name": overlap_name, "path": mask_path})
 
                         if want_regions:
