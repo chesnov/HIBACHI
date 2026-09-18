@@ -792,71 +792,8 @@ class CrossChannelAnalyzerWindow(QMainWindow):
         return None if (not label or label == self.FULL_IMAGE_LABEL) else label
 
     def _geometry_for(self, sample_data: dict, roi_name):
-        """(shape, spacing) for a sample, honouring the selected region.
-
-        A region's masks are the CROP, so its shape and spacing must come from the
-        region rather than the channel's full-resolution TIFF -- memmapping a
-        region's mask against the full shape would read past the end of the file.
-        Returns (None, None) when it cannot be determined.
-        """
-        first_ch = list(sample_data.values())[0]
-        if roi_name:
-            from .roi_sharing import region_geometry
-            geo = region_geometry(first_ch, roi_name)
-            if geo is None:
-                return None, None
-            return geo["shape"], geo["spacing"]
-
-        tif_path = next((os.path.join(first_ch, f) for f in os.listdir(first_ch)
-                         if f.lower().endswith((".tif", ".tiff"))), None)
-        if not tif_path:
-            return None, None
-        with tiff.TiffFile(tif_path) as tif:
-            shape = tuple(int(s) for s in tif.series[0].shape)
-        meta, _mode = get_sample_metadata(first_ch)
-        if not meta:
-            # No usable dimension block. Previously this fell through to a
-            # spacing of 1.0/N per axis, which is a physical scale nobody
-            # supplied; every distance the analysis then reported was wrong and
-            # still labelled microns. The caller documents (None, None) as
-            # "could not be determined" and handles it.
-            print(f"[cross-channel] {first_ch}: config has no usable "
-                  f"dimension block; geometry cannot be determined.")
-            return None, None
-
-        # A (C, Z, Y, X) or (C, Y, X) file would otherwise hand back a shape the
-        # .dat memmaps do not have. How many trailing axes are spatial comes from
-        # the dimension block's rank -- a 'z' extent means a stack -- because a
-        # 3-axis array may be (Z, Y, X) or (C, Y, X) and the array cannot say
-        # which. This used to read the mode string, which is now the same for
-        # both ranks, so `want` was always 3 and a 2D project's (C, Y, X) file
-        # kept its channel axis as if it were Z. Keep exactly the `want` trailing
-        # spatial axes and drop any leading (channel) axes. Do NOT squeeze
-        # singleton axes generally: a genuine thin-Z volume is (1, Y, X) and must
-        # stay 3D, or the 3D viewport and turntable would be lost for
-        # single-channel / few-slice samples.
-        want = 3 if meta.get('z') is not None else 2
-        if len(shape) > want:
-            shape = shape[-want:]
-        if len(shape) < want:
-            print(f"[cross-channel] {first_ch}: config describes a {want}D "
-                  f"acquisition but the image has shape {shape}; geometry "
-                  f"cannot be determined.")
-            return None, None
-
-        axes = ('z', 'y', 'x') if want == 3 else ('y', 'x')
-        spacing = []
-        for axis, count in zip(axes, shape):
-            try:
-                total = float(meta.get(axis))
-            except (TypeError, ValueError):
-                total = 0.0
-            if not (total > 0 and count):
-                print(f"[cross-channel] {first_ch}: no usable {axis!r} extent "
-                      f"in the config; refusing to invent a spacing.")
-                return None, None
-            spacing.append(total / count)
-        return shape, tuple(spacing)
+        """(shape, spacing) for a sample. See module-level geometry_for."""
+        return geometry_for(sample_data, roi_name)
 
     def preview_recipe(self):
         if not self.recipe_steps:
@@ -998,108 +935,220 @@ class CrossChannelAnalyzerWindow(QMainWindow):
         draw_proximity_bridges(viewer, df, shape, spacing)
 
     def run_batch_analysis(self):
+        """Run on every sample, at the region picked here.
+
+        Kept as it was -- this window has no tree to take a selection from.
+        The work happens in `run_relational_recipe`, which the main window
+        calls with the checked leaves instead.
+        """
         if not self.recipe_steps:
             return
-
-        # 1. Ask for an Analysis Name (to create a subfolder)
-        roi_name = self._selected_region()
-        analysis_name, ok = QInputDialog.getText(self, "Batch Run", "Enter name for this analysis:")
+        analysis_name, ok = QInputDialog.getText(
+            self, "Batch Run", "Enter name for this analysis:")
         if not ok or not analysis_name:
             return
 
-        # 2. Setup root results folder
-        project_root = os.path.dirname(self.pm.project_path)
-        batch_out_dir = os.path.join(project_root, "RELATIONAL_ANALYSIS", analysis_name)
-        os.makedirs(batch_out_dir, exist_ok=True)
+        roi_name = self._selected_region()
+        targets = [(s, roi_name) for s in sorted(self.pm.sample_registry)]
+        out_dir = run_relational_recipe(
+            self.pm, self.recipe_steps, analysis_name, targets, parent=self)
+        if out_dir:
+            QMessageBox.information(
+                self, "Success", f"Batch Complete!\nResults saved to: {out_dir}")
 
-        # 3. Save the recipe itself for reproducibility
-        # Record which region the run covered, so a results folder is
-        # self-describing rather than depending on someone remembering.
+
+
+
+# ============================================================================
+# Running a recipe. Scope is a list of targets rather than "every sample", so
+# the caller decides -- the analyzer passes every sample, and the main window
+# passes whatever is checked in the project tree, which can mix full images
+# and regions freely.
+# ============================================================================
+
+def geometry_for(sample_data: dict, roi_name):
+    """(shape, spacing) for a sample, honouring the selected region.
+
+    A region's masks are the CROP, so its shape and spacing must come from the
+    region rather than the channel's full-resolution TIFF -- memmapping a
+    region's mask against the full shape would read past the end of the file.
+    Returns (None, None) when it cannot be determined.
+    """
+    first_ch = list(sample_data.values())[0]
+    if roi_name:
+        from .roi_sharing import region_geometry
+        geo = region_geometry(first_ch, roi_name)
+        if geo is None:
+            return None, None
+        return geo["shape"], geo["spacing"]
+
+    tif_path = next((os.path.join(first_ch, f) for f in os.listdir(first_ch)
+                     if f.lower().endswith((".tif", ".tiff"))), None)
+    if not tif_path:
+        return None, None
+    with tiff.TiffFile(tif_path) as tif:
+        shape = tuple(int(s) for s in tif.series[0].shape)
+    meta, _mode = get_sample_metadata(first_ch)
+    if not meta:
+        # No usable dimension block. Previously this fell through to a
+        # spacing of 1.0/N per axis, which is a physical scale nobody
+        # supplied; every distance the analysis then reported was wrong and
+        # still labelled microns. The caller documents (None, None) as
+        # "could not be determined" and handles it.
+        print(f"[cross-channel] {first_ch}: config has no usable "
+              f"dimension block; geometry cannot be determined.")
+        return None, None
+
+    # A (C, Z, Y, X) or (C, Y, X) file would otherwise hand back a shape the
+    # .dat memmaps do not have. How many trailing axes are spatial comes from
+    # the dimension block's rank -- a 'z' extent means a stack -- because a
+    # 3-axis array may be (Z, Y, X) or (C, Y, X) and the array cannot say
+    # which. This used to read the mode string, which is now the same for
+    # both ranks, so `want` was always 3 and a 2D project's (C, Y, X) file
+    # kept its channel axis as if it were Z. Keep exactly the `want` trailing
+    # spatial axes and drop any leading (channel) axes. Do NOT squeeze
+    # singleton axes generally: a genuine thin-Z volume is (1, Y, X) and must
+    # stay 3D, or the 3D viewport and turntable would be lost for
+    # single-channel / few-slice samples.
+    want = 3 if meta.get('z') is not None else 2
+    if len(shape) > want:
+        shape = shape[-want:]
+    if len(shape) < want:
+        print(f"[cross-channel] {first_ch}: config describes a {want}D "
+              f"acquisition but the image has shape {shape}; geometry "
+              f"cannot be determined.")
+        return None, None
+
+    axes = ('z', 'y', 'x') if want == 3 else ('y', 'x')
+    spacing = []
+    for axis, count in zip(axes, shape):
         try:
-            with open(os.path.join(batch_out_dir, "region.txt"), 'w') as f:
-                f.write((roi_name or "Full image") + "\n")
-        except OSError:
-            pass
-        with open(os.path.join(batch_out_dir, "recipe.yaml"), 'w') as f:
-            yaml.dump(self.recipe_steps, f)
+            total = float(meta.get(axis))
+        except (TypeError, ValueError):
+            total = 0.0
+        if not (total > 0 and count):
+            print(f"[cross-channel] {first_ch}: no usable {axis!r} extent "
+                  f"in the config; refusing to invent a spacing.")
+            return None, None
+        spacing.append(total / count)
+    return shape, tuple(spacing)
 
-        # 4. Process all samples
-        samples = sorted(list(self.pm.sample_registry.keys()))
-        total = len(samples)
-        
-        QApplication.setOverrideCursor(Qt.WaitCursor)
-        print(f"\n{'='*60}\nSTARTING RELATIONAL BATCH: {analysis_name}\n{'='*60}")
-        
-        try:
-            for i, s_name in enumerate(samples):
-                print(f"Processing {i+1}/{total}: {s_name}...")
-                sample_data = self.pm.sample_registry[s_name]
-                
-                # Shape/spacing for this sample, from the region when one is
-                # selected. Samples lacking that region are skipped with a note
-                # rather than analysed against the wrong geometry.
-                shape, spacing = self._geometry_for(sample_data, roi_name)
-                if shape is None:
-                    print(f"  [Skip] {s_name}: "
-                          + (f"region {roi_name!r} not available in every channel"
-                             if roi_name else "no readable image"))
-                    continue
+def targets_from_leaf_keys(leaf_keys):
+    """[(sample_name, roi_name)] for the project tree's checked leaves.
 
-                # Sample-specific output folder, kept separate per region.
-                sample_out = os.path.join(batch_out_dir, s_name) if not roi_name \
-                    else os.path.join(batch_out_dir, s_name, _safe_name(roi_name))
+    A leaf key is "<sample_folder>" or "<sample_folder>::<region>", and the
+    folder is channel-specific -- checking all four channels of one image
+    yields four leaves for the same sample. The relational engine works on a
+    sample across every channel at once, so they collapse to one target.
+    Order is preserved so a run reads in the order the tree shows.
+    """
+    from .project_selection import split_leaf_key
 
-                # EXECUTE ENGINE
-                RelationalEngine.run_recipe(
-                    s_name, self.pm.sample_registry, self.recipe_steps,
-                    sample_out, shape, spacing, roi_name=roi_name
-                )
+    out, seen = [], set()
+    for key in leaf_keys or []:
+        folder, roi = split_leaf_key(key)
+        sample = os.path.basename(str(folder).rstrip("/\\"))
+        if not sample:
+            continue
+        if (sample, roi) in seen:
+            continue
+        seen.add((sample, roi))
+        out.append((sample, roi))
+    return out
 
-            QApplication.restoreOverrideCursor()
-            QMessageBox.information(self, "Success", f"Batch Complete!\nResults saved to: {batch_out_dir}")
-            print(f"\n{'='*60}\nBATCH FINISHED\n{'='*60}")
 
-        except Exception as e:
-            QApplication.restoreOverrideCursor()
-            print(f"FATAL ERROR IN BATCH: {e}")
-            traceback.print_exc()
-            QMessageBox.critical(self, "Batch Error", str(e))
-            # Without this the summary block below still runs and can report
-            # "Successfully generated" for a batch that died.
-            return
+def run_relational_recipe(pm, recipe_steps, analysis_name, targets, parent=None):
+    """Run `recipe_steps` over `targets`, returning the output folder or None.
 
-        # 5. Create Master Summary Tables
-        all_csvs = []
-        all_summaries = []
-        for s_name in samples:
-            leaf_dir = os.path.join(batch_out_dir, s_name) if not roi_name \
+    `targets` is [(sample_name, roi_name_or_None)]. Mixing full images and
+    regions in one run is allowed and normal: each target writes to its own
+    leaf under <analysis>/<sample>[/<region>]/, which is the layout
+    list_relational_analyses already reads back.
+    """
+    if not recipe_steps or not targets:
+        return None
+
+    project_root = os.path.dirname(pm.project_path)
+    batch_out_dir = os.path.join(project_root, "RELATIONAL_ANALYSIS", analysis_name)
+    os.makedirs(batch_out_dir, exist_ok=True)
+
+    with open(os.path.join(batch_out_dir, "recipe.yaml"), "w") as fh:
+        yaml.dump(list(recipe_steps), fh)
+
+    # Replaces the old single-line region.txt, which recorded ONE region for
+    # the whole analysis. That was true only while a run was "all samples, one
+    # region"; a run over checked leaves can span several regions and full
+    # images at once, and a file claiming otherwise would be worse than none.
+    # Nothing ever read region.txt, so this loses no consumer.
+    try:
+        with open(os.path.join(batch_out_dir, "targets.txt"), "w") as fh:
+            for sample, roi in targets:
+                fh.write(f"{sample}\t{roi or 'Full image'}\n")
+    except OSError:
+        pass
+
+    total = len(targets)
+    QApplication.setOverrideCursor(Qt.WaitCursor)
+    print(f"\n{'='*60}\nSTARTING RELATIONAL RUN: {analysis_name}\n{'='*60}")
+    leaf_dirs = []
+    try:
+        for i, (s_name, roi_name) in enumerate(targets):
+            label = s_name + (f" [{roi_name}]" if roi_name else "")
+            print(f"Processing {i+1}/{total}: {label}...")
+            sample_data = pm.sample_registry.get(s_name)
+            if not sample_data:
+                print(f"  [Skip] {s_name}: not in the channel registry")
+                continue
+
+            shape, spacing = geometry_for(sample_data, roi_name)
+            if shape is None:
+                print(f"  [Skip] {label}: "
+                      + (f"region {roi_name!r} not available in every channel"
+                         if roi_name else "no readable image"))
+                continue
+
+            sample_out = os.path.join(batch_out_dir, s_name) if not roi_name \
                 else os.path.join(batch_out_dir, s_name, _safe_name(roi_name))
-            # run_recipe writes "_relational_metrics.csv"; nothing has ever
-            # written "_relational_results.csv", so this list was always empty
-            # and MASTER_RELATIONAL_RESULTS.csv was never produced.
-            csv_p = os.path.join(leaf_dir, f"{s_name}_relational_metrics.csv")
-            if os.path.exists(csv_p):
-                df = pd.read_csv(csv_p)
-                df['sample_name'] = s_name
-                all_csvs.append(df)
+            leaf_dirs.append((s_name, sample_out))
 
-            # The sample-level overlap figures already carry their own
-            # sample_name column, so they concatenate directly.
-            sum_p = os.path.join(leaf_dir, "overlap_summary.csv")
-            if os.path.exists(sum_p):
-                all_summaries.append(pd.read_csv(sum_p))
+            RelationalEngine.run_recipe(
+                s_name, pm.sample_registry, list(recipe_steps),
+                sample_out, shape, spacing, roi_name=roi_name
+            )
 
-        if all_csvs:
-            master_df = pd.concat(all_csvs, ignore_index=True)
-            master_df.to_csv(os.path.join(batch_out_dir, "MASTER_RELATIONAL_RESULTS.csv"), index=False)
-            print("Successfully generated MASTER_RELATIONAL_RESULTS.csv")
+        QApplication.restoreOverrideCursor()
+        print(f"\n{'='*60}\nRUN FINISHED\n{'='*60}")
+    except Exception as exc:                                    # noqa: BLE001
+        QApplication.restoreOverrideCursor()
+        print(f"FATAL ERROR IN RELATIONAL RUN: {exc}")
+        traceback.print_exc()
+        if parent is not None:
+            QMessageBox.critical(parent, "Run error", str(exc))
+        return None
 
-        if all_summaries:
-            master_sum = pd.concat(all_summaries, ignore_index=True)
-            master_sum.to_csv(
-                os.path.join(batch_out_dir, "MASTER_OVERLAP_SUMMARY.csv"), index=False)
-            print("Successfully generated MASTER_OVERLAP_SUMMARY.csv "
-                  "(one row per sample and channel pair)")
+    # Master tables, gathered from the leaves this run actually wrote.
+    all_csvs, all_summaries = [], []
+    for s_name, leaf_dir in leaf_dirs:
+        csv_p = os.path.join(leaf_dir, f"{s_name}_relational_metrics.csv")
+        if os.path.exists(csv_p):
+            df = pd.read_csv(csv_p)
+            df["sample_name"] = s_name
+            all_csvs.append(df)
+        sum_p = os.path.join(leaf_dir, "overlap_summary.csv")
+        if os.path.exists(sum_p):
+            all_summaries.append(pd.read_csv(sum_p))
+
+    if all_csvs:
+        pd.concat(all_csvs, ignore_index=True).to_csv(
+            os.path.join(batch_out_dir, "MASTER_RELATIONAL_RESULTS.csv"), index=False)
+        print("Successfully generated MASTER_RELATIONAL_RESULTS.csv")
+    if all_summaries:
+        pd.concat(all_summaries, ignore_index=True).to_csv(
+            os.path.join(batch_out_dir, "MASTER_OVERLAP_SUMMARY.csv"), index=False)
+        print("Successfully generated MASTER_OVERLAP_SUMMARY.csv "
+              "(one row per sample and channel pair)")
+
+    return batch_out_dir
 
 
 # ============================================================================

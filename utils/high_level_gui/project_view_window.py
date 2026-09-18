@@ -14,8 +14,12 @@ from PyQt5.QtWidgets import (  # type: ignore
 from .gui_text_utils import app_icon_path, clean_filename_for_matching
 from .cross_channel_window import (
     CrossChannelAnalyzerWindow, RecipeDock, list_relational_analyses,
-    open_sample_overlay, project_is_2d_for,
+    make_analysis_key, open_sample_overlay, project_is_2d_for,
+    run_relational_recipe, targets_from_leaf_keys,
 )
+# The region subfolder name the runner writes to; the overlay key must
+# match it exactly or the picker finds nothing.
+from .cross_channel_window import _safe_name as _safe_region_name
 from .metadata import MetadataExtractor
 from .project_manager import ProjectManager
 from .project_scaffolding import apply_template_config_to_project
@@ -85,6 +89,11 @@ class ProjectViewWindow(QMainWindow):
          lambda self: self.show_recipe_dock,
          "Build a cross-channel recipe here, against the images and regions "
          "checked in the tree."),
+        ("run_recipe", "Run Cross-Channel Recipe\u2026", "analysis",
+         lambda self: self.run_recipe_on_selection,
+         "Run the recipe in the dock on every checked image and region. "
+         "Enabled when the recipe has at least one step and something is "
+         "checked."),
         ("config_library", "Config Library\u2026", "library",
          lambda self: self.open_config_library_manager,
          "Browse, import, duplicate, rename and export the configs in your "
@@ -333,6 +342,13 @@ class ProjectViewWindow(QMainWindow):
         self._actions["set_config"].setEnabled(
             bool(checked) and len(keys) <= 1)
 
+        # The cross-channel run needs both halves: a recipe to run, and
+        # something to run it on. Its scope IS the checked set, so an empty
+        # selection is not "all of them" -- it is nothing.
+        dock = getattr(self, "_recipe_dock", None)
+        self._actions["run_recipe"].setEnabled(
+            bool(checked) and dock is not None and bool(dock.steps()))
+
         # Export run config is a single-folder, reproducibility action: enable it
         # only when exactly one checked folder actually has a processed run config.
         one = checked[0] if len(checked) == 1 else None
@@ -446,6 +462,67 @@ class ProjectViewWindow(QMainWindow):
 
         self._recipe_dock.show()
         self._recipe_dock.raise_()
+
+    def run_recipe_on_selection(self):
+        """Run the dock's recipe over the checked images and regions.
+
+        Scope comes from the tree rather than being "every sample", so one run
+        can cover a single image, a single region, or any mix -- which also
+        removes the reason the old window needed a Preview button to try a
+        recipe on one sample.
+        """
+        dock = getattr(self, "_recipe_dock", None)
+        if dock is None or not dock.steps():
+            QMessageBox.information(
+                self, "No recipe",
+                "Build a recipe first: Analysis \u2192 Cross-Channel Recipe\u2026")
+            return
+
+        view = self._content_view
+        targets = targets_from_leaf_keys(
+            view.checked_folders() if view is not None else [])
+        if not targets:
+            QMessageBox.information(
+                self, "Nothing selected",
+                "Check the images or regions to run on.")
+            return
+
+        pm = getattr(self, "project_manager", None)
+        if pm is None:
+            return
+        if not getattr(pm, "sample_registry", None):
+            try:
+                pm.build_consolidated_sample_registry()
+            except Exception:
+                pass
+
+        n_roi = sum(1 for _s, r in targets if r)
+        scope = (f"{len(targets)} target(s): {len(targets) - n_roi} full image(s)"
+                 f" and {n_roi} region(s)")
+        analysis_name, ok = QInputDialog.getText(
+            self, "Run cross-channel recipe",
+            f"{scope}\n\nName for this analysis:")
+        if not ok or not analysis_name:
+            return
+
+        out_dir = run_relational_recipe(
+            pm, dock.steps(), analysis_name, targets, parent=self)
+        if not out_dir:
+            return
+
+        self._rescan_analyses()
+        if QMessageBox.question(
+                self, "Run complete",
+                f"Results saved to:\n{out_dir}\n\nOpen them now?",
+                QMessageBox.Open | QMessageBox.Close,
+                QMessageBox.Open) == QMessageBox.Open:
+            sample, roi = targets[0]
+            self._open_overlay_for(sample, make_analysis_key(
+                analysis_name, _safe_region_name(roi) if roi else None))
+
+    def _open_overlay_for(self, sample_name, analysis_key):
+        open_sample_overlay(self.project_manager, sample_name,
+                            analysis_name=analysis_key, parent=self)
 
     def open_path(self, selected_path: str) -> None:
         """
