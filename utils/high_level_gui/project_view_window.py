@@ -346,9 +346,14 @@ class ProjectViewWindow(QMainWindow):
         # The cross-channel run needs both halves: a recipe to run, and
         # something to run it on. Its scope IS the checked set, so an empty
         # selection is not "all of them" -- it is nothing.
-        # Spatial Null randomises within a project, so it needs a
-        # multichannel project but not a recipe or a selection.
-        self._actions["spatial_null"].setEnabled(bool(self._channel_dirs))
+        # Both cross-channel entries need a multichannel project, and neither
+        # needs a selection or a recipe. Gated here rather than switched on at
+        # each place a project opens: three call sites did that for the old
+        # analyzer action, and deleting the action left three stale lookups
+        # that only raised KeyError when a project was opened.
+        _multi = bool(self._channel_dirs)
+        self._actions["recipe_dock"].setEnabled(_multi)
+        self._actions["spatial_null"].setEnabled(_multi)
 
         dock = getattr(self, "_recipe_dock", None)
         can_run = bool(checked) and dock is not None and bool(dock.steps())
@@ -650,7 +655,6 @@ class ProjectViewWindow(QMainWindow):
         self.project_manager.project_path = info.path
         self._cross_scan_dir = info.path
         self._project_root = info.path
-        self._actions["cross_channel"].setEnabled(True)
         self.project_path_label.setText(f"Project Path: {info.path}")
         self._load_or_organize(info.path)
 
@@ -700,7 +704,6 @@ class ProjectViewWindow(QMainWindow):
         # project root) is what gets scanned for sibling channels.
         self._cross_scan_dir = info.channel_dirs[0] if info.channel_dirs else info.path
         self.project_manager.project_path = self._cross_scan_dir
-        self._actions["cross_channel"].setEnabled(True)
         self._update_action_buttons()
 
     def _delete_checked_regions(self) -> None:
@@ -1894,7 +1897,6 @@ class ProjectViewWindow(QMainWindow):
             if self.welcome is not None:
                 self.welcome.refresh_recents()
 
-        self._actions["cross_channel"].setEnabled(True)
         self._update_action_buttons()
 
     def set_channel_config(self) -> None:
