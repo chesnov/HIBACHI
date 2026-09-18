@@ -60,10 +60,40 @@ from sklearn.decomposition import PCA
 
 
 def _core_is_elongated(coords_local, spacing, max_aspect, ndim):
-    """PCA elongation test with correct handling of the degenerate case.
-    A near-zero smallest principal axis means an (effectively) 1-voxel-thick
-    line, i.e. maximally elongated -> True. Fewer than 11 voxels -> not judged
-    (False). Same rule used by the first-pass check and the recovery re-check."""
+    """PCA elongation test, largest principal axis over smallest.
+
+    The rule is the original one -- ``sqrt(ev[0] / ev[-1]) > max_aspect``, in
+    physical units -- with one correction: a DEGENERATE smallest axis is judged
+    on the axes that remain instead of being rejected outright.
+
+    The previous code rejected whenever the smallest eigenvalue was near zero,
+    on the reasoning that a vanishing axis means "an (effectively) 1-voxel-thick
+    line". That holds when two axes vanish. When only ONE does, the core is
+    coplanar -- a flat sheet, not a line -- and a perfectly round disc lying in
+    a single z plane was being thrown away as maximally elongated. Measured on
+    an 11-plane stack: a 197-voxel circular disc one plane thick scored
+    identically to a 1x1x200 line. Single-plane cores are the common case in a
+    stack that shallow, not a rare degeneracy: of 125 labels in the reported
+    volume, 55 were only one or two planes deep.
+
+    So the number of non-degenerate axes is counted, and elongation is measured
+    across those:
+
+    * two or more left -> ``sqrt(ev[0] / ev[k-1])`` over the non-degenerate
+      axes. With nothing degenerate this is exactly the original expression, so
+      isotropic data is unaffected; coplanar cores fall back to their in-plane
+      elongation, which is the thing actually being asked about.
+    * fewer than two   -> all the spread is on one axis (or none). That IS a
+      line, and is rejected as before.
+
+    Deliberately NOT changed to ``ev[0] / ev[1]``, which looks like the natural
+    "is it stretched out" measure but under-rejects badly here: with a 1 um z
+    step against 0.106 um pixels, ev[1] is often the z axis inflated by the
+    coarse spacing alone, and a 2x4x120 process scores 7.3 instead of 31.
+
+    Fewer than 11 voxels -> not judged (False), as before. Same rule used by the
+    first-pass check and the recovery re-check.
+    """
     if coords_local.shape[0] <= 10:
         return False
     try:
@@ -72,10 +102,17 @@ def _core_is_elongated(coords_local, spacing, max_aspect, ndim):
         ev = np.sort(np.abs(pca.explained_variance_))[::-1]
     except Exception:
         return False
-    smallest = ev[-1]
-    if smallest <= 1e-12:
+    if ev.size == 0 or ev[0] <= 1e-12:
+        # No spread at all; nothing to judge.
+        return False
+    # Degeneracy relative to the largest axis, so the test does not depend on
+    # the units the spacing happens to be in. An axis carrying ~1e-9 of the
+    # leading variance contributes no shape information.
+    non_degenerate = ev[ev > ev[0] * 1e-9]
+    if non_degenerate.size < 2:
         return True
-    return (math.sqrt(ev[0]) / math.sqrt(smallest)) > max_aspect
+    return (math.sqrt(non_degenerate[0])
+            / math.sqrt(non_degenerate[-1])) > max_aspect
 
 
 def _finalize_core(coords, dt_vals, spacing, min_seed_vol, max_aspect, ndim):
@@ -241,6 +278,90 @@ def get_min_distance_pixels(
     return pixels_from_physical(spacing, physical_distance,
                                 min_pixels=3, label=label)
 
+
+#: Largest footprint radius, in voxels, allowed on any one axis. A physical
+#: separation divided by a very fine in-plane spacing can ask for a footprint
+#: bigger than the image; this bounds the array that gets built (and pickled to
+#: every worker) rather than letting one parameter allocate unboundedly.
+_MAX_FOOTPRINT_RADIUS = 64
+
+
+def peak_separation_footprint(
+    spacing: Sequence[float], physical_distance: float, ndim: int,
+) -> np.ndarray:
+    """Boolean footprint enclosing everything within `physical_distance`.
+
+    Exists because `peak_local_max(min_distance=N)` treats N as a voxel count
+    and applies it to EVERY axis. `get_min_distance_pixels` measures against the
+    finest IN-PLANE axis, so on anisotropic data the resulting N is large in
+    voxel terms and, applied to z, demands a separation far beyond what was
+    asked for: 2 um at 0.1 um/px in-plane is 20 px, and enforcing 20 PLANES in a
+    stack 11 planes deep means two somata at different z can never both be
+    kept. The sibling `exclude_border` comment below records the same units
+    confusion being fixed for the border; this is the footprint half of it.
+
+    The footprint is an ellipsoid in voxel space -- a ball of radius
+    `physical_distance` in PHYSICAL space -- so "2 um apart" means the same
+    thing along every axis. Note this is also slightly less suppressive than the
+    old box on isotropic data, since a box's corners reach past the radius it
+    was built from; that difference is in the direction of the stated parameter.
+    """
+    radii = []
+    clipped = False
+    for sp in list(spacing)[:ndim]:
+        r = int(round(float(physical_distance) / float(sp)))
+        r = max(1, r)
+        if r > _MAX_FOOTPRINT_RADIUS:
+            r = _MAX_FOOTPRINT_RADIUS
+            clipped = True
+        radii.append(r)
+    if clipped:
+        print(f"  [soma] peak separation footprint clipped to "
+              f"{_MAX_FOOTPRINT_RADIUS} voxels on at least one axis; "
+              f"{physical_distance} um is very large next to this spacing.")
+
+    grids = np.ogrid[tuple(slice(-r, r + 1) for r in radii)]
+    norm = sum((g / r) ** 2 for g, r in zip(grids, radii))
+    return norm <= 1.0
+
+
+def dedupe_peaks_physical(peaks, values, spacing, physical_distance):
+    """Keep the strongest peak in each `physical_distance` neighbourhood.
+
+    `peak_local_max` has no tie-breaking: every voxel of a plateau that is
+    maximal within the footprint comes back as its own peak. On this data
+    plateaus are the norm rather than the exception -- a core spanning every
+    plane of its own crop has no background above or below it, so z contributes
+    nothing to the distance transform and an entire z column shares one DT
+    value. A round blob three planes deep therefore returned three "peaks" at
+    the same (y, x).
+
+    That matters because `len(peaks) > 1` is what triggers the clump-splitting
+    watershed. Three markers down one column split a single soma into three
+    slices, each of which then has to clear `min_fragment_size` on its own --
+    so a soma that would have been placed whole can be dropped entirely. The
+    within-label separation gate would have discarded the duplicates later
+    anyway, but only after the split had already fragmented the core.
+
+    Greedy in descending peak value, which is what the footprint was meant to
+    achieve and is unaffected by ties.
+    """
+    peaks = np.asarray(peaks)
+    if peaks.shape[0] <= 1:
+        return peaks
+    phys = peaks * np.asarray(spacing, dtype=float)
+    order = np.argsort(np.asarray(values), kind="stable")[::-1]
+    kept: List[int] = []
+    for idx in order:
+        p = phys[idx]
+        if all(float(np.linalg.norm(p - phys[k])) >= physical_distance
+               for k in kept):
+            kept.append(int(idx))
+    # Back to the order peak_local_max produced, so marker numbering (and hence
+    # the watershed's label ids) does not depend on DT ties.
+    return peaks[sorted(kept)]
+
+
 # --------------------------------------------------------------------------
 # Candidate generation, split out so it can run in parallel
 # --------------------------------------------------------------------------
@@ -260,6 +381,8 @@ def _generate_label_candidates(
     intensity_smooth_um: float,
     intensity_weight: float,
     int_peak_sep: int,
+    peak_footprint: np.ndarray,
+    peak_separation_um: float,
     memmap_voxel_threshold: int,
     show_tile_bar: bool = True,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
@@ -523,18 +646,28 @@ def _generate_label_candidates(
 
                 # exclude_border=False is REQUIRED here, not cosmetic.
                 # peak_local_max defaults exclude_border to min_distance and
-                # applies it to EVERY axis. int_peak_sep comes from the lateral
-                # spacing, so on anisotropic data it is large in voxel terms
-                # (2.5 um / 0.156 um = 16 px). A z stack a few slices deep is
-                # then entirely inside the excluded border and peak_local_max
-                # returns nothing: `len(peaks) > 1` was never true and the
+                # applies it to EVERY axis. A z stack a few slices deep is then
+                # entirely inside the excluded border and peak_local_max returns
+                # nothing: `len(peaks) > 1` was never true and the
                 # clump-splitting watershed below never executed on a single
                 # fragment. Measured on a 2 um z-step Hoechst stack: 0 peaks for
                 # every one of the 8 largest clumps, 2-6 peaks each once fixed.
+                #
+                # `footprint` rather than `min_distance` for the same reason, on
+                # the other axis of the same units confusion: min_distance is a
+                # voxel count applied isotropically, so an in-plane-derived
+                # value silently demanded that separation in PLANES too. See
+                # `peak_separation_footprint`.
                 peaks = peak_local_max(
-                    frag_dt, min_distance=int_peak_sep, labels=frag_crop,
+                    frag_dt, footprint=peak_footprint, labels=frag_crop,
                     exclude_border=False
                 )
+                # Collapse plateau ties, which the footprint alone cannot do.
+                if len(peaks) > 1:
+                    peaks = dedupe_peaks_physical(
+                        peaks, frag_dt[tuple(np.asarray(peaks).T)],
+                        spacing, peak_separation_um,
+                    )
 
                 if len(peaks) > 1:
                     markers = np.zeros(frag_crop.shape, dtype=np.int32)
@@ -708,6 +841,17 @@ def extract_soma_masks(
     int_peak_sep = get_min_distance_pixels(
         spacing, min_physical_peak_separation, label="min peak separation"
     )
+    # Built once here rather than per fragment: it depends only on the spacing
+    # and the requested separation, and it is pickled to each worker.
+    _peak_footprint = peak_separation_footprint(
+        spacing, min_physical_peak_separation, ndim
+    )
+    if ndim == 3 and len(set(float(s) for s in spacing)) > 1:
+        _fp_r = tuple((d - 1) // 2 for d in _peak_footprint.shape)
+        print(f"  Peak separation footprint: radii {_fp_r} voxels "
+              f"(= {min_physical_peak_separation:.2f} µm on every axis; "
+              f"an isotropic min_distance would have used "
+              f"{int_peak_sep} on all three)")
 
     # Find labels via slices (efficient bounding boxes)
     slices = ndimage.find_objects(segmentation_mask)
@@ -851,6 +995,8 @@ def extract_soma_masks(
         max_allowed_core_aspect_ratio=max_allowed_core_aspect_ratio,
         intensity_smooth_um=intensity_smooth_um,
         intensity_weight=intensity_weight, int_peak_sep=int_peak_sep,
+        peak_footprint=_peak_footprint,
+        peak_separation_um=float(min_physical_peak_separation),
         memmap_voxel_threshold=memmap_voxel_threshold,
     )
 
