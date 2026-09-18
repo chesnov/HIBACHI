@@ -297,6 +297,40 @@ class RelationalEngine:
         return out
 
     @staticmethod
+    def _name_overlap_mask(mask_path, out_dir, overlap_name):
+        """Move a step's overlap mask to a self-describing filename.
+
+        The viewer lists the `.dat` files in a result folder and names each
+        layer after the FILE, so the filename is what a reader actually sees --
+        the descriptive name the engine puts in `results_to_viz` never reaches
+        a reopened analysis.
+
+        Those filenames said the wrong thing. Depending on which code path
+        built the mask it was either `intersection_<partner>.dat`, which names
+        only one of the two channels and reads as if it were that channel's
+        data, or `step_<i>_relate.dat`, which names the step's position and
+        not its content. Same result, two names, neither of them the answer to
+        "what am I looking at".
+
+        One name for it: `overlap_<primary>_in_<partner>.dat`, matching how the
+        CSVs are named. Returns the new path, or the old one if the move fails
+        -- a mask under an ugly name beats no mask.
+        """
+        safe = "".join(c if (c.isalnum() or c in "-_") else "_"
+                       for c in str(overlap_name))
+        dest = os.path.join(out_dir, f"overlap_{safe}.dat")
+        if os.path.abspath(dest) == os.path.abspath(mask_path):
+            return mask_path
+        try:
+            if os.path.exists(dest):
+                os.remove(dest)
+            os.replace(mask_path, dest)
+            return dest
+        except OSError as exc:
+            print(f"  [Warn] could not rename overlap mask: {exc}")
+            return mask_path
+
+    @staticmethod
     def channel_name_registry(channel_keys):
         """Column-safe name per channel key: the channel number.
 
@@ -576,9 +610,8 @@ class RelationalEngine:
                         # this step then built a differently-labelled mask, the
                         # first one is a superseded intermediate. Leaving it on
                         # disk put TWO derived layers in the viewer for one
-                        # step -- `intersection_<partner>` and
-                        # `step_<i>_relate` -- differing only in labelling, with
-                        # nothing to say which was the step's actual result.
+                        # step, differing only in labelling, with nothing to
+                        # say which was the step's actual result.
                         if inter_path and os.path.abspath(inter_path) != os.path.abspath(mask_path):
                             try:
                                 os.remove(inter_path)
@@ -586,6 +619,10 @@ class RelationalEngine:
                                 pass
                             inter_path = None
 
+                        mask_path = RelationalEngine._name_overlap_mask(
+                            mask_path, out_dir, overlap_name)
+                        if inter_path:
+                            inter_path = mask_path
                         results_to_viz.append({"name": overlap_name, "path": mask_path})
 
                         if want_regions:
@@ -603,8 +640,14 @@ class RelationalEngine:
                             parent_id_map = mapping
 
                     elif inter_path:
+                        # Measured but not kept: still the overlap of these two
+                        # channels, so it is named like one.
+                        inter_path = RelationalEngine._name_overlap_mask(
+                            inter_path, out_dir,
+                            f"{active_mask_name}_in_{partner_bio_name}")
                         results_to_viz.append(
-                            {"name": f"Overlap ({partner_bio_name})", "path": inter_path})
+                            {"name": os.path.basename(inter_path)[:-4],
+                             "path": inter_path})
 
                     if primary_df.empty:
                         if not partner_df.empty:
