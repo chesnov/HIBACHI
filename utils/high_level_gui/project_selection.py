@@ -1085,6 +1085,12 @@ if _HAVE_QT:
             self.tree.setColumnWidth(2, 200)
             self.tree.setSelectionMode(QAbstractItemView.ExtendedSelection)
             self.tree.setRootIsDecorated(self._multichannel)
+            # Double-click is bound to "open this row" below, and QTreeWidget
+            # ALSO toggles expansion on double-click by default. So opening a
+            # sample's multichannel view collapsed the row it was opened from,
+            # and the tree had to be re-expanded every time. The disclosure
+            # arrow still expands, and so does the keyboard.
+            self.tree.setExpandsOnDoubleClick(False)
             self.tree.itemDoubleClicked.connect(self._on_double_click)
             self.tree.itemChanged.connect(self._on_item_changed)
             root.addWidget(self.tree)
