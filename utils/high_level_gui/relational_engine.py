@@ -235,7 +235,8 @@ class RelationalEngine:
         # what the spatial null randomises, so losing them broke that path.
         safe = "".join(ch if ch.isalnum() or ch in "-_" else "_"
                        for ch in str(mask_name))
-        csv_path = os.path.join(out_dir, f"{sample_name}_{safe}_metrics.csv")
+        # One row per overlap REGION, not per object of either channel.
+        csv_path = os.path.join(out_dir, f"per_overlap_region_{safe}.csv")
         metrics_df.to_csv(csv_path, index=False)
         print(f"  [Intersect Metrics] Saved {len(metrics_df)} objects → {csv_path}")
     
@@ -297,49 +298,51 @@ class RelationalEngine:
 
     @staticmethod
     def channel_name_registry(channel_keys):
-        """Short, unique, column-safe name per channel key.
+        """Column-safe name per channel key: the channel number.
 
-        These names end up in CSV headers (`pct_of_<partner>_occupied_by_
-        <primary>`), in derived mask filenames and in viewer layer names, so
-        they have to identify the channel and they have to differ from one
-        another.
+        These names go into CSV headers (`pct_of_<partner>_occupied_by_
+        <primary>`), derived mask filenames and viewer layer names.
 
-        The previous rule was `ch_key.split('_', 2)[-1]` -- the last chunk of
-        the folder name. That gives "Microglia" for `Channel_0_Microglia`, but
-        for any other layout it takes whatever the folder happens to end with.
-        On a project whose channel folders end in the config name, EVERY
-        channel resolved to the same word, producing headers like
-        `total_vol_of_default_inside_this_default` where primary and partner
-        were different channels with identical names.
+        The number, not the folder's suffix. The suffix is a PRESET label
+        recorded at project setup -- `channel_target_name` builds it from the
+        chosen config's filename -- so it is only incidentally biological, it
+        never updates if the channel is later reprocessed with a different
+        config, and it is identical across channels whenever the reference
+        config was used. That last case produced headers like
+        `total_vol_of_default_inside_this_default`, where primary and partner
+        were different channels sharing one name.
 
-        So: take the marker suffix only when the folder really follows the
-        `Channel_<n>_<marker>` convention, fall back to the whole folder name
-        otherwise, and if two channels still collide, use the full key for the
-        colliding ones. A long header beats an ambiguous one.
+        The index is assigned per channel at setup and is unique by
+        construction, so `Channel_0` / `Channel_1` are stable, predictable, and
+        cannot collide. A folder that does not follow the convention at all
+        keeps its own name; only then can a clash arise, and the full key
+        settles it.
         """
         keys = list(channel_keys)
-
-        def short(key):
-            parts = str(key).split('_')
-            if len(parts) >= 3 and parts[0].lower() == 'channel':
-                return '_'.join(parts[2:])
-            return str(key)
-
-        names = {k: short(k) for k in keys}
-        by_name = {}
-        for k, v in names.items():
-            by_name.setdefault(v, []).append(k)
-        for v, ks in by_name.items():
-            if len(ks) > 1:
-                for k in ks:
-                    names[k] = str(k)
 
         def safe(text):
             out = "".join(c if (c.isalnum() or c in "-_") else "_"
                           for c in str(text)).strip("_")
             return out or "channel"
 
-        return {k: safe(v) for k, v in names.items()}
+        def numbered(key):
+            parts = str(key).split('_')
+            if len(parts) >= 2 and parts[0].lower() == 'channel' and parts[1].isdigit():
+                return f"Channel_{int(parts[1])}"
+            return safe(key)
+
+        names = {k: numbered(k) for k in keys}
+        if len(set(names.values())) != len(keys):
+            # Only reachable with hand-made folders, e.g. `Channel_0` beside
+            # `Channel_0_x`. An ugly name beats an ambiguous one.
+            seen = {}
+            for k, v in names.items():
+                seen.setdefault(v, []).append(k)
+            for v, ks in seen.items():
+                if len(ks) > 1:
+                    for k in ks:
+                        names[k] = safe(k)
+        return names
 
     @staticmethod
     def run_recipe(sample_name, registry, recipe, out_dir, shape, spacing,
@@ -606,7 +609,7 @@ class RelationalEngine:
                     if primary_df.empty:
                         if not partner_df.empty:
                             partner_df.to_csv(os.path.join(
-                                out_dir, f"coverage_stats_{partner_bio_name}.csv"), index=False)
+                                out_dir, f"per_object_{partner_bio_name}_coverage.csv"), index=False)
                         continue
                     # Rename the ID column for the final merge
                     id_col = f"id_{active_mask_name}"
@@ -623,7 +626,7 @@ class RelationalEngine:
                                   f"{partner_bio_name}; skipping merge. Columns: {list(primary_df.columns)}")
                             if not partner_df.empty:
                                 partner_df.to_csv(
-                                    os.path.join(out_dir, f"coverage_stats_{partner_bio_name}.csv"),
+                                    os.path.join(out_dir, f"per_object_{partner_bio_name}_coverage.csv"),
                                     index=False)
                             continue
 
@@ -646,36 +649,29 @@ class RelationalEngine:
 
                     # Save the Coverage Summary (Partner-view)
                     if not partner_df.empty:
-                        partner_df.to_csv(os.path.join(out_dir, f"coverage_stats_{partner_bio_name}.csv"), index=False)
+                        partner_df.to_csv(os.path.join(out_dir, f"per_object_{partner_bio_name}_coverage.csv"), index=False)
 
         # 5. Final Result Persistence
         #
-        # One primary is the overwhelmingly common case and keeps the historic
-        # filename. Several primaries in one recipe each get their own file,
-        # named for the primary, rather than being forced into one table on
-        # mismatched IDs.
+        # Named for what a row IS: one row per object of this primary. The
+        # sample prefix is gone -- the containing folder is already the sample
+        # -- and so is the one-primary special case: every primary simply gets
+        # its own file, which is what the multi-primary branch was doing by
+        # hand anyway.
         if final_tables:
-            if len(final_tables) == 1:
-                final_metrics_df = next(iter(final_tables.values()))
-                final_metrics_df.to_csv(
-                    os.path.join(out_dir, f"{sample_name}_relational_metrics.csv"),
-                    index=False)
-            else:
+            if len(final_tables) > 1:
                 print(f"  [Note] This recipe measured {len(final_tables)} different "
                       f"primaries. Their rows describe different objects, so they "
-                      f"cannot share a table -- writing one file each.")
-                for id_col, table in final_tables.items():
-                    primary_label = id_col[3:] if id_col.startswith("id_") else id_col
-                    safe = "".join(ch if ch.isalnum() or ch in "-_" else "_"
-                                   for ch in str(primary_label))
-                    table.to_csv(
-                        os.path.join(
-                            out_dir,
-                            f"{sample_name}_relational_metrics_{safe}.csv"),
-                        index=False)
-                # Returned for the viewer's proximity bridges, which can only
-                # draw one primary's lines.
-                final_metrics_df = next(iter(final_tables.values()))
+                      f"get one file each.")
+            for id_col, table in final_tables.items():
+                primary_label = id_col[3:] if id_col.startswith("id_") else id_col
+                safe = "".join(ch if ch.isalnum() or ch in "-_" else "_"
+                               for ch in str(primary_label))
+                table.to_csv(
+                    os.path.join(out_dir, f"per_object_{safe}.csv"), index=False)
+            # Returned for the viewer's proximity bridges, which can only draw
+            # one primary's lines.
+            final_metrics_df = next(iter(final_tables.values()))
 
         # 6. Sample-level Overlap Summary
         #

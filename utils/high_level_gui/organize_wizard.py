@@ -158,21 +158,44 @@ def detect_raw(raw_dir: str) -> Dict[str, object]:
     }
 
 
+#: Preset labels that say nothing about the channel. A preset label is a config
+#: filename stem, and `default.yaml` is the canonical reference config -- so
+#: "default" means "no custom config was chosen", which is true of every
+#: channel in the common case and therefore distinguishes none of them.
+_UNINFORMATIVE_PRESETS = {"default"}
+
+
 def channel_target_name(channel_idx: int, preset_key: str) -> str:
-    """Mirror the historical naming: 'Channel_0_Microglia' from preset 'Microglia (3D)'."""
-    first = preset_key.split()[0] if preset_key else f"ch{channel_idx}"
+    """'Channel_0_Microglia' from preset 'Microglia (3D)'; 'Channel_0' from 'default'.
+
+    The preset label is appended only when it carries information. Using the
+    reference config for every channel produced `Channel_0_default`,
+    `Channel_1_default` ... -- a suffix that is identical everywhere, tells you
+    nothing, and then leaked into analysis column headers.
+
+    Note the folder may now be a bare `Channel_<n>`, so anything parsing these
+    names must not require a trailing underscore (see
+    `existing_channel_indices`).
+    """
+    first = preset_key.split()[0] if preset_key else ""
     # keep it filesystem-safe
-    first = re.sub(r"[^A-Za-z0-9_-]", "", first) or f"ch{channel_idx}"
+    first = re.sub(r"[^A-Za-z0-9_-]", "", first)
+    if not first or first.lower() in _UNINFORMATIVE_PRESETS:
+        return f"Channel_{channel_idx}"
     return f"Channel_{channel_idx}_{first}"
 
 
 def existing_channel_indices(project_dir: str) -> List[int]:
-    """Channel indices already extracted, parsed from Channel_<n>_* folder names."""
+    """Channel indices already extracted, from `Channel_<n>` or `Channel_<n>_*`."""
     out: List[int] = []
     try:
         for item in os.listdir(project_dir):
             if os.path.isdir(os.path.join(project_dir, item)):
-                m = re.match(r"(?i)channel_(\d+)_", item)
+                # The trailing underscore is optional: a channel whose preset
+                # carried no information is a bare `Channel_<n>`. Requiring it
+                # made such a project read as single-channel, because
+                # project_view_window derives `is_multi` from this.
+                m = re.match(r"(?i)^channel_(\d+)(?:_|$)", item)
                 if m:
                     out.append(int(m.group(1)))
     except OSError:
