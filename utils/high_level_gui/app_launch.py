@@ -191,243 +191,6 @@ def _check_if_last_window() -> None:
     lifecycle("app.quit", reason="no project window and no open viewer")
     app.quit()
 
-
-# ---------------------------------------------------------------------------
-# Quit: HIBACHI owns it, not napari
-# ---------------------------------------------------------------------------
-# This is the fix for the macOS report where the app could not be closed and
-# had to be force-stopped. Its visible symptom was:
-#
-#     TypeError: After injecting dependencies for NO arguments,
-#     _close_app() missing 1 required positional argument: 'window'
-#
-# On macOS the menu bar belongs to the application rather than to a window, and
-# it outlives the window it came from. Once a napari viewer has been closed
-# (e.g. via "Back to Project List") the bar at the top of the screen is still
-# napari's, so Cmd+Q and File > Exit keep firing napari's own quit command,
-# `napari.window.file.quit_dialog`.
-#
-# That command's callback is `_close_app(window: Window)`. app-model fills
-# `window` in through in-n-out, whose provider is effectively
-# `_QtMainWindow.current()` -- and that is None once no viewer window is open,
-# because napari drops the window from its instance list on the Close event.
-# in-n-out omits any argument whose provider returns None, so the call arrives
-# as `_close_app()` and raises the TypeError above. The quit aborts, nothing
-# closes, and the only way out is to kill the process.
-#
-# The same command is also wrong for HIBACHI when a viewer IS open, which is
-# the quieter half of the same bug. It ends in napari's own `quit_app()`, and
-# that calls QApplication.quit() only when `applicationName() == "napari"`.
-# Ours is "HIBACHI" (see _apply_app_identity), so it takes the other branch
-# instead: close every window and clear the application icon. Since we also set
-# setQuitOnLastWindowClosed(False), closing the windows does not quit us
-# either -- so Quit would leave a live process with no windows and no Dock
-# icon. The same force-stop, just harder to spot.
-#
-# HIBACHI therefore takes the command over. Overwriting the registry entry
-# covers every trigger -- the File menu item, the Cmd+Q keybinding and the
-# stale macOS bar all go through the same command id -- because app-model's
-# QAction resolves the command by id at the moment it fires:
-#
-#     self._app.commands.execute_command(self._command_id)
-#
-# rather than holding on to the callback it was built with.
-
-_QUIT_COMMAND_ID = "napari.window.file.quit_dialog"
-
-_napari_quit_patched = False
-
-
-def _current_napari_window():
-    """napari's current Window, or None when no viewer window is open.
-
-    Deliberately mirrors napari's own `_provide_window` provider, since that is
-    the thing that returns None and triggers the TypeError described above.
-    """
-    try:
-        from napari._qt.qt_main_window import _QtMainWindow
-    except Exception:
-        return None
-    try:
-        qt_window = _QtMainWindow.current()
-        return qt_window._window if qt_window is not None else None
-    except Exception:
-        return None
-
-
-def quit_application(confirm: bool = True) -> bool:
-    """Quit HIBACHI from any trigger. Returns True if the quit actually began.
-
-    `app.quit()` is the one correct way out: it ends the app.exec_() loop in
-    segment.py, and every teardown step HIBACHI needs is already wired to
-    `aboutToQuit` -- _stop_running_qthreads_before_teardown here, and the
-    orphan-worker cleanup in gui_manager. It does not deliver closeEvent to
-    anything, so the project window cannot raise a second "Exit application?"
-    prompt on the way down.
-    """
-    app = QApplication.instance()
-    if app is None:
-        return False
-
-    if confirm:
-        # Parent the prompt to whatever window is in front so it appears there.
-        # None is fine and expected when the click came from the macOS menu bar
-        # with no window focused.
-        answer = QMessageBox.question(
-            app.activeWindow(), "Exit", "Exit application?",
-            QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
-        )
-        if answer != QMessageBox.Yes:
-            lifecycle("app.quit.cancelled", source="quit_command")
-            return False
-
-    lifecycle("app.quit", reason="quit requested by the user")
-    app.quit()
-    return True
-
-
-def _quit_command():
-    """app-model callback for Quit. Intentionally takes no arguments.
-
-    A required parameter is exactly what broke napari's `_close_app`. A
-    callback with no arguments and no annotations makes in-n-out skip injection
-    for it altogether (it returns such functions untouched), so this one cannot
-    fail for want of a window no matter where it is triggered from.
-    """
-    quit_application()
-
-
-def _is_missing_window_error(exc: BaseException) -> bool:
-    """True only for "app-model had no napari window to inject" TypeErrors.
-
-    Narrow on purpose. If a viewer window does exist, the same message means a
-    real bug somewhere else, and swallowing it would hide it.
-    """
-    if _current_napari_window() is not None:
-        return False
-    text = str(exc)
-    return "missing" in text and "required positional argument" in text
-
-
-def _skipped_command_future(command_id: str):
-    """A completed Future, so a skipped command still satisfies .result()."""
-    from concurrent.futures import Future
-
-    lifecycle("napari.command.skipped", command=command_id,
-              reason="no napari window open")
-    future: Future = Future()
-    future.set_result(None)
-    return future
-
-
-def _install_window_command_guard(app_model) -> None:
-    """Stop napari's other window actions from raising with no viewer open.
-
-    Quit is the one that had to be force-stopped, but it is not the only napari
-    command declared as `(window: Window)`: so are Close Window, Restart,
-    Preferences, Help > About, the Plugins dialogs and most of the View menu.
-    Every one of them raises the identical TypeError if it is triggered from a
-    stale macOS menu bar, and each would surface as its own crash report.
-
-    Rather than enumerate them -- the list moves between napari versions, and
-    plugins can add more -- this wraps the registry's command dispatch and
-    turns that one specific failure into a logged no-op. Doing nothing is the
-    correct behaviour here: these actions all operate on a viewer window that
-    is no longer there.
-    """
-    registry = getattr(app_model, "commands", None)
-    if registry is None or getattr(registry, "_hibachi_guarded", False):
-        return
-
-    original_execute = registry.execute_command
-
-    def _execute_command(command_id, *args, **kwargs):
-        try:
-            future = original_execute(command_id, *args, **kwargs)
-        except TypeError as exc:
-            if not _is_missing_window_error(exc):
-                raise
-            return _skipped_command_future(command_id)
-
-        # napari configures app-model to re-raise synchronously, which is the
-        # path above. When it is configured not to, the same failure arrives
-        # inside the future instead -- and QAction._on_triggered calls
-        # .result() on it, which re-raises. Cover both.
-        try:
-            if not future.done():
-                return future
-            exc = future.exception()
-        except Exception:
-            return future
-        if isinstance(exc, TypeError) and _is_missing_window_error(exc):
-            return _skipped_command_future(command_id)
-        return future
-
-    # Set on the instance: app-model's QAction reaches the method through the
-    # registry object, so an instance attribute shadows the class method for
-    # every existing and future action.
-    registry.execute_command = _execute_command
-    registry._hibachi_guarded = True
-
-
-def _patch_napari_quit() -> None:
-    """Point napari's Quit command at HIBACHI's, and guard the rest.
-
-    Called once from launch_image_segmentation_tool, after the QApplication
-    exists. Best-effort throughout: these are napari internals, so a napari
-    version that moves them must degrade to today's behaviour rather than stop
-    the app from starting.
-    """
-    global _napari_quit_patched
-    if _napari_quit_patched:
-        return
-
-    try:
-        from napari._app_model import get_app_model
-        from napari._qt._qapp_model.qactions import init_qactions
-    except Exception:
-        log.warning("Could not reach napari's app-model; leaving its Quit "
-                    "command in place (Cmd+Q may not quit on macOS).",
-                    exc_info=True)
-        return
-
-    try:
-        # napari normally does this inside _QtMainWindow.__init__, so the
-        # commands would not exist until the first viewer opened. It is
-        # lru_cached, so calling it here just moves it earlier and makes
-        # napari's later call a no-op -- and guarantees there is something to
-        # overwrite below even if the user never opens a sample.
-        init_qactions()
-        app_model = get_app_model()
-    except Exception:
-        log.warning("Could not initialise napari's app-model actions; "
-                    "leaving its Quit command in place.", exc_info=True)
-        return
-
-    registry = getattr(app_model, "commands", None)
-    if registry is not None:
-        try:
-            # register_command refuses to overwrite an existing id, and
-            # app-model exposes no public unregister -- but the disposer it
-            # hands back does nothing except pop this dict, so popping it here
-            # is that same operation.
-            if _QUIT_COMMAND_ID in registry:
-                registry._commands.pop(_QUIT_COMMAND_ID, None)
-            registry.register_command(_QUIT_COMMAND_ID, _quit_command, "Exit")
-            lifecycle("napari.quit_command.replaced", command=_QUIT_COMMAND_ID)
-        except Exception:
-            log.warning("Could not replace napari's Quit command %r; Cmd+Q may "
-                        "not quit HIBACHI on macOS.", _QUIT_COMMAND_ID,
-                        exc_info=True)
-
-    try:
-        _install_window_command_guard(app_model)
-    except Exception:
-        log.warning("Could not guard napari's window commands.", exc_info=True)
-
-    _napari_quit_patched = True
-
-
 def _layer_list_dock(viewer):
     """Locate napari's layer-list dock widget across versions, so we can place
     the toggle directly beneath it. Returns the QDockWidget or None."""
@@ -806,11 +569,21 @@ def build_segmentation_control_panel(viewer, gui_manager):
         "Delete a saved region and everything computed on it.\n"
         "Full-image results are not affected. Cannot be undone.",
     )
+    # Restart used to be a button on the "Resume previous session?" prompt that
+    # appeared every time a part-processed channel was opened. Removing that
+    # prompt would have left no way to start a channel over, so it is here --
+    # deliberate rather than in the way.
+    btn_restart = _compact_button(
+        "\u21ba Restart processing",
+        "Delete this channel's computed results and start from\n"
+        "Step 1. Asks for confirmation. Cannot be undone.",
+    )
     btn_draw.clicked.connect(gui_manager.draw_roi)
     btn_confirm.clicked.connect(gui_manager.confirm_roi)
     btn_clear.clicked.connect(gui_manager.clear_roi)
     btn_open.clicked.connect(gui_manager.open_roi_session)
     btn_delete.clicked.connect(gui_manager.delete_roi_session)
+    btn_restart.clicked.connect(gui_manager.restart_processing)
     for _b in (btn_draw, btn_confirm, btn_clear):
         roi_row.addWidget(_b)
     outer.addLayout(roi_row)
@@ -828,6 +601,10 @@ def build_segmentation_control_panel(viewer, gui_manager):
     # A hairline rather than a section header: the button labels itself.
     outer.addWidget(_hline())
     outer.addWidget(_compactify(make_channel_visibility_button(viewer)))
+
+    # ---- Start over -------------------------------------------------------- #
+    outer.addWidget(_hline())
+    outer.addWidget(btn_restart)
 
     # ---- Leave ------------------------------------------------------------ #
     outer.addWidget(_hline())
@@ -1120,18 +897,9 @@ def launch_image_segmentation_tool() -> QApplication:
     app = QApplication.instance() or QApplication(sys.argv)
     _apply_app_identity(app)
     
-    # Nothing closing a window may end the app on its own: closing a viewer
-    # must return to the project list, not quit, and HIBACHI decides when to
-    # exit (_check_if_last_window, the project window's closeEvent, and
-    # quit_application). Note this is NOT what fixes the `_close_app` TypeError
-    # on macOS -- see _patch_napari_quit below for that.
+    # Prevent Napari from attempting to shut down the global app lifecycle 
+    # when a viewer closes. This prevents the `_close_app` TypeError on macOS.
     app.setQuitOnLastWindowClosed(False)
-
-    # Take over napari's Quit command. Because we just told Qt not to quit on
-    # the last window, and because we are not called "napari", napari's own
-    # quit path can neither quit us nor even run when no viewer is open -- so
-    # HIBACHI owns Quit. This is the fix for the macOS force-stop.
-    _patch_napari_quit()
 
     # Stop any still-running QThreads (notably napari's StatusChecker) the moment
     # we quit, so they aren't destroyed while running -> prevents the SIGABRT
@@ -1187,15 +955,9 @@ def make_back_to_project_button(viewer: napari.Viewer, gui_manager: Any) -> QPus
                 if hasattr(v.window, '_qt_window'):
                     v.window._qt_window.hide()
 
-                # Use napari's own close() rather than qt_win.close(), so the
-                # viewer tears itself down through its normal path (dims stop,
-                # window settings saved, instance list updated).
-                #
-                # This does NOT prevent the macOS `_close_app` "missing window"
-                # TypeError, despite what this comment used to claim -- closing
-                # the viewer is what *creates* the condition for it, since it is
-                # what empties napari's window instance list while the macOS
-                # menu bar lives on. _patch_napari_quit is what handles that.
+                # CRITICAL FIX: Use Napari's native close() instead of qt_win.close().
+                # This ensures the internal app_model deregisters its actions properly
+                # and prevents the 'in_n_out missing window' TypeError on macOS.
                 lifecycle("napari.close.scheduled", delay_ms=50)
                 QTimer.singleShot(50, lambda: (lifecycle("napari.close.invoke"), v.close()))
             except Exception:

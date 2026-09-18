@@ -646,11 +646,9 @@ class DynamicGUIManager(QObject):
         Loads a saved ROI (sub-region) session for this image.
 
         `roi_name` selects one explicitly -- which is how the project view opens a
-        particular ROI row, and how a batch worker targets one. When it is None the
-        behaviour depends on how many regions are available: none means fall
-        through to the full image, one means ask as before, and several means
-        offer a picker, because a channel can hold "ROI 1", "ROI 2", ... and
-        silently loading the first would be a coin toss.
+        particular ROI row, and how a batch worker targets one. Without it this
+        does nothing and the caller falls through to the full image: opening a
+        channel means opening the channel.
 
         Regions are looked up with ``available_roi_sessions``, so the ones drawn
         in this sample's OTHER channels are offered here too. A region is a
@@ -678,33 +676,18 @@ class DynamicGUIManager(QObject):
             roi_dir = self._resolve_region(sample_dir, match, quiet=True)
             if roi_dir is None:
                 return False
-        elif not sessions:
-            return False
-        elif len(sessions) == 1:
-            only = sessions[0]
-            where = ("" if only["local"] else
-                     f"\n\nIt was drawn in {only['source_channel']}; opening it "
-                     "here will crop this channel to the same region.")
-            reply = QMessageBox.question(
-                None,
-                "ROI Session Found",
-                f"A saved region ('{only['name']}') was found for this image."
-                f"{where}\n\n"
-                "Load the ROI session?\n"
-                "(Choose 'No' to work on the full image instead.)",
-                QMessageBox.Yes | QMessageBox.No,
-            )
-            if reply != QMessageBox.Yes:
-                return False
-            roi_name = only["name"]
-            roi_dir = self._resolve_region(sample_dir, only)
-            if roi_dir is None:
-                return False
         else:
-            choice = self._pick_roi_session(sessions)
-            if choice is None or choice is self.FULL_IMAGE:
-                return False        # both mean "work on the full image"
-            roi_name, roi_dir = choice
+            # No `roi_name` means the caller asked for the CHANNEL, so that is
+            # what opens. Opening a channel used to interrupt with "a saved
+            # region was found -- load it?", or a picker when there were
+            # several, which asked about regions at the one moment the answer
+            # was already known: a region is opened by picking its row in the
+            # project view, which passes `roi_name` and never reaches here.
+            #
+            # Regions are not hidden by this. They are outlined on the full
+            # image by `_show_saved_region_layers`, and 'Open region' steps
+            # into one without reopening the viewer.
+            return False
 
         roi_json = os.path.join(roi_dir, "roi_polygon.json")
         if not os.path.exists(roi_json):
@@ -2138,25 +2121,18 @@ class DynamicGUIManager(QObject):
 
     def restore_from_checkpoint(self) -> None:
         """
-        Checks for existing outputs and prompts the user to Resume/View or Restart.
+        Load whatever is already on disk and carry on from there.
 
-        The choice is offered in an explicit loop rather than by mutual recursion
-        with _confirm_restart(). Declining the restart confirmation comes back
-        here to re-offer the choice, but a dismissal that is NOT an explicit
-        button press -- Escape, the window's close box, or a stray queued event
-        closing the modal -- is treated as the safe, non-destructive "just show
-        what's on disk" and ends the loop.
+        This used to prompt Resume/View or Restart on every open. Reopening a
+        channel to continue it is the reason for reopening it, so the question
+        had an obvious answer, and the destructive alternative does not belong
+        in front of the common case. Restart lives in the viewer instead.
 
-        This matters because QMessageBox.clickedButton() returns None on such a
-        dismissal. The previous code routed None into the `else` (Restart) path,
-        and _confirm_restart() then recursed back into this method, so a repeated
-        or automatic dismissal (a held Escape key, or an event delivered while
-        the dialog is shown right after the viewer window is raised/activated)
-        bounced between the two methods, stacking a new modal dialog and two
-        nested exec_() event loops each round until the machine became
-        unresponsive. Terminating on dismissal and looping instead of recursing
-        makes that runaway impossible.
+        `_confirm_restart` still asks before acting, because that is the
+        choice worth interrupting for: it deletes every computed output for
+        the channel.
         """
+
         checkpoint_step = self.strategy.get_last_completed_step()
 
         if checkpoint_step <= 0:
@@ -2192,39 +2168,37 @@ class DynamicGUIManager(QObject):
             if not is_complete and checkpoint_step < self.num_steps:
                 self.create_step_widgets(self.processing_steps[checkpoint_step])
 
-        while True:
-            msg = QMessageBox()
-            if is_complete:
-                msg.setText("All steps complete.")
-                msg.setInformativeText("View results or restart from beginning?")
-                accept_btn = msg.addButton("View Results", QMessageBox.YesRole)
-            else:
-                msg.setText("Resume previous session?")
-                msg.setInformativeText(f"Found data up to Step {checkpoint_step}.\n"
-                                       f"Resume from Step {checkpoint_step + 1}?")
-                accept_btn = msg.addButton("Resume", QMessageBox.YesRole)
-            restart_btn = msg.addButton("Restart", QMessageBox.NoRole)
-            # Escape / closing the dialog maps to the non-destructive choice, so
-            # a dismissal can never fall through to the destructive Restart path
-            # or re-open this prompt.
-            msg.setDefaultButton(accept_btn)
-            msg.setEscapeButton(accept_btn)
-            msg.exec_()
+        # Resume, without asking. Reopening a partly-processed channel used to
+        # stop on "Resume previous session? / Restart", which asks a question
+        # whose answer is obvious: you opened it to carry on. Restart is the
+        # rare, destructive one, so it is a button in the viewer rather than a
+        # gate in front of the common case.
+        #
+        # Loading what is on disk is also the outcome the old dialog already
+        # defaulted to on Escape or a dismissal, so this is the path that was
+        # taken anyway whenever the prompt was waved away.
+        if is_complete:
+            print("  [Checkpoint] all steps complete; showing saved results.")
+        else:
+            print(f"  [Checkpoint] resuming from step {checkpoint_step + 1} "
+                  f"(found data up to step {checkpoint_step}).")
+        _accept_existing()
 
-            if msg.clickedButton() is restart_btn:
-                # Explicit Restart request: confirm it. If the reset goes ahead
-                # we're done; if the user declines (or dismisses the confirm),
-                # loop once to re-offer the choice. _confirm_restart() no longer
-                # calls back into this method, so no recursive dialog stack can
-                # build up.
-                if self._confirm_restart():
-                    return
-                continue
+    def restart_processing(self) -> None:
+        """Delete this channel's computed outputs and start again from step 1.
 
-            # "View Results" / "Resume", or any dismissal (clickedButton() is
-            # None): settle on the existing results without re-prompting.
-            _accept_existing()
+        The viewer's entry point for what used to be the Restart button on the
+        open prompt. That prompt is gone, and this is the deliberate way to ask
+        for the same thing -- deliberate being the point, since it discards
+        every computed output for the channel. `_confirm_restart` does the
+        confirming.
+        """
+        if self.strategy.get_last_completed_step() <= 0:
+            QMessageBox.information(
+                None, "Nothing to restart",
+                "This channel has no saved results yet.")
             return
+        self._confirm_restart()
 
     def _confirm_restart(self) -> bool:
         """Confirm, then delete old files and restart from Step 1.
