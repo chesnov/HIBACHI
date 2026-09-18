@@ -90,11 +90,6 @@ class ProjectViewWindow(QMainWindow):
          "Randomise the segmented masks and re-measure, to see what the "
          "recipe's numbers look like by chance. Uses the recipe in the dock "
          "when there is one."),
-        ("run_recipe", "Run Cross-Channel Recipe\u2026", "analysis",
-         lambda self: self.run_recipe_on_selection,
-         "Run the recipe in the dock on every checked image and region. "
-         "Enabled when the recipe has at least one step and something is "
-         "checked."),
         ("config_library", "Config Library\u2026", "library",
          lambda self: self.open_config_library_manager,
          "Browse, import, duplicate, rename and export the configs in your "
@@ -355,9 +350,11 @@ class ProjectViewWindow(QMainWindow):
         self._actions["recipe_dock"].setEnabled(_multi)
         self._actions["spatial_null"].setEnabled(_multi)
 
+        # Running is a button on the recipe dock, not a menu entry: it acts on
+        # the recipe, which lives there, and a menu item for it sat greyed out
+        # next to the entry that opens the dock -- two entries for one thing.
         dock = getattr(self, "_recipe_dock", None)
         can_run = bool(checked) and dock is not None and bool(dock.steps())
-        self._actions["run_recipe"].setEnabled(can_run)
         if dock is not None:
             # The panel knows whether there is a recipe; only the window knows
             # whether anything is checked, so the final say is here.
