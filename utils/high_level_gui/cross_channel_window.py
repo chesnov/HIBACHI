@@ -972,6 +972,36 @@ def targets_from_leaf_keys(leaf_keys):
     return out
 
 
+def _clear_result_leaf(leaf_dir):
+    """Empty one sample's result folder before writing a fresh run into it.
+
+    Re-running under an analysis name that already exists used to leave the
+    previous run's files in place, because a run only overwrites the files it
+    happens to produce. Change the labelling between runs and the two produce
+    DIFFERENT filenames, so both survive -- and the viewer, which lists every
+    `.dat` it finds, then showed two derived masks for one step with no way to
+    tell which run each came from. Reading the stale one is reading the old
+    settings.
+
+    Scoped hard: only a directory inside RELATIONAL_ANALYSIS is touched, and
+    only its files, so a mistaken path cannot delete anything that was not
+    generated. Other samples' leaves are untouched, so adding a sample to an
+    existing analysis still works.
+    """
+    if not os.path.isdir(leaf_dir):
+        return
+    if "RELATIONAL_ANALYSIS" not in os.path.abspath(leaf_dir).split(os.sep):
+        print(f"  [Warn] refusing to clear {leaf_dir}: not a results folder")
+        return
+    for name in os.listdir(leaf_dir):
+        path = os.path.join(leaf_dir, name)
+        try:
+            if os.path.isfile(path):
+                os.remove(path)
+        except OSError as exc:
+            print(f"  [Warn] could not remove stale {name}: {exc}")
+
+
 def run_relational_recipe(pm, recipe_steps, analysis_name, targets, parent=None):
     """Run `recipe_steps` over `targets`, returning the output folder or None.
 
@@ -1024,6 +1054,7 @@ def run_relational_recipe(pm, recipe_steps, analysis_name, targets, parent=None)
 
             sample_out = os.path.join(batch_out_dir, s_name) if not roi_name \
                 else os.path.join(batch_out_dir, s_name, _safe_name(roi_name))
+            _clear_result_leaf(sample_out)
             leaf_dirs.append((s_name, sample_out))
 
             RelationalEngine.run_recipe(
