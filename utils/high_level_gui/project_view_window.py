@@ -13,7 +13,8 @@ from PyQt5.QtWidgets import (  # type: ignore
 
 from .gui_text_utils import app_icon_path, clean_filename_for_matching
 from .cross_channel_window import (
-    CrossChannelAnalyzerWindow, list_relational_analyses, open_sample_overlay,
+    CrossChannelAnalyzerWindow, RecipeDock, list_relational_analyses,
+    open_sample_overlay, project_is_2d_for,
 )
 from .metadata import MetadataExtractor
 from .project_manager import ProjectManager
@@ -80,6 +81,10 @@ class ProjectViewWindow(QMainWindow):
          lambda self: self.open_cross_channel_analyzer,
          "Compare channels of one sample, build relational recipes and view "
          "overlays."),
+        ("recipe_dock", "Cross-Channel Recipe\u2026", "analysis",
+         lambda self: self.show_recipe_dock,
+         "Build a cross-channel recipe here, against the images and regions "
+         "checked in the tree."),
         ("config_library", "Config Library\u2026", "library",
          lambda self: self.open_config_library_manager,
          "Browse, import, duplicate, rename and export the configs in your "
@@ -404,6 +409,43 @@ class ProjectViewWindow(QMainWindow):
         self.analyzer_window.show()
         self.analyzer_window.raise_()
         self.analyzer_window.activateWindow()
+
+    def show_recipe_dock(self):
+        """Show the cross-channel recipe dock, creating it on first use.
+
+        Channel choices come from the project's channel folders. The tree keys
+        channels by full path while the relational engine keys them by folder
+        basename, so the basename is what goes into a recipe step -- that is
+        the key `pm.sample_registry` uses and therefore the one the engine can
+        resolve per sample.
+        """
+        if not getattr(self, "_channel_dirs", None):
+            QMessageBox.information(
+                self, "Multichannel only",
+                "Cross-channel recipes need a multichannel project.")
+            return
+
+        if getattr(self, "_recipe_dock", None) is None:
+            def _channels():
+                return [(os.path.basename(d.rstrip("/\\")),
+                         os.path.basename(d.rstrip("/\\")))
+                        for d in self._channel_dirs]
+
+            def _is_2d():
+                pm = getattr(self, "project_manager", None)
+                reg = getattr(pm, "sample_registry", None) if pm else None
+                if not reg and pm is not None:
+                    try:
+                        reg = pm.build_consolidated_sample_registry()
+                    except Exception:
+                        reg = {}
+                return project_is_2d_for(reg or {})
+
+            self._recipe_dock = RecipeDock(_channels, _is_2d, self)
+            self.addDockWidget(Qt.RightDockWidgetArea, self._recipe_dock)
+
+        self._recipe_dock.show()
+        self._recipe_dock.raise_()
 
     def open_path(self, selected_path: str) -> None:
         """
@@ -907,70 +949,18 @@ class ProjectViewWindow(QMainWindow):
         except Exception:
             organized = set()
 
-        # 1. Does this file's OWN name already name an organized sample?
-        #
-        # Answered from the name alone, before the file is touched, which is
-        # what makes it work for the two cases the scene-key probe below cannot
-        # reach:
-        #
-        # * TIFF and CZI. `list_sources` only enumerates the multi-image
-        #   formats -- whole-slide files through slideio, .lif, and Zarr
-        #   stores. TIFF and CZI are read by their own libraries (tifffile,
-        #   aicspylibczi) and are deliberately excluded from the slideio format
-        #   table, so it returns [] for them. Relying on it alone therefore
-        #   sent the three commonest formats past every check and into the
-        #   "could not read it as an image" warning -- immediately after setup
-        #   had organized them, and while listing .czi among the readable
-        #   formats in the same dialog.
-        #
-        # * Anything setup has MOVED. Single-channel organization relocates the
-        #   raw image into its sample folder, so by the time this runs the
-        #   dropped path can be gone, and every probe of it fails.
-        #
-        # These formats contribute exactly one sample named for the file stem
-        # -- the same key `detect_raw` records and `unorganized_sources`
-        # compares, so this agrees with how the folder was named.
-        if folder_name_for_source(base) in organized:
-            return
-
-        # 2. Gone from the dropped path, and not named after anything
-        # organized. Setup consumed it (see the move above); there is nothing
-        # left to read and nothing useful to say about it. Warning that a file
-        # which is not there cannot be read would be the same misfire in a
-        # different costume.
-        if not os.path.exists(source_file):
-            return
-
-        # 3. Multi-image sources. One file becomes several samples, named
-        # `<stem>_<scene>`, which the bare filename never produces -- so a
-        # fully organized slide needs its scene keys enumerated to be
-        # recognised. Header reads only, so this is cheap. Restricted to
-        # formats that actually have a slideio/backend spec, both because it is
-        # the only case that needs it and because probing a TIFF here logged a
-        # spurious "not a format HIBACHI reads through slideio" line about a
-        # file the app reads perfectly well.
-        keys = []
+        # Ask the file what samples it contributes, then compare each one
+        # against the organized folders. The previous guard tested
+        # `folder_name_for_source(base)` -- a name derived from the bare
+        # filename -- which a multi-scene slide never produces: its folders are
+        # `<stem>_<scene>`. So a fully organized slide always fell through, and
+        # then hit the "could not read it as an image" warning below, which is
+        # both wrong and alarming. Header reads only, so this is cheap.
         try:
-            from .slide_formats import spec_for_path
-            if spec_for_path(source_file) is not None:
-                from .slide_reader import list_sources
-                keys = list(list_sources(source_file))
+            from .slide_reader import list_sources
+            keys = list(list_sources(source_file))
         except Exception:
             keys = []
-
-        # 4. A readable single-image file that is present but genuinely not
-        # organized yet. It contributes one sample, keyed by its basename --
-        # exactly what `list_sources` returns for a single-scene slide -- so
-        # giving it a key here routes it through the same "offer to add it"
-        # branch below instead of the unreadable warning. That offer is the
-        # thing the user was asking for by dropping the file.
-        if not keys:
-            try:
-                from .slide_formats import is_image_path
-                if is_image_path(source_file):
-                    keys = [base]
-            except Exception:
-                pass
 
         if keys:
             # ANY organized sample from this file means the user has already
@@ -995,10 +985,7 @@ class ProjectViewWindow(QMainWindow):
                 self._add_images(project_dir)
             return
 
-        # Not organizable: the file is here, has a readable-looking name or
-        # not, and nothing can actually get an image out of it. Everything that
-        # IS readable was given a key above, so reaching this point now means a
-        # genuine read failure rather than a gap in the checks.
+        # Not organizable: nothing here can read it.
         from .slide_formats import (
             unsupported_format_label, unsupported_format_message,
         )

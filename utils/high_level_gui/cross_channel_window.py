@@ -9,10 +9,11 @@ import numpy as np
 import pandas as pd
 import tifffile as tiff  # type: ignore
 import napari  # type: ignore
-from PyQt5.QtCore import Qt  # type: ignore
+from PyQt5.QtCore import Qt, pyqtSignal  # type: ignore
 from PyQt5.QtWidgets import (  # type: ignore
     QApplication, QMessageBox, QMainWindow, QVBoxLayout, QHBoxLayout, QListWidget, QListWidgetItem, QPushButton, QWidget, QLabel, QInputDialog, QComboBox,
-    QDialog, QDialogButtonBox, QCheckBox, QFormLayout, QGroupBox, QDoubleSpinBox
+    QDialog, QDialogButtonBox, QCheckBox, QFormLayout, QGroupBox, QDoubleSpinBox,
+    QSizePolicy, QDockWidget
 )
 from .relational_engine import RelationalEngine
 
@@ -20,6 +21,20 @@ from .metadata import get_sample_metadata
 
 
 PREVIOUS_RESULT = "PREVIOUS_RESULT"
+
+
+def _wide_combo(minimum_chars=26):
+    """A QComboBox that shows its contents instead of collapsing.
+
+    QComboBox defaults to AdjustToMinimumContentsLengthWithIcon, so inside a
+    QFormLayout its sizeHint is roughly one icon wide and the text only becomes
+    readable once the popup opens.
+    """
+    box = QComboBox()
+    box.setSizeAdjustPolicy(QComboBox.AdjustToContents)
+    box.setMinimumContentsLength(minimum_chars)
+    box.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+    return box
 
 
 class _RelateDialog(QDialog):
@@ -46,6 +61,7 @@ class _RelateDialog(QDialog):
             self._choices.append((PREVIOUS_RESULT, "Previous result"))
 
         self.setWindowTitle("Overlap" if kind == "overlap" else "Distance")
+        self.setMinimumWidth(460)
         outer = QVBoxLayout(self)
 
         lead = ("Measure how much of one channel sits inside another."
@@ -56,8 +72,8 @@ class _RelateDialog(QDialog):
         outer.addWidget(_lead)
 
         form = QFormLayout()
-        self.cb_primary = QComboBox()
-        self.cb_partner = QComboBox()
+        self.cb_primary = _wide_combo()
+        self.cb_partner = _wide_combo()
         for key, disp in self._choices:
             self.cb_primary.addItem(disp, key)
         form.addRow("Primary (one row per object):", self.cb_primary)
@@ -79,7 +95,7 @@ class _RelateDialog(QDialog):
 
             # Labelling only matters if something downstream will use the mask,
             # so it stays hidden until then instead of being asked up front.
-            self.cb_label = QComboBox()
+            self.cb_label = _wide_combo()
             self.lbl_label = QLabel("Label the overlap by:")
             lf = QFormLayout()
             lf.addRow(self.lbl_label, self.cb_label)
@@ -205,10 +221,11 @@ class _FilterDialog(QDialog):
     def __init__(self, parent, choices, has_previous, size_word, unit):
         super().__init__(parent)
         self.setWindowTitle("Size filter")
+        self.setMinimumWidth(420)
         outer = QVBoxLayout(self)
         form = QFormLayout()
 
-        self.cb_source = QComboBox()
+        self.cb_source = _wide_combo()
         if has_previous:
             self.cb_source.addItem("Previous result", PREVIOUS_RESULT)
         for key, disp in choices:
@@ -237,6 +254,204 @@ class _FilterDialog(QDialog):
                 "size_unit": unit,
                 "input": None if key == PREVIOUS_RESULT else key,
                 "name": f"Filter {disp}: keep \u2265 {self.spin.value():g} {unit}"}
+
+
+
+def project_is_2d_for(sample_registry) -> bool:
+    """True when a project's images are planes rather than stacks.
+
+    Free function so the recipe panel can answer it without owning a project
+    manager; `CrossChannelAnalyzerWindow.project_is_2d` delegates here.
+    """
+    for sample_data in (sample_registry or {}).values():
+        for ch_path in sample_data.values():
+            try:
+                dims, _mode = get_sample_metadata(ch_path)
+            except Exception:
+                continue
+            if dims:
+                return dims.get("z") is None
+    return False
+
+
+class RecipePanel(QWidget):
+    """The ordered list of steps, and the buttons that add to it.
+
+    Extracted so the recipe stack is a widget rather than window state. It is
+    the only part of the cross-channel analyzer that the main window does not
+    already have a better version of: selection lives in the project tree, and
+    viewing results lives in the overlay the tree already opens. Everything
+    here is host-agnostic -- what the channels are, and whether the project is
+    2D, arrive as callables -- so the same widget serves the standalone
+    analyzer and a dock on the main window.
+
+    Owns `recipe_steps`. Hosts should read `steps()` rather than keeping their
+    own copy, so there is one recipe rather than two that can disagree.
+    """
+
+    changed = pyqtSignal()
+
+    def __init__(self, channel_provider, is_2d_provider, parent=None):
+        super().__init__(parent)
+        self._channel_provider = channel_provider
+        self._is_2d_provider = is_2d_provider
+        self.recipe_steps = []
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+
+        self.recipe_list = QListWidget()
+        self.recipe_list.setAlternatingRowColors(True)
+        root.addWidget(self.recipe_list)
+
+        add_row = QHBoxLayout()
+        self.btn_overlap = QPushButton("+ Overlap")
+        self.btn_dist = QPushButton("+ Distance")
+        self.btn_filter = QPushButton("+ Size Filter")
+        self.btn_overlap.setToolTip(
+            "How much of one channel sits inside another. Choose any of: "
+            "coverage percentages, the size of each overlap region, or keeping "
+            "the overlap as a mask for later steps.")
+        self.btn_dist.setToolTip(
+            "How far each object is from its nearest partner, edge to edge.")
+        self.btn_filter.setToolTip("Drop objects below a size threshold.")
+        self.btn_overlap.clicked.connect(lambda: self.add_relate_step("overlap"))
+        self.btn_dist.clicked.connect(lambda: self.add_relate_step("distance"))
+        self.btn_filter.clicked.connect(self.add_filter_step)
+        for b in (self.btn_overlap, self.btn_dist, self.btn_filter):
+            add_row.addWidget(b)
+        root.addLayout(add_row)
+
+        edit_row = QHBoxLayout()
+        self.btn_remove = QPushButton("Remove")
+        self.btn_up = QPushButton("Up")
+        self.btn_down = QPushButton("Down")
+        self.btn_clear = QPushButton("Clear")
+        self.btn_remove.clicked.connect(self.remove_step)
+        self.btn_up.clicked.connect(lambda: self.move_step(-1))
+        self.btn_down.clicked.connect(lambda: self.move_step(1))
+        self.btn_clear.clicked.connect(self.clear_steps)
+        for b in (self.btn_remove, self.btn_up, self.btn_down, self.btn_clear):
+            edit_row.addWidget(b)
+        root.addLayout(edit_row)
+
+        self._refresh()
+
+    # ---- state ----------------------------------------------------------- #
+    def steps(self):
+        return list(self.recipe_steps)
+
+    def set_steps(self, steps):
+        self.recipe_steps = [dict(s) for s in (steps or [])]
+        self._rebuild_list()
+
+    def _rebuild_list(self):
+        self.recipe_list.clear()
+        for s in self.recipe_steps:
+            self.recipe_list.addItem(s.get("name", s.get("type", "step")))
+        self._refresh()
+
+    def _refresh(self):
+        """Empty-state hint, and buttons that are off when they cannot act."""
+        empty = not self.recipe_steps
+        if empty and self.recipe_list.count() == 0:
+            hint = QListWidgetItem(
+                "No steps yet \u2014 add one below. Order matters: a step can "
+                "use the previous step's result.")
+            hint.setFlags(Qt.NoItemFlags)
+            self.recipe_list.addItem(hint)
+        for b in (self.btn_remove, self.btn_up, self.btn_down, self.btn_clear):
+            b.setEnabled(not empty)
+        self.changed.emit()
+
+    # ---- inputs ----------------------------------------------------------- #
+    def channel_choices(self):
+        return list(self._channel_provider() or [])
+
+    def size_unit(self):
+        return "um\u00b2" if self._is_2d_provider() else "um\u00b3"
+
+    def size_word(self):
+        return "Area" if self._is_2d_provider() else "Volume"
+
+    def has_previous_result(self):
+        """True when an earlier step leaves a mask for this one to act on."""
+        return any(s.get('type') == 'filter'
+                   or (s.get('type') in ('relate', 'intersect')
+                       and s.get('keep_mask', s.get('type') == 'intersect'))
+                   for s in self.recipe_steps)
+
+    # ---- editing ---------------------------------------------------------- #
+    def add_relate_step(self, kind):
+        choices = self.channel_choices()
+        has_prev = self.has_previous_result()
+        if len(choices) + (1 if has_prev else 0) < 2:
+            QMessageBox.warning(self, "Not enough inputs",
+                                "This needs two things to compare: either two "
+                                "channels, or one channel and a result from an "
+                                "earlier step.")
+            return
+        dlg = _RelateDialog(self, kind, choices, has_prev, self.size_word())
+        if dlg.exec_() != QDialog.Accepted:
+            return
+        self._append(dlg.step())
+
+    def add_filter_step(self):
+        choices = self.channel_choices()
+        if not choices and not self.has_previous_result():
+            QMessageBox.warning(self, "No channels",
+                                "No channels are available to filter.")
+            return
+        dlg = _FilterDialog(self, choices, self.has_previous_result(),
+                            self.size_word(), self.size_unit())
+        if dlg.exec_() != QDialog.Accepted:
+            return
+        self._append(dlg.step(self.size_unit()))
+
+    def _append(self, step):
+        if not self.recipe_steps:
+            self.recipe_list.clear()        # drop the empty-state hint
+        self.recipe_steps.append(step)
+        self.recipe_list.addItem(step["name"])
+        self._refresh()
+
+    def remove_step(self):
+        row = self.recipe_list.currentRow()
+        if 0 <= row < len(self.recipe_steps):
+            self.recipe_steps.pop(row)
+            self.recipe_list.takeItem(row)
+            self._refresh()
+
+    def move_step(self, delta):
+        row = self.recipe_list.currentRow()
+        new = row + delta
+        if 0 <= row < len(self.recipe_steps) and 0 <= new < len(self.recipe_steps):
+            self.recipe_steps[row], self.recipe_steps[new] = \
+                self.recipe_steps[new], self.recipe_steps[row]
+            self._rebuild_list()
+            self.recipe_list.setCurrentRow(new)
+
+    def clear_steps(self):
+        if not self.recipe_steps:
+            return
+        if QMessageBox.question(self, "Clear recipe", "Clear entire recipe?",
+                                QMessageBox.Yes | QMessageBox.No) != QMessageBox.Yes:
+            return
+        self.recipe_steps = []
+        self.recipe_list.clear()
+        self._refresh()
+
+
+class RecipeDock(QDockWidget):
+    """RecipePanel as a dock, for hosting on the main project window."""
+
+    def __init__(self, channel_provider, is_2d_provider, parent=None):
+        super().__init__("Cross-channel recipe", parent)
+        self.setObjectName("CrossChannelRecipeDock")
+        self.panel = RecipePanel(channel_provider, is_2d_provider, self)
+        self.setWidget(self.panel)
+
+    def steps(self):
+        return self.panel.steps()
 
 
 
@@ -413,67 +628,22 @@ class CrossChannelAnalyzerWindow(QMainWindow):
         # --- 2. MIDDLE PANEL: Recipe List & Controls ---
         mid_panel = QVBoxLayout()
         mid_panel.addWidget(QLabel("<b>2. Analysis Recipe (Order Matters):</b>"))
-        
-        recipe_hbox = QHBoxLayout()
-        self.recipe_list = QListWidget()
-        recipe_hbox.addWidget(self.recipe_list)
-        
-        step_controls = QVBoxLayout()
-        self.btn_remove = QPushButton("❌ Remove")
-        self.btn_up = QPushButton("🔼 Up")
-        self.btn_down = QPushButton("🔽 Down")
-        self.btn_clear = QPushButton("🗑️ Clear All")
-        
-        self.btn_remove.clicked.connect(self.remove_step)
-        self.btn_up.clicked.connect(lambda: self.move_step(-1))
-        self.btn_down.clicked.connect(lambda: self.move_step(1))
-        self.btn_clear.clicked.connect(self.clear_recipe)
-        
-        step_controls.addWidget(self.btn_remove)
-        step_controls.addWidget(self.btn_up)
-        step_controls.addWidget(self.btn_down)
-        step_controls.addStretch()
-        step_controls.addWidget(self.btn_clear)
-        recipe_hbox.addLayout(step_controls)
-        
-        mid_panel.addLayout(recipe_hbox)
-        
-        # --- 3. ADD STEP BUTTONS ---
-        add_step_layout = QHBoxLayout()
-        
-        # No longer generates an intensity image: it randomises the segmented
-        # masks themselves and exports raw distances for downstream statistics.
-        self.btn_synth = QPushButton("🎲 Spatial Null (randomise masks)")
-        self.btn_synth.setStyleSheet("background-color: #8A2BE2; color: white;") # Purple
-        
-        # Four buttons, one per question the user can actually ask. Overlap and
-        # Intersection used to be separate buttons that both computed A AND B
-        # and both surfaced a mask, differing only in which outputs they kept --
-        # so they are one button whose dialog asks which outputs you want.
-        self.btn_overlap = QPushButton("+ Overlap")
-        self.btn_dist = QPushButton("+ Distance")
-        self.btn_filter = QPushButton("+ Size Filter")
-        self.btn_overlap.setToolTip(
-            "How much of one channel sits inside another. Choose any of: "
-            "coverage percentages, the size of each overlap region, or keeping "
-            "the overlap as a mask for later steps."
-        )
-        self.btn_dist.setToolTip(
-            "How far each object is from its nearest partner, edge to edge, "
-            "with the connection lines drawn in the preview."
-        )
-        self.btn_filter.setToolTip("Drop objects below a size threshold.")
 
+        # The recipe list, its edit controls and the add-step buttons all live
+        # in RecipePanel now, so the standalone analyzer and the dock on the
+        # main window build recipes through one implementation rather than two
+        # that can drift apart.
+        self.recipe_panel = RecipePanel(self._channel_choices,
+                                        self.project_is_2d, self)
+        mid_panel.addWidget(self.recipe_panel)
+
+        # Spatial Null is not a recipe step -- it randomises the masks
+        # themselves and exports raw distances for downstream statistics -- so
+        # it stays a separate action rather than joining the panel.
+        self.btn_synth = QPushButton("\U0001F3B2 Spatial Null (randomise masks)")
+        self.btn_synth.setStyleSheet("background-color: #8A2BE2; color: white;")
         self.btn_synth.clicked.connect(self.open_synthetic_dialog)
-        self.btn_overlap.clicked.connect(lambda: self._add_relate_step("overlap"))
-        self.btn_dist.clicked.connect(lambda: self._add_relate_step("distance"))
-        self.btn_filter.clicked.connect(self.add_filter_step)
-
-        add_step_layout.addWidget(self.btn_synth)
-        add_step_layout.addWidget(self.btn_overlap)
-        add_step_layout.addWidget(self.btn_dist)
-        add_step_layout.addWidget(self.btn_filter)
-        mid_panel.addLayout(add_step_layout)
+        mid_panel.addWidget(self.btn_synth)
 
         # --- 4. EXECUTION PANEL ---
         exec_layout = QVBoxLayout()
@@ -481,7 +651,7 @@ class CrossChannelAnalyzerWindow(QMainWindow):
         # Sample Selector
         selector_layout = QHBoxLayout()
         selector_layout.addWidget(QLabel("Preview Target Sample:"))
-        self.sample_selector = QComboBox()
+        self.sample_selector = _wide_combo(20)
         self.sample_selector.addItems(sorted(list(self.pm.sample_registry.keys())))
         selector_layout.addWidget(self.sample_selector)
         exec_layout.addLayout(selector_layout)
@@ -492,7 +662,7 @@ class CrossChannelAnalyzerWindow(QMainWindow):
         # sample changes.
         region_layout = QHBoxLayout()
         region_layout.addWidget(QLabel("Region:"))
-        self.region_selector = QComboBox()
+        self.region_selector = _wide_combo(20)
         region_layout.addWidget(self.region_selector)
         exec_layout.addLayout(region_layout)
         self.sample_selector.currentTextChanged.connect(self._reload_regions)
@@ -517,40 +687,11 @@ class CrossChannelAnalyzerWindow(QMainWindow):
         container.setLayout(main_layout)
         self.setCentralWidget(container)
         
-        self.recipe_steps = []
+        # RecipePanel owns the recipe; `recipe_steps` below is a view onto
+        # it, so the run code is unchanged and there is only ever one list.
 
     # =========================================================================
     # RECIPE EDITING METHODS
-    # =========================================================================
-
-    def remove_step(self):
-        row = self.recipe_list.currentRow()
-        if row >= 0:
-            self.recipe_steps.pop(row)
-            self.recipe_list.takeItem(row)
-
-    def move_step(self, direction):
-        """direction: -1 for up, 1 for down"""
-        row = self.recipe_list.currentRow()
-        new_row = row + direction
-        if 0 <= new_row < self.recipe_list.count():
-            # Swap in logic list
-            self.recipe_steps[row], self.recipe_steps[new_row] = \
-                self.recipe_steps[new_row], self.recipe_steps[row]
-            
-            # Swap in UI list
-            item = self.recipe_list.takeItem(row)
-            self.recipe_list.insertItem(new_row, item)
-            self.recipe_list.setCurrentRow(new_row)
-
-    def clear_recipe(self):
-        reply = QMessageBox.question(self, "Confirm", "Clear entire recipe?", QMessageBox.Yes | QMessageBox.No)
-        if reply == QMessageBox.Yes:
-            self.recipe_steps = []
-            self.recipe_list.clear()
-
-    # =========================================================================
-    # ADD STEP METHODS
     # =========================================================================
 
     def get_checked_channels(self):
@@ -584,6 +725,10 @@ class CrossChannelAnalyzerWindow(QMainWindow):
             QMessageBox.critical(self, "Error",
                                  f"Failed to open the spatial null dialog:\n{e}")
 
+    @property
+    def recipe_steps(self):
+        return self.recipe_panel.recipe_steps
+
     def _channel_choices(self):
         """(key, display) for every channel, checked ones first."""
         checked = self.get_checked_channels()
@@ -591,30 +736,6 @@ class CrossChannelAnalyzerWindow(QMainWindow):
                 for i in range(self.channel_list.count())]
         ordered = checked + [c for c in allc if c not in checked]
         return [(c, c) for c in ordered]
-
-    def _has_previous_result(self):
-        """True when an earlier step leaves a mask for this one to act on."""
-        return any(s.get('type') == 'filter'
-                   or (s.get('type') in ('relate', 'intersect')
-                       and s.get('keep_mask', s.get('type') == 'intersect'))
-                   for s in self.recipe_steps)
-
-    def _add_relate_step(self, kind):
-        """Overlap and distance both come from one form. See _RelateDialog."""
-        choices = self._channel_choices()
-        has_prev = self._has_previous_result()
-        if len(choices) + (1 if has_prev else 0) < 2:
-            QMessageBox.warning(self, "Not enough inputs",
-                                "This needs two things to compare: either two "
-                                "channels, or one channel and a result from an "
-                                "earlier step.")
-            return
-        dlg = _RelateDialog(self, kind, choices, has_prev, self.size_word())
-        if dlg.exec_() != QDialog.Accepted:
-            return
-        step = dlg.step()
-        self.recipe_steps.append(step)
-        self.recipe_list.addItem(step["name"])
 
     def project_is_2d(self):
         """True when this project's images are planes rather than stacks.
@@ -631,21 +752,8 @@ class CrossChannelAnalyzerWindow(QMainWindow):
         the disk. Defaults to 3D when no config carries dimensions, matching the
         previous behaviour for an unreadable project.
         """
-        if getattr(self, "_is_2d_cache", None) is not None:
-            return self._is_2d_cache
-        is_2d = None
-        for sample_data in self.pm.sample_registry.values():
-            for ch_path in sample_data.values():
-                try:
-                    dims, _mode = get_sample_metadata(ch_path)
-                except Exception:
-                    continue
-                if dims:
-                    is_2d = dims.get("z") is None
-                    break
-            if is_2d is not None:
-                break
-        self._is_2d_cache = bool(is_2d) if is_2d is not None else False
+        if getattr(self, "_is_2d_cache", None) is None:
+            self._is_2d_cache = project_is_2d_for(self.pm.sample_registry)
         return self._is_2d_cache
 
     def size_unit(self):
@@ -654,24 +762,6 @@ class CrossChannelAnalyzerWindow(QMainWindow):
 
     def size_word(self):
         return "Area" if self.project_is_2d() else "Volume"
-
-    def add_filter_step(self):
-        """Size filter: one form for source and threshold."""
-        dlg = _FilterDialog(self, self._channel_choices(),
-                            self._has_previous_result(),
-                            self.size_word(), self.size_unit())
-        if dlg.exec_() != QDialog.Accepted:
-            return
-        if dlg.cb_source.count() == 0:
-            QMessageBox.warning(self, "No channels",
-                                "No channels are available to filter.")
-            return
-        step = dlg.step(self.size_unit())
-        self.recipe_steps.append(step)
-        self.recipe_list.addItem(step["name"])
-
-
-    FULL_IMAGE_LABEL = "Full image"
 
     def _reload_regions(self, sample_name: str = "") -> None:
         """Repopulate the region picker for the selected sample."""
