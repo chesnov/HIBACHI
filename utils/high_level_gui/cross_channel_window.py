@@ -290,8 +290,10 @@ class RecipePanel(QWidget):
     """
 
     changed = pyqtSignal()
+    runRequested = pyqtSignal()
 
-    def __init__(self, channel_provider, is_2d_provider, parent=None):
+    def __init__(self, channel_provider, is_2d_provider, parent=None,
+                 show_run=False):
         super().__init__(parent)
         self._channel_provider = channel_provider
         self._is_2d_provider = is_2d_provider
@@ -334,6 +336,17 @@ class RecipePanel(QWidget):
             edit_row.addWidget(b)
         root.addLayout(edit_row)
 
+        # The run belongs with the buttons that build the recipe, not off in a
+        # menu: everything else about a recipe is done here. Optional because
+        # the standalone analyzer has its own batch button.
+        self.btn_run = QPushButton("Run on checked images\u2026")
+        self.btn_run.setToolTip(
+            "Run this recipe on every image and region checked in the project "
+            "tree.")
+        self.btn_run.clicked.connect(self.runRequested.emit)
+        self.btn_run.setVisible(bool(show_run))
+        root.addWidget(self.btn_run)
+
         self._refresh()
 
     # ---- state ----------------------------------------------------------- #
@@ -361,6 +374,9 @@ class RecipePanel(QWidget):
             self.recipe_list.addItem(hint)
         for b in (self.btn_remove, self.btn_up, self.btn_down, self.btn_clear):
             b.setEnabled(not empty)
+        # Enabled on having a recipe; the host disables it further when nothing
+        # is checked in the tree, which it is the only one that can see.
+        self.btn_run.setEnabled(not empty)
         self.changed.emit()
 
     # ---- inputs ----------------------------------------------------------- #
@@ -447,11 +463,16 @@ class RecipeDock(QDockWidget):
     def __init__(self, channel_provider, is_2d_provider, parent=None):
         super().__init__("Cross-channel recipe", parent)
         self.setObjectName("CrossChannelRecipeDock")
-        self.panel = RecipePanel(channel_provider, is_2d_provider, self)
+        self.panel = RecipePanel(channel_provider, is_2d_provider, self,
+                                 show_run=True)
         self.setWidget(self.panel)
 
     def steps(self):
         return self.panel.steps()
+
+    @property
+    def runRequested(self):
+        return self.panel.runRequested
 
 
 
@@ -1042,14 +1063,23 @@ def targets_from_leaf_keys(leaf_keys):
     sample across every channel at once, so they collapse to one target.
     Order is preserved so a run reads in the order the tree shows.
     """
+    from .gui_text_utils import clean_filename_for_matching
     from .project_selection import split_leaf_key
 
     out, seen = [], set()
     for key in leaf_keys or []:
         folder, roi = split_leaf_key(key)
-        sample = os.path.basename(str(folder).rstrip("/\\"))
-        if not sample:
+        base = os.path.basename(str(folder).rstrip("/\\"))
+        if not base:
             continue
+        # The tree keys samples by folder basename; the consolidated registry
+        # keys them by the CLEANED name (lowercased, extensions and " #N"
+        # scene suffixes stripped) -- see build_consolidated_sample_registry.
+        # Passing the raw basename matched nothing, so every target was
+        # skipped and the run reported success having done nothing. The
+        # analysis output folders are named by the registry key too, so this
+        # is also what makes the results findable afterwards.
+        sample = clean_filename_for_matching(base)
         if (sample, roi) in seen:
             continue
         seen.add((sample, roi))
@@ -1118,6 +1148,20 @@ def run_relational_recipe(pm, recipe_steps, analysis_name, targets, parent=None)
 
         QApplication.restoreOverrideCursor()
         print(f"\n{'='*60}\nRUN FINISHED\n{'='*60}")
+
+        # Every target skipped means the run produced nothing. Returning the
+        # folder anyway made the caller offer to open results that did not
+        # exist, so the first sign of trouble was a confusing "no channels"
+        # error from the viewer rather than the actual failure here.
+        if not leaf_dirs:
+            msg = ("None of the selected images could be analysed. "
+                   "Check that they are processed in every channel"
+                   + (", and that the selected regions exist in all of them."
+                      if any(r for _s, r in targets) else "."))
+            print(f"  [Run] {msg}")
+            if parent is not None:
+                QMessageBox.warning(parent, "Nothing was analysed", msg)
+            return None
     except Exception as exc:                                    # noqa: BLE001
         QApplication.restoreOverrideCursor()
         print(f"FATAL ERROR IN RELATIONAL RUN: {exc}")

@@ -346,8 +346,17 @@ class ProjectViewWindow(QMainWindow):
         # something to run it on. Its scope IS the checked set, so an empty
         # selection is not "all of them" -- it is nothing.
         dock = getattr(self, "_recipe_dock", None)
-        self._actions["run_recipe"].setEnabled(
-            bool(checked) and dock is not None and bool(dock.steps()))
+        can_run = bool(checked) and dock is not None and bool(dock.steps())
+        self._actions["run_recipe"].setEnabled(can_run)
+        if dock is not None:
+            # The panel knows whether there is a recipe; only the window knows
+            # whether anything is checked, so the final say is here.
+            dock.panel.btn_run.setEnabled(can_run)
+            dock.panel.btn_run.setToolTip(
+                "Run this recipe on every image and region checked in the "
+                "project tree." if can_run else
+                ("Check the images or regions to run on." if dock.steps()
+                 else "Add at least one step first."))
 
         # Export run config is a single-folder, reproducibility action: enable it
         # only when exactly one checked folder actually has a processed run config.
@@ -458,6 +467,7 @@ class ProjectViewWindow(QMainWindow):
                 return project_is_2d_for(reg or {})
 
             self._recipe_dock = RecipeDock(_channels, _is_2d, self)
+            self._recipe_dock.runRequested.connect(self.run_recipe_on_selection)
             self.addDockWidget(Qt.RightDockWidgetArea, self._recipe_dock)
 
         self._recipe_dock.show()
@@ -490,11 +500,24 @@ class ProjectViewWindow(QMainWindow):
         pm = getattr(self, "project_manager", None)
         if pm is None:
             return
-        if not getattr(pm, "sample_registry", None):
-            try:
-                pm.build_consolidated_sample_registry()
-            except Exception:
-                pass
+        # Re-anchor the scan at THIS project's channel dir and rebuild fresh,
+        # for the reason _open_overlay documents: project_path drifts when you
+        # open a channel leaf, the analyzer, or another project, and a stale
+        # registry here means every target silently fails to resolve.
+        if self._cross_scan_dir:
+            pm.project_path = self._cross_scan_dir
+        pm.build_consolidated_sample_registry()
+
+        missing = [s for s, _r in targets if s not in pm.sample_registry]
+        if missing:
+            QMessageBox.warning(
+                self, "Not in the channel registry",
+                "These images are not processed in every channel, so they "
+                "cannot be compared across channels:\n\n  "
+                + "\n  ".join(sorted(set(missing))))
+            targets = [(s, r) for s, r in targets if s not in set(missing)]
+            if not targets:
+                return
 
         n_roi = sum(1 for _s, r in targets if r)
         scope = (f"{len(targets)} target(s): {len(targets) - n_roi} full image(s)"
