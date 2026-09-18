@@ -228,25 +228,60 @@ class SpatialNullDialog(QDialog):
 
     # -- recipe interpretation ------------------------------------------------
 
+    def _channel_label(self, channel_key: str) -> str:
+        """Display name for a channel, matching the analysis outputs.
+
+        Routed through the same registry the relational engine uses, so a
+        channel reads the same here as in every CSV header. The old
+        `split("_", 2)[-1]` gave the config preset's name, which is identical
+        for every channel whenever the reference config was used.
+        """
+        try:
+            from ..high_level_gui.relational_engine import RelationalEngine
+            return RelationalEngine.channel_name_registry(
+                self.all_channels).get(channel_key, str(channel_key))
+        except Exception:
+            return str(channel_key)
+
+    @staticmethod
+    def _step_inputs(step: Dict[str, Any]) -> List[str]:
+        """The two channels a mask-producing step combines, in either shape.
+
+        A legacy `intersect` step lists them in `inputs`; the merged `relate`
+        step names them `primary` and `target`.
+        """
+        if step.get("inputs"):
+            pair = list(step["inputs"])
+        else:
+            pair = [step.get("primary"), step.get("target")]
+        return [c for c in pair if isinstance(c, str) and c
+                and c != "PREVIOUS_RESULT"]
+
     def _recipe_intersection(self) -> List[str]:
         """Channels of the last intersection step, if the recipe has one."""
         step = self._recipe_intersect_step()
-        if not step:
-            return []
-        return [c for c in (step.get("inputs") or []) if c != "PREVIOUS_RESULT"]
+        return self._step_inputs(step) if step else []
 
     def _recipe_intersect_step(self) -> Optional[Dict[str, Any]]:
-        """The last intersect step, kept whole for its label_mode/preserve_ids.
+        """The last step that BUILDS an overlap mask, kept whole for its
+        label_mode/preserve_ids.
 
-        Those matter: the overlap is recomputed here from the two segmentations
-        using the same settings, so the null does not require a relational batch
-        to have been run first.
+        Those matter: the overlap is recomputed here from the two
+        segmentations using the same settings, so the null does not require a
+        relational batch to have been run first.
+
+        Two step shapes qualify. The old `intersect` type always built a mask.
+        The merged `relate` type only does so when asked -- `keep_mask` -- and
+        a relate step that merely measures coverage produces no mask and is
+        not an intersection for this purpose. Matching on `type ==
+        "intersect"` alone meant every recipe built since the merge looked
+        like it had no intersection at all, silently losing the
+        overlap-as-domain option here.
         """
         for step in reversed(self.recipe):
-            if step.get("type") == "intersect":
-                inputs = [c for c in (step.get("inputs") or [])
-                          if c != "PREVIOUS_RESULT"]
-                if len(inputs) >= 2:
+            stype = step.get("type")
+            if stype == "intersect" or (stype == "relate" and step.get("keep_mask")):
+                if len(self._step_inputs(step)) >= 2:
                     return step
         return None
 
@@ -289,9 +324,10 @@ class SpatialNullDialog(QDialog):
         program, names = [], []
         for step in self.recipe:
             kind = step.get("type")
-            if kind == "intersect":
-                inputs = [c for c in (step.get("inputs") or [])
-                          if c != "PREVIOUS_RESULT"]
+            # A `relate` step builds a mask only when it was asked to keep
+            # one; one that merely measures coverage changes nothing here.
+            if kind == "intersect" or (kind == "relate" and step.get("keep_mask")):
+                inputs = self._step_inputs(step)
                 if not program:
                     if len(inputs) < 2:
                         return [], ""
@@ -300,7 +336,7 @@ class SpatialNullDialog(QDialog):
                         "channel_b": inputs[1],
                         "label_mode": step.get("label_mode") or "connected",
                         "preserve_ids": bool(step.get("preserve_ids"))})
-                    names = [c.split("_", 2)[-1] for c in inputs[:2]]
+                    names = [self._channel_label(c) for c in inputs[:2]]
                 else:
                     if not inputs:
                         return [], ""
@@ -308,7 +344,7 @@ class SpatialNullDialog(QDialog):
                         "type": "intersect", "channel_b": inputs[0],
                         "label_mode": step.get("label_mode") or "connected",
                         "preserve_ids": bool(step.get("preserve_ids"))})
-                    names.append(inputs[0].split("_", 2)[-1])
+                    names.append(self._channel_label(inputs[0]))
             elif kind == "filter":
                 if not program:
                     # The channel comes from the step itself. It used to be guessed

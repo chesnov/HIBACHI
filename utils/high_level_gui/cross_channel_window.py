@@ -261,7 +261,8 @@ def project_is_2d_for(sample_registry) -> bool:
     """True when a project's images are planes rather than stacks.
 
     Free function so the recipe panel can answer it without owning a project
-    manager; `CrossChannelAnalyzerWindow.project_is_2d` delegates here.
+    manager. Rank comes from a sample config, not from array shapes: a 3-axis
+    array can be (Z, Y, X) or (C, Y, X), so the array alone cannot settle it.
     """
     for sample_data in (sample_registry or {}).values():
         for ch_path in sample_data.values():
@@ -272,6 +273,224 @@ def project_is_2d_for(sample_registry) -> bool:
             if dims:
                 return dims.get("z") is None
     return False
+
+
+class _RecipeLibraryDialog(QDialog):
+    """Browse, load, save, rename, delete and share saved recipes.
+
+    Deliberately one dialog rather than a scatter of buttons: managing a
+    library is its own task, and the dock should stay a recipe builder.
+    """
+
+    def __init__(self, parent, current_steps, available_channels=()):
+        super().__init__(parent)
+        self._current = list(current_steps or [])
+        self._available = list(available_channels or [])
+        self.chosen_steps = None          # set when the user loads one
+
+        self.setWindowTitle("Recipe library")
+        self.setMinimumWidth(560)
+        outer = QVBoxLayout(self)
+
+        lead = QLabel(
+            "Recipes saved here are available in every project. A recipe names "
+            "channels by number, so it applies to any project with those "
+            "channels.")
+        lead.setWordWrap(True)
+        outer.addWidget(lead)
+
+        self.listw = QListWidget()
+        self.listw.itemDoubleClicked.connect(self._load)
+        self.listw.currentRowChanged.connect(self._refresh)
+        outer.addWidget(self.listw)
+
+        self.detail = QLabel()
+        self.detail.setWordWrap(True)
+        self.detail.setStyleSheet("color: #555;")
+        outer.addWidget(self.detail)
+
+        row = QHBoxLayout()
+        self.btn_load = QPushButton("Load")
+        self.btn_save = QPushButton("Save current\u2026")
+        self.btn_rename = QPushButton("Rename\u2026")
+        self.btn_delete = QPushButton("Delete")
+        self.btn_import = QPushButton("Import\u2026")
+        self.btn_export = QPushButton("Export\u2026")
+        self.btn_load.clicked.connect(self._load)
+        self.btn_save.clicked.connect(self._save)
+        self.btn_rename.clicked.connect(self._rename)
+        self.btn_delete.clicked.connect(self._delete)
+        self.btn_import.clicked.connect(self._import)
+        self.btn_export.clicked.connect(self._export)
+        for b in (self.btn_load, self.btn_save, self.btn_rename,
+                  self.btn_delete, self.btn_import, self.btn_export):
+            row.addWidget(b)
+        outer.addLayout(row)
+
+        close = QDialogButtonBox(QDialogButtonBox.Close)
+        close.rejected.connect(self.reject)
+        outer.addWidget(close)
+
+        self._reload()
+
+    # -- state -------------------------------------------------------------
+    def _reload(self):
+        from . import recipe_library as rl
+        self.entries = rl.list_library()
+        self.listw.clear()
+        for e in self.entries:
+            self.listw.addItem(e.label)
+        if self.entries:
+            self.listw.setCurrentRow(0)
+        # A file that is in the folder but is not a recipe is reported rather
+        # than silently skipped, so a misfiled config does not just vanish.
+        problems = rl.scan_problems()
+        if problems:
+            self.listw.addItem(QListWidgetItem(
+                f"({len(problems)} file(s) here are not recipes)"))
+        self._refresh()
+
+    def _selected(self):
+        i = self.listw.currentRow()
+        return self.entries[i] if 0 <= i < len(self.entries) else None
+
+    def _refresh(self, *_):
+        from . import recipe_library as rl
+        e = self._selected()
+        has = e is not None
+        for b in (self.btn_load, self.btn_rename, self.btn_delete,
+                  self.btn_export):
+            b.setEnabled(has)
+        self.btn_save.setEnabled(bool(self._current))
+        if not has:
+            self.detail.setText(
+                "" if self.entries else "No saved recipes yet.")
+            return
+        try:
+            steps = rl.load(e)
+        except rl.RecipeLibraryError as exc:
+            self.detail.setText(f"Unreadable: {exc}")
+            return
+        lines = [f"\u2022 {s.get('name', s.get('type'))}" for s in steps]
+        missing = rl.missing_channels(steps, self._available)
+        if missing:
+            lines.append("")
+            lines.append("This project has no " + ", ".join(missing)
+                         + " \u2014 those steps would be skipped.")
+        self.detail.setText("\n".join(lines))
+
+    # -- actions -----------------------------------------------------------
+    def _load(self, *_):
+        from . import recipe_library as rl
+        e = self._selected()
+        if e is None:
+            return
+        try:
+            steps = rl.load(e)
+        except rl.RecipeLibraryError as exc:
+            QMessageBox.warning(self, "Could not load", str(exc))
+            return
+        if self._current and QMessageBox.question(
+                self, "Replace the current recipe?",
+                f"The dock holds {len(self._current)} step(s). Replace them "
+                f"with '{e.name}'?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No) != QMessageBox.Yes:
+            return
+        self.chosen_steps = steps
+        self.accept()
+
+    def _save(self, *_):
+        from . import recipe_library as rl
+        name, ok = QInputDialog.getText(self, "Save recipe", "Name:")
+        if not ok or not name.strip():
+            return
+        try:
+            rl.save(self._current, name)
+        except FileExistsError:
+            if QMessageBox.question(
+                    self, "Replace?", f"'{name}' already exists. Replace it?",
+                    QMessageBox.Yes | QMessageBox.No,
+                    QMessageBox.No) != QMessageBox.Yes:
+                return
+            rl.save(self._current, name, overwrite=True)
+        except rl.RecipeLibraryError as exc:
+            QMessageBox.warning(self, "Could not save", str(exc))
+            return
+        self._reload()
+
+    def _rename(self, *_):
+        from . import recipe_library as rl
+        e = self._selected()
+        if e is None:
+            return
+        name, ok = QInputDialog.getText(self, "Rename recipe", "New name:",
+                                        text=e.name)
+        if not ok or not name.strip():
+            return
+        try:
+            rl.rename(e, name)
+        except (FileExistsError, OSError) as exc:
+            QMessageBox.warning(self, "Could not rename", str(exc))
+            return
+        self._reload()
+
+    def _delete(self, *_):
+        from . import recipe_library as rl
+        e = self._selected()
+        if e is None:
+            return
+        if QMessageBox.question(
+                self, "Delete recipe", f"Delete '{e.name}'?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No) != QMessageBox.Yes:
+            return
+        try:
+            rl.delete(e)
+        except OSError as exc:
+            QMessageBox.warning(self, "Could not delete", str(exc))
+            return
+        self._reload()
+
+    def _import(self, *_):
+        from . import recipe_library as rl
+        from PyQt5.QtWidgets import QFileDialog
+        # Defaults to the project's results folder: every run writes its
+        # recipe.yaml there, so "reuse what I ran last month" is this button.
+        path, _f = QFileDialog.getOpenFileName(
+            self, "Import a recipe (or a run's recipe.yaml)", "",
+            "Recipes (*.yaml *.yml)")
+        if not path:
+            return
+        try:
+            rl.import_file(path)
+        except FileExistsError:
+            base = os.path.splitext(os.path.basename(path))[0]
+            if QMessageBox.question(
+                    self, "Replace?", f"'{base}' already exists. Replace it?",
+                    QMessageBox.Yes | QMessageBox.No,
+                    QMessageBox.No) != QMessageBox.Yes:
+                return
+            rl.import_file(path, overwrite=True)
+        except (rl.RecipeLibraryError, OSError) as exc:
+            QMessageBox.warning(self, "Could not import", str(exc))
+            return
+        self._reload()
+
+    def _export(self, *_):
+        from . import recipe_library as rl
+        from PyQt5.QtWidgets import QFileDialog
+        e = self._selected()
+        if e is None:
+            return
+        path, _f = QFileDialog.getSaveFileName(
+            self, "Export recipe", f"{e.name}.yaml", "Recipes (*.yaml)")
+        if not path:
+            return
+        try:
+            rl.export(e, path)
+        except OSError as exc:
+            QMessageBox.warning(self, "Could not export", str(exc))
 
 
 class RecipePanel(QWidget):
@@ -339,6 +558,13 @@ class RecipePanel(QWidget):
         # The run belongs with the buttons that build the recipe, not off in a
         # menu: everything else about a recipe is done here. Optional because
         # the standalone analyzer has its own batch button.
+        self.btn_library = QPushButton("Recipes\u2026")
+        self.btn_library.setToolTip(
+            "Saved recipes: load one, save this one, or import the recipe.yaml "
+            "from a previous run.")
+        self.btn_library.clicked.connect(self.open_library)
+        edit_row.addWidget(self.btn_library)
+
         self.btn_run = QPushButton("Run on checked images\u2026")
         self.btn_run.setToolTip(
             "Run this recipe on every image and region checked in the project "
@@ -377,6 +603,8 @@ class RecipePanel(QWidget):
         # Enabled on having a recipe; the host disables it further when nothing
         # is checked in the tree, which it is the only one that can see.
         self.btn_run.setEnabled(not empty)
+        # Always available: the library is how an empty dock gets a recipe.
+        self.btn_library.setEnabled(True)
         self.changed.emit()
 
     # ---- inputs ----------------------------------------------------------- #
@@ -429,6 +657,15 @@ class RecipePanel(QWidget):
         self.recipe_steps.append(step)
         self.recipe_list.addItem(step["name"])
         self._refresh()
+
+    def open_library(self):
+        """Browse saved recipes; load one over the current steps if chosen."""
+        dlg = _RecipeLibraryDialog(
+            self, self.recipe_steps,
+            [k for k, _d in self.channel_choices()])
+        dlg.exec_()
+        if dlg.chosen_steps is not None:
+            self.set_steps(dlg.chosen_steps)
 
     def remove_step(self):
         row = self.recipe_list.currentRow()
@@ -611,371 +848,19 @@ def _safe_name(name: str) -> str:
                    for c in str(name)).strip("_") or "region"
 
 
-class CrossChannelAnalyzerWindow(QMainWindow):
-    def __init__(self, project_manager):
-        # Resolved lazily by project_is_2d(); objects are areas in 2D and volumes
-        # in 3D, and the UI should say which.
-        self._is_2d_cache = None
-        super().__init__()
-        self.pm = project_manager
-        self.setWindowTitle("Cross-Channel Relational Analyzer")
-        self.setGeometry(150, 150, 1000, 650)
-        
-        main_layout = QHBoxLayout()
-        
-        # --- 1. LEFT PANEL: Channels ---
-        left_panel = QVBoxLayout()
-        self.channel_list = QListWidget()
-        
-        # Safely get channels
-        if not self.pm.sample_registry:
-            self.pm.build_consolidated_sample_registry()
-            
-        if self.pm.sample_registry:
-            first_sample = list(self.pm.sample_registry.keys())[0]
-            channels = sorted(list(self.pm.sample_registry[first_sample].keys()))
-            for ch in channels:
-                item = QListWidgetItem(ch)
-                item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
-                item.setCheckState(Qt.Unchecked)
-                self.channel_list.addItem(item)
-        else:
-            item = QListWidgetItem("No channels found")
-            self.channel_list.addItem(item)
-        
-        left_panel.addWidget(QLabel("<b>1. Select Input Channels:</b>"))
-        left_panel.addWidget(self.channel_list)
-        
-        # --- 2. MIDDLE PANEL: Recipe List & Controls ---
-        mid_panel = QVBoxLayout()
-        mid_panel.addWidget(QLabel("<b>2. Analysis Recipe (Order Matters):</b>"))
+# The standalone CrossChannelAnalyzerWindow lived here. It was a second copy of
+# the project window's job: its own sample dropdown, its own region dropdown and
+# its own channel checkboxes, alongside a Preview button that RE-RAN a recipe in
+# order to show you anything. The project window already has a checkable tree of
+# samples, channels and regions, an analyses picker and an overlay viewer, so
+# what remained unique here was the recipe itself -- which is now RecipePanel,
+# hosted as a dock on that window.
+#
+# Everything the window did survives: building a recipe (RecipePanel), running
+# one (run_relational_recipe, scoped by the tree's checked leaves rather than
+# "every sample"), and viewing results (the tree's own overlay, now filtered to
+# the channels the analysis used).
 
-        # The recipe list, its edit controls and the add-step buttons all live
-        # in RecipePanel now, so the standalone analyzer and the dock on the
-        # main window build recipes through one implementation rather than two
-        # that can drift apart.
-        self.recipe_panel = RecipePanel(self._channel_choices,
-                                        self.project_is_2d, self)
-        mid_panel.addWidget(self.recipe_panel)
-
-        # Spatial Null is not a recipe step -- it randomises the masks
-        # themselves and exports raw distances for downstream statistics -- so
-        # it stays a separate action rather than joining the panel.
-        self.btn_synth = QPushButton("\U0001F3B2 Spatial Null (randomise masks)")
-        self.btn_synth.setStyleSheet("background-color: #8A2BE2; color: white;")
-        self.btn_synth.clicked.connect(self.open_synthetic_dialog)
-        mid_panel.addWidget(self.btn_synth)
-
-        # --- 4. EXECUTION PANEL ---
-        exec_layout = QVBoxLayout()
-        
-        # Sample Selector
-        selector_layout = QHBoxLayout()
-        selector_layout.addWidget(QLabel("Preview Target Sample:"))
-        self.sample_selector = _wide_combo(20)
-        self.sample_selector.addItems(sorted(list(self.pm.sample_registry.keys())))
-        selector_layout.addWidget(self.sample_selector)
-        exec_layout.addLayout(selector_layout)
-
-        # Region selector. Only regions that exist in EVERY channel of the sample
-        # are offered: the analysis compares one region's mask across channels, so a
-        # region missing from one channel cannot be analysed. Rebuilt whenever the
-        # sample changes.
-        region_layout = QHBoxLayout()
-        region_layout.addWidget(QLabel("Region:"))
-        self.region_selector = _wide_combo(20)
-        region_layout.addWidget(self.region_selector)
-        exec_layout.addLayout(region_layout)
-        self.sample_selector.currentTextChanged.connect(self._reload_regions)
-        self._reload_regions(self.sample_selector.currentText())
-
-        self.btn_preview = QPushButton("👁️ Preview Recipe (Napari)")
-        self.btn_preview.setFixedHeight(40)
-        self.btn_preview.clicked.connect(self.preview_recipe)
-
-        self.btn_batch = QPushButton("🚀 RUN RECIPE ON ALL SAMPLES")
-        self.btn_batch.setFixedHeight(50)
-        self.btn_batch.setStyleSheet("background-color: #2E8B57; color: white; font-weight: bold;")
-        self.btn_batch.clicked.connect(self.run_batch_analysis)
-        
-        exec_layout.addWidget(self.btn_preview)
-        exec_layout.addWidget(self.btn_batch)
-        mid_panel.addLayout(exec_layout)
-
-        container = QWidget()
-        main_layout.addLayout(left_panel, 1)
-        main_layout.addLayout(mid_panel, 3)
-        container.setLayout(main_layout)
-        self.setCentralWidget(container)
-        
-        # RecipePanel owns the recipe; `recipe_steps` below is a view onto
-        # it, so the run code is unchanged and there is only ever one list.
-
-    # =========================================================================
-    # RECIPE EDITING METHODS
-    # =========================================================================
-
-    # =========================================================================
-    # ADD STEP METHODS
-    # =========================================================================
-
-    def get_checked_channels(self):
-        return [self.channel_list.item(i).text() for i in range(self.channel_list.count()) 
-                if self.channel_list.item(i).checkState() == Qt.Checked]
-
-    def open_synthetic_dialog(self):
-        """Launch the spatial-null dialog, informed by the current recipe.
-
-        The recipe matters: an intersection step means the OVERLAP objects are
-        what get randomised, and it makes the parent-object domains meaningful,
-        so the dialog needs the steps and the selected region -- not just the
-        project.
-
-        Catches Exception rather than only ImportError: the previous handler let
-        any failure inside the dialog's constructor escape unhandled, which took
-        the window down instead of reporting.
-        """
-        try:
-            from ..spatial_null import SpatialNullDialog
-            dialog = SpatialNullDialog(
-                self.pm,
-                checked_channels=self.get_checked_channels(),
-                recipe=self.recipe_steps,
-                roi_name=self._selected_region(),
-                parent=self,
-            )
-            dialog.exec_()
-        except Exception as e:
-            traceback.print_exc()
-            QMessageBox.critical(self, "Error",
-                                 f"Failed to open the spatial null dialog:\n{e}")
-
-    @property
-    def recipe_steps(self):
-        return self.recipe_panel.recipe_steps
-
-    def _channel_choices(self):
-        """(key, display) for every channel, checked ones first."""
-        checked = self.get_checked_channels()
-        allc = [self.channel_list.item(i).text()
-                for i in range(self.channel_list.count())]
-        ordered = checked + [c for c in allc if c not in checked]
-        return [(c, c) for c in ordered]
-
-    def project_is_2d(self):
-        """True when this project's images are planes rather than stacks.
-
-        Read from a sample's saved config rather than inferred from array shapes:
-        a 3-axis array can be (Z, Y, X) or (C, Y, X), so the array alone cannot
-        settle it. What settles it is the config's dimension block -- a 'z'
-        extent means a stack -- and NOT the mode string, which used to be the
-        discriminator here. With one mode `mode.endswith("_2d")` is always
-        False, so every project reported as 3D and every 2D project's object
-        sizes were labelled um3 and called "Volume".
-
-        Cached, because it cannot change within a project and the lookup touches
-        the disk. Defaults to 3D when no config carries dimensions, matching the
-        previous behaviour for an unreadable project.
-        """
-        if getattr(self, "_is_2d_cache", None) is None:
-            self._is_2d_cache = project_is_2d_for(self.pm.sample_registry)
-        return self._is_2d_cache
-
-    def size_unit(self):
-        """'um²' in 2D, 'um³' in 3D — objects are areas or volumes, not both."""
-        return "um\u00b2" if self.project_is_2d() else "um\u00b3"
-
-    def size_word(self):
-        return "Area" if self.project_is_2d() else "Volume"
-
-    FULL_IMAGE_LABEL = "Full image"
-
-    def _reload_regions(self, sample_name: str = "") -> None:
-        """Repopulate the region picker for the selected sample."""
-        self.region_selector.clear()
-        self.region_selector.addItem(self.FULL_IMAGE_LABEL)
-        try:
-            channels = list(
-                (self.pm.sample_registry.get(sample_name) or {}).values())
-            from .roi_sharing import regions_common_to_channels
-            for name in regions_common_to_channels(channels,
-                                                   require_segmentation=True):
-                self.region_selector.addItem(name)
-        except Exception as exc:
-            print(f"  [Relational] could not list regions: {exc}")
-
-    def _selected_region(self):
-        """Region name chosen in the picker, or None for the full image."""
-        try:
-            label = self.region_selector.currentText()
-        except Exception:
-            return None
-        return None if (not label or label == self.FULL_IMAGE_LABEL) else label
-
-    def _geometry_for(self, sample_data: dict, roi_name):
-        """(shape, spacing) for a sample. See module-level geometry_for."""
-        return geometry_for(sample_data, roi_name)
-
-    def preview_recipe(self):
-        if not self.recipe_steps:
-            QMessageBox.information(self, "Info", "Recipe is empty.")
-            return
-
-        # 1. Ask for a name to make this a "Single Run"
-        analysis_name, ok = QInputDialog.getText(
-            self, "Single Sample Run", 
-            "Enter a name for this analysis (files will be saved):",
-            text="Preview_Run"
-        )
-        if not ok or not analysis_name: return
-
-        sample_name = self.sample_selector.currentText()
-        sample_data = self.pm.sample_registry[sample_name]
-        roi_name = self._selected_region()
-
-        # 2. Setup Viewer
-        # Setup permanent path for this sample's relational results. A region's
-        # results go in their own subfolder so running the same recipe on the full
-        # image and on a region cannot overwrite one another.
-        project_root = os.path.dirname(self.pm.project_path)
-        leaf = sample_name if not roi_name else os.path.join(
-            sample_name, _safe_name(roi_name))
-        sample_out_dir = os.path.join(
-            project_root, "RELATIONAL_ANALYSIS", analysis_name, leaf
-        )
-        os.makedirs(sample_out_dir, exist_ok=True)
-        # Self-describing results, matching the batch path.
-        try:
-            with open(os.path.join(project_root, "RELATIONAL_ANALYSIS",
-                                   analysis_name, "region.txt"), "w") as fh:
-                fh.write((roi_name or "Full image") + "\n")
-        except OSError:
-            pass
-
-        _prepare_previews(sample_data, parent=self)
-        viewer = napari.Viewer(title=f"Cross-Channel Preview: {sample_name}")
-        # Any failure below leaves a live napari window (Qt owns it, so it is not
-        # collected when this frame unwinds), holding a GL context and the loaded
-        # image for the rest of the session. Close it instead.
-        #
-        # Imported lazily: a module-level import would close the cycle
-        # cross_channel_window -> app_launch -> project_view_window -> here.
-        from .app_launch import close_viewer_on_error
-        with close_viewer_on_error(viewer):
-            try:
-                _qw = viewer.window._qt_window
-                _qw.showMaximized(); _qw.raise_(); _qw.activateWindow()
-            except Exception:
-                pass
-        
-            # Predefined colormaps for raw channels
-            colormaps = ['cyan', 'magenta', 'yellow', 'green', 'red', 'blue']
-        
-            # 3. Load Raw Data and Segmentation for EVERY channel in this sample
-            shape = None
-            spacing = (1.0, 1.0, 1.0)
-        
-            for i, (ch_name, ch_path) in enumerate(sample_data.items()):
-                # Find files
-                tif_file = next((os.path.join(ch_path, f) for f in os.listdir(ch_path) if f.lower().endswith(('.tif', '.tiff'))), None)
-                dat_file = RelationalEngine._find_dat(ch_path)
-            
-                # Fetch metadata from the first valid channel we find
-                if shape is None and tif_file:
-                    with tiff.TiffFile(tif_file) as tif:
-                        shape = tif.series[0].shape
-                    # Spacing from the config's dimension block: total_um per
-                    # axis divided by that axis's pixel count. Unusable extents
-                    # leave the isotropic default in place (this is the display
-                    # path; the measurement paths refuse instead), with the
-                    # helper printing why.
-                    meta, _ = get_sample_metadata(ch_path)
-                    _sp = _spacing_from_extents(meta, shape, ch_path)
-                    if _sp is not None:
-                        spacing = _sp
-
-                # Add Raw Intensity
-                if tif_file:
-                    raw_img = _raw_for_display(tif_file)
-                    cmap = colormaps[i % len(colormaps)]
-                    viewer.add_image(raw_img, name=f"Raw: {ch_name}", colormap=cmap, blending='additive', opacity=0.5,
-                                     multiscale=isinstance(raw_img, list),
-                                     **_display_range(raw_img))
-
-                # Add Segmentation Labels (Semi-transparent)
-                if dat_file:
-                    seg_data = np.memmap(dat_file, dtype=np.int32, mode='r', shape=shape)
-                    viewer.add_labels(seg_data, name=f"Seg: {ch_name}", opacity=0.3)
-
-            # 4. Execute Relational Recipe
-            temp_dir = os.path.join(list(sample_data.values())[0], "relational_preview_temp")
-            os.makedirs(temp_dir, exist_ok=True)
-        
-            # Run calculation
-            derived_masks, metrics_df = RelationalEngine.run_recipe(
-                sample_name, self.pm.sample_registry, self.recipe_steps,
-                sample_out_dir, shape, spacing, roi_name=roi_name
-            )
-
-            # Add the Red Proximity Lines
-            if metrics_df is not None:
-                self._draw_proximity_bridges(viewer, metrics_df, shape, spacing)
-
-            # 5. Add Derived Results (High Opacity Labels)
-            for res in derived_masks:
-                data = np.memmap(res['path'], dtype=np.int32, mode='r', shape=shape)
-                viewer.add_labels(data, name=f"DERIVED: {res['name']}")
-
-            # Final Adjustments
-            if len(shape) == 3:
-                viewer.dims.ndisplay = 3
-                # Set scale to handle anisotropy if 3D
-                # (Napari scale is z_scale, y_scale, x_scale)
-                # Use spacing[0]/spacing[2] for z-scale factor
-                z_scale = spacing[0]/spacing[2] if len(spacing)==3 else 1.0
-                for layer in viewer.layers:
-                    layer.scale = (z_scale, 1, 1)
-
-            # One-click hide/show-all toggle under the layer list.
-            try:
-                from .app_launch import add_channel_visibility_toggle
-                add_channel_visibility_toggle(viewer)
-            except Exception as exc:
-                print(f"Could not add channel visibility toggle: {exc}")
-
-            # 3D rotation recorder (3D samples only), docked beneath the layer list.
-            if shape and len(shape) == 3:
-                try:
-                    from ..fluorescence_module.turntable import add_turntable_button
-                    add_turntable_button(viewer)
-                except Exception as exc:
-                    print(f"Could not add 3D rotation recorder: {exc}")
-
-    def _draw_proximity_bridges(self, viewer, df, shape, spacing):
-        """Delegate to the module-level bridge drawer (used by preview_recipe)."""
-        draw_proximity_bridges(viewer, df, shape, spacing)
-
-    def run_batch_analysis(self):
-        """Run on every sample, at the region picked here.
-
-        Kept as it was -- this window has no tree to take a selection from.
-        The work happens in `run_relational_recipe`, which the main window
-        calls with the checked leaves instead.
-        """
-        if not self.recipe_steps:
-            return
-        analysis_name, ok = QInputDialog.getText(
-            self, "Batch Run", "Enter name for this analysis:")
-        if not ok or not analysis_name:
-            return
-
-        roi_name = self._selected_region()
-        targets = [(s, roi_name) for s in sorted(self.pm.sample_registry)]
-        out_dir = run_relational_recipe(
-            self.pm, self.recipe_steps, analysis_name, targets, parent=self)
-        if out_dir:
-            QMessageBox.information(
-                self, "Success", f"Batch Complete!\nResults saved to: {out_dir}")
 
 
 
@@ -1173,9 +1058,11 @@ def run_relational_recipe(pm, recipe_steps, analysis_name, targets, parent=None)
     # Master tables, gathered from the leaves this run actually wrote.
     all_csvs, all_summaries = [], []
     for s_name, leaf_dir in leaf_dirs:
-        csv_p = os.path.join(leaf_dir, f"{s_name}_relational_metrics.csv")
-        if os.path.exists(csv_p):
-            df = pd.read_csv(csv_p)
+        # A run can produce one per-object table per primary, so glob rather
+        # than expect a single known filename. The "_coverage" files are the
+        # partner view -- a different row grain -- and must not be mixed in.
+        for f in sorted(_per_object_files(leaf_dir)):
+            df = pd.read_csv(os.path.join(leaf_dir, f))
             df["sample_name"] = s_name
             all_csvs.append(df)
         sum_p = os.path.join(leaf_dir, "overlap_summary.csv")
@@ -1184,8 +1071,8 @@ def run_relational_recipe(pm, recipe_steps, analysis_name, targets, parent=None)
 
     if all_csvs:
         pd.concat(all_csvs, ignore_index=True).to_csv(
-            os.path.join(batch_out_dir, "MASTER_RELATIONAL_RESULTS.csv"), index=False)
-        print("Successfully generated MASTER_RELATIONAL_RESULTS.csv")
+            os.path.join(batch_out_dir, "MASTER_PER_OBJECT.csv"), index=False)
+        print("Successfully generated MASTER_PER_OBJECT.csv")
     if all_summaries:
         pd.concat(all_summaries, ignore_index=True).to_csv(
             os.path.join(batch_out_dir, "MASTER_OVERLAP_SUMMARY.csv"), index=False)
@@ -1217,6 +1104,20 @@ def split_analysis_key(key: str):
         analysis, _, region = text.partition(ANALYSIS_SEP)
         return analysis, (region or None)
     return text, None
+
+
+def _per_object_files(directory: str):
+    """Per-object tables in a result folder: the PRIMARY view, one per primary.
+
+    Excludes "..._coverage.csv", which is the partner view at a different row
+    grain -- one row per partner object -- and would corrupt a concatenation.
+    """
+    try:
+        return [f for f in os.listdir(directory)
+                if f.startswith("per_object_") and f.endswith(".csv")
+                and not f.endswith("_coverage.csv")]
+    except OSError:
+        return []
 
 
 def _has_result_files(directory: str) -> bool:
@@ -1316,7 +1217,43 @@ def draw_proximity_bridges(viewer, df, shape, spacing):
     print(f"  [Visualizer] Plotted connection bridges for partners: {partners}")
 
 
-def open_sample_overlay(project_manager, sample_name, analysis_name=None, parent=None):
+def channels_used_by_recipe(recipe_steps):
+    """Channel keys a recipe actually touches, in first-seen order.
+
+    Reads the keys a step can name a channel with: `primary`, `target`,
+    `input` (size filter), and the legacy `inputs` pair. PREVIOUS_RESULT is a
+    reference to an earlier step, not a channel, so it is skipped.
+    """
+    out = []
+    for step in recipe_steps or []:
+        if not isinstance(step, dict):
+            continue
+        candidates = [step.get('primary'), step.get('target'), step.get('input')]
+        candidates.extend(step.get('inputs') or [])
+        for c in candidates:
+            if (isinstance(c, str) and c and c != PREVIOUS_RESULT
+                    and c not in out):
+                out.append(c)
+    return out
+
+
+def recipe_for_analysis(analysis_dir):
+    """The recipe a saved analysis was produced by, or None.
+
+    Every run writes `recipe.yaml` at the analysis root. Runs made before that
+    existed -- and anything hand-assembled -- have none, which callers must
+    treat as "no information" rather than "no channels".
+    """
+    try:
+        with open(os.path.join(analysis_dir, "recipe.yaml")) as fh:
+            data = yaml.safe_load(fh)
+    except (OSError, yaml.YAMLError):
+        return None
+    return data if isinstance(data, list) else None
+
+
+def open_sample_overlay(project_manager, sample_name, analysis_name=None,
+                        parent=None, channels=None):
     """
     Open a napari viewer for one multi-channel sample.
 
@@ -1328,6 +1265,13 @@ def open_sample_overlay(project_manager, sample_name, analysis_name=None, parent
 
     `sample_name` is the consolidated-registry key (the clean sample name), which
     is also the analysis output subfolder name. Returns True if a viewer opened.
+
+    With an analysis selected, only the channels that analysis USED are loaded,
+    read from its `recipe.yaml`. Opening a two-channel overlap in a four-channel
+    project used to add all eight raw and segmentation layers, burying the two
+    that the analysis was about. `channels` overrides that with an explicit
+    allow-list; an analysis with no recipe on disk falls back to every channel,
+    since absence of a recipe is not evidence of which channels were involved.
     """
     pm = project_manager
     if not pm.sample_registry:
@@ -1343,6 +1287,7 @@ def open_sample_overlay(project_manager, sample_name, analysis_name=None, parent
     sample_out_dir = None
     analysis_label = analysis_name
     region_dir = None
+    recipe = None
     if analysis_name:
         # The picker hands over a key, which may name a region inside the analysis.
         analysis_name, region_dir = split_analysis_key(analysis_name)
@@ -1362,6 +1307,28 @@ def open_sample_overlay(project_manager, sample_name, analysis_name=None, parent
                 + ("\n\nThis sample may not have that region." if region_dir else "")
             )
             return False
+
+        recipe = recipe_for_analysis(
+            os.path.join(project_root, "RELATIONAL_ANALYSIS", analysis_name))
+
+    # Narrow to the channels this view is about. Order follows the registry so
+    # colour assignment stays stable for a channel across analyses.
+    wanted = list(channels) if channels is not None else channels_used_by_recipe(recipe)
+    if wanted:
+        shown = {k: v for k, v in sample_data.items() if k in set(wanted)}
+        if shown:
+            skipped = [k for k in wanted if k not in sample_data]
+            if skipped:
+                # The recipe names a channel this sample does not have -- a
+                # renamed folder, or a sample not processed in that channel.
+                print(f"  [overlay] recipe channels missing from {sample_name}: "
+                      + ", ".join(skipped))
+            sample_data = shown
+        else:
+            # None of them resolved; showing nothing would be worse than
+            # showing everything.
+            print(f"  [overlay] none of the recipe's channels matched "
+                  f"{sample_name}; showing all channels.")
 
     title = (f"Overlay: {analysis_label} | {sample_name}"
              if analysis_name else f"Sample: {sample_name}")
@@ -1420,12 +1387,15 @@ def open_sample_overlay(project_manager, sample_name, analysis_name=None, parent
                 except Exception as e:
                     print(f"Could not load {f}: {e}")
 
-            csv_path = os.path.join(sample_out_dir, f"{sample_name}_relational_metrics.csv")
-            if os.path.exists(csv_path):
+            # Bridges come from a per-object table. With several primaries
+            # there are several; draw each, since each holds its own lines.
+            for f in sorted(_per_object_files(sample_out_dir)):
                 try:
-                    draw_proximity_bridges(viewer, pd.read_csv(csv_path), shape, spacing)
+                    draw_proximity_bridges(
+                        viewer, pd.read_csv(os.path.join(sample_out_dir, f)),
+                        shape, spacing)
                 except Exception as e:
-                    print(f"Could not draw bridges: {e}")
+                    print(f"Could not draw bridges from {f}: {e}")
 
         # 3. Viewport for 3D.
         if shape and len(shape) == 3:

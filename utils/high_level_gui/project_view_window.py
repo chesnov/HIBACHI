@@ -13,7 +13,7 @@ from PyQt5.QtWidgets import (  # type: ignore
 
 from .gui_text_utils import app_icon_path, clean_filename_for_matching
 from .cross_channel_window import (
-    CrossChannelAnalyzerWindow, RecipeDock, list_relational_analyses,
+    RecipeDock, list_relational_analyses,
     make_analysis_key, open_sample_overlay, project_is_2d_for,
     run_relational_recipe, targets_from_leaf_keys,
 )
@@ -81,14 +81,15 @@ class ProjectViewWindow(QMainWindow):
          "Delete the checked regions and everything computed on them. "
          "Full-image results are not affected. Enabled when at least one "
          "region row is checked."),
-        ("cross_channel", "Open Cross-Channel Analyzer", "analysis",
-         lambda self: self.open_cross_channel_analyzer,
-         "Compare channels of one sample, build relational recipes and view "
-         "overlays."),
         ("recipe_dock", "Cross-Channel Recipe\u2026", "analysis",
          lambda self: self.show_recipe_dock,
-         "Build a cross-channel recipe here, against the images and regions "
-         "checked in the tree."),
+         "Compare channels: build a recipe, run it on the checked images and "
+         "regions, and view the results by double-clicking a row."),
+        ("spatial_null", "Spatial Null\u2026", "analysis",
+         lambda self: self.open_spatial_null,
+         "Randomise the segmented masks and re-measure, to see what the "
+         "recipe's numbers look like by chance. Uses the recipe in the dock "
+         "when there is one."),
         ("run_recipe", "Run Cross-Channel Recipe\u2026", "analysis",
          lambda self: self.run_recipe_on_selection,
          "Run the recipe in the dock on every checked image and region. "
@@ -345,6 +346,10 @@ class ProjectViewWindow(QMainWindow):
         # The cross-channel run needs both halves: a recipe to run, and
         # something to run it on. Its scope IS the checked set, so an empty
         # selection is not "all of them" -- it is nothing.
+        # Spatial Null randomises within a project, so it needs a
+        # multichannel project but not a recipe or a selection.
+        self._actions["spatial_null"].setEnabled(bool(self._channel_dirs))
+
         dock = getattr(self, "_recipe_dock", None)
         can_run = bool(checked) and dock is not None and bool(dock.steps())
         self._actions["run_recipe"].setEnabled(can_run)
@@ -413,27 +418,62 @@ class ProjectViewWindow(QMainWindow):
             return
         run_optimization_dialog(self, list(checked), mode)
 
-    def open_cross_channel_analyzer(self):
+    def open_spatial_null(self):
+        """Launch the spatial-null dialog for this project.
+
+        It used to hang off the analyzer window, which is why it needed that
+        window's channel checkboxes. Here the checked channels come from the
+        tree, the recipe from the dock, and the region from the checked leaves.
+
+        The registry is anchored and rebuilt first, as everywhere else in this
+        window: build_consolidated_sample_registry scans
+        os.path.dirname(project_path), so project_path must point at a channel
+        dir for the whole project root to be scanned.
+        """
         if self._cross_scan_dir:
-            # build_consolidated_sample_registry scans os.path.dirname(project_path),
-            # so anchoring project_path at a channel dir makes it scan the whole
-            # project root for sibling channels.
             self.project_manager.project_path = self._cross_scan_dir
         registry = self.project_manager.build_consolidated_sample_registry()
         if not registry:
             QMessageBox.warning(
-                self,
-                "No Compatible Data",
-                "Could not find any multi-channel samples in the parent directory.\n\n"
-                "Ensure your project is organized into 'Channel_X' folders, and that "
-                "they share matching sample names."
-            )
+                self, "No compatible data",
+                "Could not find any multi-channel samples in the parent "
+                "directory.\n\nEnsure your project is organized into "
+                "'Channel_X' folders, and that they share matching sample "
+                "names.")
             return
 
-        self.analyzer_window = CrossChannelAnalyzerWindow(self.project_manager)
-        self.analyzer_window.show()
-        self.analyzer_window.raise_()
-        self.analyzer_window.activateWindow()
+        view = self._content_view
+        # The tree keys channels by full path; the registry keys them by folder
+        # basename, which is what the dialog matches against.
+        checked_channels = sorted(
+            os.path.basename(str(k).rstrip("/\\"))
+            for k in (view.checked_channel_keys() if view is not None else set())
+            if k)
+
+        dock = getattr(self, "_recipe_dock", None)
+        recipe = dock.steps() if dock is not None else []
+
+        # One region only if every checked leaf agrees on one; a mixed
+        # selection has no single region to randomise within.
+        targets = targets_from_leaf_keys(
+            view.checked_folders() if view is not None else [])
+        regions = {r for _s, r in targets}
+        roi_name = regions.pop() if len(regions) == 1 else None
+
+        try:
+            from ..spatial_null import SpatialNullDialog
+            SpatialNullDialog(self.project_manager,
+                              checked_channels=checked_channels,
+                              recipe=recipe, roi_name=roi_name,
+                              parent=self).exec_()
+        except Exception as exc:                                # noqa: BLE001
+            import traceback
+            traceback.print_exc()
+            QMessageBox.critical(
+                self, "Error",
+                f"Failed to open the spatial null dialog:\n{exc}")
+        self._rescan_analyses()
+        self._maybe_rediscover_channels()
 
     def show_recipe_dock(self):
         """Show the cross-channel recipe dock, creating it on first use.

@@ -10,7 +10,7 @@ from .metadata import MetadataExtractor, get_sample_metadata
 from .parameter_widgets import ScalesTableWidget, create_parameter_widget
 from .project_scaffolding import scan_available_presets, apply_template_config_to_project, organize_channel_project, organize_processing_dir
 from .project_manager import ApplicationState, app_state, ProjectManager
-from .cross_channel_window import CrossChannelAnalyzerWindow
+from .cross_channel_window import RecipeDock, RecipePanel
 from .project_view_window import ProjectViewWindow
 from .app_launch import _check_if_last_window, _handle_napari_close, interactive_segmentation_with_config, launch_image_segmentation_tool, create_back_to_project_button
 from .metadata import HAS_CZI
@@ -32,7 +32,8 @@ __all__ = [
     "app_state",
     "ProjectManager",
     "ProjectViewWindow",
-    "CrossChannelAnalyzerWindow",
+    "RecipeDock",
+    "RecipePanel",
     "_check_if_last_window",
     "_handle_napari_close",
     "interactive_segmentation_with_config",

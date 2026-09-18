@@ -1,7 +1,10 @@
 # Cross-Channel Analyzer
 
 **Corresponding modules:**
-*   `utils/high_level_gui/cross_channel_window.py` — the window and recipe builder
+*   `utils/high_level_gui/recipe_library.py` — saved recipes, shared across
+    projects
+*   `utils/high_level_gui/cross_channel_window.py` — the recipe panel, the
+    runner and the overlay viewer
 *   `utils/high_level_gui/relational_engine.py` — execution
 *   `utils/fluorescence_module/interaction_analysis.py` — the distance and
     overlap measurements, at both ranks (this was once two modules, one per
@@ -27,9 +30,26 @@ the results, so an analysis can be repeated.
 
 ## Building a recipe
 
-Tick channels in the list, then add a step. There are four:
-**Overlap**, **Distance**, **Size Filter** and **Spatial Null**. Each opens one
-form; nothing is asked in a chain of follow-up prompts.
+Cross-channel analysis lives in the project window. **Analysis →
+Cross-Channel Recipe…** opens a dock holding the recipe and three buttons:
+**Overlap**, **Distance** and **Size Filter**. Each opens one form; nothing is
+asked in a chain of follow-up prompts.
+
+**Recipes…** in the dock opens the recipe library: saved recipes live under
+`~/.hibachi/recipes`, alongside the processing configs in `~/.hibachi/configs`,
+and are available in every project. You can save the current recipe, load,
+rename, delete, export one to share, or import one — including the
+`recipe.yaml` that every run leaves beside its results, which needs no
+conversion. A recipe names channels by number, so the library tells you when a
+recipe needs a channel this project does not have.
+
+A run's scope is whatever is **checked in the project tree** — any mix of full
+images and regions. Results are opened from the tree like any other view.
+Spatial Null is a project-level tool under the same menu.
+
+There is no separate analyzer window; it was a second copy of the project
+window's sample list, region picker and viewer, and only the recipe was ever
+unique to it.
 
 Each step either produces a new mask
 or produces measurements.
@@ -104,7 +124,10 @@ The **region** selector applies the whole recipe to one saved sub-region instead
 of the full image, for every sample that has a region of that name. Sub-regions
 come from the ROI workflow — see [Sub-Regions](roi_regions.md).
 
-The choice is recorded in `region.txt` next to the results.
+The scope is recorded in `targets.txt` next to the results, one line per
+image or region covered. A run started from the main window takes its scope
+from the checked rows in the project tree, so it can mix full images and
+regions freely; the older analyzer window runs every sample at one region.
 
 ---
 
@@ -132,26 +155,36 @@ Everything lands under:
 ```
 <project_root>/RELATIONAL_ANALYSIS/<analysis_name>/
 ├── recipe.yaml                     the recipe that produced this
-├── region.txt                      which region it ran on
-├── MASTER_RELATIONAL_RESULTS.csv   every sample's per-object rows, concatenated
+├── targets.txt                     which images and regions it covered
+├── MASTER_PER_OBJECT.csv           every sample's per-object rows, concatenated
 ├── MASTER_OVERLAP_SUMMARY.csv      every sample's sample-level overlap figures
 └── <sample>/
-    ├── <sample>_relational_metrics.csv
-    ├── overlap_summary.csv
-    ├── coverage_stats_<partner>.csv
+    ├── per_object_<primary>.csv            one row per primary object
+    ├── per_object_<partner>_coverage.csv   one row per partner object
+    ├── per_overlap_region_<a>_in_<b>.csv   one row per overlap region
+    ├── overlap_summary.csv                 one row per channel pair
     ├── pairwise_distances_<partner>.csv   (only if asked for)
     ├── intersection_<partner>.dat
     └── (intermediate masks from each mask-producing step)
 ```
 
-When one recipe measures several different primaries, the per-object table is
-written once per primary as `<sample>_relational_metrics_<primary>.csv` instead
-of the single file above, since those rows describe different objects.
+Every file is named for **what one of its rows is**. That distinction matters:
+"how much of A is inside B" and "how much of B is covered by A" are different
+questions at different row grains, so they cannot share a table. A recipe with
+several primaries simply writes one `per_object_<primary>.csv` each.
+
+Channels are named by their number -- `Channel_0`, `Channel_1` -- in every
+column header, mask filename and viewer layer. The channel index is assigned at
+setup and is unique by construction, so these names are stable and cannot
+collide. A channel folder's suffix, where it has one, is the label of the config
+preset chosen at setup; it is not a channel identity, never updates if the
+channel is reprocessed, and is the same for every channel whenever the reference
+config was used, so it is not used for naming.
 
 A region run nests one level deeper, `<sample>/<region>/`, so an analysis of the
 full image and the same analysis of a region do not overwrite each other.
 
-### `<sample>_relational_metrics.csv` — one row per primary object
+### `per_object_<primary>.csv` — one row per primary object
 
 Relationship measurements only — the primary object's own size and shape stay in
 its channel's `metrics_df_<mode>.csv`, joined on the object ID. Each partner
@@ -171,7 +204,7 @@ Analysing several partners adds another set of these per partner, merged onto th
 same rows — so one table answers "how far is each microglion from a neuron, and
 from a vessel".
 
-### `coverage_stats_<partner>.csv` — one row per **partner** object
+### `per_object_<partner>_coverage.csv` — one row per **partner** object
 
 The same relationship from the other side:
 
@@ -204,12 +237,12 @@ The last two are an *incidence* measure — what share of objects are involved �
 which is a different question from what share of the material is. Both are
 often wanted.
 
-### `MASTER_RELATIONAL_RESULTS.csv` and `MASTER_OVERLAP_SUMMARY.csv`
+### `MASTER_PER_OBJECT.csv` and `MASTER_OVERLAP_SUMMARY.csv`
 
 The per-object rows and the sample-level overlap rows, each concatenated across
 every sample with a `sample_name` column. `MASTER_OVERLAP_SUMMARY.csv` is
 normally the one to load for a cross-sample comparison of overlap;
-`MASTER_RELATIONAL_RESULTS.csv` is for per-object distributions.
+`MASTER_PER_OBJECT.csv` is for per-object distributions.
 
 ---
 
