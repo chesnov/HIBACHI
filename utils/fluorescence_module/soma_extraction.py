@@ -108,7 +108,28 @@ def _core_is_elongated(coords_local, spacing, max_aspect, ndim):
     # Degeneracy relative to the largest axis, so the test does not depend on
     # the units the spacing happens to be in. An axis carrying ~1e-9 of the
     # leading variance contributes no shape information.
-    non_degenerate = ev[ev > ev[0] * 1e-9]
+    # A core confined to ONE plane of a stack is a slice, not a core, and is
+    # rejected here.
+    #
+    # This function previously rejected any core with a degenerate smallest
+    # axis, on the reasoning that a vanishing axis means a line. I changed that
+    # to judge the remaining axes instead, because in principle a coplanar core
+    # is a flat sheet rather than a line. On a real z-stack that was wrong and
+    # made placement markedly worse: 56% of the somas it produced were one
+    # plane thick, every one of them past the configured aspect limit, and they
+    # sat wherever the intensity percentile happened to cut -- typically
+    # hugging a cell's edge rather than its middle. The blanket rejection was
+    # doing real work.
+    #
+    # It is a rank-3 judgement only. In 2D every core is "coplanar" by
+    # definition, so the rule would reject everything; there the two in-plane
+    # axes are all there is and the original largest-over-smallest test is
+    # exactly right. That distinction is what the earlier version got wrong in
+    # the other direction.
+    degenerate = ev <= ev[0] * 1e-9
+    if ndim >= 3 and degenerate.any():
+        return True
+    non_degenerate = ev[~degenerate]
     if non_degenerate.size < 2:
         return True
     return (math.sqrt(non_degenerate[0])
