@@ -307,43 +307,52 @@ def get_min_distance_pixels(
 _MAX_FOOTPRINT_RADIUS = 64
 
 
-def peak_separation_footprint(
-    spacing: Sequence[float], physical_distance: float, ndim: int,
-) -> np.ndarray:
-    """Boolean footprint enclosing everything within `physical_distance`.
+def peak_separation_radii(spacing, physical_distance, ndim):
+    """Per-axis voxel radii for a physical separation.
 
-    Exists because `peak_local_max(min_distance=N)` treats N as a voxel count
-    and applies it to EVERY axis. `get_min_distance_pixels` measures against the
-    finest IN-PLANE axis, so on anisotropic data the resulting N is large in
-    voxel terms and, applied to z, demands a separation far beyond what was
-    asked for: 2 um at 0.1 um/px in-plane is 20 px, and enforcing 20 PLANES in a
-    stack 11 planes deep means two somata at different z can never both be
-    kept. The sibling `exclude_border` comment below records the same units
-    confusion being fixed for the border; this is the footprint half of it.
-
-    The footprint is an ellipsoid in voxel space -- a ball of radius
-    `physical_distance` in PHYSICAL space -- so "2 um apart" means the same
-    thing along every axis. Note this is also slightly less suppressive than the
-    old box on isotropic data, since a box's corners reach past the radius it
-    was built from; that difference is in the direction of the stated parameter.
+    `peak_local_max(min_distance=N)` treats N as a voxel count on EVERY axis,
+    and `get_min_distance_pixels` derives N from the finest IN-PLANE axis. On
+    anisotropic data that silently demands far more separation in z than was
+    asked for: 3 um at 0.156 um/px in-plane is 19 px, and 19 PLANES at a 2 um
+    step is 38 um, in a stack 22 um deep. Two cells at different depths could
+    never both be kept.
     """
     radii = []
-    clipped = False
     for sp in list(spacing)[:ndim]:
         r = int(round(float(physical_distance) / float(sp)))
-        r = max(1, r)
-        if r > _MAX_FOOTPRINT_RADIUS:
-            r = _MAX_FOOTPRINT_RADIUS
-            clipped = True
-        radii.append(r)
-    if clipped:
-        print(f"  [soma] peak separation footprint clipped to "
-              f"{_MAX_FOOTPRINT_RADIUS} voxels on at least one axis; "
-              f"{physical_distance} um is very large next to this spacing.")
+        radii.append(max(1, min(r, _MAX_FOOTPRINT_RADIUS)))
+    return tuple(radii)
 
-    grids = np.ogrid[tuple(slice(-r, r + 1) for r in radii)]
-    norm = sum((g / r) ** 2 for g, r in zip(grids, radii))
-    return norm <= 1.0
+
+def peak_search_box(radii, ndim):
+    """Separable box size for the local-maximum pre-pass.
+
+    Deliberately the box INSCRIBED in the ellipsoid of `radii` (each half-
+    extent divided by sqrt(ndim)), not the ellipsoid itself, for two reasons.
+
+    Speed: scipy's maximum_filter is separable for `size=` and for a footprint
+    that is a full box, but takes a generic per-voxel path for any other
+    footprint. An ellipsoidal footprint of radii (2, 19, 19) measured 981 ms
+    per call against 5.5 ms for the equivalent `size=` -- which is where a 20x
+    slowdown came from when this used `footprint=`. (A benchmark using a full
+    BOX footprint hides this completely, because scipy routes that back to the
+    separable path.)
+
+    Correctness: an inscribed box can only ever be LESS suppressive than the
+    ellipsoid, so no peak the caller wanted is lost here. The exact Euclidean
+    separation is then enforced by `dedupe_peaks_physical`, which is where it
+    belonged anyway -- a voxel-grid footprint can only ever approximate it.
+    """
+    import math as _math
+    shrink = _math.sqrt(ndim)
+    return tuple(max(1, int(r / shrink)) * 2 + 1 for r in radii)
+
+
+def local_maxima(values, mask, box):
+    """Local maxima of `values` within `mask`, using a separable box filter."""
+    mx = ndimage.maximum_filter(values, size=box, mode="nearest")
+    hits = (values == mx) & mask & (values > 0)
+    return np.argwhere(hits)
 
 
 def dedupe_peaks_physical(peaks, values, spacing, physical_distance):
@@ -402,7 +411,7 @@ def _generate_label_candidates(
     intensity_smooth_um: float,
     intensity_weight: float,
     int_peak_sep: int,
-    peak_footprint: np.ndarray,
+    peak_box: tuple,
     peak_separation_um: float,
     memmap_voxel_threshold: int,
     show_tile_bar: bool = True,
@@ -679,11 +688,10 @@ def _generate_label_candidates(
                 # voxel count applied isotropically, so an in-plane-derived
                 # value silently demanded that separation in PLANES too. See
                 # `peak_separation_footprint`.
-                peaks = peak_local_max(
-                    frag_dt, footprint=peak_footprint, labels=frag_crop,
-                    exclude_border=False
-                )
-                # Collapse plateau ties, which the footprint alone cannot do.
+                # Cheap separable pre-pass, then the exact physical rule.
+                # See peak_search_box for why the box rather than an
+                # ellipsoidal footprint.
+                peaks = local_maxima(frag_dt, frag_crop, peak_box)
                 if len(peaks) > 1:
                     peaks = dedupe_peaks_physical(
                         peaks, frag_dt[tuple(np.asarray(peaks).T)],
@@ -864,11 +872,11 @@ def extract_soma_masks(
     )
     # Built once here rather than per fragment: it depends only on the spacing
     # and the requested separation, and it is pickled to each worker.
-    _peak_footprint = peak_separation_footprint(
-        spacing, min_physical_peak_separation, ndim
-    )
+    _peak_radii = peak_separation_radii(
+        spacing, min_physical_peak_separation, ndim)
+    _peak_box = peak_search_box(_peak_radii, ndim)
     if ndim == 3 and len(set(float(s) for s in spacing)) > 1:
-        _fp_r = tuple((d - 1) // 2 for d in _peak_footprint.shape)
+        _fp_r = _peak_radii
         print(f"  Peak separation footprint: radii {_fp_r} voxels "
               f"(= {min_physical_peak_separation:.2f} µm on every axis; "
               f"an isotropic min_distance would have used "
@@ -1016,7 +1024,7 @@ def extract_soma_masks(
         max_allowed_core_aspect_ratio=max_allowed_core_aspect_ratio,
         intensity_smooth_um=intensity_smooth_um,
         intensity_weight=intensity_weight, int_peak_sep=int_peak_sep,
-        peak_footprint=_peak_footprint,
+        peak_box=_peak_box,
         peak_separation_um=float(min_physical_peak_separation),
         memmap_voxel_threshold=memmap_voxel_threshold,
     )
