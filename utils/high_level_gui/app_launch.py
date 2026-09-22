@@ -13,7 +13,7 @@ from PyQt5.QtCore import QTimer, Qt  # type: ignore
 from PyQt5.QtGui import QIcon  # type: ignore
 from PyQt5.QtWidgets import (  # type: ignore
     QApplication, QMessageBox, QVBoxLayout, QHBoxLayout, QPushButton, QWidget,
-    QLabel, QFrame, QSizePolicy
+    QLabel, QFrame, QSizePolicy, QScrollArea, QToolButton
 )
 
 from .gui_text_utils import app_icon_path
@@ -402,6 +402,237 @@ def _give_layer_list_room(viewer, panel_dock=None) -> None:
         except Exception:
             log.debug("could not place control panel under the layer list",
                       exc_info=True)
+
+
+# --------------------------------------------------------------------------- #
+# The segmentation viewer's side panel: one column that scrolls as a whole
+#
+# The left side used to be four separate docks stacked by QMainWindow: napari's
+# layer controls and layer list, our control panel and the rotation button.
+# Qt cannot make a window shorter than the summed MINIMUM heights of the docks
+# in a column (~860 px here), so on a 1080p screen at 125-150% scaling Windows
+# maximised the window taller than the screen, the control panel's buttons sat
+# below the taskbar, and manual resizing stopped at the same floor.
+#
+# Now the four are sections of ONE dock whose content is a single scroll area.
+# The dock's minimum height is small, so the window always fits; when the
+# screen is short the whole column scrolls -- no section is squeezed or given a
+# scrollbar of its own -- and when it is tall nothing scrolls and the spare
+# height goes to the layer list. Any section can be collapsed from its header,
+# and the choice is remembered.
+# --------------------------------------------------------------------------- #
+
+_LAYER_ROWS_SHOWN_MIN = 4     # the layer list always shows at least this many rows
+_LAYER_ROWS_SHOWN_MAX = 10    # ...and grows with the layer count up to this many
+_LAYER_ROW_FALLBACK_PX = 32   # napari's row height, if the view cannot tell us
+
+
+def _panel_settings():
+    """Where section collapse state is kept: per install, beside resources.json."""
+    from PyQt5.QtCore import QSettings
+    try:
+        from ..fluorescence_module.resource_budget import state_dir
+        path = os.path.join(state_dir(), "viewer_layout.ini")
+    except Exception:
+        path = os.path.join(os.path.expanduser("~"), ".hibachi", "viewer_layout.ini")
+    return QSettings(path, QSettings.IniFormat)
+
+
+class CollapsibleSection(QWidget):
+    """A header that shows or hides the section's body. Remembers its state."""
+
+    def __init__(self, title: str, body: QWidget, key: str,
+                 expanded: bool = True, parent=None):
+        super().__init__(parent)
+        self._key = f"sections/{key}"
+        self.body = body
+
+        self.header = QToolButton()
+        self.header.setText(title)
+        self.header.setCheckable(True)
+        self.header.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        self.header.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.header.setAutoRaise(True)
+        self.header.setStyleSheet(
+            "QToolButton { border: none; padding: 3px 2px; font-weight: bold;"
+            " color: #b0b0b0; text-align: left; }")
+        self.header.toggled.connect(self._apply)
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(0)
+        lay.addWidget(self.header)
+        lay.addWidget(_hline())
+        lay.addWidget(body)
+
+        saved = _panel_settings().value(self._key, None)
+        if saved is not None:
+            expanded = str(saved).lower() in ("true", "1")
+        self.header.setChecked(expanded)
+        self._apply(expanded, save=False)
+
+    def _apply(self, expanded: bool, save: bool = True) -> None:
+        self.header.setArrowType(Qt.DownArrow if expanded else Qt.RightArrow)
+        self.body.setVisible(expanded)
+        if save:
+            _panel_settings().setValue(self._key, bool(expanded))
+
+    def set_expanded(self, expanded: bool) -> None:
+        self.header.setChecked(bool(expanded))
+
+    def is_expanded(self) -> bool:
+        return self.header.isChecked()
+
+
+def _fit_layer_list_to_layers(viewer, view) -> None:
+    """Give the layer list room for its layers, instead of a fixed floor.
+
+    The column scrolls as a whole, so the list does not have to fit the screen
+    by itself: it asks for enough height to show every layer, between
+    _LAYER_ROWS_SHOWN_MIN and _LAYER_ROWS_SHOWN_MAX rows, re-sized as layers
+    are added or removed. Past the maximum it scrolls internally, as napari's
+    list always has. On a tall screen it also takes the column's spare height.
+
+    napari's list view asks for a large default height of its own (~480 px,
+    whatever the layer count), which would push the column into scrolling on
+    every screen. Its vertical size hint is therefore ignored and replaced by
+    the row-based minimum.
+    """
+    if view is None:
+        return
+    view.setSizePolicy(view.sizePolicy().horizontalPolicy(), QSizePolicy.Ignored)
+    # Spare height given to the Layers section must reach the list itself, not
+    # the layer/viewer button rows napari stacks around it.
+    try:
+        holder = view.parentWidget().layout()
+        holder.setStretchFactor(view, 1)
+    except Exception:
+        pass
+
+    def _update(*_args) -> None:
+        try:
+            row_h = _LAYER_ROW_FALLBACK_PX
+            if view.model() is not None and view.model().rowCount() > 0:
+                hinted = view.sizeHintForRow(0)
+                if hinted > 0:
+                    row_h = hinted
+            # One spare row, so there is always somewhere to drop a dragged
+            # layer below the last one.
+            shown = max(_LAYER_ROWS_SHOWN_MIN,
+                        min(_LAYER_ROWS_SHOWN_MAX, len(viewer.layers) + 1))
+            view.setMinimumHeight(shown * row_h + 2 * view.frameWidth() + 4)
+        except Exception:
+            log.debug("could not size the layer list", exc_info=True)
+
+    _update()
+    try:
+        viewer.layers.events.inserted.connect(_update)
+        viewer.layers.events.removed.connect(_update)
+    except Exception:
+        pass
+    QTimer.singleShot(0, _update)
+
+
+def build_scrollable_side_panel(viewer, sections) -> Any:
+    """Replace the left column with one dock that scrolls as a whole.
+
+    `sections` is a list of ``(title, widget, key, expanded)`` added below
+    napari's layer controls and layer list, which are moved in from their own
+    docks. Returns the new dock, or None if napari's docks could not be found
+    (the caller then falls back to separate docks).
+
+    napari's Window > Layer Controls / Layer List menu items show and hide
+    napari's docks. Those are now empty and hidden, so showing one is turned
+    into toggling the matching section instead.
+    """
+    qv = getattr(viewer.window, "_qt_viewer", None)
+    try:
+        controls_dock = qv.dockLayerControls
+        list_dock = qv.dockLayerList
+        controls_w = controls_dock.widget()
+        list_w = list_dock.widget()
+    except Exception:
+        log.debug("napari's layer docks were not found", exc_info=True)
+        return None
+    if controls_w is None or list_w is None:
+        return None
+
+    # Detach napari's widgets from their docks (setWidget does not delete the
+    # previous widget) and hide the now-empty docks.
+    controls_dock.setWidget(QWidget())
+    list_dock.setWidget(QWidget())
+    controls_dock.hide()
+    list_dock.hide()
+
+    content = QWidget()
+    column = QVBoxLayout(content)
+    column.setContentsMargins(4, 2, 4, 4)
+    column.setSpacing(6)
+
+    # The layer controls are exactly their natural height; only the layer list
+    # takes spare height on a tall screen.
+    controls_w.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
+    s_controls = CollapsibleSection("Layer controls", controls_w,
+                                    "layer_controls")
+    s_layers = CollapsibleSection("Layers", list_w, "layer_list")
+    # The layer list view itself, by name: searching the container for "an item
+    # view" finds a hidden popup list inside one of napari's buttons first.
+    _fit_layer_list_to_layers(viewer, getattr(qv, "layers", None))
+    column.addWidget(s_controls)
+    column.addWidget(s_layers, 1)
+    for title, widget, key, expanded in sections:
+        if widget is None:
+            continue
+        widget.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+        column.addWidget(CollapsibleSection(title, widget, key, expanded))
+
+    scroll = QScrollArea()
+    scroll.setWidgetResizable(True)
+    scroll.setFrameShape(QFrame.NoFrame)
+    # Width is never scrolled: the column is as wide as its widest section.
+    scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+    scroll.setWidget(content)
+
+    def _fit_width() -> None:
+        try:
+            need = content.minimumSizeHint().width()
+            bar = scroll.verticalScrollBar().sizeHint().width()
+            scroll.setMinimumWidth(need + bar + 2)
+        except Exception:
+            pass
+    _fit_width()
+    QTimer.singleShot(0, _fit_width)
+
+    # The side panel is a scrollbar wider than napari's own column. Keep the
+    # right column's width (the parameter panel) as it was, so that width comes
+    # from the canvas instead: the parameters are the part that runs wide.
+    window = viewer.window._qt_window
+    from PyQt5.QtWidgets import QDockWidget
+    right = [(d, d.width()) for d in window.findChildren(QDockWidget)
+             if d.isVisible() and window.dockWidgetArea(d) == Qt.RightDockWidgetArea]
+
+    dock = viewer.window.add_dock_widget(scroll, area="left", name="Side panel")
+
+    def _keep_right_width() -> None:
+        try:
+            live = [(d, w) for d, w in right if d.isVisible()]
+            if live:
+                window.resizeDocks([d for d, _ in live], [w for _, w in live],
+                                   Qt.Horizontal)
+        except Exception:
+            pass
+    _keep_right_width()
+    QTimer.singleShot(0, _keep_right_width)
+
+    # Route napari's menu toggles for the two emptied docks to the sections.
+    for napari_dock, section in ((controls_dock, s_controls),
+                                 (list_dock, s_layers)):
+        def _redirect(visible, d=napari_dock, s=section):
+            if visible:
+                QTimer.singleShot(0, d.hide)
+                s.set_expanded(not s.is_expanded())
+        napari_dock.visibilityChanged.connect(_redirect)
+    return dock
 
 
 def make_channel_visibility_button(viewer) -> QPushButton:
@@ -814,16 +1045,8 @@ def interactive_segmentation_with_config(selected_folder: str = None,
         control_panel, refresh_nav = build_segmentation_control_panel(
             viewer, gui_manager
         )
-        control_dock = viewer.window.add_dock_widget(
-            control_panel, area="left", name="Controls"
-        )
-        # Cap the panel at its content height and sit it under the layer list, so
-        # the spare vertical space in the left column goes to the layer list.
-        _lock_panel_height(control_panel, control_dock)
-        _give_layer_list_room(viewer, control_dock)
-        refresh_nav()
 
-        # 3D rotation recorder (3D samples only), docked beneath the layer list.
+        # 3D rotation recorder (3D samples only), a section of the side panel.
         # The cross-channel overlay adds this too; single-channel projects open
         # here instead, so without this the turntable would be unavailable to
         # them. Gated on a 3D image and a non-2D mode; failure must never block
@@ -836,17 +1059,37 @@ def interactive_segmentation_with_config(selected_folder: str = None,
             # and the mode test is what used to exclude it. `config_ndim`
             # returns None when a config declares nothing, in which case fall
             # back to the shape rather than refusing outright.
-            from ..fluorescence_module.turntable import add_turntable_button
             from .metadata import config_ndim
             _declared = config_ndim(config)
             _is_3d = (
                 _shape is not None and len(_shape) >= 3
                 and (_declared == 3 if _declared is not None else True)
             )
+            rotation_widget = None
             if _is_3d:
-                add_turntable_button(viewer)
+                from ..fluorescence_module.turntable import make_turntable_widget
+                rotation_widget = make_turntable_widget(viewer)
         except Exception as exc:
+            rotation_widget = None
             log.warning("Could not add 3D rotation recorder: %s", exc)
+
+        # One scrollable side panel instead of four stacked docks, so the
+        # window can never be taller than the screen (see the comment above
+        # build_scrollable_side_panel).
+        side = build_scrollable_side_panel(viewer, [
+            ("Controls", control_panel, "controls", True),
+            ("3D rotation", rotation_widget, "rotation", True),
+        ])
+        if side is None:
+            # napari's docks moved in some version: keep the old layout.
+            control_dock = viewer.window.add_dock_widget(
+                control_panel, area="left", name="Controls")
+            _lock_panel_height(control_panel, control_dock)
+            _give_layer_list_room(viewer, control_dock)
+            if rotation_widget is not None:
+                viewer.window.add_dock_widget(
+                    rotation_widget, area="left", name="Rotation")
+        refresh_nav()
 
     except Exception as e:
         log.exception("Failed to open segmentation viewer for %r", selected_folder)

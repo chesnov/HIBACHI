@@ -699,10 +699,12 @@ def _locate_layer_list_dock(viewer):
     return None
 
 
-def add_turntable_button(viewer):
-    """Dock a '🎥 Record 3D Rotation' button beneath the layer list. Mirrors the
-    placement of add_channel_visibility_toggle so the two controls sit together.
-    Returns the QDockWidget (or None on failure)."""
+def make_turntable_widget(viewer) -> QWidget:
+    """The '🎥 Record 3D Rotation' button in its container, not docked.
+
+    For callers that place it themselves, like the segmentation viewer's
+    scrollable side panel. `add_turntable_button` docks the same widget.
+    """
     btn = QPushButton("🎥 Record 3D Rotation")
     btn.setToolTip("Spin the 3D view and save it as an MP4 or GIF movie.")
 
@@ -729,7 +731,14 @@ def add_turntable_button(viewer):
     lay = QVBoxLayout(container)
     lay.setContentsMargins(5, 3, 5, 3)
     lay.addWidget(btn)
+    return container
 
+
+def add_turntable_button(viewer):
+    """Dock a '🎥 Record 3D Rotation' button beneath the layer list. Mirrors the
+    placement of add_channel_visibility_toggle so the two controls sit together.
+    Returns the QDockWidget (or None on failure)."""
+    container = make_turntable_widget(viewer)
     dock = viewer.window.add_dock_widget(container, area="left", name="Rotation")
 
     # Sit it directly beneath the layer list.

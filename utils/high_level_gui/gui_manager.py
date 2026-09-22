@@ -3105,10 +3105,24 @@ class DynamicGUIManager(QObject):
         """Generates parameter widgets for the given step."""
         # Temporarily lock the window size to prevent macOS from shrinking 
         # the window when the old parameter dock is removed.
+        #
+        # Two guards, because this lock could otherwise make an oversized
+        # window permanent (buttons below the screen edge that resizing cannot
+        # reach): the lock is capped at the screen's available size, and a
+        # rebuild that starts while another's lock is still pending keeps the
+        # ORIGINAL minimum rather than saving the lock as the value to restore.
         try:
             qt_win = self.viewer.window._qt_window
-            old_min = qt_win.minimumSize()
-            qt_win.setMinimumSize(qt_win.size())
+            if getattr(self, "_saved_min_size", None) is None:
+                self._saved_min_size = qt_win.minimumSize()
+            lock = qt_win.size()
+            screen = qt_win.screen()
+            if screen is not None:
+                avail = screen.availableGeometry().size()
+                chrome = max(0, qt_win.frameGeometry().height() - qt_win.height())
+                avail.setHeight(max(0, avail.height() - chrome))
+                lock = lock.boundedTo(avail)
+            qt_win.setMinimumSize(lock)
         except Exception:
             qt_win = None
 
@@ -3223,7 +3237,18 @@ class DynamicGUIManager(QObject):
         
         # Release the minimum size lock on the next event loop tick
         if qt_win:
-            QTimer.singleShot(0, lambda: qt_win.setMinimumSize(old_min))
+            QTimer.singleShot(0, lambda: self._release_min_size(qt_win))
+
+    def _release_min_size(self, qt_win) -> None:
+        """Undo create_step_widgets' size lock, once, restoring the original."""
+        saved = getattr(self, "_saved_min_size", None)
+        if saved is None:
+            return
+        self._saved_min_size = None
+        try:
+            qt_win.setMinimumSize(saved)
+        except Exception:
+            pass
 
     def create_interaction_widgets(self, step_display: str, config_key: str) -> None:
         """Creates specialized widgets for the Interaction Analysis step."""
