@@ -828,6 +828,12 @@ def prepare(state_dir: str, executable: Optional[str] = None,
         return Report(mode="software", reason="HIBACHI_SOFTWARE_OPENGL=1")
     if sys.platform.startswith("linux"):
         return _prepare_linux(state_dir, os.path.abspath(executable or sys.executable), log)
+    if sys.platform == "darwin":
+        # One GPU on Apple Silicon; on dual-GPU Intel Macs macOS itself moves
+        # OpenGL programs to the discrete GPU (the app bundle's Info.plist does
+        # not opt out). OpenGL always exists, so there is no fallback to make.
+        return Report(mode="unchanged",
+                      reason="macOS chooses the graphics processor automatically")
     if not sys.platform.startswith("win"):
         return Report(mode="unchanged", reason="not Windows or Linux")
     if forced == "0":

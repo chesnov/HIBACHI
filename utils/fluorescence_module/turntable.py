@@ -1,11 +1,18 @@
 """
-turntable.py -- Record a rotating 3D animation of the current napari view.
+turntable.py -- Record a movie of the current napari view.
 
-This adds a "🎥 Record 3D Rotation" button beneath the layer list in the
-single-channel and channel-merged napari viewers. Clicking it opens a small
-settings dialog (rotation speed, direction, axis, which layers to include,
-fps, output format and resolution), then renders a turntable movie by spinning
-the camera one frame at a time and grabbing a screenshot per frame.
+This adds a "🎥 Record Movie" button to the single-channel and channel-merged
+napari viewers. Clicking it opens a small settings dialog offering two kinds of
+movie, then renders it one frame at a time, grabbing a screenshot per frame:
+
+* **Rotate the 3D view** -- a turntable: the camera spins at a chosen speed,
+  direction and axis.
+* **Fly through Z slices** -- the view steps through the stack's slices in 2D,
+  over a chosen range, speed and direction (including back and forth). The
+  current zoom and pan are kept, so a zoomed-in region can be flown through.
+
+Both share the output options (fps, format, resolution, which layers), and both
+put the viewer back exactly as it was afterwards.
 
 Design notes
 ------------
@@ -21,6 +28,7 @@ Design notes
 
 Public API
 ----------
+    make_turntable_widget(viewer) -> QWidget
     add_turntable_button(viewer) -> QDockWidget | None
 """
 
@@ -62,6 +70,17 @@ _AXIS_CHOICES = [
 ]
 _FORMATS = ["mp4", "gif"]
 
+MODE_ROTATE = "rotate"
+MODE_ZSWEEP = "zsweep"
+_MODES = [(MODE_ROTATE, "Rotate the 3D view"), (MODE_ZSWEEP, "Fly through Z slices")]
+
+Z_FORWARD = "forward"
+Z_BACKWARD = "backward"
+Z_PINGPONG = "pingpong"
+_Z_DIRECTIONS = [(Z_FORWARD, "First slice \u2192 last"),
+                 (Z_BACKWARD, "Last slice \u2192 first"),
+                 (Z_PINGPONG, "Back and forth")]
+
 _SETTINGS_ORG = "HIBACHI"
 _SETTINGS_APP = "Turntable"
 
@@ -83,6 +102,13 @@ class TurntableSettings:
     use_visible_layers: bool = True  # True: whatever is currently visible; False: custom set
     custom_layer_names: List[str] = field(default_factory=list)
     last_dir: str = ""             # remembered output directory
+    mode: str = MODE_ROTATE        # MODE_ROTATE or MODE_ZSWEEP
+    z_speed: float = 10.0          # fly-through speed, slices per second
+    z_direction: str = Z_FORWARD   # Z_FORWARD | Z_BACKWARD | Z_PINGPONG
+    # The slice range is the data's, not a preference: never persisted, and
+    # set from the viewer each time the dialog opens.
+    z_start: int = 0
+    z_end: int = -1                # -1: through the last slice
 
     # -- persistence --------------------------------------------------------- #
     @classmethod
@@ -100,6 +126,11 @@ class TurntableSettings:
             d.fmt = str(s.value("fmt", d.fmt))
             d.use_visible_layers = _as_bool(s.value("use_visible_layers", d.use_visible_layers))
             d.last_dir = str(s.value("last_dir", d.last_dir) or "")
+            mode = str(s.value("mode", d.mode))
+            d.mode = mode if mode in dict(_MODES) else MODE_ROTATE
+            d.z_speed = float(s.value("z_speed", d.z_speed))
+            z_dir = str(s.value("z_direction", d.z_direction))
+            d.z_direction = z_dir if z_dir in dict(_Z_DIRECTIONS) else Z_FORWARD
         except Exception as exc:  # corrupt/legacy value -> fall back to defaults
             logger.warning("Could not load turntable settings (%s); using defaults.", exc)
             d = cls()
@@ -108,8 +139,8 @@ class TurntableSettings:
     def save(self) -> None:
         s = QSettings(_SETTINGS_ORG, _SETTINGS_APP)
         for k, v in asdict(self).items():
-            if k == "custom_layer_names":
-                continue  # layer sets are view-specific; not worth persisting
+            if k in ("custom_layer_names", "z_start", "z_end"):
+                continue  # view-/data-specific; not worth persisting
             s.setValue(k, v)
 
     # -- derived quantities -------------------------------------------------- #
@@ -127,6 +158,44 @@ class TurntableSettings:
     @property
     def duration_s(self) -> float:
         return self.total_degrees / self.speed_dps if self.speed_dps > 0 else 0.0
+
+
+def zsweep_plan(start: int, end: int, speed: float, fps: int,
+                direction: str = Z_FORWARD) -> List[int]:
+    """The slice index shown in each frame of a Z fly-through.
+
+    Pure, so it can be tested without a viewer. `start` and `end` are inclusive
+    and may be given in either order.
+
+    `speed` is slices per second, so each slice is on screen for 1/speed s:
+
+    * slower than the frame rate -> every slice is held for the SAME number of
+      frames (uneven holds read as judder);
+    * as fast or faster -> slices are evenly skipped, landing exactly on both
+      ends.
+
+    Back and forth holds the turning slice once, not twice, and ends before the
+    first slice so a looping GIF or player does not stutter on a repeat.
+    """
+    lo, hi = sorted((int(start), int(end)))
+    count = hi - lo + 1
+    if count <= 1:
+        return [lo]
+    speed = max(1e-6, float(speed))
+    fps = max(1, int(fps))
+    frames_per_slice = fps / speed
+    if frames_per_slice >= 1.0:
+        hold = max(1, int(round(frames_per_slice)))
+        one_way = [lo + i for i in range(count) for _ in range(hold)]
+    else:
+        n = max(2, int(round((count - 1) / speed * fps)) + 1)
+        one_way = [lo + int(round(i * (count - 1) / (n - 1))) for i in range(n)]
+    if direction == Z_BACKWARD:
+        return [lo + hi - z for z in one_way]
+    if direction == Z_PINGPONG:
+        back = [z for z in reversed(one_way) if z not in (lo, hi)]
+        return one_way + back
+    return one_way
 
 
 def _as_bool(v) -> bool:
@@ -257,20 +326,32 @@ class TurntableDialog(QDialog):
     def __init__(self, viewer, parent=None):
         super().__init__(parent)
         self.viewer = viewer
-        self.setWindowTitle("Record 3D Rotation")
+        self.setWindowTitle("Record Movie")
         self.setMinimumWidth(440)
         self.settings = TurntableSettings.load()
         self._mp4_ok = _ensure_ffmpeg()
+        self._z_axis, self._z_count = _z_axis_and_count(viewer)
         self._build_ui()
         self._sync_from_settings()
+        self._on_mode_changed()
         self._update_estimate()
 
     # -- UI construction ----------------------------------------------------- #
     def _build_ui(self):
         root = QVBoxLayout(self)
 
-        # --- Motion -------------------------------------------------------- #
-        motion = QGroupBox("Motion")
+        # --- Kind of movie ------------------------------------------------- #
+        kind_row = QHBoxLayout()
+        kind_row.addWidget(QLabel("Movie:"))
+        self.combo_mode = QComboBox()
+        for _key, label in _MODES:
+            self.combo_mode.addItem(label)
+        kind_row.addWidget(self.combo_mode, 1)
+        root.addLayout(kind_row)
+
+        # --- Motion: rotation ------------------------------------------------ #
+        motion = QGroupBox("Rotation")
+        self.group_rotate = motion
         form = QFormLayout(motion)
 
         self.spin_speed = QDoubleSpinBox()
@@ -296,6 +377,40 @@ class TurntableDialog(QDialog):
         form.addRow("Revolutions:", self.spin_turns)
 
         root.addWidget(motion)
+
+        # --- Motion: Z fly-through ---------------------------------------- #
+        zbox = QGroupBox("Z fly-through")
+        self.group_z = zbox
+        zform = QFormLayout(zbox)
+        last = max(0, self._z_count - 1)
+        self.spin_z_start = QSpinBox()
+        self.spin_z_end = QSpinBox()
+        for w in (self.spin_z_start, self.spin_z_end):
+            w.setRange(0, last)
+        zrange = QHBoxLayout()
+        zrange.addWidget(self.spin_z_start)
+        zrange.addWidget(QLabel("to"))
+        zrange.addWidget(self.spin_z_end)
+        zrange.addWidget(QLabel(f"(of {self._z_count})"), 1)
+        zform.addRow("Slices:", zrange)
+
+        self.spin_z_speed = QDoubleSpinBox()
+        self.spin_z_speed.setRange(0.5, 500.0)
+        self.spin_z_speed.setDecimals(1)
+        self.spin_z_speed.setSuffix(" slices/s")
+        zform.addRow("Speed:", self.spin_z_speed)
+
+        self.combo_z_dir = QComboBox()
+        for _key, label in _Z_DIRECTIONS:
+            self.combo_z_dir.addItem(label)
+        zform.addRow("Direction:", self.combo_z_dir)
+
+        znote = QLabel("Shown as 2D slices at the current zoom and position, "
+                       "so a zoomed-in region can be flown through.")
+        znote.setWordWrap(True)
+        znote.setStyleSheet("color: gray;")
+        zform.addRow(znote)
+        root.addWidget(zbox)
 
         # --- Output -------------------------------------------------------- #
         out = QGroupBox("Output")
@@ -372,9 +487,12 @@ class TurntableDialog(QDialog):
         root.addLayout(btns)
 
         # Live estimate updates
-        for w in (self.spin_speed, self.spin_turns, self.spin_fps):
+        for w in (self.spin_speed, self.spin_turns, self.spin_fps,
+                  self.spin_z_start, self.spin_z_end, self.spin_z_speed):
             w.valueChanged.connect(self._update_estimate)
+        self.combo_z_dir.currentIndexChanged.connect(self._update_estimate)
         self.combo_fmt.currentIndexChanged.connect(self._on_fmt_changed)
+        self.combo_mode.currentIndexChanged.connect(self._on_mode_changed)
 
     # -- state <-> widgets --------------------------------------------------- #
     def _sync_from_settings(self):
@@ -390,6 +508,14 @@ class TurntableDialog(QDialog):
         self.radio_visible.setChecked(s.use_visible_layers)
         self.radio_custom.setChecked(not s.use_visible_layers)
         self.list_layers.setEnabled(not s.use_visible_layers)
+        self.combo_mode.setCurrentIndex(
+            [k for k, _ in _MODES].index(s.mode) if s.mode in dict(_MODES) else 0)
+        self.spin_z_start.setValue(0)
+        self.spin_z_end.setValue(max(0, self._z_count - 1))
+        self.spin_z_speed.setValue(s.z_speed)
+        self.combo_z_dir.setCurrentIndex(
+            [k for k, _ in _Z_DIRECTIONS].index(s.z_direction)
+            if s.z_direction in dict(_Z_DIRECTIONS) else 0)
         self._suggest_path()
 
     def _collect(self) -> TurntableSettings:
@@ -408,14 +534,35 @@ class TurntableDialog(QDialog):
             for i in range(self.list_layers.count())
             if self.list_layers.item(i).checkState() == Qt.Checked
         ]
+        s.mode = _MODES[self.combo_mode.currentIndex()][0]
+        s.z_start = int(self.spin_z_start.value())
+        s.z_end = int(self.spin_z_end.value())
+        s.z_speed = float(self.spin_z_speed.value())
+        s.z_direction = _Z_DIRECTIONS[self.combo_z_dir.currentIndex()][0]
         return s
+
+    def _mode(self) -> str:
+        return _MODES[self.combo_mode.currentIndex()][0]
+
+    def _on_mode_changed(self, *_):
+        z = self._mode() == MODE_ZSWEEP
+        self.group_rotate.setVisible(not z)
+        self.group_z.setVisible(z)
+        # Keep the suggested file name in step with the kind of movie, unless
+        # the user has typed their own.
+        cur = self.edit_path.text().strip()
+        if not cur or "_turntable_" in cur or "_zsweep_" in cur:
+            self._suggest_path()
+        self._update_estimate()
+        self.adjustSize()
 
     # -- helpers ------------------------------------------------------------- #
     def _default_filename(self) -> str:
         title = getattr(self.viewer, "title", "") or "view"
         safe = "".join(c if c.isalnum() or c in "-_" else "_" for c in title).strip("_")
         stamp = time.strftime("%Y%m%d_%H%M%S")
-        return f"{safe or 'view'}_turntable_{stamp}.{_FORMATS[self.combo_fmt.currentIndex()]}"
+        kind = "zsweep" if self._mode() == MODE_ZSWEEP else "turntable"
+        return f"{safe or 'view'}_{kind}_{stamp}.{_FORMATS[self.combo_fmt.currentIndex()]}"
 
     def _suggest_path(self):
         base_dir = self.settings.last_dir or os.path.expanduser("~")
@@ -436,7 +583,7 @@ class TurntableDialog(QDialog):
             self.settings.last_dir or os.path.expanduser("~"), self._default_filename()
         )
         path, _ = QFileDialog.getSaveFileName(
-            self, "Save rotation movie", start, f"{ext.upper()} (*.{ext})"
+            self, "Save movie", start, f"{ext.upper()} (*.{ext})"
         )
         if path:
             if not path.lower().endswith("." + ext):
@@ -445,15 +592,23 @@ class TurntableDialog(QDialog):
 
     def _update_estimate(self):
         try:
-            tmp = TurntableSettings(
-                speed_dps=float(self.spin_speed.value()),
-                turns=float(self.spin_turns.value()),
-                fps=int(self.spin_fps.value()),
-            )
+            fps = int(self.spin_fps.value())
+            if self._mode() == MODE_ZSWEEP:
+                frames = len(zsweep_plan(
+                    self.spin_z_start.value(), self.spin_z_end.value(),
+                    self.spin_z_speed.value(), fps,
+                    _Z_DIRECTIONS[self.combo_z_dir.currentIndex()][0]))
+                duration = frames / max(1, fps)
+            else:
+                tmp = TurntableSettings(
+                    speed_dps=float(self.spin_speed.value()),
+                    turns=float(self.spin_turns.value()),
+                    fps=fps,
+                )
+                frames, duration = tmp.total_frames, tmp.duration_s
             mp4_note = "" if self._mp4_ok else "  (ffmpeg not found — MP4 disabled, use GIF)"
             self.lbl_estimate.setText(
-                f"≈ {tmp.total_frames} frames · {tmp.duration_s:.1f}s at "
-                f"{tmp.fps} fps{mp4_note}"
+                f"≈ {frames} frames · {duration:.1f}s at {fps} fps{mp4_note}"
             )
         except Exception:
             self.lbl_estimate.setText("")
@@ -490,6 +645,166 @@ class TurntableDialog(QDialog):
 # --------------------------------------------------------------------------- #
 def _max_layer_ndim(viewer) -> int:
     return max((getattr(l, "ndim", 0) for l in viewer.layers), default=0)
+
+
+def _z_axis_and_count(viewer):
+    """(axis, number of slices) the fly-through steps along. See `_z_reference`."""
+    axis, count, _origin, _step = _z_reference(viewer)
+    return axis, count
+
+
+def _z_reference(viewer):
+    """(axis, slices, world origin, world step) of the stack to fly through.
+
+    The axis is the one the Z slider moves in 2D view: the first non-displayed
+    axis in the 2D arrangement (computed for 2D whatever the current display,
+    since a 3D view displays that axis rather than slicing it).
+
+    Slices are counted in the IMAGE, not in napari's slider steps. The slider
+    step is the finest scale of any layer, so one layer with a different Z
+    scale -- an unscaled annotation, say -- makes the slider walk many steps
+    per real slice, and a fly-through driven by it shows the same slice over
+    and over. Positions are therefore computed from the largest image layer's
+    own scale and offset, which is exact whatever else is loaded. napari's dims
+    are the fallback when no image layer spans the axis.
+    """
+    try:
+        dims = viewer.dims
+        order = list(dims.order)
+        candidates = order[:len(order) - 2]
+        axis = next((a for a in candidates if int(dims.nsteps[a]) > 1),
+                    candidates[-1] if candidates else 0)
+    except Exception:
+        return 0, 1, 0.0, 1.0
+
+    best = None
+    ndim = len(viewer.dims.nsteps)
+    for layer in viewer.layers:
+        try:
+            layer_axis = axis - (ndim - int(layer.ndim))
+            if layer_axis < 0:
+                continue
+            data = layer.data
+            shape = getattr(data, "shape", None)
+            if shape is None and isinstance(data, (list, tuple)) and data:
+                shape = data[0].shape        # multiscale: full resolution
+            n = int(shape[layer_axis])
+            if n <= 1:
+                continue
+            is_image = type(layer).__name__ == "Image"
+            key = (is_image, n)
+            if best is None or key > best[0]:
+                best = (key, n, float(layer.translate[layer_axis]),
+                        float(layer.scale[layer_axis]))
+        except Exception:
+            continue
+    if best is not None:
+        _key, n, origin, step = best
+        return axis, n, origin, step
+    try:
+        lo, _hi, step = viewer.dims.range[axis]
+        return axis, int(viewer.dims.nsteps[axis]), float(lo), float(step)
+    except Exception:
+        return axis, 1, 0.0, 1.0
+
+
+def render_movie(viewer, settings: TurntableSettings, out_path: str,
+                 parent: Optional[QWidget] = None) -> bool:
+    """Render whichever kind of movie `settings.mode` selects."""
+    if settings.mode == MODE_ZSWEEP:
+        return render_zsweep(viewer, settings, out_path, parent=parent)
+    return render_turntable(viewer, settings, out_path, parent=parent)
+
+
+def render_zsweep(viewer, settings: TurntableSettings, out_path: str,
+                  parent: Optional[QWidget] = None) -> bool:
+    """Fly through the Z slices in 2D and save the movie. True on success.
+
+    The current zoom and pan are kept. Display mode, the current slice and
+    layer visibility are restored afterwards, whatever happens.
+    """
+    if _max_layer_ndim(viewer) < 3:
+        QMessageBox.warning(parent, "Need 3D data",
+                            "A Z fly-through needs a 3D (or higher) dataset in the viewer.")
+        return False
+
+    axis, count, origin, step = _z_reference(viewer)
+    if count <= 1:
+        QMessageBox.warning(parent, "Only one slice",
+                            "This image has a single Z slice, so there is nothing to fly through.")
+        return False
+    last = count - 1
+    start = max(0, min(last, int(settings.z_start)))
+    end = last if int(settings.z_end) < 0 else max(0, min(last, int(settings.z_end)))
+    plan = zsweep_plan(start, end, settings.z_speed, settings.fps, settings.z_direction)
+
+    prior_ndisplay = viewer.dims.ndisplay
+    prior_point = tuple(viewer.dims.point)
+    prior_vis = _apply_layer_selection(viewer, settings)
+    viewer.dims.ndisplay = 2
+
+    progress = QProgressDialog("Rendering Z fly-through\u2026", "Cancel", 0,
+                               len(plan), parent)
+    progress.setWindowTitle("Recording Z Fly-through")
+    progress.setWindowModality(Qt.WindowModal)
+    progress.setMinimumDuration(0)
+    progress.setValue(0)
+
+    frames = []
+    cancelled = False
+    try:
+        shown = None
+        shot = None
+        for i, z in enumerate(plan):
+            if progress.wasCanceled():
+                cancelled = True
+                break
+            if z != shown:
+                # The slice's own world position (see _z_reference), not a
+                # slider step.
+                viewer.dims.set_point(axis, origin + z * step)
+                QApplication.processEvents()  # let the canvas redraw the slice
+                # Same note as render_turntable: no `scale` argument here.
+                shot = viewer.screenshot(canvas_only=settings.canvas_only,
+                                         flash=False)
+                shot = _resize_rgb(np.asarray(shot)[..., :3], settings.scale)
+                shown = z
+            # A held slice reuses its frame rather than re-rendering it.
+            frames.append(shot)
+            progress.setValue(i + 1)
+    finally:
+        try:
+            viewer.dims.ndisplay = prior_ndisplay
+            viewer.dims.set_point(range(len(prior_point)), prior_point)
+            for layer, vis in prior_vis.items():
+                try:
+                    layer.visible = vis
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        progress.close()
+
+    if cancelled or not frames:
+        return False
+    return _save_movie(frames, settings, out_path, parent, "Fly-through saved")
+
+
+def _save_movie(frames, settings: TurntableSettings, out_path: str,
+                parent, title: str) -> bool:
+    """Write `frames` in the chosen format and report it. True on success."""
+    try:
+        if settings.fmt == "gif":
+            _write_gif(out_path, frames, settings.fps)
+        else:
+            _write_mp4(out_path, frames, settings.fps)
+    except Exception as exc:
+        logger.exception("Movie export failed")
+        QMessageBox.critical(parent, "Export failed", f"Could not write the movie:\n{exc}")
+        return False
+    QMessageBox.information(parent, title,
+                            f"Saved {len(frames)} frames to:\n{out_path}")
+    return True
 
 
 def _apply_layer_selection(viewer, settings: TurntableSettings):
@@ -570,20 +885,7 @@ def render_turntable(viewer, settings: TurntableSettings, out_path: str,
 
     if cancelled or not frames:
         return False
-
-    try:
-        if settings.fmt == "gif":
-            _write_gif(out_path, frames, settings.fps)
-        else:
-            _write_mp4(out_path, frames, settings.fps)
-    except Exception as exc:
-        logger.exception("Turntable export failed")
-        QMessageBox.critical(parent, "Export failed", f"Could not write the movie:\n{exc}")
-        return False
-
-    QMessageBox.information(parent, "Rotation saved",
-                            f"Saved {len(frames)} frames to:\n{out_path}")
-    return True
+    return _save_movie(frames, settings, out_path, parent, "Rotation saved")
 
 
 def _resize_rgb(arr: np.ndarray, scale: float) -> np.ndarray:
@@ -700,20 +1002,21 @@ def _locate_layer_list_dock(viewer):
 
 
 def make_turntable_widget(viewer) -> QWidget:
-    """The '🎥 Record 3D Rotation' button in its container, not docked.
+    """The '🎥 Record Movie' button in its container, not docked.
 
     For callers that place it themselves, like the segmentation viewer's
     scrollable side panel. `add_turntable_button` docks the same widget.
     """
-    btn = QPushButton("🎥 Record 3D Rotation")
-    btn.setToolTip("Spin the 3D view and save it as an MP4 or GIF movie.")
+    btn = QPushButton("🎥 Record Movie")
+    btn.setToolTip("Save an MP4 or GIF of the view: rotate it in 3D, or fly "
+                   "through the Z slices.")
 
     def _open_dialog():
         if _max_layer_ndim(viewer) < 3:
             QMessageBox.information(
                 viewer.window._qt_window if hasattr(viewer.window, "_qt_window") else None,
                 "Need 3D data",
-                "Load a 3D dataset to record a rotation.",
+                "Load a 3D dataset to record a movie.",
             )
             return
         parent = None
@@ -723,7 +1026,7 @@ def make_turntable_widget(viewer) -> QWidget:
             pass
         dlg = TurntableDialog(viewer, parent=parent)
         if dlg.exec_() == QDialog.Accepted:
-            render_turntable(viewer, dlg.settings, dlg.output_path, parent=parent)
+            render_movie(viewer, dlg.settings, dlg.output_path, parent=parent)
 
     btn.clicked.connect(_open_dialog)
 
@@ -735,11 +1038,11 @@ def make_turntable_widget(viewer) -> QWidget:
 
 
 def add_turntable_button(viewer):
-    """Dock a '🎥 Record 3D Rotation' button beneath the layer list. Mirrors the
+    """Dock a '🎥 Record Movie' button beneath the layer list. Mirrors the
     placement of add_channel_visibility_toggle so the two controls sit together.
     Returns the QDockWidget (or None on failure)."""
     container = make_turntable_widget(viewer)
-    dock = viewer.window.add_dock_widget(container, area="left", name="Rotation")
+    dock = viewer.window.add_dock_widget(container, area="left", name="Movie")
 
     # Sit it directly beneath the layer list.
     try:

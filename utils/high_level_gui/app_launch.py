@@ -1074,7 +1074,8 @@ def interactive_segmentation_with_config(selected_folder: str = None,
             viewer, gui_manager
         )
 
-        # 3D rotation recorder (3D samples only), a section of the side panel.
+        # Movie recorder (3D samples only: rotation or Z fly-through), a
+        # section of the side panel.
         # The cross-channel overlay adds this too; single-channel projects open
         # here instead, so without this the turntable would be unavailable to
         # them. Gated on a 3D image and a non-2D mode; failure must never block
@@ -1106,7 +1107,7 @@ def interactive_segmentation_with_config(selected_folder: str = None,
         # build_scrollable_side_panel).
         side = build_scrollable_side_panel(viewer, [
             ("Controls", control_panel, "controls", True),
-            ("3D rotation", rotation_widget, "rotation", True),
+            ("Movie", rotation_widget, "rotation", True),
         ])
         if side is None:
             # napari's docks moved in some version: keep the old layout.
