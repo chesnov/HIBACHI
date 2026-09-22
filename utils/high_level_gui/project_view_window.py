@@ -105,7 +105,7 @@ class ProjectViewWindow(QMainWindow):
          lambda self: self.open_settings,
          "Application settings for this computer: how much memory and how "
          "many processor cores may be used, and whether project setup asks "
-         "for dimensions it cannot read from the images."),
+         "to confirm dimensions of exactly 1 \u00b5m per pixel."),
     )
 
 

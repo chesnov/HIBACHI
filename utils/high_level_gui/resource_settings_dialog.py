@@ -3,8 +3,9 @@ The application Settings dialog: per-install preferences, in tabs.
 
 *   **Resources** -- the one place a user sets how much of their machine the
     pipeline may use.
-*   **Project setup** -- whether setup asks for physical dimensions it could
-    not establish on its own (`dimension_entry`).
+*   **Project setup** -- whether setup asks to confirm dimensions that were
+    found but are exactly 1 um/pixel (`dimension_entry`). Missing dimensions
+    are always asked for; that is not a setting.
 
 Resources: three numbers -- RAM, cores, VRAM -- stored per install, not per project. The
 reasoning for "three, and only three" is in `resource_budget`: how a step spends
@@ -59,7 +60,7 @@ class SettingsDialog(QDialog):
         self.device = resource_budget.probe_device(refresh=True)
         self.limits = resource_budget.feasible_range(self.device)
         current = resource_budget.load_settings(self.device)
-        self._initial_prompt = dimension_entry.prompt_enabled()
+        self._initial_prompt = dimension_entry.confirm_unit_scale_enabled()
 
         outer = QVBoxLayout(self)
         self.tabs = QTabWidget()
@@ -214,13 +215,12 @@ class SettingsDialog(QDialog):
         box = QGroupBox("Physical dimensions")
         box_layout = QVBoxLayout(box)
         self.dim_prompt_check = QCheckBox(
-            "Ask for dimensions when an image is not calibrated"
+            "Confirm dimensions of exactly 1 \u00b5m per pixel"
         )
         self.dim_prompt_check.setChecked(self._initial_prompt)
         self.dim_prompt_check.setToolTip(
-            "Shown during project setup when an image's size could not be read "
-            "from its metadata or a metadata CSV, or when the recorded size is "
-            "identical to its pixel count (exactly 1 \u00b5m per pixel)."
+            "Applies when an image's dimensions were found, but on at least one "
+            "axis they equal its pixel count, i.e. exactly 1 \u00b5m per pixel."
         )
         box_layout.addWidget(self.dim_prompt_check)
 
@@ -230,14 +230,12 @@ class SettingsDialog(QDialog):
         # word-wrapped QLabel inside a QGroupBox gets its height from the
         # unwrapped width and is clipped.
         note = QLabel(
-            "When this is off, project setup no longer stops to ask. Images "
-            "whose scale could not be read keep their pixel counts as their "
-            "dimensions, so sizes, distances and densities measured on them "
-            "are in pixels, not microns.\n\n"
-            "A metadata CSV next to the raw images is still used whenever it "
-            "has a matching row, and uncalibrated images are still recorded as "
-            "such in their config (dimensions_source: pixels_assumed). "
-            "Dimensions can be corrected per image in the project view."
+            "A dimension that works out to exactly 1 \u00b5m per pixel is "
+            "occasionally right, but more often means pixel counts were entered "
+            "where microns belong. Turn this off if your data genuinely has "
+            "1 \u00b5m pixels: the found dimensions are then used as given.\n\n"
+            "This does not affect images whose dimensions could not be found at "
+            "all. Setup always asks for those."
         )
         note.setWordWrap(True)
         note.setStyleSheet("color: #555;")
@@ -279,7 +277,7 @@ class SettingsDialog(QDialog):
         prompt = self.dim_prompt_check.isChecked()
         if prompt != self._initial_prompt:
             try:
-                dimension_entry.set_prompt_enabled(prompt)
+                dimension_entry.set_confirm_unit_scale(prompt)
             except OSError as exc:
                 QMessageBox.critical(
                     self, "Could not save",

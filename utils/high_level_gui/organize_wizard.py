@@ -891,19 +891,15 @@ if _HAVE_QT:
             Probing reads headers only (never pixel data), except for the pixel
             counts used to prefill the dialog, which come from the shape.
 
-            Settings > Project setup can turn the prompt off. Then nothing is
-            probed or asked and an empty dict is returned, which is exactly the
-            "no manual input" case: the CSV and file metadata still apply, and
-            any axis they leave unresolved is written as its pixel count and
-            stamped ``pixels_assumed`` by the scaffolding, as before.
+            Settings > Project setup can switch off ONE reason for asking: a
+            dimension that was found but is exactly 1 um/pixel. It never
+            switches off the prompt for a missing dimension -- see
+            `dimension_entry.PROMPT_SETTING_KEY`.
             """
-            from .dimension_entry import prompt_enabled
-            if not prompt_enabled():
-                print("[dimensions] manual dimension prompt is off in Settings; "
-                      "uncalibrated axes will keep their pixel counts.")
-                return {}
-
-            from .dimension_entry import collect_manual_dimensions, plan_manual_entry
+            from .dimension_entry import (
+                collect_manual_dimensions, confirm_unit_scale_enabled,
+                plan_manual_entry,
+            )
             from .metadata import MetadataExtractor
             from .gui_text_utils import clean_filename_for_matching
             from .project_scaffolding import (
@@ -955,6 +951,7 @@ if _HAVE_QT:
                 files_meta, mode,
                 csv_overrides=csv_overrides,
                 match_override=_match_dimension_override,
+                check_unit_scale=confirm_unit_scale_enabled(),
             )
             if not needs:
                 return {}
@@ -1025,17 +1022,6 @@ if _HAVE_QT:
                 return
 
             names = sorted(set(unscaled))
-
-            # The user switched the dimension prompt off in Settings, i.e. has
-            # already said pixel-count dimensions are acceptable. A warning
-            # after every setup would be the same interruption in a different
-            # dialog, so it goes to the log instead. The configs still carry
-            # `dimensions_source: pixels_assumed`, which is the durable record.
-            from .dimension_entry import prompt_enabled
-            if not prompt_enabled():
-                print(f"[dimensions] {len(names)} image(s) recorded with pixel-"
-                      f"count dimensions (not calibrated): {', '.join(names)}")
-                return
 
             shown = "\n".join(f"\u2022 {n}" for n in names[:8])
             if len(names) > 8:

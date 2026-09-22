@@ -404,13 +404,23 @@ def per_axis_sources(
 
 
 # --------------------------------------------------------------------------- #
-# Setting: whether to prompt at all (Settings > Project setup)
+# Setting: confirm exactly-1-um/pixel dimensions? (Settings > Project setup)
 # --------------------------------------------------------------------------- #
-#: Per-install, never per-project, and never written into a config: it changes
-#: what setup ASKS, not what a result is. When off, setup proceeds without the
-#: dialog and unresolved axes are stamped ``pixels_assumed`` as usual, so the
-#: lack of calibration stays recorded.
-PROMPT_SETTING_KEY = "prompt_for_uncalibrated_dimensions"
+#: Controls ONE case only: ``REASON_UNIT_SCALE`` -- a dimension WAS found (file
+#: metadata or a metadata CSV), but it works out to exactly 1.0 um per pixel on
+#: some axis, so the total equals the pixel count. When off, that found value
+#: is accepted as given, keeping its real provenance.
+#:
+#: It never affects ``REASON_MISSING``. An axis with no scale at all is always
+#: asked about, whatever this says: silently recording pixel counts as microns
+#: is the error this module exists to prevent. (A spacing of exactly 1.0 read
+#: from the file's own header counts as missing -- see `_is_real_spacing` --
+#: because uncalibrated writers emit exactly that.)
+#:
+#: Per-install, never per-project, and never written into a config. The key
+#: name is new: an "off" saved by the earlier, wrongly broad version of this
+#: setting does not carry over.
+PROMPT_SETTING_KEY = "confirm_unit_scale_dimensions"
 
 
 def preferences_path() -> str:
@@ -438,8 +448,11 @@ def _read_preferences() -> Dict[str, Any]:
     return data if isinstance(data, dict) else {}
 
 
-def prompt_enabled() -> bool:
-    """Whether setup should show the dimension dialog. Defaults to True.
+def confirm_unit_scale_enabled() -> bool:
+    """Whether setup asks to confirm exactly-1-um/pixel dimensions. Default True.
+
+    Pass the result as ``plan_manual_entry(check_unit_scale=...)``. Missing
+    dimensions are asked about regardless.
 
     Only a real JSON boolean is honoured; a hand-edited ``"false"`` or ``0``
     reads as the default rather than possibly meaning the opposite.
@@ -448,7 +461,7 @@ def prompt_enabled() -> bool:
     return value if isinstance(value, bool) else True
 
 
-def set_prompt_enabled(enabled: bool) -> str:
+def set_confirm_unit_scale(enabled: bool) -> str:
     """Persist atomically, keeping any other keys in the file. Returns the path."""
     import json
     import os
