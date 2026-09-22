@@ -91,8 +91,8 @@ class SettingsDialog(QDialog):
         # two can never describe different machines. Not probed here: the
         # launcher is the only place that asks the graphics driver.
         render = resource_budget.rendering_summary()
-        render_label = QLabel(render or "not recorded (HIBACHI was started "
-                                        "without its launcher)")
+        render_label = QLabel(render or "not recorded by the launcher "
+                                        "for this session")
         det_form.addRow("Viewer draws with:", render_label)
         layout.addWidget(detected)
 

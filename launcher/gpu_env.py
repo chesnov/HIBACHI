@@ -782,21 +782,34 @@ def short_renderer(renderer: str) -> str:
 def rendering_summary(state_dir: str) -> str:
     """What the viewer draws with, in one line, from the launcher's decision.
 
-    Read from the cache rather than probed, so the app never pays for (or
-    risks) an OpenGL probe of its own: the launcher is the only place that
-    asks the driver. Empty when no decision has been recorded -- HIBACHI was
-    started without its launcher, or on a platform the launcher does not
-    probe.
+    Read, never probed: the launcher is the only place that asks the graphics
+    driver. Which record applies is decided by the environment the launcher
+    gives the app (HIBACHI_GL_MODE / HIBACHI_GL_REASON), because that describes
+    THIS launch:
+
+    * absent -> the app was not started by the launcher; "" (unknown). The
+      cache is not used then, since nothing ties it to this process.
+    * "unchanged" -> the launcher decided to change nothing, and says why
+      (no NVIDIA driver, a GPU already chosen in the environment, probe
+      skipped or inconclusive). The renderer was not asked for, so it is not
+      claimed.
+    * "hardware" / "software" -> the renderer recorded for this launch.
     """
-    rep = last_report(state_dir)
-    if rep is None or rep.gl is None or not rep.gl.renderer:
-        if rep is not None and rep.mode == "software":
-            return "software rendering (no graphics-card acceleration)"
+    mode = os.environ.get("HIBACHI_GL_MODE")
+    reason = os.environ.get("HIBACHI_GL_REASON") or ""
+    if not mode:
         return ""
-    how = {
-        "software": " \u2014 software rendering, no graphics-card acceleration",
-    }.get(rep.mode, "")
-    if rep.env.get("__NV_PRIME_RENDER_OFFLOAD") == "1":
+    if mode == "unchanged":
+        return f"system default \u2014 {reason}" if reason else "system default"
+    rep = last_report(state_dir)
+    if rep is None or rep.gl is None or not rep.gl.renderer or rep.mode != mode:
+        if mode == "software":
+            return "software rendering (no graphics-card acceleration)"
+        return f"hardware rendering \u2014 {reason}" if reason else "hardware rendering"
+    how = ""
+    if mode == "software":
+        how = " \u2014 software rendering, no graphics-card acceleration"
+    elif rep.env.get("__NV_PRIME_RENDER_OFFLOAD") == "1":
         how = " (NVIDIA render offload)"
     return f"{short_renderer(rep.gl.renderer)}{how}"
 
