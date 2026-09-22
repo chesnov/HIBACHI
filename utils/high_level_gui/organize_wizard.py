@@ -977,6 +977,19 @@ if _HAVE_QT:
             # is the only place the shape's LENGTH is seen: both branches report
             # z=1 for a 2D image, so the counts alone cannot say whether a depth
             # is a question -- and the mode string no longer can either.
+            if name.lower().endswith('.czi'):
+                # tifffile cannot open a CZI, so without this every CZI had no
+                # pixel counts: its rank was unknown (a 2D CZI was asked for a
+                # depth) and an exactly-1-um axis could not be recognised.
+                try:
+                    from aicspylibczi import CziFile
+                    shape = CziFile(path).get_dims_shape()[0]
+                    x = shape['X'][1] - shape['X'][0]
+                    y = shape['Y'][1] - shape['Y'][0]
+                    z = (shape['Z'][1] - shape['Z'][0]) if 'Z' in shape else 1
+                    return {'z': z, 'y': y, 'x': x, NDIM_KEY: 3 if z > 1 else 2}
+                except Exception:
+                    return {}
             if MetadataExtractor._slide_source(name)[0] is not None:
                 # Slide scenes are sized via the slide reader rather than
                 # tifffile. Prefill is a convenience, so failing to get counts

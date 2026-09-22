@@ -84,6 +84,8 @@ _UNIT_TO_UM: Dict[str, float] = {
     "millimeter": 1e3, "millimetre": 1e3, "mm": 1e3,
     "centimeter": 1e4, "centimetre": 1e4, "cm": 1e4,
     "meter": 1e6, "metre": 1e6, "m": 1e6,
+    "microns": 1.0, "micrometers": 1.0, "micrometres": 1.0,
+    "angstrom": 1e-4, "\u00e5": 1e-4, "\u212b": 1e-4,
 }
 
 #: Smallest-axis length still plausible as a channel axis when guessing the
@@ -246,7 +248,9 @@ def _unit_factor(unit: Any) -> Optional[float]:
     """Microns per `unit`, or None if the unit is unrecognised."""
     if unit is None or unit == "":
         return None
-    return _UNIT_TO_UM.get(str(unit).strip().lower())
+    # ImageJ writes micro as the literal escape "\u00B5m" in its description.
+    key = str(unit).strip().lower().replace("\\u00b5", "\u00b5")
+    return _UNIT_TO_UM.get(key)
 
 
 #: Attribute keys that plain (non-NGFF) stores use for voxel size, in the order
@@ -260,7 +264,10 @@ _PLAIN_SCALE_KEYS: Tuple[str, ...] = (
 
 def _scale_from_plain_attrs(attrs: Dict[str, Any],
                             n_spatial: int) -> Optional[List[float]]:
-    """Voxel size in microns from informal attrs, or None if absent."""
+    """Voxel size in microns from informal attrs, or None if absent.
+
+    See `_plain_scale_unit_stated` for whether the unit was actually given.
+    """
     for key in _PLAIN_SCALE_KEYS:
         if key not in attrs:
             continue
@@ -280,6 +287,32 @@ def _scale_from_plain_attrs(attrs: Dict[str, Any],
     return None
 
 
+def _plain_scale_unit_stated(attrs: Dict[str, Any], n_spatial: int) -> bool:
+    """True when the attr `_scale_from_plain_attrs` used names a known unit.
+
+    The informal keys are otherwise unitless and ASSUMED to be microns, and a
+    ``scale: [1, 1, 1]`` is a common placeholder, so only a dict carrying a
+    recognised ``unit`` counts as a statement of calibration.
+    """
+    for key in _PLAIN_SCALE_KEYS:
+        if key not in attrs:
+            continue
+        val = attrs[key]
+        if isinstance(val, dict):
+            values = val.get("values") or val.get("value") or val.get("size")
+            unit_ok = _unit_factor(val.get("unit")) is not None
+        else:
+            values, unit_ok = val, False
+        try:
+            nums = [float(v) for v in values]
+        except (TypeError, ValueError):
+            continue
+        if len(nums) < n_spatial or any(v <= 0 for v in nums):
+            continue
+        return unit_ok
+    return False
+
+
 # --------------------------------------------------------------------------- #
 # Inspection
 # --------------------------------------------------------------------------- #
@@ -294,6 +327,10 @@ class ZarrArrayInfo:
     um_y: float = 1.0
     um_z: float = 0.0
     scale_found: bool = False
+    #: Axes whose scale the store states with a recognised unit, so a genuine
+    #: 1 um spacing is not taken for a placeholder. See
+    #: `dimension_entry.EXPLICIT_SCALE_KEY`.
+    explicit_axes: Tuple[str, ...] = ()
     channel_names: List[str] = field(default_factory=list)
     multiscale_levels: int = 1
     usable: bool = True
@@ -480,6 +517,9 @@ def _describe_ngff(group_path: str, group, entry: Dict[str, Any],
     info.um_y, ok_y = _phys("y", 1.0)
     info.um_z, ok_z = _phys("z", 0.0)
     info.scale_found = bool(ok_x and ok_y)
+    info.explicit_axes = tuple(
+        a for a, ok in (("x", ok_x and ok_y), ("y", ok_x and ok_y), ("z", ok_z))
+        if ok)
 
     info.channel_names = _ngff_channel_names(
         {**root_attrs, **_attrs_dict(group)}, info.channels)
@@ -510,6 +550,11 @@ def _describe_plain(path: str, arr,
         info.um_y = float(mapping.get("y", 1.0))
         info.um_z = float(mapping.get("z", 0.0))
         info.scale_found = info.um_x > 0 and info.um_y > 0
+        if _plain_scale_unit_stated(attrs, len(spatial)):
+            info.explicit_axes = tuple(
+                a for a in ("x", "y", "z")
+                if a in mapping and float(mapping[a]) > 0
+                and (a == "z" or info.scale_found))
     return info
 
 
@@ -749,6 +794,8 @@ def scene_metadata(source_key: str, root: str = "") -> Dict[str, Any]:
     # A single-slice array has no meaningful Z spacing; 1.0 keeps the recorded
     # depth equal to the slice count instead of zero.
     meta["z"] = float(info.um_z) if info.um_z and info.um_z > 0 else 1.0
+    from .dimension_entry import EXPLICIT_SCALE_KEY
+    meta[EXPLICIT_SCALE_KEY] = sorted(info.explicit_axes)
     return meta
 
 

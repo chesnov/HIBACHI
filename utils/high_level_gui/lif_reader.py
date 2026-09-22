@@ -357,12 +357,20 @@ def scene_metadata(source_key: str, root: str = "") -> Dict[str, Any]:
         print(f"    Could not read scale from {source_key}: {exc}")
         return meta
 
+    # readlif reports a scale only where the file carries a Length, so every
+    # axis set here is stated by the file (a 1 um step included). See
+    # `dimension_entry.EXPLICIT_SCALE_KEY`.
+    from .dimension_entry import EXPLICIT_SCALE_KEY
+    explicit = []
     if im.um_x and im.um_y:
         meta.update({"x": im.um_x, "y": im.um_y, "found": True})
+        explicit += ["x", "y"]
     # Z spacing is only meaningful for a stack. A single plane keeps 1.0 so the
     # recorded depth equals the slice count rather than zero.
     if im.z_slices > 1 and im.um_z:
         meta["z"] = im.um_z
+        explicit.append("z")
+    meta[EXPLICIT_SCALE_KEY] = explicit
     return meta
 
 

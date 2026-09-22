@@ -343,63 +343,126 @@ class MetadataExtractor:
 
     @staticmethod
     def read_tiff_metadata(path: str) -> Dict[str, Union[float, bool]]:
-        """Attempts to read physical scale (microns) with robust ImageJ support."""
-        meta: Dict[str, Union[float, bool]] = {'x': 1.0, 'y': 1.0, 'z': 1.0, 'found': False}
+        """Physical scale (microns per pixel) from TIFF tags, ImageJ and OME-XML.
+
+        Besides x/y/z/found, records which axes the file STATES (see
+        `dimension_entry.EXPLICIT_SCALE_KEY`), so that a genuine 1 um/pixel
+        calibration is not mistaken for the uncalibrated placeholder:
+
+        * OME ``PhysicalSize{X,Y,Z}`` -- always a statement: a writer only emits
+          the attribute when it is given a value. Its ``...Unit`` is honoured
+          (the OME default is um); an unrecognised unit is not guessed at.
+        * TIFF ResolutionUnit CENTIMETER / INCH, or an ImageJ ``unit`` with
+          ResolutionUnit NONE -- a statement, EXCEPT in files written by
+          Python's tifffile (Software tag ``tifffile.py``). tifffile defaults
+          to INCH whenever a resolution is passed, and ImageJ-mode writers
+          (HIBACHI's own extraction among them) write unit 'micron' whether or
+          not the data is calibrated, so those tags prove nothing there.
+        * ResolutionUnit NONE with no ImageJ unit -- a guess, never a statement.
+
+        OME statements fill every axis the tags did not state, so a guessed
+        tag value no longer masks the real OME-XML (it used to be read only
+        when nothing else was found).
+        """
+        from .dimension_entry import EXPLICIT_SCALE_KEY
+        from .zarr_reader import _unit_factor
+
+        meta: Dict[str, Any] = {'x': 1.0, 'y': 1.0, 'z': 1.0, 'found': False}
+        explicit = set()
         try:
             with tiff.TiffFile(path) as tif:
                 ij = tif.imagej_metadata or {}
-                # 1. Capture Z-Spacing from ImageJ immediately
-                if 'spacing' in ij:
-                    meta['z'] = float(ij['spacing'])
-                    meta['found'] = True
+                page = tif.pages[0] if tif.pages else None
+                software = str(getattr(page, 'software', '') or '').lower()
+                tags_trusted = not software.startswith('tifffile')
+                # um per ImageJ unit; None when absent or not a length
+                # ('pixel', 'inch', ...), in which case nothing is stated.
+                ij_factor = _unit_factor(ij.get('unit'))
 
-                # 2. Capture X/Y from Tags or ImageJ
-                if tif.pages:
-                    page = tif.pages[0]
+                # 1. Z spacing from ImageJ, in ImageJ's unit.
+                if 'spacing' in ij:
+                    try:
+                        sp = float(ij['spacing'])
+                    except (TypeError, ValueError):
+                        sp = 0.0
+                    if sp > 0:
+                        if ij_factor is not None:
+                            meta['z'] = sp * ij_factor
+                            if tags_trusted:
+                                explicit.add('z')
+                        else:
+                            # No unit stated: taken as microns, as before, but
+                            # not as a statement.
+                            meta['z'] = sp
+                        meta['found'] = True
+
+                # 2. X/Y from the resolution tags.
+                if page is not None:
                     x_res = page.tags.get('XResolution')
                     y_res = page.tags.get('YResolution')
                     u_tag = page.tags.get('ResolutionUnit')
-                    
                     if x_res and y_res:
                         x_val, y_val = x_res.value, y_res.value
                         x_dens = x_val[0]/x_val[1] if isinstance(x_val, tuple) else x_val
                         y_dens = y_val[0]/y_val[1] if isinstance(y_val, tuple) else y_val
-                        
-                        # Unit detection: Tag says 'None' (1), but ImageJ string might say 'micron'
-                        unit_str = str(ij.get('unit', '')).lower()
                         u_val = u_tag.value if u_tag else 1
-                        
-                        if x_dens > 0:
-                            # Case: Unit is Microns (Standard for Fiji calibration)
-                            if u_val == 3 or unit_str in ['micron', 'µm', 'um']:
-                                # If unit is cm (3), density is px/cm. 10000/dens = um/px
-                                # If unit is micron, density is px/um. 1/dens = um/px
-                                factor = 10000.0 if u_val == 3 else 1.0
-                                meta['x'], meta['y'] = factor/x_dens, factor/y_dens
-                                meta['found'] = True
-                            # Case: Unit is Inches (DPI)
-                            elif u_val == 2:
-                                meta['x'], meta['y'] = 25400.0/x_dens, 25400.0/y_dens
-                                meta['found'] = True
-                            # Case: Unit is "None" but we have numbers (often happens in bio-formats)
+                        if x_dens > 0 and y_dens > 0:
+                            stated = False
+                            if u_val == 3:           # px per cm
+                                meta['x'], meta['y'] = 1e4 / x_dens, 1e4 / y_dens
+                                stated = True
+                            elif ij_factor is not None:
+                                # px per ImageJ unit (Fiji writes NONE + unit).
+                                meta['x'] = ij_factor / x_dens
+                                meta['y'] = ij_factor / y_dens
+                                stated = True
+                            elif u_val == 2:         # px per inch
+                                meta['x'], meta['y'] = 25400.0 / x_dens, 25400.0 / y_dens
+                                stated = True
                             elif u_val == 1:
-                                if x_dens < 1.0: # Likely already microns per pixel
+                                # Unit "None": a guess at what the numbers mean.
+                                if x_dens < 1.0:     # likely already um per px
                                     meta['x'], meta['y'] = x_dens, y_dens
-                                else: # Likely pixels per micron
-                                    meta['x'], meta['y'] = 1.0/x_dens, 1.0/y_dens
+                                else:                # likely px per um
+                                    meta['x'], meta['y'] = 1.0 / x_dens, 1.0 / y_dens
+                            else:
+                                x_dens = 0           # unknown unit code: ignore
+                            if x_dens:
                                 meta['found'] = True
+                                if stated and tags_trusted:
+                                    explicit.update(('x', 'y'))
 
-                # 3. OME-XML Fallback
-                if not meta['found'] and tif.ome_metadata:
+                # 3. OME-XML: stated values, in their stated unit.
+                if tif.ome_metadata:
                     txt = str(tif.ome_metadata)
-                    for ax in ['X', 'Y', 'Z']:
-                        m = re.search(rf'PhysicalSize{ax}="([\d\.]+)"', txt)
-                        if m: 
-                            meta[ax.lower()] = float(m.group(1))
-                            meta['found'] = True
+                    # First Pixels element only: a pyramid repeats the Image
+                    # element once per level.
+                    m = re.search(r'<(?:\w+:)?Pixels\b[^>]*>', txt)
+                    tag = m.group(0) if m else ''
+                    for ax in ('X', 'Y', 'Z'):
+                        a = ax.lower()
+                        if a in explicit:
+                            continue
+                        v = re.search(rf'\bPhysicalSize{ax}="([^"]+)"', tag)
+                        if not v:
+                            continue
+                        try:
+                            val = float(v.group(1))
+                        except ValueError:
+                            continue
+                        if not (val > 0):
+                            continue
+                        u = re.search(rf'\bPhysicalSize{ax}Unit="([^"]*)"', tag)
+                        factor = _unit_factor(u.group(1)) if u else 1.0
+                        if factor is None:
+                            continue
+                        meta[a] = val * factor
+                        explicit.add(a)
+                        meta['found'] = True
 
         except Exception as e:
             print(f"Metadata read error: {e}")
+        meta[EXPLICIT_SCALE_KEY] = sorted(explicit)
         return meta
 
     @staticmethod
@@ -791,11 +854,19 @@ class MetadataExtractor:
         if not scale_map and hasattr(czi, 'meta'):
             xml = czi.meta() if callable(czi.meta) else czi.meta
             scale_map = MetadataExtractor._parse_czi_xml_scaling(xml)
+        # Which axes the file actually STATES, as opposed to the 1.0
+        # placeholders filled in below. A CZI <Distance Id="Z"> of 1E-06 is a
+        # genuine 1 um step; without this it is indistinguishable from an
+        # absent Z and treated as uncalibrated. See
+        # `dimension_entry.EXPLICIT_SCALE_KEY`.
+        from .dimension_entry import EXPLICIT_SCALE_KEY
         return {
             'x': scale_map.get('X', 1.0),
             'y': scale_map.get('Y', 1.0),
             'z': scale_map.get('Z', 1.0),
-            'found': bool(scale_map)
+            'found': bool(scale_map),
+            EXPLICIT_SCALE_KEY: sorted(
+                k.lower() for k in scale_map if k in ('X', 'Y', 'Z')),
         }
 
 def get_sample_metadata(folder_path):

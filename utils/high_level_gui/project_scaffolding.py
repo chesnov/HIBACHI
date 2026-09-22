@@ -752,12 +752,17 @@ def organize_channel_project(
         # a CSV carrying pixel counts in the micron columns passes every other
         # check. Excluded when manually confirmed -- the user has attested that
         # 1 um/pixel is correct for that axis.
+        #
+        # Skipped when Settings turns off the 1 um/pixel confirmation: these
+        # axes HAVE a stated value (missing ones are `still_missing`, reported
+        # regardless), and the user has chosen to accept 1 um as given.
+        from .dimension_entry import confirm_unit_scale_enabled
         suspect = [
             a for a in unit_scale_axes(
                 totals, {'x': width, 'y': height, 'z': z_slices}, mode,
                 ndim=img_ndim)
             if a not in manual_axes and a not in still_missing
-        ]
+        ] if confirm_unit_scale_enabled() else []
 
         if still_missing or suspect:
             summary['unscaled'].append(src_file)
@@ -1298,12 +1303,15 @@ def organize_processing_dir(
             # Same belt-and-braces check as the multi-channel path: a final
             # total equal to its pixel count means 1 um/pixel, which is far more
             # often an uncalibrated image than a real one.
+            # Off when Settings accepts 1 um/pixel as given; missing axes are
+            # still reported via `still_missing`.
+            from .dimension_entry import confirm_unit_scale_enabled
             suspect = [
                 a for a in unit_scale_axes(
                     totals, {'x': width, 'y': height, 'z': z_slices}, mode,
                     ndim=img_ndim)
                 if a not in manual_axes and a not in still_missing
-            ]
+            ] if confirm_unit_scale_enabled() else []
             for _axis in suspect:
                 per_axis[_axis] = SOURCE_PIXELS_ASSUMED
             axis_sources[img_file] = per_axis
@@ -1443,11 +1451,12 @@ def organize_processing_dir(
                     print(f"  Dimensions ({', '.join(sorted(row_manual_axes))}) "
                           f"of {matched_file} entered or confirmed manually.")
 
+            from .dimension_entry import confirm_unit_scale_enabled
             row_suspect = [
                 a for a in unit_scale_axes(row_totals, row_pixels, mode,
                                            ndim=row_ndim)
                 if a not in row_manual_axes
-            ]
+            ] if confirm_unit_scale_enabled() else []
             per_axis_row = {
                 a: (SOURCE_MANUAL if a in row_manual_axes else SOURCE_CSV)
                 for a in axes_for_mode(mode, row_ndim)

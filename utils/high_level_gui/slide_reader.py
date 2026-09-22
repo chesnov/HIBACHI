@@ -335,11 +335,20 @@ def scene_metadata(source_key: str, root: str = "") -> Dict[str, Any]:
             except Exception:
                 um_z = 0.0
 
+            # slideio reports 0 for a resolution the file does not carry, so
+            # a positive value is one the file states (a 1 um step included).
+            # See `dimension_entry.EXPLICIT_SCALE_KEY`.
+            from .dimension_entry import EXPLICIT_SCALE_KEY
+            explicit = []
             if um_x > 0 and um_y > 0:
                 meta.update({"x": um_x, "y": um_y, "found": True})
+                explicit += ["x", "y"]
             # A single-slice scene has no meaningful Z spacing; 1.0 keeps the
             # recorded depth equal to the slice count instead of zero.
             meta["z"] = um_z if um_z > 0 else 1.0
+            if um_z > 0:
+                explicit.append("z")
+            meta[EXPLICIT_SCALE_KEY] = explicit
     except Exception as exc:
         print(f"    Could not read scale from {source_key}: {exc}")
     return meta

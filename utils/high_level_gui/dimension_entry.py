@@ -244,6 +244,34 @@ def unit_scale_axes(
     )
 
 
+#: Axes whose spacing the file states EXPLICITLY, as a list under this key in a
+#: metadata dict. For these, a spacing of exactly 1.0 um is a real calibration,
+#: not the uncalibrated-writer placeholder `_is_real_spacing` guards against --
+#: e.g. a CZI with ``<Distance Id="Z"><Value>1E-06</Value>``. Only readers that
+#: can tell "stated" from "defaulted" set it (currently CZI). Such an axis is
+#: not missing; if its total equals its pixel count it is a ``REASON_UNIT_SCALE``
+#: confirmation, which the Settings toggle governs.
+#:
+#: Set by every reader that can tell stated from defaulted: CZI, LIF, slideio
+#: slides, OME-Zarr / Zarr, and TIFF (OME-XML; resolution/ImageJ units except
+#: in tifffile-written files -- see `MetadataExtractor.read_tiff_metadata`).
+#: A reader that does not set it leaves the old rule in force: exactly 1.0 is
+#: treated as missing, so the failure mode is always an extra prompt, never a
+#: silently accepted placeholder.
+EXPLICIT_SCALE_KEY = "explicit_axes"
+
+
+def _is_stated_spacing(meta: Dict[str, Any], axis: str) -> bool:
+    """A spacing the file explicitly states: positive and finite, 1.0 allowed."""
+    if axis not in set(meta.get(EXPLICIT_SCALE_KEY) or ()):
+        return False
+    try:
+        num = float(meta.get(axis))
+    except (TypeError, ValueError):
+        return False
+    return num == num and 0 < num < float("inf")
+
+
 def scale_gaps(meta: Optional[Dict[str, Any]], mode=None,
                ndim=None) -> Tuple[str, ...]:
     """Axes for which `meta` provides no trustworthy scale.
@@ -255,7 +283,9 @@ def scale_gaps(meta: Optional[Dict[str, Any]], mode=None,
     axes = axes_for_mode(mode, ndim)
     if not isinstance(meta, dict) or not meta.get("found"):
         return axes
-    return tuple(a for a in axes if not _is_real_spacing(meta.get(a)))
+    return tuple(a for a in axes
+                 if not (_is_real_spacing(meta.get(a))
+                         or _is_stated_spacing(meta, a)))
 
 
 def resulting_totals(
