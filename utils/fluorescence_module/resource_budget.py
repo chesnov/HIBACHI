@@ -72,7 +72,6 @@ import json
 import math
 import threading
 import os
-import subprocess
 import sys
 import time
 from dataclasses import dataclass, asdict, field
@@ -208,44 +207,61 @@ class DeviceCapabilities:
 _DEVICE_CACHE: Optional[DeviceCapabilities] = None
 
 
-def _probe_gpus() -> Tuple[Tuple[str, float], ...]:
-    """
-    Installed GPUs and their VRAM, via ``nvidia-smi``.
+def _gpu_env():
+    """The launcher's `gpu_env` module, or None if it cannot be imported.
 
-    A subprocess rather than a library on purpose: there is no CUDA package in
-    the environment (no cupy, no cucim, no torch), so there is nothing to import
-    and asking would mean adding a dependency in order to answer a question the
-    driver already answers. Anything that is not an NVIDIA card reports no GPU,
-    which disables GPU work rather than guessing at a capacity.
-
-    Best-effort in every direction: a missing binary, a driver error, a timeout
-    or unparseable output all mean "no usable GPU". This function must never be
-    the reason the application fails to start.
+    `gpu_env` is HIBACHI's single GPU inventory -- the launcher uses it to
+    choose how the viewer renders -- so the budget asks it rather than keeping
+    a second `nvidia-smi` query that could disagree. Imported from
+    ``<repo>/launcher`` the way `version_manager` imports `updater`: the app may
+    use launcher modules, never the reverse. It is standard-library only, so it
+    is as safe to import in a processing worker as this module is.
     """
     try:
-        out = subprocess.run(
-            ["nvidia-smi", "--query-gpu=name,memory.total",
-             "--format=csv,noheader,nounits"],
-            capture_output=True, text=True, timeout=5.0, check=False,
-        )
-    except (OSError, subprocess.SubprocessError):
+        # repo layout: <repo>/utils/fluorescence_module/resource_budget.py
+        repo = os.path.dirname(os.path.dirname(os.path.dirname(
+            os.path.abspath(__file__))))
+        launcher = os.path.join(repo, "launcher")
+        if launcher not in sys.path:
+            sys.path.insert(0, launcher)
+        import gpu_env  # type: ignore
+        return gpu_env
+    except Exception:
+        return None
+
+
+def _probe_gpus() -> Tuple[Tuple[str, float], ...]:
+    """
+    Installed GPUs and their VRAM, as ``(name, GB)`` pairs.
+
+    NVIDIA only, because this sizes GPU COMPUTATION, and CUDA is the only
+    GPU compute path HIBACHI could take. Anything else reports no GPU, which
+    disables GPU work rather than guessing at a capacity. (What the VIEWER
+    draws with is a different question, answered by `rendering_summary`.)
+
+    Best-effort in every direction: if the inventory is unavailable or the
+    driver does not answer, the answer is "no usable GPU". This function must
+    never be the reason the application fails to start.
+    """
+    env = _gpu_env()
+    if env is None:
         return ()
-    if out.returncode != 0 or not out.stdout.strip():
+    try:
+        return tuple((a.name, float(a.vram_gb)) for a in env.nvidia_gpus()
+                     if a.vram_gb > 0)
+    except Exception:
         return ()
 
-    found: List[Tuple[str, float]] = []
-    for line in out.stdout.strip().splitlines():
-        parts = [p.strip() for p in line.split(",")]
-        if len(parts) < 2:
-            continue
-        try:
-            mib = float(parts[1])
-        except ValueError:
-            continue
-        # nvidia-smi reports MiB; the setting is in GB (1024^3) so that a
-        # 24576 MiB card reads as 24.0 rather than 25.8.
-        found.append((parts[0], mib / 1024.0))
-    return tuple(found)
+
+def rendering_summary() -> str:
+    """What the viewer draws with, as recorded by the launcher. "" if unknown."""
+    env = _gpu_env()
+    if env is None:
+        return ""
+    try:
+        return env.rendering_summary(state_dir())
+    except Exception:
+        return ""
 
 
 def probe_device(refresh: bool = False) -> DeviceCapabilities:

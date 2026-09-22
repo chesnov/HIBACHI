@@ -39,6 +39,8 @@ Environment knobs (all optional):
                           crash on opening a project ("glBindFramebuffer not
                           found" / "no OpenGL context").
     HIBACHI_GPU_PROBE     '0' to skip the graphics probe and launch as before.
+                          On Linux the probe only decides whether to request
+                          NVIDIA render offload on a hybrid laptop.
 
 Command line:
     --rollback            open the rollback chooser instead of launching
@@ -726,6 +728,11 @@ def _choose_rendering(splash):
                        " (cached)" if report.from_cache else "")
     if report.mode == "software":
         _enable_software_opengl()
+    for key, value in (report.env or {}).items():
+        # Linux NVIDIA offload. `prepare` only returns these when nothing in
+        # the environment already chose a GPU, and setdefault keeps it so.
+        os.environ.setdefault(key, value)
+        _LAUNCHER_LOG.info("graphics: %s=%s", key, value)
     # For the app, which says so in the viewer rather than leaving a slow
     # window unexplained.
     os.environ["HIBACHI_GL_MODE"] = report.mode

@@ -1,8 +1,10 @@
 """
 gpu_env -- choose how HIBACHI's viewer renders, before the app starts.
 
-Windows only. On every other platform `prepare()` does nothing and returns a
-report saying so, so the launcher can call it unconditionally.
+Windows: the full treatment described below. Linux: one job only -- on a laptop
+with an NVIDIA GPU next to an integrated one, request NVIDIA render offload when
+HIBACHI would otherwise run on the integrated GPU (see `_prepare_linux`). macOS:
+nothing. `prepare()` is safe to call unconditionally.
 
 Why this exists
 ---------------
@@ -36,6 +38,16 @@ that fails for reasons unrelated to graphics -- a module that will not import --
 is "inconclusive" and changes nothing, so this can never make a working machine
 worse than it was before this module existed.
 
+This module is also the ONE place HIBACHI takes inventory of its GPUs.
+`resource_budget` (the processing budget and the Settings tab) asks
+`nvidia_gpus()` here rather than running its own query, so the launcher's
+decision and the Settings tab can never describe two different machines. The
+app imports this file from ``<repo>/launcher`` the way `version_manager`
+imports `updater`; nothing here may import from the app, so a broken app update
+can never stop the launcher from starting (or from offering a rollback).
+Standard library only, for the same reason and because `resource_budget` is
+imported inside processing workers.
+
 Results are cached per machine state (adapters, driver versions, interpreter,
 remote session), so the probe's few seconds are paid only when something
 changed.
@@ -61,7 +73,7 @@ from typing import Any, Dict, List, Optional
 _CREATE_NO_WINDOW = 0x08000000 if sys.platform.startswith("win") else 0
 
 #: Bump when the cache's meaning changes, so old entries are ignored.
-_CACHE_VERSION = 1
+_CACHE_VERSION = 2
 _CACHE_FILE = "gpu_probe.json"
 
 #: The probe imports Qt and vispy and opens a context: a few seconds normally.
@@ -102,6 +114,7 @@ class Adapter:
     driver_version: str = ""
     driver_date: str = ""  # YYYY-MM-DD, or ""
     has_driver: bool = True
+    vram_gb: float = 0.0   # dedicated memory where known (NVIDIA), else 0
 
 
 @dataclass
@@ -142,6 +155,8 @@ class Report:
     gpu_preference_set: List[str] = field(default_factory=list)
     issues: List[Issue] = field(default_factory=list)
     from_cache: bool = False
+    #: Environment variables the app should be started with (Linux offload).
+    env: Dict[str, str] = field(default_factory=dict)
 
     def summary(self) -> str:
         gl = self.gl
@@ -151,7 +166,58 @@ class Report:
 
 
 # --------------------------------------------------------------------------- #
-# Adapters
+# NVIDIA inventory (every platform) -- the one nvidia-smi query in HIBACHI
+# --------------------------------------------------------------------------- #
+_NVIDIA_CACHE: Optional[List[Adapter]] = None
+
+
+def parse_nvidia_smi(text: str) -> List[Adapter]:
+    """`name, memory.total (MiB), driver_version` lines as Adapters. Pure."""
+    found: List[Adapter] = []
+    for line in (text or "").strip().splitlines():
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) < 2 or not parts[0]:
+            continue
+        try:
+            mib = float(parts[1])
+        except ValueError:
+            mib = 0.0
+        # MiB to GB (1024^3), so a 24576 MiB card reads as 24.0, not 25.8.
+        found.append(Adapter(name=parts[0], vendor="nvidia", kind="discrete",
+                             driver_version=parts[2] if len(parts) > 2 else "",
+                             vram_gb=mib / 1024.0))
+    return found
+
+
+def nvidia_gpus(refresh: bool = False) -> List[Adapter]:
+    """NVIDIA GPUs with a working driver, with their VRAM. [] if none.
+
+    Asks the driver's own `nvidia-smi`, which ships with it on Windows and
+    Linux alike, rather than a CUDA library: there is none in the environment,
+    and adding one to answer a question the driver already answers would be a
+    dependency for nothing. A missing binary, a driver error, a timeout or
+    unparseable output all mean "no NVIDIA GPU"; this is never allowed to be
+    the reason anything fails to start. Cached per process, because it spawns
+    one.
+    """
+    global _NVIDIA_CACHE
+    if _NVIDIA_CACHE is not None and not refresh:
+        return list(_NVIDIA_CACHE)
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=name,memory.total,driver_version",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=5.0, check=False,
+            creationflags=_CREATE_NO_WINDOW)
+        found = parse_nvidia_smi(out.stdout) if out.returncode == 0 else []
+    except (OSError, subprocess.SubprocessError):
+        found = []
+    _NVIDIA_CACHE = found
+    return list(found)
+
+
+# --------------------------------------------------------------------------- #
+# Adapters (Windows)
 # --------------------------------------------------------------------------- #
 _WMI_SCRIPT = r"""
 $ErrorActionPreference = 'SilentlyContinue'
@@ -240,9 +306,19 @@ def _query_adapters():
              "-ExecutionPolicy", "Bypass", "-Command", _WMI_SCRIPT],
             capture_output=True, text=True, timeout=_WMI_TIMEOUT_S,
             creationflags=_CREATE_NO_WINDOW)
-        return parse_wmi_output(out.stdout)
+        adapters, vm = parse_wmi_output(out.stdout)
     except Exception:
         return [], False
+    # WMI caps reported memory at 4 GB, so NVIDIA VRAM comes from the driver.
+    by_name = {a.name.lower(): a for a in nvidia_gpus()}
+    for a in adapters:
+        if a.vendor == "nvidia":
+            match = by_name.get(a.name.lower()) or next(
+                (n for key, n in by_name.items()
+                 if key in a.name.lower() or a.name.lower() in key), None)
+            if match is not None:
+                a.vram_gb = match.vram_gb
+    return adapters, vm
 
 
 def _is_remote_session() -> bool:
@@ -587,19 +663,160 @@ def _report_from_dict(d: Dict[str, Any]) -> Report:
     return rep
 
 
+# --------------------------------------------------------------------------- #
+# Linux: NVIDIA render offload on hybrid laptops
+# --------------------------------------------------------------------------- #
+#: What `prime-run` sets. With the proprietary driver in on-demand mode these
+#: route a program's OpenGL to the NVIDIA GPU; without them it stays on the
+#: integrated one, by design, to save power.
+NV_OFFLOAD_ENV = {"__NV_PRIME_RENDER_OFFLOAD": "1",
+                  "__GLX_VENDOR_LIBRARY_NAME": "nvidia"}
+
+#: Any of these set means the user (or the desktop, e.g. GNOME's "Launch using
+#: Discrete Graphics Card") already chose a GPU. Never overridden.
+_LINUX_GPU_CHOICE_VARS = ("__NV_PRIME_RENDER_OFFLOAD", "__GLX_VENDOR_LIBRARY_NAME",
+                          "DRI_PRIME", "__VK_LAYER_NV_optimus")
+
+
+def _drm_devices_linux() -> List[str]:
+    """`vendor:device` for each GPU the kernel knows, for the cache key."""
+    found = []
+    base = "/sys/class/drm"
+    try:
+        for name in sorted(os.listdir(base)):
+            if not re.fullmatch(r"card\d+", name):
+                continue
+            ids = []
+            for part in ("vendor", "device"):
+                try:
+                    with open(os.path.join(base, name, "device", part)) as fh:
+                        ids.append(fh.read().strip())
+                except OSError:
+                    ids.append("?")
+            found.append(":".join(ids))
+    except OSError:
+        pass
+    return found
+
+
+def _prepare_linux(state_dir: str, exe: str, log) -> Report:
+    """Request NVIDIA render offload when that is what makes the viewer use it.
+
+    Three probes' worth of evidence, each cheap next to guessing wrong:
+    a working NVIDIA driver (nvidia-smi answers), the default renderer NOT
+    being NVIDIA already, and a second probe confirming the offload variables
+    really deliver the NVIDIA renderer. Anything else leaves the launch as it
+    was. Mesa already falls back to software rendering by itself on Linux, so
+    there is no software decision to make here.
+    """
+    already = [v for v in _LINUX_GPU_CHOICE_VARS if v in os.environ]
+    if already:
+        return Report(mode="unchanged",
+                      reason=f"GPU already chosen in the environment ({', '.join(already)})")
+    nvidia = nvidia_gpus()
+    if not nvidia:
+        return Report(mode="unchanged", reason="no working NVIDIA driver")
+
+    path = os.path.join(state_dir, _CACHE_FILE)
+    fp = json.dumps({"v": _CACHE_VERSION, "os": "linux", "exe": exe,
+                     "nvidia": sorted(f"{a.name}|{a.driver_version}" for a in nvidia),
+                     "drm": _drm_devices_linux()},
+                    sort_keys=True)
+    cache = _load_cache(path)
+    if cache.get("fingerprint") == fp and cache.get("report"):
+        rep = _report_from_dict(cache["report"])
+        rep.from_cache = True
+        return rep
+
+    default = probe_opengl(exe)
+    log(f"OpenGL probe (default): {default.status} {default.renderer!r}")
+    rep_adapters = list(nvidia)
+    if default.status == "ok" and _gl_vendor(default) == "nvidia":
+        rep = Report(mode="hardware", gl=default,
+                     reason=f"already on {default.renderer}")
+    else:
+        env = dict(os.environ)
+        env.update(NV_OFFLOAD_ENV)
+        offload = probe_opengl(exe, env=env)
+        log(f"OpenGL probe (NVIDIA offload): {offload.status} {offload.renderer!r}")
+        if (offload.status == "ok" and _gl_vendor(offload) == "nvidia"
+                and not offload.is_software):
+            rep = Report(mode="hardware", gl=offload, env=dict(NV_OFFLOAD_ENV),
+                         reason=f"NVIDIA render offload: {offload.renderer}")
+        else:
+            rep = Report(mode="unchanged", gl=default,
+                         reason=f"NVIDIA offload did not take effect "
+                                f"({offload.status} {offload.renderer!r})")
+            if offload.status == "inconclusive" or default.status == "inconclusive":
+                return rep                  # not cached: nothing was learned
+    rep.adapters = rep_adapters
+    _save_cache(path, {"fingerprint": fp, "report": asdict(rep), "shown": []})
+    return rep
+
+
+def last_report(state_dir: str) -> Optional[Report]:
+    """The launcher's most recent recorded decision, or None if there is none."""
+    data = _load_cache(os.path.join(state_dir, _CACHE_FILE)).get("report")
+    if not data:
+        return None
+    try:
+        return _report_from_dict(data)
+    except Exception:
+        return None
+
+
+def short_renderer(renderer: str) -> str:
+    """The card's name from an OpenGL renderer string, without driver detail.
+
+    "NVIDIA GeForce RTX 4060 Laptop GPU/PCIe/SSE2" -> "NVIDIA GeForce RTX 4060
+    Laptop GPU"; "AMD Radeon 890M Graphics (radeonsi, strix1, ACO, ...)" ->
+    "AMD Radeon 890M Graphics". The full string stays in the launcher log.
+    """
+    text = (renderer or "").strip()
+    if "/" in text and "nvidia" in text.lower():
+        text = text.split("/", 1)[0]
+    text = re.sub(r"\s*\([^()]*\)\s*$", "", text)
+    return text.strip() or (renderer or "").strip()
+
+
+def rendering_summary(state_dir: str) -> str:
+    """What the viewer draws with, in one line, from the launcher's decision.
+
+    Read from the cache rather than probed, so the app never pays for (or
+    risks) an OpenGL probe of its own: the launcher is the only place that
+    asks the driver. Empty when no decision has been recorded -- HIBACHI was
+    started without its launcher, or on a platform the launcher does not
+    probe.
+    """
+    rep = last_report(state_dir)
+    if rep is None or rep.gl is None or not rep.gl.renderer:
+        if rep is not None and rep.mode == "software":
+            return "software rendering (no graphics-card acceleration)"
+        return ""
+    how = {
+        "software": " \u2014 software rendering, no graphics-card acceleration",
+    }.get(rep.mode, "")
+    if rep.env.get("__NV_PRIME_RENDER_OFFLOAD") == "1":
+        how = " (NVIDIA render offload)"
+    return f"{short_renderer(rep.gl.renderer)}{how}"
+
+
 def prepare(state_dir: str, executable: Optional[str] = None,
             log=lambda msg: None) -> Report:
     """Probe (or reuse the cached probe) and return the decision.
 
-    Does not change the environment; the caller applies `report.mode`.
+    Does not change the environment; the caller applies `report.mode` and
+    `report.env`.
     """
-    if not sys.platform.startswith("win"):
-        return Report(mode="unchanged", reason="not Windows")
     if os.environ.get("HIBACHI_GPU_PROBE") == "0":
         return Report(mode="unchanged", reason="HIBACHI_GPU_PROBE=0")
     forced = os.environ.get("HIBACHI_SOFTWARE_OPENGL")
     if forced == "1":
         return Report(mode="software", reason="HIBACHI_SOFTWARE_OPENGL=1")
+    if sys.platform.startswith("linux"):
+        return _prepare_linux(state_dir, os.path.abspath(executable or sys.executable), log)
+    if not sys.platform.startswith("win"):
+        return Report(mode="unchanged", reason="not Windows or Linux")
     if forced == "0":
         return Report(mode="hardware", reason="HIBACHI_SOFTWARE_OPENGL=0")
 

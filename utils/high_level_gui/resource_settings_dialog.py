@@ -86,6 +86,14 @@ class SettingsDialog(QDialog):
                     f"({self.device.total_vram_gb:.1f} GB)"
                     if self.device.gpu_name else "none detected")
         det_form.addRow("Graphics:", QLabel(gpu_text))
+        # What the viewer draws with, from the launcher's decision -- the same
+        # inventory as the row above (both come from launcher/gpu_env), so the
+        # two can never describe different machines. Not probed here: the
+        # launcher is the only place that asks the graphics driver.
+        render = resource_budget.rendering_summary()
+        render_label = QLabel(render or "not recorded (HIBACHI was started "
+                                        "without its launcher)")
+        det_form.addRow("Viewer draws with:", render_label)
         layout.addWidget(detected)
 
         # ---- the ceiling ------------------------------------------------
