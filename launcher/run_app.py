@@ -30,12 +30,15 @@ Environment knobs (all optional):
     HIBACHI_NO_SPLASH     '1' to disable the splash window
     HIBACHI_ROLLBACK      '1' to open the rollback chooser instead of launching
     HIBACHI_STATE_DIR     where to keep launcher state (default: ~/.hibachi)
-    HIBACHI_SOFTWARE_OPENGL '1' to force Qt's bundled software OpenGL. Use this
-                          in virtual machines (VirtualBox/VMware), over remote
-                          desktop, or on any host whose GPU/driver can't provide
-                          modern OpenGL -- symptom is a vispy/OpenGL crash on
-                          opening a project ("Using glBindFramebuffer with no
-                          OpenGL context" / "glBindFramebuffer not found").
+    HIBACHI_SOFTWARE_OPENGL '1' to force Qt's bundled software OpenGL, '0' to
+                          force hardware OpenGL. Unset (the default), Windows
+                          launches probe the graphics driver and choose for
+                          themselves -- see gpu_env.py. Software rendering is
+                          what virtual machines, remote desktop and driverless
+                          hosts need; the symptom without it is a vispy/OpenGL
+                          crash on opening a project ("glBindFramebuffer not
+                          found" / "no OpenGL context").
+    HIBACHI_GPU_PROBE     '0' to skip the graphics probe and launch as before.
 
 Command line:
     --rollback            open the rollback chooser instead of launching
@@ -132,6 +135,7 @@ if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
 import updater  # noqa: E402
+import gpu_env  # noqa: E402
 from splash import get_splash  # noqa: E402
 
 APP_ENTRY = "segment.py"  # relative to repo root
@@ -502,6 +506,12 @@ def _collect_crash_report(code: int) -> tuple[str, str | None]:
     if gpu_signature:
         sections.insert(1, _gpu_reset_advice(gpu_signature))
         _LAUNCHER_LOG.warning("crash looks like a GPU driver reset (%r)", gpu_signature)
+        # The driver passed the probe but failed under real load, so the cached
+        # "hardware" verdict is wrong for this machine: probe afresh next time.
+        try:
+            gpu_env.invalidate(_state_dir())
+        except Exception:
+            pass
 
     # If the app-side logs are absent, the crash window would otherwise look
     # empty of anything useful. Say so plainly and point at the likely cause so
@@ -666,6 +676,82 @@ def _launch_app(repo_root: str) -> int:
     return code
 
 
+def _state_dir() -> str:
+    """Launcher state directory (same convention as updater)."""
+    return os.environ.get("HIBACHI_STATE_DIR") or os.path.join(
+        os.path.expanduser("~"), ".hibachi")
+
+
+def _enable_software_opengl() -> None:
+    """Point Qt and vispy at the bundled software OpenGL (Mesa llvmpipe).
+
+    Must run before the child creates its QApplication and before vispy imports
+    its GL backend; the child inherits this process's environment. Two pieces
+    are needed and BOTH matter:
+      * QT_OPENGL=software  -> Qt loads its bundled opengl32sw.dll (Mesa
+        llvmpipe, OpenGL 3.3) instead of the host's legacy OpenGL 1.1.
+      * VISPY_GL_LIB=<...>/opengl32sw.dll  -> vispy loads its GL functions from
+        the SAME Mesa library. vispy otherwise loads the host opengl32.dll on
+        its own and never sees Qt's software context, which is why QT_OPENGL
+        alone leaves "glBindFramebuffer not found" / "no OpenGL context".
+    """
+    os.environ.setdefault("QT_OPENGL", "software")
+    if sys.platform.startswith("win") and not os.environ.get("VISPY_GL_LIB"):
+        _sp = os.path.join(sys.prefix, "Lib", "site-packages")
+        for _rel in (
+            os.path.join("PyQt5", "Qt5", "bin", "opengl32sw.dll"),
+            os.path.join("PyQt5", "Qt", "bin", "opengl32sw.dll"),
+            os.path.join("PySide2", "opengl32sw.dll"),
+            os.path.join("PySide6", "opengl32sw.dll"),
+        ):
+            _cand = os.path.join(_sp, _rel)
+            if os.path.isfile(_cand):
+                os.environ["VISPY_GL_LIB"] = _cand
+                break
+
+
+def _choose_rendering(splash):
+    """Probe the graphics setup (Windows) and apply the decision.
+
+    Never raises: a problem here must not stop HIBACHI from starting, so any
+    failure launches exactly as before this existed.
+    """
+    try:
+        _msg(splash, "Checking graphics...")
+        report = gpu_env.prepare(_state_dir(), log=_LAUNCHER_LOG.info)
+    except Exception as exc:
+        _LAUNCHER_LOG.warning("graphics probe failed (%s); launching unchanged", exc)
+        return None
+    _LAUNCHER_LOG.info("graphics: %s%s", report.summary(),
+                       " (cached)" if report.from_cache else "")
+    if report.mode == "software":
+        _enable_software_opengl()
+    # For the app, which says so in the viewer rather than leaving a slow
+    # window unexplained.
+    os.environ["HIBACHI_GL_MODE"] = report.mode
+    os.environ["HIBACHI_GL_REASON"] = report.reason or ""
+    return report
+
+
+def _announce_graphics(report) -> None:
+    """Show each graphics problem once per machine state. Never raises."""
+    if report is None:
+        return
+    try:
+        fresh = gpu_env.issues_to_announce(_state_dir(), report)
+    except Exception:
+        return
+    if not fresh:
+        return
+    import dialogs
+    for issue in fresh:
+        try:
+            dialogs.gpu_notice(issue.title, issue.message,
+                               issue.link, issue.link_label)
+        except Exception as exc:
+            _LAUNCHER_LOG.warning("could not show graphics notice: %s", exc)
+
+
 def _activate_env_path() -> None:
     """
     Put the active env's binary directories on PATH.
@@ -771,37 +857,18 @@ def main() -> int:
     # directly. Do this before check_for_update or it reports "git not found".
     _activate_env_path()
 
-    # Software-OpenGL fallback for VMs / remote desktop / driverless hosts. Must
-    # be set before the child creates its QApplication and before vispy imports
-    # its GL backend, so we set it on our own environment (the launch below
-    # inherits it). Two pieces are needed and BOTH matter:
-    #   * QT_OPENGL=software  -> Qt loads its bundled opengl32sw.dll (Mesa
-    #     llvmpipe, OpenGL 3.3) instead of the host's legacy OpenGL 1.1.
-    #   * VISPY_GL_LIB=<...>/opengl32sw.dll  -> vispy loads its GL functions from
-    #     the SAME Mesa library. vispy otherwise loads the host opengl32.dll on
-    #     its own and never sees Qt's software context, which is why QT_OPENGL
-    #     alone leaves "glBindFramebuffer not found" / "no OpenGL context".
-    # Opt-in only, so machines with real GPUs keep hardware acceleration.
+    # Explicit software OpenGL, applied this early so every path below -- the
+    # rollback chooser included -- inherits it. Without the override the choice
+    # is made by the graphics probe just before launch (_choose_rendering).
     if os.environ.get("HIBACHI_SOFTWARE_OPENGL") == "1":
-        os.environ.setdefault("QT_OPENGL", "software")
-        if sys.platform.startswith("win") and not os.environ.get("VISPY_GL_LIB"):
-            _sp = os.path.join(sys.prefix, "Lib", "site-packages")
-            for _rel in (
-                os.path.join("PyQt5", "Qt5", "bin", "opengl32sw.dll"),
-                os.path.join("PyQt5", "Qt", "bin", "opengl32sw.dll"),
-                os.path.join("PySide2", "opengl32sw.dll"),
-                os.path.join("PySide6", "opengl32sw.dll"),
-            ):
-                _cand = os.path.join(_sp, _rel)
-                if os.path.isfile(_cand):
-                    os.environ["VISPY_GL_LIB"] = _cand
-                    break
+        _enable_software_opengl()
 
     # Explicit rollback entry point (recovery shortcut / power users).
     if want_rollback:
         _run_rollback(repo_root)
         return 0
 
+    graphics = None
     splash = get_splash(enabled=not no_splash)
     try:
         # A previous session left the checkout on code whose dependency spec
@@ -874,11 +941,18 @@ def main() -> int:
         if not sys.platform.startswith("darwin"):
             _refresh_shortcut(splash, repo_root)
 
+        # After any environment rebuild above, so the probe runs against the
+        # interpreter and packages the app will actually use.
+        graphics = _choose_rendering(splash)
+
         _msg(splash, "Launching HIBACHI...")
     finally:
         # Always tear the splash down before the Qt app grabs the screen.
         if splash is not None:
             splash.close()
+
+    # After the splash: the launcher shows one Tk window at a time.
+    _announce_graphics(graphics)
 
     code = _launch_app(repo_root)
 

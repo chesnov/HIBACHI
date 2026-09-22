@@ -650,3 +650,42 @@ def notify(title: str, message: str) -> None:
                command=lambda: _finish(root)).pack(side="right")
     root.protocol("WM_DELETE_WINDOW", lambda: _finish(root))
     _run(root)
+
+def gpu_notice(title: str, message: str, link: str = "",
+               link_label: str = "") -> None:
+    """A graphics-setup notice, with a button that opens the fix when there is one.
+
+    `link` is a web page or an ``ms-settings:`` URI. Opening it is left to the
+    user: HIBACHI never downloads or installs drivers itself.
+    """
+    tk, root, ui = _new_root()
+    if tk is None:
+        print(f"[dialogs] {title}: {message} {link}")
+        return
+    from tkinter import ttk
+
+    _header(tk, root, ui, title, subtitle="HIBACHI \u00b7 graphics")
+    body = _body(tk, root)
+    ttk.Label(body, text=message, wraplength=460, justify="left").pack(
+        anchor="w", padx=22, pady=(18, 12)
+    )
+    btns = ttk.Frame(body)
+    btns.pack(fill="x", padx=22, pady=(4, 18))
+
+    def _open() -> None:
+        try:
+            if link.startswith("ms-settings:") and hasattr(os, "startfile"):
+                os.startfile(link)  # type: ignore[attr-defined]
+            else:
+                import webbrowser
+                webbrowser.open(link)
+        except Exception as exc:
+            print(f"[dialogs] could not open {link}: {exc}")
+
+    ttk.Button(btns, text="Continue", style="Accent.TButton",
+               command=lambda: _finish(root)).pack(side="right")
+    if link:
+        ttk.Button(btns, text=link_label or "Open page",
+                   command=_open).pack(side="right", padx=(0, 8))
+    root.protocol("WM_DELETE_WINDOW", lambda: _finish(root))
+    _run(root)

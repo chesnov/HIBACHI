@@ -945,6 +945,33 @@ def close_viewer_on_error(viewer):
     return _guard()
 
 
+def _show_render_mode(viewer) -> None:
+    """Say so in the viewer when it draws without the graphics card.
+
+    The launcher chooses software rendering when the graphics driver cannot
+    provide what napari needs (see launcher/gpu_env.py). Everything still works,
+    but slowly -- and a slow viewer that does not explain itself looks like a
+    bug in HIBACHI. The note is permanent, with the reason in its tooltip.
+    """
+    if os.environ.get("HIBACHI_GL_MODE") != "software":
+        return
+    reason = os.environ.get("HIBACHI_GL_REASON") or "set in the environment"
+    try:
+        label = QLabel("\u26a0 Software rendering \u2014 no graphics-card "
+                       "acceleration")
+        label.setToolTip(
+            "The viewer is drawing without the graphics card, so large images "
+            "open and move slowly. Results are not affected.\n\n"
+            f"Reason: {reason}\n\n"
+            "Updating the graphics driver, or running HIBACHI on the computer "
+            "itself rather than over Remote Desktop, usually restores it.")
+        label.setStyleSheet("color: #e0a040; padding: 0 8px;")
+        viewer.window._qt_window.statusBar().addPermanentWidget(label)
+        log.info("viewer is using software rendering: %s", reason)
+    except Exception:
+        log.debug("could not show the rendering-mode note", exc_info=True)
+
+
 def _handle_napari_close() -> None:
     """Callback when Napari closes."""
     lifecycle("napari.destroyed", note="qt window destroyed signal fired")
@@ -1029,6 +1056,7 @@ def interactive_segmentation_with_config(selected_folder: str = None,
 
         qt_window = viewer.window._qt_window
         qt_window.destroyed.connect(_handle_napari_close)
+        _show_render_mode(viewer)
 
         # Open maximized and bring to the foreground so the user doesn't have to
         # click the app icon to surface it.
