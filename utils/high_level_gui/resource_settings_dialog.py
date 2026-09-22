@@ -230,12 +230,8 @@ class SettingsDialog(QDialog):
         # word-wrapped QLabel inside a QGroupBox gets its height from the
         # unwrapped width and is clipped.
         note = QLabel(
-            "A dimension that works out to exactly 1 \u00b5m per pixel is "
-            "occasionally right, but more often means pixel counts were entered "
-            "where microns belong. Turn this off if your data genuinely has "
-            "1 \u00b5m pixels: the found dimensions are then used as given.\n\n"
-            "This does not affect images whose dimensions could not be found at "
-            "all. Setup always asks for those."
+            "When off, found dimensions of exactly 1 \u00b5m per pixel are used "
+            "as given. Missing dimensions are always asked for."
         )
         note.setWordWrap(True)
         note.setStyleSheet("color: #555;")
