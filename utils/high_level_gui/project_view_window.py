@@ -654,13 +654,19 @@ class ProjectViewWindow(QMainWindow):
         self._cross_scan_dir = info.path
         self._project_root = info.path
         self.project_path_label.setText(f"Project Path: {info.path}")
-        self._load_or_organize(info.path)
+        project_open = self._load_or_organize(info.path)
 
         # If the user picked a specific FILE, say what became of it. A folder can
         # be an organized project and still hold loose images beside it, so
         # dropping one of those loaded the project and silently ignored the file
         # that was actually chosen -- from the user's side, nothing happened.
-        if info.source_file:
+        #
+        # Only when a project is open. Otherwise the drop was answered by the
+        # setup wizard, whose outcome the user has already seen -- and if they
+        # cancelled it, "not part of this project" is both true and exactly what
+        # they chose, so reporting it (as this used to) is an error for a
+        # deliberate action.
+        if info.source_file and project_open:
             self._report_dropped_file(info.path, info.source_file)
 
     def open_multichannel(self, info) -> None:
@@ -1090,18 +1096,32 @@ class ProjectViewWindow(QMainWindow):
         except Exception:
             organized = set()
 
+        # A single-scene source is organized under its own name. Checked before
+        # reading the file because single-channel setup MOVES the file into
+        # that folder, so after a successful setup it is no longer where it
+        # was dropped and cannot be read from there.
+        if folder_name_for_source(base) in organized:
+            return
+        # Gone from where it was dropped: only setup moves a raw file (single-
+        # channel setup moves each source into its folder), so it was consumed
+        # by setup -- a multi-scene slide's folders do not match the bare name
+        # above. There is nothing left to add, and it is not "unreadable".
+        if not os.path.exists(source_file):
+            return
+
         # Ask the file what samples it contributes, then compare each one
-        # against the organized folders. The previous guard tested
-        # `folder_name_for_source(base)` -- a name derived from the bare
-        # filename -- which a multi-scene slide never produces: its folders are
-        # `<stem>_<scene>`. So a fully organized slide always fell through, and
-        # then hit the "could not read it as an image" warning below, which is
-        # both wrong and alarming. Header reads only, so this is cheap.
+        # against the organized folders -- a multi-scene slide's folders are
+        # `<stem>_<scene>`, never the bare filename. The keys come from the SAME
+        # rule setup imports by (`sources_for_entry`). This used to ask
+        # `slide_reader.list_sources`, which only knows slide formats and returns
+        # [] for every TIFF and CZI, so each of those -- imported fine -- was
+        # reported below as unreadable. Header reads only, so this is cheap.
+        from .organize_wizard import sources_for_entry
         try:
-            from .slide_reader import list_sources
-            keys = list(list_sources(source_file))
-        except Exception:
-            keys = []
+            keys, reject_reason = sources_for_entry(
+                os.path.dirname(os.path.abspath(source_file)), base)
+        except Exception as exc:
+            keys, reject_reason = [], str(exc)
 
         if keys:
             # ANY organized sample from this file means the user has already
@@ -1133,6 +1153,13 @@ class ProjectViewWindow(QMainWindow):
         if unsupported_format_label(source_file):
             QMessageBox.warning(self, "Unsupported file format",
                                 unsupported_format_message(source_file))
+        elif reject_reason and reject_reason != "not a readable image format":
+            # A readable format that setup deliberately excludes (e.g. an RGB
+            # slide label, a slide with no usable scenes): give setup's own
+            # reason rather than claim the file could not be read.
+            QMessageBox.warning(
+                self, "File not added",
+                f"{base} is not part of this project: {reject_reason}.")
         else:
             # The readable list is derived, not written out: the hardcoded copy
             # here went stale the moment .lif and Zarr were added, so it told
@@ -1799,13 +1826,20 @@ class ProjectViewWindow(QMainWindow):
         if run_organize_wizard(self, project_dir, mode="new", project_dir=project_dir):
             self.open_path(project_dir)
 
-    def _load_or_organize(self, selected_path: str) -> None:
+    def _load_or_organize(self, selected_path: str) -> bool:
+        """Open the folder as a project, offering setup if it is raw images.
+
+        Returns True when a project is open afterwards -- it already was one,
+        or setup just completed -- and False otherwise (setup cancelled or
+        failed, nothing to organize, or an error), so the caller can tell a
+        project it may report on from a folder the user walked away from.
+        """
         try:
             # Already organized? Just list it.
             self.project_manager._find_valid_image_folders()
             if self.project_manager.image_folders:
                 self._populate_image_list(selected_path)
-                return
+                return True
 
             # Not organized yet -- are there raw images to set up into a project?
             #
@@ -1854,7 +1888,7 @@ class ProjectViewWindow(QMainWindow):
                     )
                     self._install_content_view(None)
                     self._update_action_buttons()
-                    return
+                    return False
 
                 from .organize_wizard import run_organize_wizard
                 self._organizing = os.path.abspath(selected_path)
@@ -1864,16 +1898,19 @@ class ProjectViewWindow(QMainWindow):
                         # After setup the folder is a single- or multi-channel
                         # project; re-route so it opens in the right view.
                         self.open_path(selected_path)
+                        return True
                 finally:
                     self._organizing = None
-                return
+                return False
 
             # Nothing organized and nothing to organize.
             self._install_content_view(None)
             self._update_action_buttons()
+            return False
 
         except Exception as e:
             QMessageBox.critical(self, "Error", str(e))
+            return False
 
     def _populate_image_list(self, selected_path: str) -> None:
         """Build the single-channel contents view and record the project as recent."""

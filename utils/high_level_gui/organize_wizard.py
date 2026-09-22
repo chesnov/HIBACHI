@@ -71,6 +71,54 @@ from .gui_text_utils import is_os_sidecar  # noqa: E402
 # --------------------------------------------------------------------------- #
 # Pure logic (unit-testable)
 # --------------------------------------------------------------------------- #
+def sources_for_entry(raw_dir: str, name: str):
+    """The source keys one folder entry contributes to setup, and why not if none.
+
+    Returns ``(keys, reject_reason)``:
+
+    * a slide file -> one key per scene (a single-scene slide: its bare name);
+    * a plain TIFF / CZI -> ``[name]``, unless the TIFF cannot be processed;
+    * anything unusable -> ``([], reason)``.
+
+    This is THE rule for what setup imports. `detect_raw` applies it to every
+    entry; `ProjectViewWindow._report_dropped_file` applies it to a dropped file,
+    so the two can never disagree. They used to: the report asked
+    `slide_reader.list_sources`, which only knows slide formats, so every
+    dropped TIFF or CZI -- imported fine -- was reported as unreadable.
+    """
+    from .metadata import tiff_reject_reason  # lazy: heavy import
+
+    path = os.path.join(raw_dir, name)
+    if not _is_source_entry(path, name, _RAW_EXTS):
+        return [], "not a readable image format"
+    if is_os_sidecar(name):
+        return [], "operating-system sidecar file"
+
+    # A slide file is not one image: each scanned scene becomes its own
+    # source, keyed "file::scene". A single-scene slide yields a bare
+    # filename, so nothing else in the pipeline has to care.
+    if name.lower().endswith(_SLIDE_EXTS):
+        try:
+            from .slide_reader import list_sources
+            scene_keys = list_sources(path)
+        except Exception as exc:
+            print(f"  [detect] could not read slide {name}: {exc}")
+            scene_keys = []
+        if not scene_keys:
+            return [], "no readable scenes"
+        return list(scene_keys), None
+
+    # A plain TIFF is checked here rather than at import: an image the
+    # pipeline cannot process should never appear in the wizard's list at
+    # all. Same predicate the organizers use, so detection and import cannot
+    # disagree about what is importable.
+    if name.lower().endswith(('.tif', '.tiff')):
+        reason = tiff_reject_reason(path)
+        if reason:
+            return [], reason
+    return [name], None
+
+
 def detect_raw(raw_dir: str) -> Dict[str, object]:
     """
     Inspect a folder's raw images.
@@ -86,7 +134,7 @@ def detect_raw(raw_dir: str) -> Dict[str, object]:
     channels each (SizeC=3 on an interleaved RGB image) and imported as
     samples whose recorded depth was the image height.
     """
-    from .metadata import MetadataExtractor, tiff_reject_reason  # lazy: heavy import, keeps helpers testable
+    from .metadata import MetadataExtractor  # lazy: heavy import, keeps helpers testable
 
     files: List[str] = []
     skipped: List[str] = []
@@ -102,37 +150,16 @@ def detect_raw(raw_dir: str) -> Dict[str, object]:
                 skipped.append(f)
                 continue
 
-            # A slide file is not one image: each scanned scene becomes its own
-            # source, keyed "file::scene". A single-scene slide yields a bare
-            # filename, so nothing else in the pipeline has to care.
-            if f.lower().endswith(_SLIDE_EXTS):
-                try:
-                    from .slide_reader import list_sources
-                    scene_keys = list_sources(os.path.join(raw_dir, f))
-                except Exception as exc:
-                    print(f"  [detect] could not read slide {f}: {exc}")
-                    scene_keys = []
-                if scene_keys:
-                    files.extend(scene_keys)
-                    if len(scene_keys) > 1:
-                        print(f"  [detect] {f} contains "
-                              f"{len(scene_keys)} scenes")
-                else:
-                    print(f"  [detect] {f} yielded no readable scenes; skipped")
-                continue
-
-            # A plain TIFF is checked here rather than at import: an image the
-            # pipeline cannot process should never appear in the wizard's list
-            # at all. Same predicate the organizers use, so detection and
-            # import cannot disagree about what is importable.
-            if f.lower().endswith(('.tif', '.tiff')):
-                reason = tiff_reject_reason(os.path.join(raw_dir, f))
-                if reason:
-                    rejected.append({'file': f, 'reason': reason})
-                    print(f"  [detect] {f} cannot be processed: {reason}")
-                    continue
-
-            files.append(f)
+            keys, reason = sources_for_entry(raw_dir, f)
+            if keys:
+                files.extend(keys)
+                if len(keys) > 1:
+                    print(f"  [detect] {f} contains {len(keys)} scenes")
+            elif f.lower().endswith(_SLIDE_EXTS):
+                print(f"  [detect] {f} yielded no readable scenes; skipped")
+            else:
+                rejected.append({'file': f, 'reason': reason})
+                print(f"  [detect] {f} cannot be processed: {reason}")
     except OSError:
         pass
     if skipped:
@@ -766,7 +793,14 @@ if _HAVE_QT:
             # runs when the user clicks Organize/Finish
             try:
                 self._collect_selections()
-                self._run()
+                if not self._run():
+                    # Cancelled at the dimension prompt. Nothing was written,
+                    # so this is not a success: closing as Accepted made the
+                    # caller treat the untouched folder as a new project,
+                    # re-open it, and report "Setup didn't create a project".
+                    # Stay open, as for a cancel during the run, so the user
+                    # can add a metadata CSV or retry, or close the wizard.
+                    return
             except SetupCancelled as exc:
                 # The user asked for this, so it is not a failure. A red critical
                 # box here would read as a crash. The wizard stays open so they
@@ -778,8 +812,12 @@ if _HAVE_QT:
                 return
             super().accept()
 
-        def _run(self) -> None:
+        def _run(self) -> bool:
             """Run setup on a worker thread, keeping the GUI alive throughout.
+
+            Returns True when setup ran, False when the user cancelled at the
+            dimension prompt (nothing written). Failures and a cancel during
+            the run raise instead.
 
             Setup used to run inline on the main thread with a single
             processEvents() per channel. For a plain TIFF folder that is
@@ -874,6 +912,7 @@ if _HAVE_QT:
 
             self._verify_created(worker.targets, worker.summaries)
             self._report_unscaled(worker.summaries)
+            return True
 
         def _resolve_missing_dimensions(self, raw_files, plan):
             """Ask for physical extents that automatic detection could not supply.
