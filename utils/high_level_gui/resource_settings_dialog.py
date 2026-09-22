@@ -1,14 +1,19 @@
 """
-The one place a user sets how much of their machine the pipeline may use.
+The application Settings dialog: per-install preferences, in tabs.
 
-Three numbers -- RAM, cores, VRAM -- stored per install, not per project. The
+*   **Resources** -- the one place a user sets how much of their machine the
+    pipeline may use.
+*   **Project setup** -- whether setup asks for physical dimensions it could
+    not establish on its own (`dimension_entry`).
+
+Resources: three numbers -- RAM, cores, VRAM -- stored per install, not per project. The
 reasoning for "three, and only three" is in `resource_budget`: how a step spends
 its allowance (more workers or bigger blocks) is decided in code, because that
 trade differs per step and nobody should have to tune fifteen knobs to make one
 machine faster than another.
 
-This module is Qt; `resource_budget` is not, and the dependency runs one way
-only. Pipeline steps -- including ones inside worker processes -- import the
+This module is Qt; `resource_budget` and `dimension_entry` are not, and the
+dependency runs one way only. Pipeline steps -- including ones inside worker processes -- import the
 budget; nothing in the budget imports this.
 """
 
@@ -16,8 +21,9 @@ from typing import Optional
 
 from PyQt5.QtCore import Qt  # type: ignore
 from PyQt5.QtWidgets import (  # type: ignore
-    QDialog, QDialogButtonBox, QDoubleSpinBox, QFormLayout, QFrame, QGroupBox,
-    QHBoxLayout, QLabel, QMessageBox, QPushButton, QSpinBox, QVBoxLayout,
+    QCheckBox, QDialog, QDialogButtonBox, QDoubleSpinBox, QFormLayout, QFrame,
+    QGroupBox, QHBoxLayout, QLabel, QMessageBox, QPushButton, QSpinBox,
+    QTabWidget, QVBoxLayout, QWidget,
 )
 
 # This module lives in `high_level_gui/`; `resource_budget` lives in
@@ -30,13 +36,21 @@ try:
 except ImportError:  # pragma: no cover - direct script execution
     import resource_budget
 
+try:
+    from . import dimension_entry
+except ImportError:  # pragma: no cover - direct script execution
+    import dimension_entry  # type: ignore
 
-class ResourceSettingsDialog(QDialog):
-    """Set the RAM / cores / VRAM ceiling for this installation."""
 
-    def __init__(self, parent=None):
+class SettingsDialog(QDialog):
+    """Per-install settings: resource ceiling and project-setup behaviour."""
+
+    TAB_RESOURCES = 0
+    TAB_SETUP = 1
+
+    def __init__(self, parent=None, initial_tab: int = TAB_RESOURCES):
         super().__init__(parent)
-        self.setWindowTitle("Resource Limits")
+        self.setWindowTitle("Settings")
         self.setModal(True)
 
         # Re-measured on open rather than taken from the cache: `available` moves
@@ -45,8 +59,14 @@ class ResourceSettingsDialog(QDialog):
         self.device = resource_budget.probe_device(refresh=True)
         self.limits = resource_budget.feasible_range(self.device)
         current = resource_budget.load_settings(self.device)
+        self._initial_prompt = dimension_entry.prompt_enabled()
 
-        layout = QVBoxLayout(self)
+        outer = QVBoxLayout(self)
+        self.tabs = QTabWidget()
+        outer.addWidget(self.tabs)
+
+        resources_tab = QWidget()
+        layout = QVBoxLayout(resources_tab)
 
         # ---- what the machine has --------------------------------------
         detected = QGroupBox("This machine")
@@ -152,7 +172,6 @@ class ResourceSettingsDialog(QDialog):
         path_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
         layout.addWidget(path_label)
 
-        # ---- buttons ------------------------------------------------------
         row = QHBoxLayout()
         self.reset_btn = QPushButton("Recommended for this machine")
         self.reset_btn.setToolTip(
@@ -164,15 +183,78 @@ class ResourceSettingsDialog(QDialog):
         row.addWidget(self.reset_btn)
         row.addStretch(1)
         layout.addLayout(row)
+        layout.addStretch(1)
+        self.tabs.addTab(resources_tab, "Resources")
 
+        self.tabs.addTab(self._build_setup_tab(), "Project setup")
+        self.tabs.setCurrentIndex(initial_tab)
+
+        # What the spin boxes showed on open, after their own rounding. Save
+        # compares against this rather than against `current`, whose extra
+        # decimals would make an untouched box look edited.
+        self._initial_resources = self._resource_values()
+
+        # ---- buttons ------------------------------------------------------
+        # One Save for every tab: the user should not have to wonder whether
+        # switching tabs discarded what they set on the other one.
         buttons = QDialogButtonBox(
             QDialogButtonBox.Save | QDialogButtonBox.Cancel
         )
         buttons.accepted.connect(self._save)
         buttons.rejected.connect(self.reject)
-        layout.addWidget(buttons)
+        outer.addWidget(buttons)
 
         self.setMinimumWidth(520)
+
+    # ------------------------------------------------------------------
+    def _build_setup_tab(self) -> QWidget:
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+
+        box = QGroupBox("Physical dimensions")
+        box_layout = QVBoxLayout(box)
+        self.dim_prompt_check = QCheckBox(
+            "Ask for dimensions when an image is not calibrated"
+        )
+        self.dim_prompt_check.setChecked(self._initial_prompt)
+        self.dim_prompt_check.setToolTip(
+            "Shown during project setup when an image's size could not be read "
+            "from its metadata or a metadata CSV, or when the recorded size is "
+            "identical to its pixel count (exactly 1 \u00b5m per pixel)."
+        )
+        box_layout.addWidget(self.dim_prompt_check)
+
+        layout.addWidget(box)
+
+        # Outside the group box, like the notes on the Resources tab: a
+        # word-wrapped QLabel inside a QGroupBox gets its height from the
+        # unwrapped width and is clipped.
+        note = QLabel(
+            "When this is off, project setup no longer stops to ask. Images "
+            "whose scale could not be read keep their pixel counts as their "
+            "dimensions, so sizes, distances and densities measured on them "
+            "are in pixels, not microns.\n\n"
+            "A metadata CSV next to the raw images is still used whenever it "
+            "has a matching row, and uncalibrated images are still recorded as "
+            "such in their config (dimensions_source: pixels_assumed). "
+            "Dimensions can be corrected per image in the project view."
+        )
+        note.setWordWrap(True)
+        note.setStyleSheet("color: #555;")
+        layout.addWidget(note)
+
+        layout.addStretch(1)
+
+        line = QFrame()
+        line.setFrameShape(QFrame.HLine)
+        line.setFrameShadow(QFrame.Sunken)
+        layout.addWidget(line)
+
+        path_label = QLabel(f"Saved in: {dimension_entry.preferences_path()}")
+        path_label.setStyleSheet("color: #777; font-size: 10px;")
+        path_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        layout.addWidget(path_label)
+        return tab
 
     # ------------------------------------------------------------------
     def _restore_defaults(self) -> None:
@@ -182,7 +264,33 @@ class ResourceSettingsDialog(QDialog):
         self.core_spin.setValue(proposed.cores)
         self.vram_spin.setValue(proposed.vram_gb)
 
+    def _resource_values(self):
+        return (float(self.ram_spin.value()), float(self.vram_spin.value()),
+                int(self.core_spin.value()))
+
     def _save(self) -> None:
+        # Resources are written only when they were edited. Saving them on
+        # every Save would turn a first-run default -- recomputed for whatever
+        # machine this install is on -- into a fixed "user" value just because
+        # someone changed an unrelated setting on the other tab.
+        if self._resource_values() != self._initial_resources:
+            if not self._save_resources():
+                return
+        prompt = self.dim_prompt_check.isChecked()
+        if prompt != self._initial_prompt:
+            try:
+                dimension_entry.set_prompt_enabled(prompt)
+            except OSError as exc:
+                QMessageBox.critical(
+                    self, "Could not save",
+                    f"The project-setup settings could not be written to\n"
+                    f"{dimension_entry.preferences_path()}\n\n{exc}",
+                )
+                return
+        self.accept()
+
+    def _save_resources(self) -> bool:
+        """Write the resource ceiling. False if cancelled or it failed."""
         chosen = resource_budget.ResourceSettings(
             ram_gb=float(self.ram_spin.value()),
             vram_gb=float(self.vram_spin.value()),
@@ -203,7 +311,8 @@ class ResourceSettingsDialog(QDialog):
                 QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
             )
             if reply != QMessageBox.Yes:
-                return
+                self.tabs.setCurrentIndex(self.TAB_RESOURCES)
+                return False
         try:
             resource_budget.save_settings(chosen, self.device)
         except OSError as exc:
@@ -212,11 +321,19 @@ class ResourceSettingsDialog(QDialog):
                 f"The resource settings could not be written to\n"
                 f"{resource_budget.settings_path()}\n\n{exc}",
             )
-            return
-        self.accept()
+            return False
+        return True
 
 
-def open_resource_settings(parent=None) -> bool:
+#: The dialog's previous name, kept so existing imports keep working.
+ResourceSettingsDialog = SettingsDialog
+
+
+def open_settings(parent=None, initial_tab: int = SettingsDialog.TAB_RESOURCES) -> bool:
     """Show the dialog. True when the user saved."""
-    dlg = ResourceSettingsDialog(parent)
+    dlg = SettingsDialog(parent, initial_tab=initial_tab)
     return dlg.exec_() == QDialog.Accepted
+
+
+#: Previous name of `open_settings`.
+open_resource_settings = open_settings

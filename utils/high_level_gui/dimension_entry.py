@@ -404,6 +404,66 @@ def per_axis_sources(
 
 
 # --------------------------------------------------------------------------- #
+# Setting: whether to prompt at all (Settings > Project setup)
+# --------------------------------------------------------------------------- #
+#: Per-install, never per-project, and never written into a config: it changes
+#: what setup ASKS, not what a result is. When off, setup proceeds without the
+#: dialog and unresolved axes are stamped ``pixels_assumed`` as usual, so the
+#: lack of calibration stays recorded.
+PROMPT_SETTING_KEY = "prompt_for_uncalibrated_dimensions"
+
+
+def preferences_path() -> str:
+    """``<state_dir>/preferences.json`` (may not exist yet).
+
+    Not ``resources.json``: that file has a strict schema read inside worker
+    processes, and an unexpected key must not be able to reset a memory
+    ceiling. `state_dir` is imported lazily so this module stays import-light.
+    """
+    try:
+        from ..fluorescence_module.resource_budget import state_dir
+    except ImportError:  # pragma: no cover - direct script execution
+        from resource_budget import state_dir  # type: ignore
+    import os
+    return os.path.join(state_dir(), "preferences.json")
+
+
+def _read_preferences() -> Dict[str, Any]:
+    import json
+    try:
+        with open(preferences_path(), "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def prompt_enabled() -> bool:
+    """Whether setup should show the dimension dialog. Defaults to True.
+
+    Only a real JSON boolean is honoured; a hand-edited ``"false"`` or ``0``
+    reads as the default rather than possibly meaning the opposite.
+    """
+    value = _read_preferences().get(PROMPT_SETTING_KEY)
+    return value if isinstance(value, bool) else True
+
+
+def set_prompt_enabled(enabled: bool) -> str:
+    """Persist atomically, keeping any other keys in the file. Returns the path."""
+    import json
+    import os
+    payload = _read_preferences()
+    payload[PROMPT_SETTING_KEY] = bool(enabled)
+    path = preferences_path()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(payload, fh, indent=2)
+    os.replace(tmp, path)
+    return path
+
+
+# --------------------------------------------------------------------------- #
 # Manual entry dialog (Qt imported lazily so the logic above stays headless)
 # --------------------------------------------------------------------------- #
 _AXIS_LABEL = {"x": "Width (µm)", "y": "Height (µm)", "z": "Depth (µm)"}

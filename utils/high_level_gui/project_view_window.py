@@ -94,18 +94,18 @@ class ProjectViewWindow(QMainWindow):
          lambda self: self.open_config_library_manager,
          "Browse, import, duplicate, rename and export the configs in your "
          "cross-project library (and see any that failed to load)."),
-        # Deliberately NOT called "Settings", "Preferences", "Options" or
-        # "Configure". Those are exactly the words Qt's Cocoa plugin pattern
-        # matches when it relocates an action into the macOS application menu --
-        # the same trap documented at the `setMenuRole` call in `initUI`, which
-        # once made an entire menu vanish. `NoRole` is set there and covers
-        # this, but a name that never triggers the guess is one less thing
-        # depending on that call surviving a refactor.
-        ("resource_limits", "Resource Limits\u2026", "machine",
-         lambda self: self.open_resource_limits,
-         "Set how much memory and how many processor cores this application "
-         "may use. Higher limits process large datasets faster; results are "
-         "identical at any setting."),
+        # Labelled "Settings", which is one of the words Qt's Cocoa plugin
+        # pattern-matches to relocate an action into the macOS application
+        # menu -- the trap documented at the `setMenuRole` call in `initUI`,
+        # which once made an entire menu vanish. The `NoRole` set there is
+        # LOAD-BEARING for this item: without it the action moves to the
+        # HIBACHI menu, the Settings menu is left empty, and Qt stops drawing
+        # it. Do not remove that call without renaming this action.
+        ("settings", "Settings\u2026", "settings",
+         lambda self: self.open_settings,
+         "Application settings for this computer: how much memory and how "
+         "many processor cores may be used, and whether project setup asks "
+         "for dimensions it cannot read from the images."),
     )
 
 
@@ -249,11 +249,12 @@ class ProjectViewWindow(QMainWindow):
             "analysis": bar.addMenu("&Analysis"),
             "library": bar.addMenu("&Library"),
             # Per-INSTALL settings, not per-project: what this computer is
-            # allowed to spend. Kept out of &Library, which holds configs --
-            # those travel with a project and are part of a result's
-            # provenance, whereas a resource ceiling is a property of the
-            # machine and deliberately never enters a config.
-            "machine": bar.addMenu("&Machine"),
+            # allowed to spend, and how setup behaves on it. Kept out of
+            # &Library, which holds configs -- those travel with a project and
+            # are part of a result's provenance, whereas these are properties
+            # of the installation and deliberately never enter a config.
+            # "Se&ttings": Alt+S is already &Selection.
+            "settings": bar.addMenu("Se&ttings"),
         }
         for key, label, menu_key, slot, tip in self._ACTION_SPECS:
             action = menus[menu_key].addAction(label)
@@ -2170,23 +2171,27 @@ class ProjectViewWindow(QMainWindow):
         idx = labels.index(choice)
         return entries[idx].path
 
-    def open_resource_limits(self) -> None:
-        """Open the resource ceiling dialog.
+    def open_settings(self) -> None:
+        """Open the Settings dialog.
 
         Nothing needs to be reloaded afterwards. Every processing step reads
-        the saved setting when it starts, via `resource_budget.open_budget`, so
-        a change applies to the next step that runs -- including the next step
-        of a batch already in progress.
+        the saved resource setting when it starts, via
+        `resource_budget.open_budget`, so a change applies to the next step
+        that runs -- including the next step of a batch already in progress.
+        Setup reads the dimension-prompt preference each time it runs.
         """
         try:
-            from .resource_settings_dialog import ResourceSettingsDialog
+            from .resource_settings_dialog import SettingsDialog
         except ImportError as exc:
             QMessageBox.warning(
                 self, "Unavailable",
-                f"The resource settings dialog could not be loaded:\n{exc}"
+                f"The settings dialog could not be loaded:\n{exc}"
             )
             return
-        ResourceSettingsDialog(self).exec_()
+        SettingsDialog(self).exec_()
+
+    #: Previous name of `open_settings`.
+    open_resource_limits = open_settings
 
     def open_config_library_manager(self) -> None:
         """Open the Config Library manager dialog."""

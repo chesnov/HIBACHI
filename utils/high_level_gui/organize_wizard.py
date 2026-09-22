@@ -158,44 +158,21 @@ def detect_raw(raw_dir: str) -> Dict[str, object]:
     }
 
 
-#: Preset labels that say nothing about the channel. A preset label is a config
-#: filename stem, and `default.yaml` is the canonical reference config -- so
-#: "default" means "no custom config was chosen", which is true of every
-#: channel in the common case and therefore distinguishes none of them.
-_UNINFORMATIVE_PRESETS = {"default"}
-
-
 def channel_target_name(channel_idx: int, preset_key: str) -> str:
-    """'Channel_0_Microglia' from preset 'Microglia (3D)'; 'Channel_0' from 'default'.
-
-    The preset label is appended only when it carries information. Using the
-    reference config for every channel produced `Channel_0_default`,
-    `Channel_1_default` ... -- a suffix that is identical everywhere, tells you
-    nothing, and then leaked into analysis column headers.
-
-    Note the folder may now be a bare `Channel_<n>`, so anything parsing these
-    names must not require a trailing underscore (see
-    `existing_channel_indices`).
-    """
-    first = preset_key.split()[0] if preset_key else ""
+    """Mirror the historical naming: 'Channel_0_Microglia' from preset 'Microglia (3D)'."""
+    first = preset_key.split()[0] if preset_key else f"ch{channel_idx}"
     # keep it filesystem-safe
-    first = re.sub(r"[^A-Za-z0-9_-]", "", first)
-    if not first or first.lower() in _UNINFORMATIVE_PRESETS:
-        return f"Channel_{channel_idx}"
+    first = re.sub(r"[^A-Za-z0-9_-]", "", first) or f"ch{channel_idx}"
     return f"Channel_{channel_idx}_{first}"
 
 
 def existing_channel_indices(project_dir: str) -> List[int]:
-    """Channel indices already extracted, from `Channel_<n>` or `Channel_<n>_*`."""
+    """Channel indices already extracted, parsed from Channel_<n>_* folder names."""
     out: List[int] = []
     try:
         for item in os.listdir(project_dir):
             if os.path.isdir(os.path.join(project_dir, item)):
-                # The trailing underscore is optional: a channel whose preset
-                # carried no information is a bare `Channel_<n>`. Requiring it
-                # made such a project read as single-channel, because
-                # project_view_window derives `is_multi` from this.
-                m = re.match(r"(?i)^channel_(\d+)(?:_|$)", item)
+                m = re.match(r"(?i)channel_(\d+)_", item)
                 if m:
                     out.append(int(m.group(1)))
     except OSError:
@@ -913,7 +890,19 @@ if _HAVE_QT:
 
             Probing reads headers only (never pixel data), except for the pixel
             counts used to prefill the dialog, which come from the shape.
+
+            Settings > Project setup can turn the prompt off. Then nothing is
+            probed or asked and an empty dict is returned, which is exactly the
+            "no manual input" case: the CSV and file metadata still apply, and
+            any axis they leave unresolved is written as its pixel count and
+            stamped ``pixels_assumed`` by the scaffolding, as before.
             """
+            from .dimension_entry import prompt_enabled
+            if not prompt_enabled():
+                print("[dimensions] manual dimension prompt is off in Settings; "
+                      "uncalibrated axes will keep their pixel counts.")
+                return {}
+
             from .dimension_entry import collect_manual_dimensions, plan_manual_entry
             from .metadata import MetadataExtractor
             from .gui_text_utils import clean_filename_for_matching
@@ -1036,6 +1025,18 @@ if _HAVE_QT:
                 return
 
             names = sorted(set(unscaled))
+
+            # The user switched the dimension prompt off in Settings, i.e. has
+            # already said pixel-count dimensions are acceptable. A warning
+            # after every setup would be the same interruption in a different
+            # dialog, so it goes to the log instead. The configs still carry
+            # `dimensions_source: pixels_assumed`, which is the durable record.
+            from .dimension_entry import prompt_enabled
+            if not prompt_enabled():
+                print(f"[dimensions] {len(names)} image(s) recorded with pixel-"
+                      f"count dimensions (not calibrated): {', '.join(names)}")
+                return
+
             shown = "\n".join(f"\u2022 {n}" for n in names[:8])
             if len(names) > 8:
                 shown += f"\n\u2026 and {len(names) - 8} more"
