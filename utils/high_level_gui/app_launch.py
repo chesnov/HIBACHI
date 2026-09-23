@@ -972,6 +972,29 @@ def _show_render_mode(viewer) -> None:
         log.debug("could not show the rendering-mode note", exc_info=True)
 
 
+def _record_viewer_renderer(viewer) -> None:
+    """Ask the viewer's OWN OpenGL context what it renders on, and keep it.
+
+    The launcher's probe runs before the app exists, in a separate process;
+    driver profiles (NVIDIA Control Panel, AMD Software) can put the real
+    viewer somewhere else. This is the ground truth: the context napari draws
+    with. Kept in the process environment for the Settings tab and logged.
+    """
+    try:
+        canvas = viewer.window._qt_viewer.canvas
+        scene = getattr(canvas, "_scene_canvas", canvas)
+        scene.set_current()
+        from vispy.gloo import gl
+        renderer = str(gl.glGetParameter(gl.GL_RENDERER) or "")
+        vendor = str(gl.glGetParameter(gl.GL_VENDOR) or "")
+    except Exception:
+        log.debug("could not read the viewer's OpenGL renderer", exc_info=True)
+        return
+    if renderer:
+        os.environ["HIBACHI_VIEWER_RENDERER"] = renderer
+        log.info("viewer OpenGL renderer: %s (%s)", renderer, vendor)
+
+
 def _handle_napari_close() -> None:
     """Callback when Napari closes."""
     lifecycle("napari.destroyed", note="qt window destroyed signal fired")
@@ -1057,6 +1080,8 @@ def interactive_segmentation_with_config(selected_folder: str = None,
         qt_window = viewer.window._qt_window
         qt_window.destroyed.connect(_handle_napari_close)
         _show_render_mode(viewer)
+        # After the window is shown, when its context exists.
+        QTimer.singleShot(0, lambda: _record_viewer_renderer(viewer))
 
         # Open maximized and bring to the foreground so the user doesn't have to
         # click the app icon to surface it.

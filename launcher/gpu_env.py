@@ -783,9 +783,10 @@ def short_renderer(renderer: str) -> str:
 
 
 def rendering_summary(state_dir: str) -> str:
-    """What the viewer draws with, in one line, from the launcher's decision.
+    """What the viewer draws with, in one line.
 
-    Read, never probed: the launcher is the only place that asks the graphics
+    Prefers what an open viewer measured in its own OpenGL context; otherwise
+    the launcher's decision, read, never probed: the launcher is the only place that asks the graphics
     driver. Which record applies is decided by the environment the launcher
     gives the app (HIBACHI_GL_MODE / HIBACHI_GL_REASON), because that describes
     THIS launch:
@@ -798,6 +799,12 @@ def rendering_summary(state_dir: str) -> str:
       claimed.
     * "hardware" / "software" -> the renderer recorded for this launch.
     """
+    # Ground truth first: the renderer an open viewer's own context reported
+    # (recorded by app_launch). Driver profiles can move the viewer to a
+    # different GPU from the one the launcher's pre-start probe saw.
+    live = os.environ.get("HIBACHI_VIEWER_RENDERER")
+    if live:
+        return f"{short_renderer(live)} (measured in the viewer)"
     mode = os.environ.get("HIBACHI_GL_MODE")
     reason = os.environ.get("HIBACHI_GL_REASON") or ""
     if not mode:
