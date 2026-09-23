@@ -3107,6 +3107,62 @@ class DynamicGUIManager(QObject):
             kind_box.currentIndexChanged.connect(_kind_changed)
         return bool(current)
 
+    #: Step 3 parameters that elongated soma mode does not read. Hidden while it
+    #: is selected, for the same reason parameters are hidden when seeding from
+    #: another channel: an editable control that cannot affect the result
+    #: invites tuning it.
+    _ELONGATED_HIDDEN = (
+        "ratios_to_process", "intensity_smooth_um", "intensity_weight",
+        "min_physical_peak_separation", "absolute_min_thickness_um",
+        "absolute_max_thickness_um", "max_allowed_core_aspect_ratio",
+    )
+
+    def _add_soma_shape_widget(self, layout, config_key: str,
+                               parameters: Dict[str, Any]) -> bool:
+        """The soma-shape dropdown. Returns True when 'elongated' is selected.
+
+        Built like the soma-source dropdown: the definition may exist only in
+        the reference (a project set up before the parameter existed), in
+        which case the control shows the neutral default, 'compact'.
+        """
+        from PyQt5.QtWidgets import QComboBox, QLabel  # type: ignore
+
+        pconf = parameters.get("soma_shape")
+        if not isinstance(pconf, dict):
+            pconf = self._reference_param(config_key, "soma_shape") or {}
+        options = [str(o) for o in (pconf.get("options") or ["compact", "elongated"])]
+        current = str(pconf.get("value") or "compact")
+        if current not in options:
+            options.append(current)
+
+        label = QLabel(str(pconf.get("label") or "Soma shape"))
+        label.setStyleSheet("font-weight: bold;")
+        layout.addWidget(label)
+        box = QComboBox()
+        for o in options:
+            box.addItem(o, o)
+        box.setCurrentIndex(max(0, box.findData(current)))
+        if pconf.get("description"):
+            box.setToolTip(str(pconf["description"]))
+        layout.addWidget(box)
+        if current == "elongated":
+            note = QLabel("Elongated: one seed per fibre, full length. Only "
+                          "Intensity Percentiles and Min Seed Size apply; the "
+                          "other soma parameters are hidden.")
+            note.setWordWrap(True)
+            note.setStyleSheet("color: #666; font-style: italic;")
+            layout.addWidget(note)
+
+        def _changed(_index: int, key=config_key) -> None:
+            self.parameter_changed(key, "soma_shape", box.currentData() or "compact")
+            # Rebuild so the hidden parameters appear or disappear with the
+            # choice, as the soma-source dropdown does.
+            if self.current_step_method:
+                self.create_step_widgets(self.current_step_method)
+
+        box.currentIndexChanged.connect(_changed)
+        return current == "elongated"
+
     def create_step_widgets(self, step_method_name: str) -> None:
         """Generates parameter widgets for the given step."""
         # Temporarily lock the window size to prevent macOS from shrinking 
@@ -3192,6 +3248,12 @@ class DynamicGUIManager(QObject):
         if self._param_defined(config_key, "soma_source_channel", parameters):
             seeded_externally = self._add_soma_source_widget(
                 scroll_l, config_key, parameters)
+        # Soma shape only matters when this channel finds its own somas.
+        elongated = False
+        if (not seeded_externally
+                and self._param_defined(config_key, "soma_shape", parameters)):
+            elongated = self._add_soma_shape_widget(
+                scroll_l, config_key, parameters)
 
         if isinstance(parameters, dict):
             # Check if Absolute mode is enabled
@@ -3205,7 +3267,8 @@ class DynamicGUIManager(QObject):
                 # only when seeded_externally: with no channel chosen the
                 # dropdown is not built, and falling through would render the
                 # raw key as an editable text box.
-                if pname in ("soma_source_channel", "soma_source_artifact"):
+                if pname in ("soma_source_channel", "soma_source_artifact",
+                             "soma_shape"):
                     continue
                 # Seeding from another channel makes every soma-finding
                 # parameter here unused: nothing in this step reads them. They
@@ -3213,6 +3276,8 @@ class DynamicGUIManager(QObject):
                 # reason rank-inapplicable parameters are -- an editable
                 # control that cannot affect the result invites tuning it.
                 if seeded_externally:
+                    continue
+                if elongated and pname in self._ELONGATED_HIDDEN:
                     continue
                 # Mutually exclusive parameter filtering
                 if pname in["scale_profiles", "scale_profiles_percentile"] and is_absolute:

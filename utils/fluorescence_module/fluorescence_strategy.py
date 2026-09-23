@@ -605,6 +605,11 @@ class FluorescenceStrategy(ProcessingStrategy):
                     _require(params, "absolute_max_thickness_um", float)
                 ),
                 memmap_final_mask=True,
+                # `params.get`, not `_require`: the parameter is
+                # neutral_default, so a project set up before it existed has no
+                # such key and must behave exactly as it did. "compact" is that
+                # behaviour.
+                soma_shape=str(params.get("soma_shape", "compact") or "compact"),
                 # Where the result memmap is written before being copied to
                 # `cell_bodies_path`. This used to be passed as
                 # `temp_root_path`, which `extract_soma_masks` has no parameter

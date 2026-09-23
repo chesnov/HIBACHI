@@ -187,6 +187,24 @@ execute_soma_extraction:
         them; choose it when its cell count is what you trust. Note that a
         finished cell is much larger than a core, so one seed can span a thin
         bridge between two of this channel's cells and leave them merged.
+    soma_shape:
+      # 'compact' is the behaviour every run had before this parameter existed,
+      # so an old config that lacks it keeps working unchanged.
+      neutral_default: true
+      label: Soma shape
+      type: str
+      value: compact
+      options:
+      - compact
+      - elongated
+      description: >-
+        'compact' finds a round core per cell (nuclei, cell bodies) by peeling
+        intensity and distance thresholds, keeping the tightest core. Choose
+        'elongated' for spindle- or fibre-shaped cells with no compact body:
+        it seeds each fibre along its full length, following the local fibre
+        direction, and reads only Intensity Percentiles and Min Seed Size --
+        every other parameter below is hidden. Every scale it uses is derived
+        from the objects' measured fibre radius.
     ratios_to_process:
       label: Ratios to Process (Peeling; comma-sep floats)
       type: list

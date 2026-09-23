@@ -359,6 +359,8 @@ class _CandidateParams:
     peak_box: tuple
     peak_separation_um: float
     memmap_voxel_threshold: int
+    soma_shape: str
+    temp_dir: Optional[str]
 
 
 def _generate_label_candidates(
@@ -394,6 +396,10 @@ def _generate_label_candidates(
     worker process cannot share the caller's dict. The counters are pure sums,
     so merging deltas in any order gives the same totals.
     """
+    if params.soma_shape == "elongated":
+        return _elongated_label_candidates(
+            lbl, sl, segmentation_mask, intensity_image, params)
+
     # Local names, so the body reads exactly as it did when these were
     # separate parameters.
     spacing = params.spacing
@@ -692,6 +698,457 @@ def _generate_label_candidates(
     return label_candidates, diag_stats
 
 
+# =============================================================================
+# Elongated somas (soma_shape="elongated")
+# =============================================================================
+#: The two soma shapes step 3 knows. "compact" is the only behaviour this step
+#: had before the setting existed, and stays the default.
+SOMA_SHAPES = ("compact", "elongated")
+
+# Every scale below is a multiple of the object's measured fibre radius r, so
+# none of them is a parameter. The multiples sit in the middle of ranges over
+# which the result did not change on the spindle test stack:
+#   along-fibre smoothing  10 r   (flat from 5 r to 32 r)
+#   single-fibre width      4 r   (flat from 3 r to 6 r; 8 r starts accepting
+#                                  two fibres side by side)
+#   direction averaging     2 r   (stabilises the local direction estimate)
+_ALONG_SMOOTH_R = 10.0
+_WIDTH_LIMIT_R = 4.0
+_DIRECTION_AVG_R = 2.0
+
+
+# ---- exact percentiles with bounded memory -------------------------------- #
+def _sortable_keys(v: np.ndarray) -> np.ndarray:
+    """float32 values as uint32 keys that sort in the same order (IEEE-754:
+    flip the sign bit of non-negatives, every bit of negatives)."""
+    u = np.ascontiguousarray(v, dtype=np.float32).view(np.uint32)
+    neg = (u >> 31).astype(bool)
+    return np.where(neg, ~u, u | np.uint32(0x80000000))
+
+
+def _key_to_float(k: int) -> np.float32:
+    k = np.uint32(k)
+    u = (k ^ np.uint32(0x80000000)) if (k >> np.uint32(31)) else ~k
+    return np.array([u], dtype=np.uint32).view(np.float32)[0]
+
+
+def _exact_percentiles(chunks, percentiles):
+    """`np.percentile(all_values, p)` (method 'linear') for each p, where
+    `chunks()` yields the values piecewise, holding at most one chunk and two
+    65,536-bin histograms. Order statistics are found exactly by selecting on
+    the sortable integer form of the floats, 16 bits per pass; the
+    interpolation is numpy's own, so the result is bit-identical."""
+    import numpy.lib._function_base_impl as _fb
+    n = 0
+    hi = np.zeros(65536, np.int64)
+    for v in chunks():
+        if v.size:
+            n += v.size
+            hi += np.bincount(_sortable_keys(v) >> np.uint32(16), minlength=65536)
+    if n == 0:
+        return [np.float32(0)] * len(percentiles)
+    method = _fb._QuantileMethods["linear"]
+    plan = []
+    for p in percentiles:
+        vi = float(np.asanyarray(method["get_virtual_index"](n, np.float64(p) / 100.0)))
+        lo_i = min(max(int(np.floor(vi)), 0), n - 1)
+        hi_i = min(lo_i + 1, n - 1) if vi < n - 1 else n - 1
+        if vi >= n - 1:
+            lo_i = n - 1
+        gamma = float(method["fix_gamma"](np.asanyarray(vi - np.floor(vi)), np.asanyarray(vi)))
+        plan.append((lo_i, hi_i, gamma))
+    ranks = sorted({r for lo_i, hi_i, _ in plan for r in (lo_i, hi_i)})
+    cum = np.cumsum(hi)
+    prefix = {r: int(np.searchsorted(cum, r, side="right")) for r in ranks}
+    below = {r: int(cum[prefix[r]] - hi[prefix[r]]) for r in ranks}
+    lows = {pf: np.zeros(65536, np.int64) for pf in set(prefix.values())}
+    for v in chunks():
+        if not v.size:
+            continue
+        k = _sortable_keys(v); top = k >> np.uint32(16)
+        for pf, h in lows.items():
+            sel = k[top == pf]
+            if sel.size:
+                h += np.bincount(sel & np.uint32(0xFFFF), minlength=65536)
+    value = {}
+    for r in ranks:
+        pf = prefix[r]; c = np.cumsum(lows[pf])
+        low = int(np.searchsorted(c, r - below[r], side="right"))
+        value[r] = _key_to_float((pf << 16) | low)
+    out = []
+    for lo_i, hi_i, gamma in plan:
+        out.append(np.float32(_fb._lerp(value[lo_i], value[hi_i], gamma)))
+    return out
+
+
+# ---- the three per-tile operators ------------------------------------------ #
+def _ridge_and_direction(img, planes, spacing, r, is_stack):
+    """Bright-ridge strength and the along-fibre direction, plane by plane.
+
+    2D Hessian at sigma = r, per plane, as step 1's tubularity filter works.
+    Strength is minus the most negative eigenvalue (the curvature ACROSS a
+    bright line), clipped at 0 and scale-normalised. The direction along the
+    fibre is the eigenvector of the other eigenvalue:
+    arctan2(2*Hrc, Hrr - Hcc) / 2 is the angle of the eigenvector of the
+    LARGER eigenvalue, which on a bright ridge points along it. It is averaged
+    over 2 r in the doubled-angle representation, weighted by strength, so it
+    is stable and has no 180-degree ambiguity. Returns R and the unit vector
+    (C, S) in (row, col) order.
+    """
+    from skimage.feature import hessian_matrix
+    s_px = max(0.5, r / float(spacing[-1]))
+    R = np.zeros(img.shape, np.float32)
+    C = np.zeros(img.shape, np.float32)
+    S = np.zeros(img.shape, np.float32)
+    for z in planes:
+        Hrr, Hrc, Hcc = hessian_matrix(np.asarray(img[z], np.float32), sigma=s_px,
+                                       order="rc", use_gaussian_derivatives=True)
+        tr = Hrr + Hcc
+        disc = np.sqrt(((Hrr - Hcc) / 2.0) ** 2 + Hrc ** 2)
+        R[z] = np.maximum(0.0, -(tr / 2.0 - disc)) * s_px ** 2
+        th = 0.5 * np.arctan2(2.0 * Hrc, Hrr - Hcc)
+        c2 = ndimage.gaussian_filter(np.cos(2 * th) * R[z], _DIRECTION_AVG_R * s_px)
+        s2 = ndimage.gaussian_filter(np.sin(2 * th) * R[z], _DIRECTION_AVG_R * s_px)
+        a = 0.5 * np.arctan2(s2, c2)
+        C[z], S[z] = np.cos(a), np.sin(a)
+    if is_stack:  # smooth across planes at the same physical scale
+        R = ndimage.gaussian_filter1d(R, r / float(spacing[0]), axis=0)
+    return R, C, S
+
+
+def _along_fibre_smooth(R, C, S, where, spacing, sigma_um):
+    """Gaussian average of R along each voxel's own fibre direction, for the
+    voxels in `where`: a straight line of +-3 sigma, linear interpolation."""
+    zz, yy, xx = np.nonzero(where)
+    s_px = sigma_um / float(spacing[-1])
+    ts = np.arange(-3 * s_px, 3 * s_px + 1, max(1.0, s_px / 4))
+    w = np.exp(-0.5 * (ts / s_px) ** 2)
+    w /= w.sum()
+    dy = C[zz, yy, xx].astype(np.float64)
+    dx = S[zz, yy, xx].astype(np.float64)
+    ny, nx = R.shape[1], R.shape[2]
+    acc = np.zeros(zz.size, np.float32)
+    for t, wt in zip(ts, w):
+        # Bilinear sample within the voxel's own plane. The whole and
+        # fractional parts of the offset come from t*d alone, never from the
+        # absolute position, so a voxel gets bit-identical values whichever
+        # tile crop it is computed in. Edges clamp, as mode="nearest".
+        oy, ox = t * dy, t * dx
+        fy, fx = np.floor(oy), np.floor(ox)
+        wy, wx = oy - fy, ox - fx
+        y0 = np.clip(yy + fy.astype(np.int64), 0, ny - 1)
+        y1 = np.clip(yy + fy.astype(np.int64) + 1, 0, ny - 1)
+        x0 = np.clip(xx + fx.astype(np.int64), 0, nx - 1)
+        x1 = np.clip(xx + fx.astype(np.int64) + 1, 0, nx - 1)
+        v = ((1 - wy) * ((1 - wx) * R[zz, y0, x0] + wx * R[zz, y0, x1])
+             + wy * ((1 - wx) * R[zz, y1, x0] + wx * R[zz, y1, x1]))
+        acc += np.float32(wt) * v.astype(np.float32)
+    out = np.zeros(R.shape, np.float32)
+    out[zz, yy, xx] = acc
+    return out
+
+
+def _piece_width(vox, spacing, C, S, seg_um):
+    """Widest in-plane spread across the local fibre direction (5-95 pct).
+
+    Measured in stretches of length seg_um along the piece, each against the
+    direction of its own voxels, so a curved fibre is not mistaken for a wide
+    one."""
+    yx = vox[:, 1:] * spacing[1:]
+    d = np.c_[C[tuple(vox.T)], S[tuple(vox.T)]].mean(0)
+    d /= np.linalg.norm(d) + 1e-9
+    along = yx @ d
+    nb = max(1, int(np.ceil(np.ptp(along) / seg_um)))
+    edges = np.linspace(along.min(), along.max() + 1e-6, nb + 1)
+    worst = 0.0
+    for b in range(nb):
+        m = (along >= edges[b]) & (along < edges[b + 1])
+        if m.sum() < 5:
+            continue
+        dl = np.c_[C[tuple(vox[m].T)], S[tuple(vox[m].T)]].mean(0)
+        dl /= np.linalg.norm(dl) + 1e-9
+        p = yx[m] @ np.array([-dl[1], dl[0]])
+        worst = max(worst, float(np.percentile(p, 95) - np.percentile(p, 5)))
+    return worst
+
+
+# ---- tiling ------------------------------------------------------------------ #
+def _tile_targets(box, tile):
+    """The tiles' own regions: `box` cut into blocks of `tile`, each voxel in
+    exactly one."""
+    import itertools
+    axes = [range(b.start, b.stop, t) for b, t in zip(box, tile)]
+    for starts in itertools.product(*axes):
+        yield tuple(slice(s0, min(s0 + t, b.stop))
+                    for s0, t, b in zip(starts, tile, box))
+
+
+def _grow(target, halo, bounds):
+    """`target` grown by `halo` voxels per axis, clamped to `bounds`."""
+    return tuple(slice(max(bd.start, t.start - h), min(bd.stop, t.stop + h))
+                 for t, h, bd in zip(target, halo, bounds))
+
+
+def _local(inner, outer):
+    """`inner` expressed in the coordinates of the crop `outer`."""
+    return tuple(slice(i.start - o.start, i.stop - o.start)
+                 for i, o in zip(inner, outer))
+
+
+class _Union:
+    def __init__(self):
+        self.p = [0]
+
+    def new(self):
+        self.p.append(len(self.p))
+        return len(self.p) - 1
+
+    def find(self, a):
+        while self.p[a] != a:
+            self.p[a] = self.p[self.p[a]]
+            a = self.p[a]
+        return a
+
+    def union(self, a, b):
+        a, b = self.find(a), self.find(b)
+        if a != b:
+            self.p[max(a, b)] = min(a, b)
+
+
+def _elongated_label_candidates(lbl, sl, segmentation_mask, intensity_image,
+                                params: "_CandidateParams"):
+    """Seeds for spindle- or fibre-shaped cells, one per fibre, full length.
+
+    Thresholding intensity cannot give these: brightness varies as much along
+    a fibre as it dips between touching fibres, so pieces break into stubs
+    before they separate. What does separate them is direction. This works on
+    a ridge response smoothed ALONG each fibre, and peels with the opposite
+    preference to compact mode: ascending through the configured percentiles,
+    a connected piece only one fibre wide is accepted whole, and a wider piece
+    (several fibres merged) is re-examined one level up, inside itself only.
+
+    Tiled, with the same pinned tile shape as compact mode, so working memory
+    is one tile plus its halo whatever the object's size. Four passes over the
+    tiles; everything object-sized lives in disk memmaps in the step's temp
+    folder, not in RAM:
+
+    1. Fibre radius r: median inscribed radius on the object's centre lines.
+       Each tile's distance transform is recomputed with a larger halo until
+       it is exact inside the tile.
+    2. Ridge response and direction, with a halo covering every filter's full
+       reach, so both are identical to a whole-object computation; written to
+       disk.
+    3. The percentile thresholds over the whole object, exactly
+       (`_exact_percentiles`).
+    4. Peeling, per tile plus an overlap margin of one along-fibre smoothing
+       reach. A fibre crossing a tile boundary is found by both tiles, and
+       pieces that share voxels are joined into one seed, so fibres are not
+       cut at tile boundaries.
+
+    Config inputs: the intensity percentiles and min_fragment_size. Every
+    scale derives from r (see the constants above).
+    """
+    import shutil
+    import tempfile
+
+    diag = {"cores_evaluated": 0, "cores_too_small": 0, "thickness_rejected": 0,
+            "aspect_ratio_rejected": 0, "spatial_overlap_rejected": 0,
+            "pushed_and_dropped": 0}
+    percentiles = sorted(s["val"] for s in params.strategies if s["type"] == "Int")
+    if not percentiles:
+        return [], diag
+
+    # One code path for both ranks: a plane is a stack of one.
+    is_stack = params.ndim == 3
+    seg = segmentation_mask if is_stack else segmentation_mask[None]
+    inten = intensity_image if is_stack else intensity_image[None]
+    box = tuple(sl) if is_stack else (slice(0, 1),) + tuple(sl)
+    tile = tuple(int(t) for t in params.tile_size)
+    tile = tile if is_stack else (1,) + tile
+    sp = np.asarray(params.spacing, float)
+    sp = sp if is_stack else np.r_[1.0, sp]
+    image_bounds = tuple(slice(0, n) for n in seg.shape)
+    struct = ndimage.generate_binary_structure(3, 1)
+    targets = list(_tile_targets(box, tile))
+
+    # ---- pass 1: fibre radius, object planes, voxel count -------------------
+    ridge_vals, obj_planes, n_obj = [], np.zeros(seg.shape[0], bool), 0
+    for tg in targets:
+        h_um = 5.0
+        while True:
+            halo = [int(np.ceil(h_um / s)) + 1 for s in sp]
+            if not is_stack:
+                halo[0] = 0
+            crop = _grow(tg, halo, image_bounds)
+            obj = np.asarray(seg[crop]) == lbl
+            loc = _local(tg, crop)
+            if not obj[loc].any():
+                dt = None
+                break
+            dt = ndimage.distance_transform_edt(obj, sampling=sp)
+            # Exact inside the tile when no inner distance could reach past
+            # the halo; otherwise widen it and recompute.
+            if float(dt[loc].max()) < h_um - float(sp.max()):
+                break
+            h_um *= 2.0
+        if dt is None:
+            continue
+        ridge = obj & (dt >= ndimage.maximum_filter(dt, size=3)) & (dt > 0)
+        ridge_vals.append(dt[loc][ridge[loc]].astype(np.float32))
+        o = obj[loc]
+        obj_planes[tg[0].start:tg[0].stop] |= o.any(axis=(1, 2))
+        n_obj += int(o.sum())
+        del obj, dt, ridge
+    rv = np.concatenate(ridge_vals) if ridge_vals else np.zeros(0, np.float32)
+    if n_obj == 0 or rv.size == 0:
+        return [], diag
+    r = float(np.median(rv))
+    del ridge_vals, rv
+    if not (r > 0):
+        return [], diag
+
+    s_px = max(0.5, r / float(sp[-1]))
+    sL_px = _ALONG_SMOOTH_R * r / float(sp[-1])
+    hess_px = int(4 * s_px + 0.5)                     # gaussian truncate = 4
+    dir_px = int(4 * _DIRECTION_AVG_R * s_px + 0.5)
+    along_px = int(np.ceil(3 * sL_px)) + 1            # line reach + interpolation
+    halo_xy = max(hess_px + dir_px, hess_px + along_px) + 2
+    halo_z = (int(4 * r / float(sp[0]) + 0.5) + 1) if is_stack else 0
+    # Region the response may read from: the object's box, in-plane widened
+    # by the along-fibre reach so fibres ending at the box still see real
+    # image; across planes only the box.
+    reach_px = int(np.ceil(3 * sL_px)) + 2
+    read_bounds = (
+        slice(box[0].start, box[0].stop),
+        slice(max(0, box[1].start - reach_px), min(seg.shape[1], box[1].stop + reach_px)),
+        slice(max(0, box[2].start - reach_px), min(seg.shape[2], box[2].stop + reach_px)),
+    )
+    bshape = tuple(b.stop - b.start for b in box)
+    boff = np.array([b.start for b in box])
+    in_box = lambda t: tuple(slice(a.start - b.start, a.stop - b.start) for a, b in zip(t, box))
+
+    workdir = tempfile.mkdtemp(prefix=f"elongated_{lbl}_", dir=params.temp_dir)
+    try:
+        resp_mm = np.memmap(os.path.join(workdir, "resp.dat"), np.float32, "w+", shape=bshape)
+        c_mm = np.memmap(os.path.join(workdir, "c.dat"), np.float32, "w+", shape=bshape)
+        s_mm = np.memmap(os.path.join(workdir, "s.dat"), np.float32, "w+", shape=bshape)
+        plane_list = np.nonzero(obj_planes)[0]
+
+        # ---- pass 2: ridge response and direction, exact per tile ----------
+        for tg in targets:
+            crop = _grow(tg, (halo_z, halo_xy, halo_xy), read_bounds)
+            loc = _local(tg, crop)
+            obj_t = np.asarray(seg[tg]) == lbl
+            if not obj_t.any():
+                continue
+            img = np.asarray(inten[crop], np.float32)
+            planes = [z - crop[0].start for z in plane_list
+                      if crop[0].start <= z < crop[0].stop]
+            R, C, S = _ridge_and_direction(img, planes, sp, r, is_stack)
+            del img
+            where = np.zeros(R.shape, bool)
+            where[loc] = obj_t
+            resp = _along_fibre_smooth(R, C, S, where, sp, _ALONG_SMOOTH_R * r)
+            resp_mm[in_box(tg)] = resp[loc]
+            c_mm[in_box(tg)] = C[loc]
+            s_mm[in_box(tg)] = S[loc]
+            del R, C, S, resp, where
+        resp_mm.flush(); c_mm.flush(); s_mm.flush()
+
+        # ---- pass 3: percentile thresholds over the whole object -----------
+        def _values():
+            for tg in targets:
+                o = np.asarray(seg[tg]) == lbl
+                if o.any():
+                    yield np.asarray(resp_mm[in_box(tg)])[o]
+        thresholds = _exact_percentiles(_values, percentiles)
+
+        # ---- pass 4: peeling per tile + overlap, joined across tiles -------
+        piece_mm = np.memmap(os.path.join(workdir, "pieces.dat"), np.int32, "w+", shape=bshape)
+        uf = _Union()
+        pad = (int(np.ceil(3 * sL_px * sp[-1] / sp[0])) + 1 if is_stack else 0,
+               int(np.ceil(3 * sL_px)) + 2, int(np.ceil(3 * sL_px)) + 2)
+        for tg in targets:
+            crop = _grow(tg, pad, box)
+            loc = _local(tg, crop)
+            obj = np.asarray(seg[crop]) == lbl
+            if not obj[loc].any():
+                continue
+            bc = in_box(crop)
+            resp = np.asarray(resp_mm[bc]); C = np.asarray(c_mm[bc]); S = np.asarray(s_mm[bc])
+            in_target = np.zeros(obj.shape, bool)
+            in_target[loc] = True
+            open_ = obj.copy()
+            for p, thr in zip(percentiles, thresholds):
+                core = (resp >= thr) & open_
+                lab, _n = ndimage.label(core, structure=struct)
+                for i, psl in enumerate(ndimage.find_objects(lab), 1):
+                    if psl is None:
+                        continue
+                    diag["cores_evaluated"] += 1
+                    vox = np.argwhere(lab[psl] == i) + np.array([q.start for q in psl])
+                    if len(vox) < params.min_seed_vol:
+                        diag["cores_too_small"] += 1
+                        open_[tuple(vox.T)] = False
+                        continue
+                    if _piece_width(vox, sp, C, S, _ALONG_SMOOTH_R * r) > _WIDTH_LIMIT_R * r:
+                        continue  # several fibres: look again one level up
+                    open_[tuple(vox.T)] = False
+                    if not in_target[tuple(vox.T)].any():
+                        continue  # a neighbouring tile owns this piece
+                    # Join with whatever a neighbouring tile already wrote for
+                    # the same fibre; claim only voxels still free.
+                    gb = vox + np.array([c.start for c in bc])
+                    gidx = tuple(gb.T)
+                    have = piece_mm[gidx]
+                    nid = uf.new()
+                    for other in np.unique(have[have > 0]):
+                        uf.union(nid, int(other))
+                    free = have == 0
+                    piece_mm[tuple(gb[free].T)] = nid
+            del obj, resp, C, S, open_, in_target
+        piece_mm.flush()
+
+        # ---- assemble one candidate per joined fibre ------------------------
+        coords, best = {}, {}
+        for tg in targets:
+            ids = np.asarray(piece_mm[in_box(tg)])
+            if not ids.any():
+                continue
+            rsp = np.asarray(resp_mm[in_box(tg)])
+            vox = np.argwhere(ids > 0)
+            roots = np.array([uf.find(int(i)) for i in ids[tuple(vox.T)]])
+            vals = rsp[tuple(vox.T)]
+            g = vox + boff + np.array([t.start - b.start for t, b in zip(tg, box)])
+            for rt in np.unique(roots):
+                m = roots == rt
+                coords.setdefault(rt, []).append(g[m].astype(np.int32))
+                k = int(np.argmax(vals[m]))
+                if rt not in best or vals[m][k] > best[rt][0]:
+                    best[rt] = (float(vals[m][k]), g[m][k])
+        candidates = []
+        for rt in sorted(coords):
+            cc = np.concatenate(coords[rt])
+            pk = best[rt][1]
+            if not is_stack:
+                cc, pk = cc[:, 1:], pk[1:]
+            candidates.append({
+                "coords": cc.astype(np.int32),
+                "peak_coord": np.asarray(pk),
+                "vol": int(len(cc)),
+                "score": 1.0,
+                "strat_name": "Fibre",
+                "frag_max_thick": r,
+                "family": "Fibre",
+                "dt_vals": np.zeros(len(cc), np.float32),
+                "rank_vals": np.zeros(len(cc), np.float32),
+            })
+        del resp_mm, c_mm, s_mm, piece_mm
+        return candidates, diag
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
 #: Per-worker handles, set once by the pool initializer. The images are reopened
 #: inside each process rather than pickled per task: they are memmaps, so this
 #: costs one mapping per worker and no data movement at all, where sending them
@@ -764,6 +1221,7 @@ def extract_soma_masks(
     memmap_output_path: Optional[str] = None,
     memmap_voxel_threshold: int = 25_000_000,
     tile_size: Optional[Sequence[int]] = None,
+    soma_shape: str = "compact",
 ) -> np.ndarray:
     """
     Memory-efficient 3D Soma Extraction logic.
@@ -808,6 +1266,13 @@ def extract_soma_masks(
             bar and its RAM readout are shown, nothing else. Tiling is
             unconditional: `generate_tiles` is called for every label.
         tile_size: Tile shape for huge clumps; None uses the pinned default.
+        soma_shape: "compact" (default, the step's original behaviour) or
+            "elongated" for spindle/fibre-shaped cells: one seed per fibre,
+            full length. Elongated mode reads only the intensity percentiles
+            and min_fragment_size, and is tiled like compact mode, keeping
+            its object-sized working arrays as memmaps in `memmap_dir` (the
+            system temp folder when that is None); see
+            `_elongated_label_candidates`.
 
     Returns:
         np.ndarray: 3D labeled mask containing extracted soma seeds.
@@ -823,6 +1288,9 @@ def extract_soma_masks(
             f"soma extraction handles 2D and 3D data; got a {ndim}D array"
         )
     unit = "voxel" if ndim == 3 else "pixel"
+    if soma_shape not in SOMA_SHAPES:
+        raise ValueError(f"soma_shape must be one of {SOMA_SHAPES}; got {soma_shape!r}")
+    elongated = soma_shape == "elongated"
 
     print("\n" + "=" * 60)
     print(f"{ndim}D SOMA EXTRACTION: STARTING")
@@ -865,6 +1333,9 @@ def extract_soma_masks(
 
     # 2. Absolute Mode Initialization & Profiling
     print(f"  Absolute Mode Enforced: Processing {len(valid_labels)} labels...")
+    print(f"  Soma shape: {soma_shape}" + (
+        " (one seed per fibre; reads only the intensity percentiles and the "
+        "min seed size)" if elongated else ""))
     print(f"  Thresh: Min Volume = {min_seed_vol} {unit}s")
     print(f"  Thresh: Thickness = [{absolute_min_thickness_um:.2f} - {absolute_max_thickness_um:.2f}] µm")
     print(f"  Thresh: Peak Separation = {min_physical_peak_separation:.2f} µm")
@@ -998,6 +1469,9 @@ def extract_soma_masks(
         peak_box=_peak_box,
         peak_separation_um=float(min_physical_peak_separation),
         memmap_voxel_threshold=memmap_voxel_threshold,
+        soma_shape=soma_shape,
+        # Elongated mode keeps its object-sized working arrays on disk here.
+        temp_dir=memmap_dir,
     )
 
     _pool = None
@@ -1051,6 +1525,18 @@ def extract_soma_masks(
                     this_label_peaks = []  # committed to the global grid after this label
                     for cand in label_candidates:
                         coords = cand["coords"]
+                        if elongated:
+                            # Elongated candidates are disjoint by construction
+                            # (each accepted piece leaves the pool), so the
+                            # peak-distance gates below do not apply; only a
+                            # clash with an already written seed is refused.
+                            idx_tuple = tuple(coords.T)
+                            if np.any(final_seed_mask[idx_tuple] > 0):
+                                diag_stats["spatial_overlap_rejected"] += 1
+                                continue
+                            final_seed_mask[idx_tuple] = next_label_id
+                            next_label_id += 1
+                            continue
                         peak_phys = cand["peak_coord"] * np.array(spacing)
 
                         # Within-label proximity gate
