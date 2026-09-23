@@ -801,18 +801,18 @@ def _raw_for_display(tif_file: str):
 
 
 
-def _display_range(data) -> dict:
-    """`contrast_limits` kwarg for add_image, or {} to let napari decide.
+def _display_range(data) -> Optional[list]:
+    """`contrast_limits` for add_image, or None to let napari decide.
 
-    A dict so that failing to compute a range falls back to the previous
-    behaviour rather than forcing a wrong one.
+    None is add_image's own default, so failing to compute a range falls back
+    to the previous behaviour rather than forcing a wrong one.
     """
     try:
         from .display_pyramid import contrast_limits_for
         limits = contrast_limits_for(data)
     except Exception:
         limits = None
-    return {"contrast_limits": list(limits)} if limits else {}
+    return list(limits) if limits else None
 
 
 
@@ -1403,7 +1403,7 @@ def open_sample_overlay(project_manager, sample_name, analysis_name=None,
                 viewer.add_image(raw_img, name=f"Raw: {ch_name}", colormap=cmap,
                                  blending='additive', opacity=0.5,
                                  multiscale=isinstance(raw_img, list),
-                                 **_display_range(raw_img))
+                                 contrast_limits=_display_range(raw_img))
             if dat_file:
                 seg_data = np.memmap(dat_file, dtype=np.int32, mode='r', shape=shape)
                 viewer.add_labels(seg_data, name=f"Seg: {ch_name}", opacity=0.3,

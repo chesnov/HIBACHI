@@ -5,7 +5,7 @@ import gc
 import time
 import traceback
 import warnings
-from typing import Dict, List, Any, Tuple, TypedDict, Optional, Union
+from typing import Dict, List, Any, Tuple, TypedDict, Optional, Sequence, Union
 
 import numpy as np
 import yaml  # type: ignore
@@ -755,7 +755,9 @@ class ProcessingStrategy(abc.ABC):
         data: Union[np.ndarray, Any],
         name: str,
         layer_type: str = 'labels',
-        **kwargs: Any
+        colormap: Optional[str] = None,
+        blending: Optional[str] = None,
+        contrast_limits: Optional[Sequence[float]] = None,
     ) -> None:
         """
         Adds or updates a layer in the Napari viewer safely.
@@ -766,8 +768,18 @@ class ProcessingStrategy(abc.ABC):
             data: Data to display (array, points, etc.).
             name: Base name for the layer (mode suffix will be appended).
             layer_type: 'labels', 'image', 'shapes', or 'points'.
-            **kwargs: Additional arguments for the viewer.add_* method.
+            colormap, blending, contrast_limits: image layers only. None is
+                napari's own default for each in ``add_image``, so leaving one
+                out behaves exactly as not passing it. They are refused for
+                the other layer types rather than ignored: ``add_labels`` and
+                ``add_shapes`` default ``blending`` to 'translucent', not None.
         """
+        if layer_type != 'image' and (colormap is not None or blending is not None
+                                      or contrast_limits is not None):
+            raise ValueError(
+                f"colormap/blending/contrast_limits apply to image layers only; "
+                f"got layer_type={layer_type!r} for {name!r}"
+            )
         if viewer is None: 
             return
         layer_name = f"{name}_{self.mode_name}"
@@ -778,8 +790,6 @@ class ProcessingStrategy(abc.ABC):
         # dimensionality mismatch errors in _update_thumbnail (ndi.zoom).
         
         target_visibility = True # Default to visible
-        if 'visible' in kwargs:
-            target_visibility = kwargs.pop('visible') # Extract and remove from kwargs
 
         if layer_name in viewer.layers:
             # If the layer exists, remember its current visibility
@@ -814,8 +824,7 @@ class ProcessingStrategy(abc.ABC):
             elif hasattr(self, 'spacing') and len(self.spacing) == 3:
                 display_scale = tuple(self.spacing)
 
-        kwargs['scale'] = display_scale
-        kwargs['translate'] = kwargs.get('translate', (0.0,) * spatial_ndim)
+        display_translate = (0.0,) * spatial_ndim
 
         # Update existing layer or add new one
         if layer_name not in viewer.layers:
@@ -823,14 +832,24 @@ class ProcessingStrategy(abc.ABC):
                 # Add layer (defaulting to visible=True implicitly by removing kwarg)
                 new_layer = None
                 if layer_type == 'labels':
-                    new_layer = viewer.add_labels(data, name=layer_name, **kwargs)
+                    new_layer = viewer.add_labels(
+                        data, name=layer_name,
+                        scale=display_scale, translate=display_translate)
                 elif layer_type == 'image':
-                    new_layer = viewer.add_image(data, name=layer_name, **kwargs)
+                    new_layer = viewer.add_image(
+                        data, name=layer_name,
+                        scale=display_scale, translate=display_translate,
+                        colormap=colormap, blending=blending,
+                        contrast_limits=contrast_limits)
                 elif layer_type == 'shapes':
                     if len(data) > 0:
-                        new_layer = viewer.add_shapes(data, name=layer_name, **kwargs)
+                        new_layer = viewer.add_shapes(
+                            data, name=layer_name,
+                            scale=display_scale, translate=display_translate)
                 elif layer_type == 'points':
-                    new_layer = viewer.add_points(data, name=layer_name, **kwargs)
+                    new_layer = viewer.add_points(
+                        data, name=layer_name,
+                        scale=display_scale, translate=display_translate)
 
                 # Apply visibility AFTER creation to ensure initialization logic runs
                 if new_layer is not None:
@@ -850,8 +869,7 @@ class ProcessingStrategy(abc.ABC):
                 elif isinstance(data, np.memmap):
                     data = np.array(data)
                 layer.data = data
-                if 'scale' in kwargs:
-                    layer.scale = kwargs['scale']
+                layer.scale = display_scale
                 layer.refresh()
             except Exception as e:
                 print(f"Error updating layer {layer_name}: {e}")

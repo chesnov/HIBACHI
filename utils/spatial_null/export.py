@@ -50,6 +50,7 @@ from __future__ import annotations
 
 import json
 import os
+import zipfile
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 import numpy as np
@@ -100,6 +101,24 @@ COMPARABILITY_KEY = (
 SOFT_KEYS = ("f_grid_max_um", "f_grid_points", "measure_from")
 
 _NULL_COLUMNS_MIN = ("image_id", "draw", "set", "template_label", "voxels")
+
+
+def _write_npz(path: str, arrays: Dict[str, np.ndarray]) -> None:
+    """A compressed ``.npz`` whose member names are the dict's keys.
+
+    What ``np.savez_compressed(path, **arrays)`` writes -- one deflated
+    ``<name>.npy`` per entry, via numpy's own ``format.write_array`` -- but
+    taking the dict as one argument. The names are data (dataframe columns,
+    curve names), not parameters, and numpy offers no dict-taking form.
+    """
+    if not path.endswith(".npz"):
+        path = path + ".npz"
+    with zipfile.ZipFile(path, mode="w", compression=zipfile.ZIP_DEFLATED,
+                         allowZip64=True) as zf:
+        for name, value in arrays.items():
+            with zf.open(name + ".npy", mode="w", force_zip64=True) as fh:
+                np.lib.format.write_array(fh, np.asanyarray(value),
+                                          allow_pickle=True)
 
 
 def biological_name(channel_key: Optional[str]) -> Optional[str]:
@@ -195,7 +214,7 @@ def write_project_export(out_dir: str,
         if col.dtype == object:
             col = col.astype(str)
         payload[c] = col
-    np.savez_compressed(p, **payload)
+    _write_npz(p, payload)
     written["null_objects"] = p
     if also_csv:
         q = os.path.join(out_dir, "null_objects.csv.gz")
@@ -215,7 +234,7 @@ def write_project_export(out_dir: str,
             if col.dtype == object:
                 col = col.astype(str)
             payload[c] = col
-        np.savez_compressed(p, **payload)
+        _write_npz(p, payload)
         written["null_partners"] = p
         if also_csv:
             q = os.path.join(out_dir, "null_partners.csv.gz")
@@ -224,7 +243,7 @@ def write_project_export(out_dir: str,
 
     if f_curves:
         p = os.path.join(out_dir, "f_curves.npz")
-        np.savez_compressed(p, **f_curves)
+        _write_npz(p, f_curves)
         written["f_curves"] = p
 
     return written

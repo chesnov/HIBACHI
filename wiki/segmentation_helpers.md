@@ -16,7 +16,7 @@ transform and the log format are defined once.
 
 ## Functions
 
-*   **`flush_print(*args, **kwargs)`** — `print` followed by
+*   **`flush_print(*args)`** — `print` followed by
     `sys.stdout.flush()`. Without the flush, output still sitting in the buffer
     is lost when a native crash kills the process, so the log ends before the
     point of failure rather than at it.

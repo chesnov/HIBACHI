@@ -29,8 +29,8 @@ except Exception:  # pragma: no cover
     import logging
     log = logging.getLogger("hibachi.app_launch")
 
-    def lifecycle(event, **fields):
-        log.info("%s %s", event, " ".join(f"{k}={v!r}" for k, v in fields.items()))
+    def lifecycle(event, fields=None):
+        log.info("%s %s", event, " ".join(f"{k}={v!r}" for k, v in (fields or {}).items()))
 
 
 _shutdown_hook_connected = False
@@ -79,7 +79,7 @@ def _stop_running_qthreads_before_teardown() -> None:
         except Exception:
             continue
 
-        lifecycle("shutdown.qthread.stop", thread=type(th).__name__)
+        lifecycle("shutdown.qthread.stop", {"thread": type(th).__name__})
 
         # 1) Cooperative stop. napari's StatusChecker loops until interruption is
         #    requested but blocks on a Python Event, so requestInterruption()
@@ -185,10 +185,10 @@ def _check_if_last_window() -> None:
 
     if _has_open_napari_viewer():
         # A viewer is open (e.g. the user just opened a sample). Do not quit.
-        lifecycle("app.quit.skipped", reason="napari viewer still open")
+        lifecycle("app.quit.skipped", {"reason": "napari viewer still open"})
         return
 
-    lifecycle("app.quit", reason="no project window and no open viewer")
+    lifecycle("app.quit", {"reason": "no project window and no open viewer"})
     app.quit()
 
 def _layer_list_dock(viewer):
@@ -1043,7 +1043,7 @@ def _record_viewer_renderer(viewer) -> None:
 
 def _handle_napari_close() -> None:
     """Callback when Napari closes."""
-    lifecycle("napari.destroyed", note="qt window destroyed signal fired")
+    lifecycle("napari.destroyed", {"note": "qt window destroyed signal fired"})
     QTimer.singleShot(100, _check_if_last_window)
 
 def interactive_segmentation_with_config(selected_folder: str = None,
@@ -1093,8 +1093,11 @@ def interactive_segmentation_with_config(selected_folder: str = None,
         # also visible top-level napari widgets, so _has_open_napari_viewer()
         # counted them and the app could no longer reach its quit condition.
         if not is_supported_mode(mode):
-            lifecycle("viewer.open.rejected", folder=os.path.basename(selected_folder),
-                      mode=mode, reason="unsupported mode")
+            lifecycle("viewer.open.rejected", {
+                "folder": os.path.basename(selected_folder),
+                "mode": mode,
+                "reason": "unsupported mode",
+            })
             log.warning("Refusing to open %r: unsupported mode %r",
                         selected_folder, mode)
             QMessageBox.warning(None, "This config cannot be opened",
@@ -1116,11 +1119,12 @@ def interactive_segmentation_with_config(selected_folder: str = None,
             log.warning("Could not prepare a display preview: %s", exc)
 
         image_stack = tiff.memmap(file_loc, mode='r') 
-        lifecycle("viewer.open",
-                  folder=os.path.basename(selected_folder),
-                  mode=mode,
-                  shape=getattr(image_stack, "shape", None),
-                  dtype=str(getattr(image_stack, "dtype", "?")))
+        lifecycle("viewer.open", {
+            "folder": os.path.basename(selected_folder),
+            "mode": mode,
+            "shape": getattr(image_stack, "shape", None),
+            "dtype": str(getattr(image_stack, "dtype", "?")),
+        })
         viewer = napari.Viewer(title=f"Segmentation: {os.path.basename(selected_folder)}")
 
         qt_window = viewer.window._qt_window
@@ -1202,8 +1206,9 @@ def interactive_segmentation_with_config(selected_folder: str = None,
         if viewer is not None:
             try:
                 viewer.close()
-                lifecycle("viewer.open.failed.closed",
-                          folder=os.path.basename(selected_folder or ""))
+                lifecycle("viewer.open.failed.closed", {
+                    "folder": os.path.basename(selected_folder or ""),
+                })
             except Exception as close_exc:
                 # Never let cleanup mask the original error.
                 log.warning("Could not close the partially-opened viewer: %s",
@@ -1301,7 +1306,7 @@ def make_back_to_project_button(viewer: napari.Viewer, gui_manager: Any) -> QPus
                 # CRITICAL FIX: Use Napari's native close() instead of qt_win.close().
                 # This ensures the internal app_model deregisters its actions properly
                 # and prevents the 'in_n_out missing window' TypeError on macOS.
-                lifecycle("napari.close.scheduled", delay_ms=50)
+                lifecycle("napari.close.scheduled", {"delay_ms": 50})
                 QTimer.singleShot(50, lambda: (lifecycle("napari.close.invoke"), v.close()))
             except Exception:
                 log.exception("Error while closing napari viewer")

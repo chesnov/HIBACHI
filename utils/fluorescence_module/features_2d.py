@@ -44,12 +44,12 @@ except ImportError:
     print("Warning: 'fcswrite' library not found. FCS export will be disabled.")
 
 
-def flush_print(*args: Any, **kwargs: Any) -> None:
+def flush_print(*args: Any) -> None:
     """
     Standardized print wrapper for real-time logging.
     Forces buffer flushing to ensure logs are visible during heavy CPU tasks.
     """
-    print(*args, **kwargs)
+    print(*args)
     sys.stdout.flush()
 
 
@@ -208,7 +208,7 @@ class _DistanceMatrixOnDisk:
             who[start:stop] = np.nanargmin(blk, axis=1)
         return best, who
 
-    def to_csv(self, path_or_buf, index: bool = True, **kwargs) -> None:
+    def to_csv(self, path_or_buf, index: bool = True) -> None:
         """Write the matrix in row blocks, formatted by pandas."""
         mm = self._open()
         first = True
@@ -219,7 +219,7 @@ class _DistanceMatrixOnDisk:
                     np.array(mm[start:stop], dtype=np.float32),
                     index=self.index[start:stop], columns=self.columns,
                 )
-                frame.to_csv(fh, index=index, header=first, **kwargs)
+                frame.to_csv(fh, index=index, header=first)
                 first = False
 
     def close(self) -> None:
@@ -387,13 +387,15 @@ def shortest_distance_2d(
 
     # Configure pool to safely share contours on macOS/Windows ('spawn'), 
     # while preserving RAM-saving Copy-on-Write on Linux ('fork')
-    pool_kwargs = {}
+    # Under 'fork' the workers inherit the store and need no initializer;
+    # (None, ()) are multiprocessing's own defaults for "no initializer".
     if mp.get_start_method() != 'fork':
-        pool_kwargs['initializer'] = _init_shared_contours
-        pool_kwargs['initargs'] = (_ALL_CONTOURS,)
+        pool_initializer, pool_initargs = _init_shared_contours, (_ALL_CONTOURS,)
+    else:
+        pool_initializer, pool_initargs = None, ()
 
     tasks = [(i, n_valid, spacing_arr) for i in range(n_valid)]
-    with mp.Pool(n_jobs, **pool_kwargs) as pool:
+    with mp.Pool(n_jobs, initializer=pool_initializer, initargs=pool_initargs) as pool:
         for i, row_results in tqdm(pool.imap_unordered(_calculate_row_distances_worker_2d, tasks),
                                   total=n_valid, desc="    Distance Pass 1/2"):
             dist_mat_mm[i, i + 1:] = row_results
@@ -408,7 +410,7 @@ def shortest_distance_2d(
         if not np.isinf(row[j]):
             winning_pairs.append((actual_labels[i], actual_labels[j], i, j, spacing_arr))
 
-    with mp.Pool(n_jobs, **pool_kwargs) as pool:
+    with mp.Pool(n_jobs, initializer=pool_initializer, initargs=pool_initargs) as pool:
         points_list = list(tqdm(pool.imap_unordered(_extract_winning_points_worker_2d, winning_pairs),
                                total=len(winning_pairs), desc="    Distance Pass 2/2"))
 

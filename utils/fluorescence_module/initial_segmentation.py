@@ -1226,10 +1226,9 @@ def segment_cells_first_pass_raw(
     high_threshold_percentile: Union[float, List[float]],
     threshold_mode: str,
     trace_max_gap: float,
-    min_size: Optional[int] = None,
+    min_size: int,
     skip_tubular_enhancement: bool = False,
     temp_root_path: Optional[str] = None,
-    **kwargs: Any
 ) -> Tuple[Optional[str], Optional[str], float, Dict[str, Any]]:
     """Step 1: Raw Segmentation (Independent per-scale Smoothing + Threshold-then-OR).
 
@@ -1239,7 +1238,7 @@ def segment_cells_first_pass_raw(
     single scalar value the result is identical to the previous global behavior.
 
     Unlike the 2D pipeline, the minimum-size filter is applied GLOBALLY, once,
-    AFTER all scales are merged (see the labeling stage), so ``min_size_voxels``
+    AFTER all scales are merged (see the labeling stage), so ``min_size``
     remains a single value rather than a per-scale list.
     """
     # Config-owned parameters are keyword-only with NO defaults. Every one of
@@ -1249,23 +1248,10 @@ def segment_cells_first_pass_raw(
     # against 95/100 in 2D) that nothing ever read. Omitting one is now an error
     # at the call site rather than a silent substitution.
     #
-    # `min_size` is the config's own key. The tracks spelled it `min_size_voxels`
-    # and `min_size_pixels`; both are accepted so existing callers keep working.
-    _size = min_size
-    for _alias in ("min_size_voxels", "min_size_pixels"):
-        if _alias in kwargs:
-            if _size is None:
-                _size = kwargs.pop(_alias)
-            else:
-                kwargs.pop(_alias)
-    if _size is None:
-        raise TypeError(
-            "segment_cells_first_pass_raw requires `min_size` (the minimum "
-            "object size in voxels/pixels). It comes from the config's "
-            "`min_size` parameter; it is not defaulted here because a wrong "
-            "value silently changes what counts as an object."
-        )
-    min_size_voxels = int(_size)
+    # `min_size` is the config's own key. The former tracks spelled it
+    # `min_size_voxels` and `min_size_pixels`; those aliases arrived through
+    # `**kwargs`, which is gone, so a wrong name is now a TypeError.
+    min_size_voxels = int(min_size)
 
     # Rank from the data. Drives chunk shapes, the plane loop and which spacing
     # axes count as in-plane.
@@ -2075,26 +2061,3 @@ def segment_cells_first_pass_raw(
         for d in temp_dirs_to_clean:
             shutil.rmtree(d, ignore_errors=True)
         gc.collect()
-
-
-def segment_cells_first_pass_raw_2d(image: np.ndarray, spacing, **kwargs):
-    """
-    2D entry point, kept so existing callers and saved workflows keep working.
-
-    `segment_cells_first_pass_raw` handles both ranks; this only translates the
-    argument names the 2D module spelled differently (`image`, `min_size_pixels`,
-    `skip_enhancement`). New code should call the rank-agnostic function.
-    """
-    if "skip_enhancement" in kwargs:
-        kwargs["skip_tubular_enhancement"] = kwargs.pop("skip_enhancement")
-    return segment_cells_first_pass_raw(image, spacing, **kwargs)
-
-
-def enhance_tubular_structures_blocked_2d(image, scales, spacing, temp_root_path,
-                                          **kwargs):
-    """2D entry point for the enhancement pass; see the function above."""
-    if "skip_enhancement" in kwargs:
-        kwargs["skip_tubular_enhancement"] = kwargs.pop("skip_enhancement")
-    return enhance_tubular_structures_blocked(
-        image, scales, spacing, temp_root_path, **kwargs
-    )

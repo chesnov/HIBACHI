@@ -9,12 +9,12 @@ from scipy import ndimage
 from scipy.ndimage import _ni_support, _nd_image  # type: ignore
 
 
-def flush_print(*args: Any, **kwargs: Any) -> None:
+def flush_print(*args: Any) -> None:
     """
     Wrapper for print that forces immediate flushing of the stdout buffer.
     Essential for debugging crashes where the last log message is otherwise lost.
     """
-    print(*args, **kwargs)
+    print(*args)
     sys.stdout.flush()
 
 

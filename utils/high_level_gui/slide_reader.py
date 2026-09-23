@@ -486,15 +486,18 @@ def extract_scene_channel(
                         if sw <= 0 or sh <= 0:
                             continue
 
-                        kwargs: Dict[str, Any] = {
-                            "rect": (sx, sy, sw, sh),
-                            "size": (ow, oh),
-                            "channel_indices": [channel_idx],
-                        }
+                        # `slices` only for a real stack: a single-plane
+                        # scene is read with slideio's default slice range,
+                        # exactly as before.
                         if z_slices > 1:
-                            kwargs["slices"] = (z, z + 1)
-
-                        block = scene.read_block(**kwargs)
+                            block = scene.read_block(
+                                rect=(sx, sy, sw, sh), size=(ow, oh),
+                                channel_indices=[channel_idx],
+                                slices=(z, z + 1))
+                        else:
+                            block = scene.read_block(
+                                rect=(sx, sy, sw, sh), size=(ow, oh),
+                                channel_indices=[channel_idx])
                         block = np.squeeze(np.asarray(block))
                         if block.ndim != 2:
                             block = block.reshape(oh, ow)

@@ -28,10 +28,9 @@ What this module guarantees
 ---------------------------
 *   `analyze_segmentation` works at either rank, taking `spacing` ordered like
     the array axes.
-*   `analyze_segmentation_2d` still exists, so existing callers and saved
-    workflows keep working. Its signature is unchanged with one exception:
-    `calculate_solidity` defaults to False rather than True, which is now the
-    same default at both ranks and the same as the shipped config.
+*   There is no separate 2D entry point: `analyze_segmentation` dispatches on
+    the array's rank. `calculate_solidity` defaults to False at both ranks, the
+    same as the shipped config.
 *   `export_to_fcs` is defined once here. The two tracks' copies were identical
     apart from a docstring and one error string, so it was never rank-specific.
 
@@ -59,7 +58,7 @@ try:
 except ImportError:  # pragma: no cover
     from dim_utils import normalise_spacing
 
-__all__ = ["analyze_segmentation", "analyze_segmentation_2d", "export_to_fcs"]
+__all__ = ["analyze_segmentation", "export_to_fcs"]
 
 
 # --------------------------------------------------------------------------
@@ -127,7 +126,6 @@ def analyze_segmentation(
     n_jobs: Optional[int] = None,
     return_detailed: bool = False,
     prune_spurs_le_um: float = 0.0,
-    **kwargs: Any,
 ):
     """
     Measure per-cell features, at whichever rank the label array has.
@@ -149,8 +147,25 @@ def analyze_segmentation(
     impl = _impl(ndim)
     sp = normalise_spacing(spacing, ndim)
 
-    common = dict(
+    if ndim == 3:
+        return impl.analyze_segmentation(
+            segmented_array,
+            intensity_image=intensity_image,
+            spacing=sp,
+            calculate_distances=calculate_distances,
+            calculate_skeletons=calculate_skeletons,
+            calculate_solidity=calculate_solidity,
+            skeleton_export_path=skeleton_export_path,
+            fcs_export_path=fcs_export_path,
+            temp_dir=temp_dir,
+            n_jobs=n_jobs,
+            return_detailed=return_detailed,
+            prune_spurs_le_um=prune_spurs_le_um,
+        )
+    return impl.analyze_segmentation_2d(
+        segmented_array,
         intensity_image=intensity_image,
+        spacing_yx=sp,
         calculate_distances=calculate_distances,
         calculate_skeletons=calculate_skeletons,
         calculate_solidity=calculate_solidity,
@@ -160,24 +175,4 @@ def analyze_segmentation(
         n_jobs=n_jobs,
         return_detailed=return_detailed,
         prune_spurs_le_um=prune_spurs_le_um,
-        **kwargs,
     )
-    if ndim == 3:
-        return impl.analyze_segmentation(segmented_array, spacing=sp, **common)
-    return impl.analyze_segmentation_2d(segmented_array, spacing_yx=sp, **common)
-
-
-def analyze_segmentation_2d(segmented_array, *args, **kwargs):
-    """
-    2D entry point, kept so existing callers keep working.
-
-    Forwards untouched to the 2D implementation, including its `spacing_yx`
-    argument name. New code should call `analyze_segmentation`.
-
-    `calculate_solidity` now defaults to False here, in `features_2d` and in
-    `features_3d` alike. It was the one parameter whose default depended on
-    rank, so a direct call measured a different feature set for a plane than
-    for a stack. Nothing in the app relied on it -- every strategy passes the
-    value from the config -- so the only callers affected are direct ones.
-    """
-    return _impl(2).analyze_segmentation_2d(segmented_array, *args, **kwargs)

@@ -301,20 +301,20 @@ def _write_plane(dest_path: str, plane: np.ndarray, source_tif: str) -> None:
     except Exception:
         resolution = None
 
-    kwargs: Dict[str, Any] = {
-        "imagej": True,
-        "photometric": "minisblack",
-        # 'axes' explicitly: tifffile's ImageJ writer labels an unannotated
-        # array's leading axis as channels, which is how every extracted stack
-        # came to claim 13 channels rather than 13 slices.
-        "metadata": {"axes": "YX", "unit": unit},
-    }
-    if resolution is not None:
-        kwargs["resolution"] = resolution
-
     partial = dest_path + ".part"
     try:
-        tiff.imwrite(partial, plane, **kwargs)
+        # `resolution` may be None, which is tifffile's own default, so an
+        # unreadable source resolution writes exactly as omitting it did.
+        tiff.imwrite(
+            partial, plane,
+            imagej=True,
+            photometric="minisblack",
+            # 'axes' explicitly: tifffile's ImageJ writer labels an unannotated
+            # array's leading axis as channels, which is how every extracted
+            # stack came to claim 13 channels rather than 13 slices.
+            metadata={"axes": "YX", "unit": unit},
+            resolution=resolution,
+        )
         os.replace(partial, dest_path)
     except BaseException:
         try:

@@ -21,6 +21,7 @@ import math
 import time
 import traceback
 import multiprocessing as mp
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
@@ -332,25 +333,36 @@ def dedupe_peaks_physical(peaks, values, spacing, physical_distance):
 # --------------------------------------------------------------------------
 # Candidate generation, split out so it can run in parallel
 # --------------------------------------------------------------------------
+@dataclass(frozen=True)
+class _CandidateParams:
+    """Everything `_generate_label_candidates` needs besides the label itself.
+
+    Built once per run and pickled to each pool worker. A frozen dataclass
+    rather than a dict unpacked with ``**``: a misspelled field is an error
+    where the object is built, not a keyword silently absent at the far end.
+    """
+    spacing: Sequence[float]
+    ndim: int
+    strategies: List[Dict[str, Any]]
+    tile_size: Sequence[int]
+    min_seed_vol: int
+    absolute_min_thickness_um: float
+    absolute_max_thickness_um: float
+    max_allowed_core_aspect_ratio: float
+    intensity_smooth_um: float
+    intensity_weight: float
+    int_peak_sep: int
+    peak_box: tuple
+    peak_separation_um: float
+    memmap_voxel_threshold: int
+
+
 def _generate_label_candidates(
     lbl: int,
     sl: Tuple[slice, ...],
     segmentation_mask: np.ndarray,
     intensity_image: np.ndarray,
-    spacing: Sequence[float],
-    ndim: int,
-    strategies: List[Dict[str, Any]],
-    tile_size: Sequence[int],
-    min_seed_vol: int,
-    absolute_min_thickness_um: float,
-    absolute_max_thickness_um: float,
-    max_allowed_core_aspect_ratio: float,
-    intensity_smooth_um: float,
-    intensity_weight: float,
-    int_peak_sep: int,
-    peak_box: tuple,
-    peak_separation_um: float,
-    memmap_voxel_threshold: int,
+    params: _CandidateParams,
     show_tile_bar: bool = True,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
     """
@@ -378,6 +390,23 @@ def _generate_label_candidates(
     worker process cannot share the caller's dict. The counters are pure sums,
     so merging deltas in any order gives the same totals.
     """
+    # Local names, so the body reads exactly as it did when these were
+    # separate parameters.
+    spacing = params.spacing
+    ndim = params.ndim
+    strategies = params.strategies
+    tile_size = params.tile_size
+    min_seed_vol = params.min_seed_vol
+    absolute_min_thickness_um = params.absolute_min_thickness_um
+    absolute_max_thickness_um = params.absolute_max_thickness_um
+    max_allowed_core_aspect_ratio = params.max_allowed_core_aspect_ratio
+    intensity_smooth_um = params.intensity_smooth_um
+    intensity_weight = params.intensity_weight
+    int_peak_sep = params.int_peak_sep
+    peak_box = params.peak_box
+    peak_separation_um = params.peak_separation_um
+    memmap_voxel_threshold = params.memmap_voxel_threshold
+
     diag_stats = {
         "cores_evaluated": 0,
         "cores_too_small": 0,
@@ -689,7 +718,7 @@ def _soma_worker(task):
     try:
         return lbl, _generate_label_candidates(
             lbl, sl, _WORKER_IMAGES["seg"], _WORKER_IMAGES["int"],
-            show_tile_bar=False, **params
+            params, show_tile_bar=False
         ), None
     except Exception as exc:  # pragma: no cover - surfaced by the caller
         return lbl, None, f"{type(exc).__name__}: {exc}"
@@ -717,22 +746,22 @@ def _empty_seed_mask(segmentation_mask, memmap_dir, memmap_final_mask,
 def extract_soma_masks(
     segmentation_mask: np.ndarray,
     intensity_image: np.ndarray,
-    spacing: Optional[Sequence[float]],
-    min_fragment_size: int = 30,
-    intensity_smooth_um: float = 0.0,
-    intensity_weight: float = 0.0,
-    ratios_to_process: List[float] = [0.3, 0.4, 0.5, 0.6],
-    intensity_percentiles_to_process: List[int] = [100, 90, 80, 70, 60, 50, 40, 30],
-    min_physical_peak_separation: float = 7.0,
-    max_allowed_core_aspect_ratio: float = 10.0,
-    absolute_min_thickness_um: float = 1.5,
-    absolute_max_thickness_um: float = 10.0,
-    memmap_dir: Optional[str] = "ramiseg_temp_memmap",
-    memmap_voxel_threshold: int = 25_000_000,
+    spacing: Sequence[float],
+    *,
+    min_fragment_size: int,
+    intensity_smooth_um: float,
+    intensity_weight: float,
+    ratios_to_process: List[float],
+    intensity_percentiles_to_process: List[float],
+    min_physical_peak_separation: float,
+    max_allowed_core_aspect_ratio: float,
+    absolute_min_thickness_um: float,
+    absolute_max_thickness_um: float,
+    memmap_dir: Optional[str],
     memmap_final_mask: bool = True,
     memmap_output_path: Optional[str] = None,
+    memmap_voxel_threshold: int = 25_000_000,
     tile_size: Optional[Sequence[int]] = None,
-    **kwargs,
 ) -> np.ndarray:
     """
     Memory-efficient 3D Soma Extraction logic.
@@ -741,14 +770,18 @@ def extract_soma_masks(
     spatial tiling. Early stopping prevents unnecessary calculations on labels
     that are already "filled" or too small.
 
+    Config-owned parameters are keyword-only with NO defaults, the same rule
+    as `initial_segmentation.segment_cells_first_pass_raw`: every one comes
+    from the YAML, so a default here would be a second, invisible place to
+    configure the step. There is no `**kwargs`, so a misspelled or retired
+    parameter name is a TypeError at the call site instead of being silently
+    ignored.
+
     Args:
-        segmentation_mask: 3D labeled segmentation image.
-        intensity_image: 3D intensity image.
-        spacing: Voxel spacing (Z, Y, X).
-        smallest_quantile: Quantile (0-100) to find reference single somas.
-        min_fragment_size: Hard minimum voxel limit for a seed.
-        core_volume_target_factor_lower: Min volume relative to median.
-        core_volume_target_factor_upper: Max volume relative to median.
+        segmentation_mask: Labeled segmentation, 2D or 3D.
+        intensity_image: Intensity image, same shape.
+        spacing: Voxel spacing in microns, ordered like the array axes.
+        min_fragment_size: Hard minimum voxel (pixel) count for a seed.
         intensity_smooth_um: Gaussian sigma (microns) applied to the intensity
             before percentile thresholding. 0 disables it.
         intensity_weight: Weight of intensity relative to the distance transform
@@ -759,20 +792,20 @@ def extract_soma_masks(
         intensity_percentiles_to_process: Intensity thresholds.
         min_physical_peak_separation: Minimum global distance between seeds (um).
         max_allowed_core_aspect_ratio: Max elongation (PCA ratio).
-        ref_vol_percentile_lower/upper: Population bounds for thickness calculation.
-        ref_thickness_percentile_lower: Percentile to set min accepted thickness.
         absolute_min_thickness_um: Hard lower bound for soma thickness.
         absolute_max_thickness_um: Hard upper bound for soma thickness.
-        memmap_dir: Directory to save the final memmap result.
+        memmap_dir: Directory for the output memmap. Required, with no default:
+            the former default was the relative path "ramiseg_temp_memmap",
+            i.e. a folder in whatever the working directory happened to be.
+            None keeps the result in RAM.
+        memmap_final_mask: If True (and memmap_dir is set), the result is a
+            memmap file in memmap_dir.
+        memmap_output_path: Exact output file, overriding the name in memmap_dir.
         memmap_voxel_threshold: Voxel count above which a clump is reported as
             "huge". DISPLAY ONLY -- it controls whether the per-tile progress
             bar and its RAM readout are shown, nothing else. Tiling is
-            unconditional: `generate_tiles` is called for every label. The name
-            and the previous description ("Voxel count to trigger tiling
-            logic") both predate that and were misleading; note also that
-            `fluorescence_strategy` passes this parameter to step 4, which does
-            not accept it, and never passes it here.
-        memmap_final_mask: If True, saves result as a file in memmap_dir.
+            unconditional: `generate_tiles` is called for every label.
+        tile_size: Tile shape for huge clumps; None uses the pinned default.
 
     Returns:
         np.ndarray: 3D labeled mask containing extracted soma seeds.
@@ -952,7 +985,7 @@ def extract_soma_masks(
     # lists arrive in ascending label order and each list is internally in tile
     # then strategy order; the stable sort below breaks ties identically to the
     # single-threaded run.
-    _gen_params = dict(
+    _gen_params = _CandidateParams(
         spacing=spacing, ndim=ndim, strategies=strategies, tile_size=tile_size,
         min_seed_vol=min_seed_vol,
         absolute_min_thickness_um=absolute_min_thickness_um,
@@ -985,7 +1018,7 @@ def extract_soma_masks(
                 _results = [
                     (lb, _generate_label_candidates(
                         lb, slices[lb - 1], segmentation_mask, intensity_image,
-                        **_gen_params), None)
+                        _gen_params), None)
                     for lb in _batch
                 ]
             else:
@@ -1099,38 +1132,3 @@ def extract_soma_masks(
         final_seed_mask.flush()
 
     return final_seed_mask
-
-
-def extract_soma_masks_2d(
-    segmentation_mask: np.ndarray,
-    intensity_image: np.ndarray,
-    spacing: Optional[Sequence[float]] = None,
-    *,
-    tile_size_threshold: int = 2048,
-    pixel_area_threshold: int = 4_000_000,
-    memmap_output_path: Optional[str] = None,
-    **kwargs,
-):
-    """
-    2D entry point, kept so existing callers and saved workflows keep working.
-
-    `extract_soma_masks` handles both ranks now; this only translates the three
-    arguments the 2D module spelled differently:
-
-        tile_size_threshold  -> tile_size   (a scalar, broadcast to (N, N))
-        pixel_area_threshold -> memmap_voxel_threshold
-        memmap_output_path   -> honoured directly
-
-    New code should call `extract_soma_masks`.
-    """
-    return extract_soma_masks(
-        segmentation_mask,
-        intensity_image,
-        spacing,
-        tile_size=(int(tile_size_threshold),) * int(segmentation_mask.ndim),
-        memmap_voxel_threshold=int(pixel_area_threshold),
-        memmap_output_path=memmap_output_path,
-        memmap_final_mask=memmap_output_path is not None,
-        memmap_dir=os.path.dirname(memmap_output_path) if memmap_output_path else None,
-        **kwargs,
-    )

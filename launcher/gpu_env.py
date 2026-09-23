@@ -67,7 +67,7 @@ import re
 import subprocess
 import sys
 import time
-from dataclasses import asdict, dataclass, field
+from dataclasses import MISSING, asdict, dataclass, field, fields
 from typing import Any, Dict, List, Optional
 
 _CREATE_NO_WINDOW = 0x08000000 if sys.platform.startswith("win") else 0
@@ -415,8 +415,8 @@ def _gl_probe_child() -> int:
     Prints one JSON line. Exit status is irrelevant: a crash is detected by the
     parent as missing output, which is the point of running it separately.
     """
-    def emit(**kw):
-        print("GLPROBE " + json.dumps(kw), flush=True)
+    def emit(payload):
+        print("GLPROBE " + json.dumps(payload), flush=True)
 
     # Same DLL setup as segment.py, or PyQt5 cannot load on a clean machine and
     # the probe would be "inconclusive" for a reason that has nothing to do
@@ -432,7 +432,7 @@ def _gl_probe_child() -> int:
         from PyQt5.QtGui import QGuiApplication, QOffscreenSurface, QOpenGLContext
         from vispy.gloo import gl
     except Exception as exc:
-        emit(status="inconclusive", detail=f"import failed: {exc}")
+        emit({"status": "inconclusive", "detail": f"import failed: {exc}"})
         return 0
 
     try:
@@ -441,18 +441,20 @@ def _gl_probe_child() -> int:
         surface.create()
         ctx = QOpenGLContext()
         if not ctx.create() or not ctx.makeCurrent(surface):
-            emit(status="no_context", detail="Qt could not create an OpenGL context")
+            emit({"status": "no_context", "detail": "Qt could not create an OpenGL context"})
             return 0
         # vispy's own function table, loaded from the same library napari
         # will use, so this sees exactly what the viewer will see.
-        emit(status="ok",
-             vendor=str(gl.glGetParameter(gl.GL_VENDOR) or ""),
-             renderer=str(gl.glGetParameter(gl.GL_RENDERER) or ""),
-             version=str(gl.glGetParameter(gl.GL_VERSION) or ""))
+        emit({
+            "status": "ok",
+            "vendor": str(gl.glGetParameter(gl.GL_VENDOR) or ""),
+            "renderer": str(gl.glGetParameter(gl.GL_RENDERER) or ""),
+            "version": str(gl.glGetParameter(gl.GL_VERSION) or ""),
+        })
         ctx.doneCurrent()
         del app
     except Exception as exc:
-        emit(status="no_context", detail=f"{type(exc).__name__}: {exc}")
+        emit({"status": "no_context", "detail": f"{type(exc).__name__}: {exc}"})
     return 0
 
 
@@ -667,13 +669,70 @@ def issues_to_announce(state_dir: str, report: Report) -> List[Issue]:
     return fresh
 
 
+def _cached_value(d: Dict[str, Any], cls, name: str):
+    """``d[name]``, or the dataclass's own default for that field when absent.
+
+    Mirrors what ``cls(**d)`` did without unpacking: a missing field with no
+    default is an error, and the default comes from the dataclass itself, so
+    it is not restated here.
+    """
+    if name in d:
+        return d[name]
+    f = {f.name: f for f in fields(cls)}[name]
+    if f.default is not MISSING:
+        return f.default
+    if f.default_factory is not MISSING:
+        return f.default_factory()
+    raise TypeError(f"cached {cls.__name__} has no {name!r}")
+
+
+def _reject_unknown(d: Dict[str, Any], cls) -> Dict[str, Any]:
+    """Refuse keys the dataclass does not have, as ``cls(**d)`` did."""
+    unknown = set(d) - {f.name for f in fields(cls)}
+    if unknown:
+        raise TypeError(f"cached {cls.__name__} has unknown fields {sorted(unknown)}")
+    return d
+
+
+def _adapter_from_dict(a: Dict[str, Any]) -> Adapter:
+    a = _reject_unknown(a, Adapter)
+    v = lambda n: _cached_value(a, Adapter, n)
+    return Adapter(name=v("name"), vendor=v("vendor"), kind=v("kind"),
+                   driver_version=v("driver_version"),
+                   driver_date=v("driver_date"), has_driver=v("has_driver"),
+                   vram_gb=v("vram_gb"))
+
+
+def _glinfo_from_dict(g: Dict[str, Any]) -> GLInfo:
+    g = _reject_unknown(g, GLInfo)
+    v = lambda n: _cached_value(g, GLInfo, n)
+    return GLInfo(status=v("status"), vendor=v("vendor"),
+                  renderer=v("renderer"), version=v("version"),
+                  detail=v("detail"))
+
+
+def _issue_from_dict(i: Dict[str, Any]) -> Issue:
+    i = _reject_unknown(i, Issue)
+    v = lambda n: _cached_value(i, Issue, n)
+    return Issue(id=v("id"), title=v("title"), message=v("message"),
+                 link=v("link"), link_label=v("link_label"))
+
+
 def _report_from_dict(d: Dict[str, Any]) -> Report:
-    rep = Report(**{k: v for k, v in d.items()
-                    if k not in ("adapters", "gl", "issues")})
-    rep.adapters = [Adapter(**a) for a in d.get("adapters") or []]
-    rep.gl = GLInfo(**d["gl"]) if d.get("gl") else None
-    rep.issues = [Issue(**i) for i in d.get("issues") or []]
-    return rep
+    d = _reject_unknown(d, Report)
+    v = lambda n: _cached_value(d, Report, n)
+    return Report(
+        mode=v("mode"),
+        reason=v("reason"),
+        adapters=[_adapter_from_dict(a) for a in d.get("adapters") or []],
+        gl=_glinfo_from_dict(d["gl"]) if d.get("gl") else None,
+        remote_session=v("remote_session"),
+        virtual_machine=v("virtual_machine"),
+        gpu_preference_set=v("gpu_preference_set"),
+        issues=[_issue_from_dict(i) for i in d.get("issues") or []],
+        from_cache=v("from_cache"),
+        env=v("env"),
+    )
 
 
 # --------------------------------------------------------------------------- #

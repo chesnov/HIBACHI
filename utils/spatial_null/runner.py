@@ -441,7 +441,7 @@ def run_project(jobs: Sequence[SampleJob],
                 explicit_domains: Optional[Dict[str, np.ndarray]] = None,
                 log: Callable[[str], None] = print,
                 progress: Optional[Any] = None,
-                progress_cb: Optional[Callable[..., None]] = None,
+                progress_cb: Optional[Callable[[Dict[str, Any]], None]] = None,
                 cancel_check: Optional[Callable[[], bool]] = None
                 ) -> Dict[str, Any]:
     """Run the null across a project's samples and write the export.
@@ -459,10 +459,10 @@ def run_project(jobs: Sequence[SampleJob],
     prepared: List[Dict[str, Any]] = []
     probes: List[float] = []
 
-    def _report(**kw):
+    def _report(payload: Dict[str, Any]) -> None:
         if progress_cb is not None:
             try:
-                progress_cb(**kw)
+                progress_cb(payload)
             except Exception:
                 pass                       # never let the UI break the run
 
@@ -470,8 +470,12 @@ def run_project(jobs: Sequence[SampleJob],
         if cancel_check is not None and cancel_check():
             log("Cancelled during setup.")
             return {"n_samples": 0, "cancelled": True}
-        _report(phase="prepare", sample=job.sample,
-                sample_index=idx, n_samples=len(jobs))
+        _report({
+            "phase": "prepare",
+            "sample": job.sample,
+            "sample_index": idx,
+            "n_samples": len(jobs),
+        })
         try:
             primary = job.load_primary()
         except (ValueError, OSError, TypeError) as exc:
@@ -591,8 +595,14 @@ def run_project(jobs: Sequence[SampleJob],
         log(f"  [{job.sample}] {int(np.unique(item['primary'][item['primary']>0]).size)} "
             f"objects, domain={item['domain'].source}, "
             f"{params.n_reference}+{params.n_test} draws...")
-        _report(phase="run", sample=job.sample, sample_index=idx,
-                n_samples=len(prepared), draw=0, n_draws=total_draws)
+        _report({
+            "phase": "run",
+            "sample": job.sample,
+            "sample_index": idx,
+            "n_samples": len(prepared),
+            "draw": 0,
+            "n_draws": total_draws,
+        })
 
         qc_hook = None
         if n_qc and out_dir:
@@ -614,9 +624,14 @@ def run_project(jobs: Sequence[SampleJob],
                 per_parent_containment=params.per_parent_containment,
                 qc_hook=qc_hook, n_qc_draws=(n_qc if qc_hook else 0),
                 cancel_check=cancel_check,
-                draw_callback=lambda i, n, _s=job.sample, _x=idx: _report(
-                    phase="run", sample=_s, sample_index=_x,
-                    n_samples=len(prepared), draw=i, n_draws=n),
+                draw_callback=lambda i, n, _s=job.sample, _x=idx: _report({
+                    "phase": "run",
+                    "sample": _s,
+                    "sample_index": _x,
+                    "n_samples": len(prepared),
+                    "draw": i,
+                    "n_draws": n,
+                }),
                 progress=progress)
         except Exception as exc:                       # one bad image, not the run
             log(f"  [{job.sample}] FAILED: {exc}")

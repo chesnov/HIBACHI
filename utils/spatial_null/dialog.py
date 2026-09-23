@@ -111,7 +111,7 @@ class _NullWorker(QThread):
                 self._jobs, self._params, out_dir=self._out_dir,
                 project_name=self._project, channels=self._channels,
                 log=lambda m: self.logline.emit(str(m)),
-                progress_cb=lambda **kw: self.progress.emit(dict(kw)),
+                progress_cb=lambda payload: self.progress.emit(dict(payload)),
                 cancel_check=lambda: self._cancel)
             self.finished_ok.emit(result)
         except Exception as exc:

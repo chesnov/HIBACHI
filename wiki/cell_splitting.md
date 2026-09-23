@@ -253,11 +253,9 @@ Check `[PROFILE|GLOBALMERGE|SUMMARY]` before moving a lever further.
     nothing changes, up to 10 rounds. Every merge is named in the log as
     `[PROFILE|UNDERSIZE]`.
 
-    > `protect_seeded_cells` (internal, **default off**) exempts every soma-owning
-    > label and therefore switches this lever off. The symptom is
-    > `[PROFILE|UNDERSIZE|SUMMARY] merged=0` on an image that visibly needs
-    > merging. Only turn it on to shield small-but-real cells from a threshold set
-    > too high for the data, and prefer fixing the threshold instead.
+    > No label is exempt from the floor. The former internal
+    > `protect_seeded_cells` option exempted every soma-owning label, which
+    > switched this lever off; nothing ever set it and it has been removed.
 
 If no setting of the two levers gets the count right, the seeds are the problem —
 return to [Step 3](soma_extraction.md) and re-check the **Cell bodies** layer,
@@ -301,16 +299,17 @@ before changing a parameter. They appear in the order the step runs:
 
 ### Internal parameters
 
-Not exposed in the interface. Change these only in code.
+Not exposed in the interface. Change these only in code. Every config
+parameter above is a required keyword argument of `separate_multi_soma_cells`;
+there is no `**kwargs`, so a missing or misspelled one is a `TypeError` rather
+than a silent fallback. (`speed_power`, listed here previously, is the config's
+**Boundary Contrast Sharpness**.)
 
 | Name | Value | Effect |
 | :--- | :--- | :--- |
-| `max_interface_to_cell_mean_ratio` | `0.85` | Bright-cut threshold: interface intensity relative to the cell mean. |
+| `MAX_INTERFACE_TO_CELL_MEAN_RATIO` | `0.85` | Bright-cut threshold: interface intensity relative to the cell mean. One module constant, passed to both the chunk worker and the global merge pass. |
 | (borderline band) | `0.7 ×` Min Path Intensity Ratio | How close the valley-depth test must be to its threshold before the bright-cut check may override a keep. |
-| `speed_power` | `1.5` | Exponent on the flooding speed; raises the cost of thin necks so cuts prefer them. |
-| `protect_seeded_cells` | `True` | Exempt any label owning a soma from the size floor. |
 | `chunk_shape` / `overlap` | `(128, 512, 512)` / `32` (3D), `(1024, 1024)` / `64` (2D) | Processing tile size. Unlike most tiling, these affect the result — see below. |
-| `stats_block_shape` | `(128, 128, 128)` / `(128, 128)` | Block size for the post-stitch aggregate sweep. Memory only; does not affect the result. |
 | `min_contact` | `1` | Minimum shared voxels for the global pass to consider a pair. |
 
 `overlap` must be smaller than every entry of `chunk_shape`. A larger value is

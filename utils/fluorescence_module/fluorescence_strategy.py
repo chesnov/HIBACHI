@@ -398,7 +398,7 @@ class FluorescenceStrategy(ProcessingStrategy):
                 tubular_scales=tubular_scales,
                 smooth_sigma=smooth_sigma_input,
                 connect_max_gap_physical=connect_max_gap_input,
-                min_size_voxels=_require(params, "min_size", int),
+                min_size=_require(params, "min_size", int),
                 # Use the variables prepared above
                 low_threshold_percentile=low_thresh_input,
                 high_threshold_percentile=high_thresh_input,
@@ -584,31 +584,35 @@ class FluorescenceStrategy(ProcessingStrategy):
                     self._add_layer_safely(viewer, cb_display, "Cell bodies")
                 return True
 
-            soma_extraction_params = {
-                "min_fragment_size": int(_require(params, "min_fragment_size", int)),
-                "intensity_smooth_um": float(_require(params, "intensity_smooth_um", float)),
-                "intensity_weight": float(_require(params, "intensity_weight", float)),
-                "ratios_to_process": _require(params, "ratios_to_process"),
-                "intensity_percentiles_to_process": _require(params, "intensity_percentiles_to_process"),
-                "min_physical_peak_separation": float(
-                    _require(params, "min_physical_peak_separation", float)
-                ),
-                "max_allowed_core_aspect_ratio": float(
-                    _require(params, "max_allowed_core_aspect_ratio", float)
-                ),
-                "absolute_min_thickness_um": float(
-                    _require(params, "absolute_min_thickness_um", float)
-                ),
-                "absolute_max_thickness_um": float(
-                    _require(params, "absolute_max_thickness_um", float)
-                ),
-                "memmap_final_mask": True,
-                "temp_root_path": self.temp_dir
-            }
-
             cell_bodies = extract_soma_masks(
                 trimmed_labels_memmap, image_stack, self.spacing_checked,
-                **soma_extraction_params
+                min_fragment_size=int(_require(params, "min_fragment_size", int)),
+                intensity_smooth_um=float(_require(params, "intensity_smooth_um", float)),
+                intensity_weight=float(_require(params, "intensity_weight", float)),
+                ratios_to_process=_require(params, "ratios_to_process"),
+                intensity_percentiles_to_process=_require(
+                    params, "intensity_percentiles_to_process"),
+                min_physical_peak_separation=float(
+                    _require(params, "min_physical_peak_separation", float)
+                ),
+                max_allowed_core_aspect_ratio=float(
+                    _require(params, "max_allowed_core_aspect_ratio", float)
+                ),
+                absolute_min_thickness_um=float(
+                    _require(params, "absolute_min_thickness_um", float)
+                ),
+                absolute_max_thickness_um=float(
+                    _require(params, "absolute_max_thickness_um", float)
+                ),
+                memmap_final_mask=True,
+                # Where the result memmap is written before being copied to
+                # `cell_bodies_path`. This used to be passed as
+                # `temp_root_path`, which `extract_soma_masks` has no parameter
+                # for; its `**kwargs` swallowed it, so the file went to the
+                # default `memmap_dir`, a relative "ramiseg_temp_memmap" folder
+                # in the process's working directory. Only the location
+                # changes; the seeds are identical.
+                memmap_dir=self.temp_dir,
             )
 
             # Persist results
@@ -717,42 +721,31 @@ class FluorescenceStrategy(ProcessingStrategy):
                 print("  Intensity measured on the illumination-corrected "
                       f"image ({intensity_ref.dtype})")
 
-            separation_params = {
-                "min_size_threshold": int(_require(params, "min_size_threshold", int)),
-                "intensity_weight": float(_require(params, "intensity_weight", float)),
-                "max_seed_centroid_dist": float(
+            final_separated_cells = separate_multi_soma_cells(
+                trimmed_labels_memmap, intensity_input, cell_bodies_ref,
+                self.spacing_checked,
+                min_size_threshold=int(_require(params, "min_size_threshold", int)),
+                intensity_weight=float(_require(params, "intensity_weight", float)),
+                max_seed_centroid_dist=float(
                     _require(params, "max_seed_centroid_dist", float)
                 ),
-                "min_path_intensity_ratio": float(
+                min_path_intensity_ratio=float(
                     _require(params, "min_path_intensity_ratio", float)
                 ),
-                "min_local_intensity_difference": float(
+                min_local_intensity_difference=float(
                     _require(params, "min_local_intensity_difference", float)
                 ),
-                "local_analysis_radius": int(
+                local_analysis_radius=int(
                     _require(params, "local_analysis_radius", int)
                 ),
                 # Exponent on the watershed speed. `params.get`, not
-                # `_require`, on purpose: this was a code default
-                # (`kwargs.get('speed_power', 1.5)`) until it was exposed, so a
-                # project set up before then has no such key and must keep
-                # behaving exactly as it did. 1.5 here is that same value, so
-                # every existing run is unchanged whether or not its config has
-                # been reconciled.
-                "speed_power": float(params.get("speed_power", 1.5)),
-                "memmap_dir": temp_chunk_dir,
-                # `memmap_voxel_threshold` was passed here and is NOT a
-                # parameter of `separate_multi_soma_cells`: it landed in
-                # `**kwargs`, was forwarded to the chunk worker, and read by
-                # nothing. The only function that accepts it is
-                # `soma_extraction.extract_soma_masks` (step 3), which was never
-                # given it -- and there it controls nothing but whether a
-                # progress bar is drawn. Removed rather than rerouted.
-            }
-
-            final_separated_cells = separate_multi_soma_cells(
-                trimmed_labels_memmap, intensity_input, cell_bodies_ref,
-                self.spacing_checked, **separation_params
+                # `_require`, on purpose: this was a code default until it was
+                # exposed, so a project set up before then has no such key and
+                # must keep behaving exactly as it did. 1.5 here is that same
+                # former code default, so every existing run is unchanged
+                # whether or not its config has been reconciled.
+                speed_power=float(params.get("speed_power", 1.5)),
+                memmap_dir=temp_chunk_dir,
             )
 
             final_memmap = np.memmap(
@@ -1000,13 +993,18 @@ class FluorescenceStrategy(ProcessingStrategy):
         for name in layer_base_names:
             self._remove_layer_safely(viewer, name)
 
-        def load_and_add(path_key, layer_name, dtype=np.int32, **kwargs):
+        def load_and_add(path_key, layer_name, dtype=np.int32,
+                         layer_type='labels', colormap=None, blending=None,
+                         contrast_limits=None):
             path = files.get(path_key)
             if path and os.path.exists(path):
                 data = np.memmap(
                     path, dtype=dtype, mode='r', shape=self.image_shape
                 )
-                self._add_layer_safely(viewer, data, layer_name, **kwargs)
+                self._add_layer_safely(
+                    viewer, data, layer_name, layer_type=layer_type,
+                    colormap=colormap, blending=blending,
+                    contrast_limits=contrast_limits)
 
         # 2. Load layers based on progress
         if checkpoint_step >= 1:
@@ -1041,7 +1039,9 @@ class FluorescenceStrategy(ProcessingStrategy):
                     "corrected_image", "Illumination corrected",
                     dtype=_corrected_dtype,
                     layer_type='image', colormap='gray', blending='additive',
-                    **({"contrast_limits": _limits} if _limits else {}),
+                    # None when no range could be computed, which is
+                    # add_image's own default: napari then picks the range.
+                    contrast_limits=_limits if _limits else None,
                 )
             load_and_add("raw_segmentation", "Raw Intermediate Segmentation")
         if checkpoint_step >= 2:

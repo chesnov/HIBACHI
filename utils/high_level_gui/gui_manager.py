@@ -46,8 +46,8 @@ except Exception:  # pragma: no cover
     import logging as _logging
     log = _logging.getLogger("hibachi.gui_manager")
 
-    def lifecycle(event, **fields):
-        log.info("%s %s", event, " ".join(f"{k}={v!r}" for k, v in fields.items()))
+    def lifecycle(event, fields=None):
+        log.info("%s %s", event, " ".join(f"{k}={v!r}" for k, v in (fields or {}).items()))
 
 
 # =============================================================================
@@ -237,7 +237,7 @@ def _cleanup_all_orphans():
     """Forcefully terminate any lingering background threads on app exit to prevent C++ aborts."""
     pending = [w for w in _orphan_threads if w is not None]
     if pending:
-        lifecycle("orphan_threads.cleanup", count=len(pending))
+        lifecycle("orphan_threads.cleanup", {"count": len(pending)})
     # Ask first, then wait, then force. `terminate()` alone was the whole
     # policy, and it stops a thread at an arbitrary instruction -- mid-write to
     # a memmap, or inside a C extension where it aborts the process. Requesting
@@ -357,7 +357,7 @@ class StepWorker(QThread):
         self.params = params
 
     def run(self) -> None:
-        lifecycle("worker.run.start", step=self.step_index)
+        lifecycle("worker.run.start", {"step": self.step_index})
         try:
             success = self.strategy.execute_step(
                 step_index=self.step_index,
@@ -365,7 +365,7 @@ class StepWorker(QThread):
                 image_stack_or_none=self.image_stack,
                 params=self.params
             )
-            lifecycle("worker.run.finish", step=self.step_index, success=bool(success))
+            lifecycle("worker.run.finish", {"step": self.step_index, "success": bool(success)})
             self.finished_signal.emit(success)
         except ProcessingCancelled:
             # Not a failure: the user closed the window or moved on, and the step
@@ -374,7 +374,7 @@ class StepWorker(QThread):
             # removed by `_discard_step_artifact` in the manager, because a step
             # is judged complete by its artifact EXISTING -- a truncated file
             # would be treated as a finished step on the next run.
-            lifecycle("worker.run.cancelled", step=self.step_index)
+            lifecycle("worker.run.cancelled", {"step": self.step_index})
             log.info("Step %s cancelled by user request.", self.step_index)
             self.finished_signal.emit(False)
         except Exception as e:
@@ -1860,7 +1860,7 @@ class DynamicGUIManager(QObject):
             path = strategy.get_checkpoint_files().get(key)
             if path and os.path.exists(path):
                 os.remove(path)
-                lifecycle("worker.stop.artifact_discarded", step=idx, key=key)
+                lifecycle("worker.stop.artifact_discarded", {"step": idx, "key": key})
                 log.info("Discarded partial artifact for cancelled step %s: %s",
                          idx, path)
         except Exception:
@@ -1871,8 +1871,9 @@ class DynamicGUIManager(QObject):
         detaches the (now quickly-unwinding) thread so it can't crash the app on
         destruction."""
         if getattr(self, 'worker', None) and self.worker.isRunning():
-            lifecycle("worker.stop.begin",
-                      baseline_pids=len(getattr(self, '_worker_child_baseline', set())))
+            lifecycle("worker.stop.begin", {
+                "baseline_pids": len(getattr(self, '_worker_child_baseline', set())),
+            })
             _register_quit_hook()  # Ensure cleanup happens at shutdown
 
             # FIRST, ask the step itself to stop.
@@ -1931,7 +1932,7 @@ class DynamicGUIManager(QObject):
             _orphan_threads.append(self.worker)
             self.worker.finished.connect(lambda w=self.worker: _cleanup_orphan_thread(w))
             self.worker = None
-            lifecycle("worker.stop.detached", orphan_count=len(_orphan_threads))
+            lifecycle("worker.stop.detached", {"orphan_count": len(_orphan_threads)})
 
     def shutdown_and_cleanup(self) -> None:
         """Forcefully clears all data references and Napari internal buffers."""
@@ -1941,8 +1942,10 @@ class DynamicGUIManager(QObject):
             n_layers = len(self.viewer.layers) if self.viewer else 0
         except Exception:
             n_layers = "?"
-        lifecycle("cleanup.shutdown.begin",
-                  worker_running=bool(is_worker_running), layers=n_layers)
+        lifecycle("cleanup.shutdown.begin", {
+            "worker_running": bool(is_worker_running),
+            "layers": n_layers,
+        })
         self._stop_worker_safely()
 
         # 1. Clear Napari layers and buffers first
@@ -1962,7 +1965,7 @@ class DynamicGUIManager(QObject):
                     lifecycle("cleanup.intermediate_state.clear")
                     self.strategy.intermediate_state.clear() 
                 else:
-                    lifecycle("cleanup.intermediate_state.skip", reason="worker still running")
+                    lifecycle("cleanup.intermediate_state.skip", {"reason": "worker still running"})
             self.strategy = None
         
         lifecycle("cleanup.refs.release")  # dropping image_stack / viewer refs
@@ -2097,17 +2100,18 @@ class DynamicGUIManager(QObject):
         # That scan is a large part of the time to open one of these images,
         # and it reads a different array once a pyramid is present, which is
         # why the slider handles moved as soon as one appeared.
-        limits: Dict[str, Any] = {}
+        # None when no range could be computed: add_image's own default.
+        limits = None
         try:
             from .display_pyramid import contrast_limits_for
             computed = contrast_limits_for(source)
             if computed:
-                limits = {"contrast_limits": list(computed)}
+                limits = list(computed)
         except Exception:
-            limits = {}
+            limits = None
         layer = self.viewer.add_image(
             source, name=layer_name, scale=self._layer_scale(),
-            multiscale=bool(levels), **limits
+            multiscale=bool(levels), contrast_limits=limits
         )
         # Carry the full image's display range into an ROI session. A crop is
         # bounding-box shaped with everything outside the polygon zeroed, so
@@ -2739,8 +2743,10 @@ class DynamicGUIManager(QObject):
         # start with a stale request already pending.
         _cancel_clear()
         self._cancelled_step_index = step_index
-        lifecycle("worker.start", step=step_index,
-                  baseline_children=len(self._worker_child_baseline))
+        lifecycle("worker.start", {
+            "step": step_index,
+            "baseline_children": len(self._worker_child_baseline),
+        })
         self.worker = StepWorker(
             self.strategy, step_index, self.image_stack, current_values
         )

@@ -127,12 +127,6 @@ __all__ = [
 ]
 
 
-def _dialog(*args, **kwargs):
-    """Lazy accessor so importing the package does not require PyQt5."""
-    from .dialog import SpatialNullDialog
-    return SpatialNullDialog(*args, **kwargs)
-
-
 def __getattr__(name):
     # PyQt5 is only needed for the dialog, so it is imported on demand. Batch
     # and notebook use of the engine then works in a headless environment.

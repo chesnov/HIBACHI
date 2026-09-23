@@ -787,10 +787,11 @@ class _LazyDialog:
 
     _cls = None
 
-    def __call__(self, *args, **kwargs):
+    def __call__(self, plan, mode, parent=None):
+        # Same parameters as `_DimensionEntryDialog.__init__`.
         if _LazyDialog._cls is None:
             _LazyDialog._cls = _build_dialog_classes()
-        return _LazyDialog._cls(*args, **kwargs)
+        return _LazyDialog._cls(plan, mode, parent=parent)
 
 
 DimensionEntryDialog = _LazyDialog()

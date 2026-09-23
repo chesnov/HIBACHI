@@ -187,32 +187,23 @@ class RelationalEngine:
     def _save_intersection_metrics_via_pipeline(
         mask_path, shape, spacing, mask_name, id_mapping, out_dir, sample_name, is_2d
     ):
-        if is_2d:
-            from ..fluorescence_module.calculate_features import (
-                analyze_segmentation_2d)
-        else:
-            from ..fluorescence_module.calculate_features import (
-                analyze_segmentation)
+        from ..fluorescence_module.calculate_features import (
+            analyze_segmentation)
 
         mask = np.memmap(mask_path, dtype=np.int32, mode='r', shape=shape)
 
-        if is_2d:
-            sp = spacing if len(spacing) == 2 else (spacing[1], spacing[2])
-            metrics_df, _ = analyze_segmentation_2d(
-                mask,
-                intensity_image=None,
-                spacing_yx=sp,
-                calculate_distances=False,   # Not needed for synthetic filtering
-                calculate_skeletons=False,   # Expensive and unused downstream
-            )
-        else:
-            metrics_df, _ = analyze_segmentation(
-                mask,
-                intensity_image=None,
-                spacing=spacing,             # 3D takes (Z, Y, X) directly
-                calculate_distances=False,
-                calculate_skeletons=False,
-            )
+        # One entry point at both ranks: it dispatches on the mask's rank. The
+        # (Z, Y, X) -> (Y, X) reduction for a plane is the one the former 2D
+        # branch did inline.
+        if is_2d and len(spacing) != 2:
+            spacing = (spacing[1], spacing[2])
+        metrics_df, _ = analyze_segmentation(
+            mask,
+            intensity_image=None,
+            spacing=spacing,
+            calculate_distances=False,   # Not needed for synthetic filtering
+            calculate_skeletons=False,   # Expensive and unused downstream
+        )
 
         del mask
 
@@ -567,7 +558,7 @@ class RelationalEngine:
                             )
 
                     if summary:
-                        summary_rows.append({'sample_name': sample_name, **summary})
+                        summary_rows.append({'sample_name': sample_name} | dict(summary))
 
                     # ---- The overlap mask, if this step was asked for one ----
                     if want_keep or want_regions:

@@ -522,7 +522,7 @@ def _describe_ngff(group_path: str, group, entry: Dict[str, Any],
         if ok)
 
     info.channel_names = _ngff_channel_names(
-        {**root_attrs, **_attrs_dict(group)}, info.channels)
+        dict(root_attrs) | _attrs_dict(group), info.channels)
     return info
 
 

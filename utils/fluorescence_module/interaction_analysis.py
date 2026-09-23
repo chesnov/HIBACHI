@@ -76,9 +76,9 @@ def _extent_terms(ndim: int):
     """
     return ("area", "um2") if ndim == 2 else ("vol", "um3")
 
-def flush_print(*args: Any, **kwargs: Any) -> None:
+def flush_print(*args: Any) -> None:
     """Standardized wrapper for immediate log flushing to console."""
-    print(*args, **kwargs)
+    print(*args)
     sys.stdout.flush()
 
 def _safe_load_memmap(

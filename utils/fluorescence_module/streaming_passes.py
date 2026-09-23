@@ -308,6 +308,11 @@ def global_merge_pass(
     soma_mask,
     spacing,
     interface_metric_fn,
+    *,
+    local_analysis_radius: int,
+    min_local_intensity_difference: float,
+    min_path_intensity_ratio: float,
+    max_interface_to_cell_mean_ratio: float,
     stats: Optional[LabelStatistics] = None,
     global_soma_intensities: Optional[Dict[int, float]] = None,
     global_soma_centroids: Optional[Dict[int, np.ndarray]] = None,
@@ -315,7 +320,6 @@ def global_merge_pass(
     min_contact: int = 1,
     block_shape: Sequence[int] = (128, 128, 128),
     log=print,
-    **params,
 ) -> Dict[int, int]:
     """
     Run the interface merge tests once per adjacent pair of final labels, reading
@@ -335,6 +339,10 @@ def global_merge_pass(
     runs before the interface crop is read, so it costs nothing when it does not
     fire.
 
+    The four merge thresholds are keyword-only and required. They used to
+    arrive through ``**params`` with a fallback default at each read, so a
+    threshold the caller forgot was silently replaced by that default.
+
     Returns the mapping applied.
     """
     if stats is None:
@@ -344,7 +352,7 @@ def global_merge_pass(
     soma_cen = global_soma_centroids or {}
     max_sep = float(max_seed_centroid_dist or 0.0)
 
-    radius = int(params.get('local_analysis_radius', 10))
+    radius = int(local_analysis_radius)
     pad = radius + 2
     shape = tuple(int(s) for s in labels.shape)
     uf = _UnionFind()
@@ -403,9 +411,9 @@ def global_merge_pass(
             mask_A, mask_B, cell_mask, inten,
             ref_intensity, cell_mean, spacing,
             radius,
-            params.get('min_local_intensity_difference', 0.0),
-            params.get('min_path_intensity_ratio', 1.0),
-            params.get('max_interface_to_cell_mean_ratio', 0.85),
+            min_local_intensity_difference,
+            min_path_intensity_ratio,
+            max_interface_to_cell_mean_ratio,
         )
         n_tested += 1
         if metrics.get('should_merge_decision'):

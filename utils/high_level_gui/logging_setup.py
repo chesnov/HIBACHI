@@ -36,7 +36,7 @@ Public API
 ----------
     configure_logging(role="app")        -> pathlib.Path (the log directory)
     get_logger(name)                     -> logging.Logger
-    lifecycle(event, **fields)           -> None      (structured breadcrumb)
+    lifecycle(event, fields=None)        -> None      (structured breadcrumb)
     dump_now(label="manual")             -> None      (force a traceback dump)
     install_qt_message_handler()         -> None      (called by configure_logging)
 """
@@ -52,7 +52,7 @@ import sys
 import threading
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Dict, Optional
 
 # --------------------------------------------------------------------------- #
 # Location
@@ -280,18 +280,20 @@ def get_logger(name: str) -> logging.Logger:
     return logging.getLogger(f"hibachi.{name}" if not name.startswith("hibachi") else name)
 
 
-def lifecycle(event: str, **fields: Any) -> None:
+def lifecycle(event: str, fields: Optional[Dict[str, Any]] = None) -> None:
     """Log a structured lifecycle breadcrumb.
 
     Use this around open/close/cleanup so the last lines before a native abort
     tell you exactly which step was in flight, e.g.::
 
-        lifecycle("viewer.open", folder=name)
-        lifecycle("cleanup.start", worker_running=True, layers=3)
+        lifecycle("viewer.open", {"folder": name})
+        lifecycle("cleanup.start", {"worker_running": True, "layers": 3})
 
-    The message is greppable and the fields are shown as key=value.
+    The message is greppable and the fields are shown as key=value, in the
+    dict's order. The fields are one explicit dict rather than ``**fields`` so
+    this takes a fixed signature like everything else.
     """
-    extra = " ".join(f"{k}={v!r}" for k, v in fields.items())
+    extra = " ".join(f"{k}={v!r}" for k, v in (fields or {}).items())
     logging.getLogger("hibachi.lifecycle").info("%-22s %s", event, extra)
 
 

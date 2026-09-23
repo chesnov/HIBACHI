@@ -30,7 +30,6 @@ except ImportError:  # pragma: no cover - direct script execution
 try:
     from .streaming_stats import accumulate_label_statistics
     from .streaming_passes import (
-        accumulate_label_soma_map,
         apply_label_mapping,
         global_merge_pass,
         merge_undersized_streaming,
@@ -38,11 +37,19 @@ try:
 except ImportError:  # pragma: no cover - direct script execution
     from streaming_stats import accumulate_label_statistics
     from streaming_passes import (
-        accumulate_label_soma_map,
         apply_label_mapping,
         global_merge_pass,
         merge_undersized_streaming,
     )
+
+#: Merge-test threshold: two basins are candidates for merging only if their
+#: interface is darker than this fraction of the cell's mean intensity. Not a
+#: config parameter and never has been -- every read used to fall back to this
+#: same 0.85 because no caller supplied it. One named constant now, passed
+#: explicitly to both places the test runs (the chunk worker and the global
+#: merge pass), so the two cannot drift apart.
+MAX_INTERFACE_TO_CELL_MEAN_RATIO = 0.85
+
 
 try:
     from .segmentation_helpers import (
@@ -481,7 +488,7 @@ def _calculate_interface_metrics(
     local_analysis_radius: int,
     min_local_intensity_difference: float,
     min_path_intensity_ratio_heuristic: float,
-    max_interface_to_cell_mean_ratio: float = 0.85,
+    max_interface_to_cell_mean_ratio: float = MAX_INTERFACE_TO_CELL_MEAN_RATIO,
 ) -> Dict[str, Any]:
     """
     Calculates metrics to decide if two watershed basins should be merged.
@@ -581,7 +588,7 @@ def _build_adjacency_graph_for_cell(
     local_analysis_radius: int,
     min_local_intensity_difference: float,
     min_path_intensity_ratio_heuristic: float,
-    max_interface_to_cell_mean_ratio: float = 0.85,
+    max_interface_to_cell_mean_ratio: float = MAX_INTERFACE_TO_CELL_MEAN_RATIO,
     node_seed_tags: Optional[Dict[int, Set[int]]] = None,
     require_local_somas: bool = False,
     soma_centroids: Optional[Dict[int, np.ndarray]] = None,
@@ -849,7 +856,18 @@ def _separate_multi_soma_cells_chunk(
     multi_soma_cell_labels_list: List[int],
     prior_labels: Optional[np.ndarray] = None,
     prior_seed_map: Optional[Dict[int, Set[int]]] = None,
-    **kwargs
+    *,
+    intensity_weight: float,
+    speed_power: float,
+    local_analysis_radius: int,
+    min_local_intensity_difference: float,
+    min_path_intensity_ratio: float,
+    max_interface_to_cell_mean_ratio: float,
+    max_seed_centroid_dist: float,
+    local_cache_bytes: int,
+    cell_to_somas: Dict[int, Set[int]],
+    global_soma_centroids: Dict[int, np.ndarray],
+    global_soma_intensities: Dict[int, float],
 ) -> Tuple[np.ndarray, Dict, Dict[int, Set[int]]]:
     """
     Worker: Separates multi-soma cells within a specific 3D chunk.
@@ -968,7 +986,7 @@ def _separate_multi_soma_cells_chunk(
         # otherwise pull the volume into memory to avoid re-reading it. Above the
         # cap the view is used exactly as before, so the fallback is the old
         # behaviour rather than a failure. Same values either way.
-        _cache_cap = int(kwargs.get('local_cache_bytes', 0) or 0)
+        _cache_cap = int(local_cache_bytes or 0)
         local_soma = soma_mask[bbox_padded]
         local_intensity = intensity_volume[bbox_padded]
         if _cache_cap > 0:
@@ -1120,7 +1138,7 @@ def _separate_multi_soma_cells_chunk(
         # intensity is taken from the global table the coordinator already computes.
         # The merge tests need it for `ref_intensity`; without it they would score a
         # propagated interface against the 1.0 fallback.
-        _global_int = kwargs.get('global_soma_intensities', {})
+        _global_int = global_soma_intensities
         for _tag in identity_seeds:
             for _s in _tag:
                 if _s not in soma_props and _s in _global_int:
@@ -1173,11 +1191,10 @@ def _separate_multi_soma_cells_chunk(
         speed = dt + 1e-5
 
         # 4. Modulate speed by intensity
-        intensity_weight = kwargs.get('intensity_weight', 0.5)
         if intensity_weight > 0:
             # Fetch global data passed from the coordinator
-            cell_global_seeds = list(kwargs.get('cell_to_somas', {}).get(cell_label, seeds_in_crop))
-            global_intensities = kwargs.get('global_soma_intensities', {})
+            cell_global_seeds = list(cell_to_somas.get(cell_label, seeds_in_crop))
+            global_intensities = global_soma_intensities
 
             # FIX: Global Continuous Normalization
             # Instead of using local.max() (which varies wildly between chunks and causes jagged artifacts),
@@ -1192,8 +1209,7 @@ def _separate_multi_soma_cells_chunk(
             speed = speed * (1.0 + intensity_weight * norm_int)
 
         # 5. Final Landscape
-        # speed_power = 1.5 slightly increases the penalty of thin necks to prevent Voronoi cuts.
-        speed_power = kwargs.get('speed_power', 1.5)
+        # speed_power (config) > 1 increases the penalty of thin necks to prevent Voronoi cuts.
         # No flag on the branch below. A default of False here silently reintroduces
         # the Voronoi bias on every propagated chunk, and the failure is invisible
         # except as misassigned branches in the viewer. Which landscape ran is
@@ -1261,14 +1277,14 @@ def _separate_multi_soma_cells_chunk(
         nodes, edges = _build_adjacency_graph_for_cell(
             ws_local, local_mask, local_soma, soma_props, local_intensity,
             cell_mean_int, spacing,
-            kwargs.get('local_analysis_radius', 10),
-            kwargs.get('min_local_intensity_difference', 0.0),
-            kwargs.get('min_path_intensity_ratio', 1.0),
-            kwargs.get('max_interface_to_cell_mean_ratio', 0.85),
+            local_analysis_radius,
+            min_local_intensity_difference,
+            min_path_intensity_ratio,
+            max_interface_to_cell_mean_ratio,
             node_seed_tags={i + 1: s for i, s in enumerate(identity_seeds)},
             require_local_somas=True,
-            soma_centroids=kwargs.get('global_soma_centroids', {}),
-            max_seed_centroid_dist=float(kwargs.get('max_seed_centroid_dist', 0.0)),
+            soma_centroids=global_soma_centroids,
+            max_seed_centroid_dist=float(max_seed_centroid_dist),
         )
 
         # [PROFILING] Summarize what the graph decided before any merging happens.
@@ -1598,7 +1614,15 @@ def separate_multi_soma_cells(
     spacing: Optional[Tuple[float, float, float]],
     chunk_shape: Optional[Tuple[int, ...]] = None,
     overlap: int = 64,
-    **kwargs
+    *,
+    min_size_threshold: int,
+    intensity_weight: float,
+    speed_power: float,
+    max_seed_centroid_dist: float,
+    min_path_intensity_ratio: float,
+    min_local_intensity_difference: float,
+    local_analysis_radius: int,
+    memmap_dir: str,
 ) -> np.ndarray:
     """
     Main Coordinator for separating multi-soma cells in large 3D volumes.
@@ -1611,7 +1635,13 @@ def separate_multi_soma_cells(
         spacing: Voxel spacing.
         chunk_shape: Size of processing chunks.
         overlap: Overlap between chunks.
-        **kwargs: Parameters for separation (weights, thresholds).
+        min_size_threshold .. local_analysis_radius: the config's step 4
+            parameters, keyword-only and required. They used to arrive through
+            ``**kwargs`` and be read with ``kwargs.get(name, default)`` at each
+            use, so a missing or misspelled one was silently replaced by a
+            default -- and the defaults disagreed with the shipped config
+            (``intensity_weight`` 0.5 in code, 0.01 in the YAML).
+        memmap_dir: Directory for chunk files and the stitched result.
 
     Returns:
         np.ndarray: Refined 3D segmentation mask.
@@ -1648,8 +1678,7 @@ def separate_multi_soma_cells(
     # sizes here is the streaming block used by every aggregate and rewrite pass
     # after the stitch, and it reports whether one chunk fits at all.
     _budget = resource_budget.open_budget("step 4 cell separation")
-    _stats_block = tuple(kwargs.get('stats_block_shape', ())) or \
-        _streaming_block_shape(_budget, ndim)
+    _stats_block = _streaming_block_shape(_budget, ndim)
 
     # [PROFILE|CONSERVE] Input inventory for end-to-end foreground accounting.
     #
@@ -1704,21 +1733,17 @@ def separate_multi_soma_cells(
     # `_separate_multi_soma_cells_chunk`). A quarter of the step's allowance: the
     # crop is transient, one cell at a time, and the rest of the step needs room
     # for the chunk arrays and the watershed.
-    kwargs['local_cache_bytes'] = int(_budget.plannable_bytes // 4)
-    kwargs['cell_to_somas'] = cell_to_somas
-    kwargs['global_soma_centroids'] = global_soma_centroids
-    kwargs['global_soma_intensities'] = global_soma_intensities
+    local_cache_bytes = int(_budget.plannable_bytes // 4)
 
     multi_soma_labels = [c for c, s in cell_to_somas.items() if len(s) > 1]
 
     if not multi_soma_labels:
         flush_print("  No multi-soma cells found. Returning original.")
         return _copy_to_memmap(
-            segmentation_mask, kwargs.get("memmap_dir", "ramiseg_temp_memmap"),
+            segmentation_mask, memmap_dir,
             "passthrough.mmp")
 
     # 2. Process Chunks
-    memmap_dir = kwargs.get("memmap_dir", "ramiseg_temp_memmap")
     if not os.path.exists(memmap_dir):
         os.makedirs(memmap_dir, exist_ok=True)
 
@@ -1837,7 +1862,7 @@ def separate_multi_soma_cells(
     # would be multiplied by it. Which side of the cap a crop falls on decides
     # whether it is read through the memmap or copied once; the values are the
     # same either way (see the use site), so this is a memory decision only.
-    kwargs['local_cache_bytes'] = int(
+    local_cache_bytes = int(
         _budget.plannable_bytes // (4 * max(1, _workers))
     )
 
@@ -1901,8 +1926,17 @@ def separate_multi_soma_cells(
                 spacing, chunk_offset, multi_soma_labels,
                 prior_labels=prior_chunk,
                 prior_seed_map=prior_seed_map,
-                global_offset=tuple(sl_.start for sl_ in sl),
-                **kwargs
+                intensity_weight=intensity_weight,
+                speed_power=speed_power,
+                local_analysis_radius=local_analysis_radius,
+                min_local_intensity_difference=min_local_intensity_difference,
+                min_path_intensity_ratio=min_path_intensity_ratio,
+                max_interface_to_cell_mean_ratio=MAX_INTERFACE_TO_CELL_MEAN_RATIO,
+                max_seed_centroid_dist=max_seed_centroid_dist,
+                local_cache_bytes=local_cache_bytes,
+                cell_to_somas=cell_to_somas,
+                global_soma_centroids=global_soma_centroids,
+                global_soma_intensities=global_soma_intensities,
             )
             del prior_chunk
 
@@ -2226,7 +2260,7 @@ def separate_multi_soma_cells(
                     # Previously this was geometry-only (speed = dt + 1e-5), which caused
                     # large conflict zones to be cut along the geometric midplane instead of
                     # the true dark intensity valley — producing the diagonal mask artifact.
-                    stitch_intensity_weight = kwargs.get('intensity_weight', 0.5)
+                    stitch_intensity_weight = intensity_weight
                     if stitch_intensity_weight > 0 and np.any(local_domain):
                         local_int_sub = intensity_volume[sub_slice].astype(float)
                         smoothed_sub = ndimage.gaussian_filter(local_int_sub, sigma=1.0)
@@ -2273,7 +2307,6 @@ def separate_multi_soma_cells(
                         flush_print(f"    [PROFILE|STITCH|GEO] pair=({e_lab},{i_lab}) | "
                                     f"intensity_weight=0 — falling back to geometry-only speed.")
 
-                    speed_power = kwargs.get('speed_power', 1.5)
 
                     # When there is no dark valley between the two safe zones, running
                     # the geodesic watershed is pointless: any cut it produces will be at
@@ -2389,24 +2422,19 @@ def separate_multi_soma_cells(
         # is where it does the work: with `require_local_somas` active, a long-range
         # pair is never scored inside a chunk at all, so the bound has to be applied
         # at the point the decision is actually taken.
-        _merge_params = {
-            k: kwargs[k] for k in (
-                'local_analysis_radius',
-                'min_local_intensity_difference',
-                'min_path_intensity_ratio',
-                'max_interface_to_cell_mean_ratio',
-            ) if k in kwargs
-        }
         _merged = global_merge_pass(
             ret, intensity_volume, soma_mask, spacing,
             _calculate_interface_metrics,
+            local_analysis_radius=local_analysis_radius,
+            min_local_intensity_difference=min_local_intensity_difference,
+            min_path_intensity_ratio=min_path_intensity_ratio,
+            max_interface_to_cell_mean_ratio=MAX_INTERFACE_TO_CELL_MEAN_RATIO,
             stats=_stats,
-            global_soma_intensities=kwargs.get('global_soma_intensities', {}),
-            global_soma_centroids=kwargs.get('global_soma_centroids', {}),
-            max_seed_centroid_dist=float(kwargs.get('max_seed_centroid_dist', 0.0)),
+            global_soma_intensities=global_soma_intensities,
+            global_soma_centroids=global_soma_centroids,
+            max_seed_centroid_dist=float(max_seed_centroid_dist),
             block_shape=_stats_block,
             log=flush_print,
-            **_merge_params
         )
         if _merged:
             # Same substitution as the input inventory: the old line built a
@@ -2451,23 +2479,14 @@ def separate_multi_soma_cells(
         # is exactly the rule wanted: an original mask with one soma or none becomes
         # one cell, no questions.
         #
-        # `protect_seeded_cells` exempts any soma-owning label from the floor. That
-        # exempts every basin, which disables the lever entirely -- symptom in the
-        # log is `[PROFILE|UNDERSIZE|SUMMARY] merged=0` on an image that visibly
-        # needs merging. Default OFF for that reason. Turn it on only to shield
-        # small-but-real cells from a threshold set too high for the data, and
-        # prefer fixing the threshold or the intensity levers instead.
-        _protect = set()
-        if kwargs.get('protect_seeded_cells', False):
-            _protect = {
-                lbl for lbl, somas in accumulate_label_soma_map(
-                    ret, soma_mask, block_shape=_stats_block
-                ).items() if somas
-            }
+        # No label is protected from the floor. A `protect_seeded_cells` option
+        # used to exempt every soma-owning label, which exempts every basin and
+        # disables the lever entirely. It was reachable only through `**kwargs`,
+        # no caller ever set it, and it was removed with them.
         merge_undersized_streaming(
-            ret, int(kwargs.get('min_size_threshold', 0) or 0),
+            ret, int(min_size_threshold or 0),
             stats=_stats_island,
-            protected=_protect,
+            protected=set(),
             block_shape=_stats_block,
             log=flush_print,
         )
@@ -2519,67 +2538,3 @@ def separate_multi_soma_cells(
             try: os.remove(prior_path)
             except OSError: pass
         gc.collect()
-
-
-# --------------------------------------------------------------------------
-# 2D entry points
-# --------------------------------------------------------------------------
-def separate_multi_soma_cells_2d(segmentation_mask, intensity_volume, soma_mask,
-                                 spacing, chunk_shape=None, overlap: int = 64,
-                                 **kwargs):
-    """
-    2D entry point, kept so existing callers and saved workflows keep working.
-
-    `separate_multi_soma_cells` handles both ranks; the argument names were
-    already identical, so this only exists to preserve the old symbol. New code
-    should call the rank-agnostic function.
-
-    Note `overlap` now defaults to 64 at BOTH ranks. The 3D track defaulted to
-    32; since neither the configs nor the strategies pass it, that default was
-    live, and it decides which cells are judged inside a chunk rather than
-    deferred to the global merge pass.
-    """
-    return separate_multi_soma_cells(
-        segmentation_mask, intensity_volume, soma_mask, spacing,
-        chunk_shape=chunk_shape, overlap=overlap, **kwargs
-    )
-
-
-def _calculate_interface_metrics_2d_aligned(*args, **kwargs):
-    """2D alias; the implementation is rank-agnostic."""
-    return _calculate_interface_metrics(*args, **kwargs)
-
-
-def _analyze_local_intensity_difference_2d_aligned(*args, **kwargs):
-    """2D alias; the implementation is rank-agnostic."""
-    return _analyze_local_intensity_difference_optimized(*args, **kwargs)
-
-
-def _build_adjacency_graph_for_cell_2d(*args, **kwargs):
-    """2D alias; the implementation is rank-agnostic."""
-    return _build_adjacency_graph_for_cell(*args, **kwargs)
-
-
-def _separate_multi_soma_cells_chunk_2d(*args, **kwargs):
-    """2D alias; the implementation is rank-agnostic."""
-    return _separate_multi_soma_cells_chunk(*args, **kwargs)
-
-
-def _reassign_disconnected_islands_2d(*args, **kwargs):
-    """2D alias; the implementation is rank-agnostic."""
-    return _reassign_disconnected_islands(*args, **kwargs)
-
-
-def _get_chunk_slices_2d(*args, **kwargs):
-    """2D alias; the implementation is rank-agnostic."""
-    return _get_chunk_slices(*args, **kwargs)
-
-
-def _soma_first_chunk_order_2d(*args, **kwargs):
-    """2D alias; the implementation is rank-agnostic."""
-    return _soma_first_chunk_order(*args, **kwargs)
-
-
-def _min_soma_separation_2d(*args, **kwargs):
-    """2D alias; the implementation is rank-agnostic."""
-    return _min_soma_separation(*args, **kwargs)

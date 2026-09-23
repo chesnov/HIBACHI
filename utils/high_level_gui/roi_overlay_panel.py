@@ -258,9 +258,9 @@ class OverlayROIPanel:
                 continue
 
             colour = _REGION_COLOURS[index % len(_REGION_COLOURS)]
-            shape_kwargs = {}
-            if scale is not None and len(scale) == len(self.full_shape or ()):
-                shape_kwargs["scale"] = scale
+            # None is add_shapes' own default (unit scale).
+            shape_scale = (scale if scale is not None
+                           and len(scale) == len(self.full_shape or ()) else None)
 
             layer = self.viewer.add_shapes(
                 verts,
@@ -269,7 +269,7 @@ class OverlayROIPanel:
                 edge_color=colour,
                 face_color=[0, 0, 0, 0.0],
                 edge_width=2,
-                **shape_kwargs,
+                scale=shape_scale,
             )
             # Read-only by intent: this shows what is committed to disk, and
             # editing it would imply the change propagates, which it does not.
@@ -355,9 +355,9 @@ class OverlayROIPanel:
         # the wrong Z.
         ref_scale = self._reference_scale()
 
-        shape_kwargs = {}
-        if ref_scale is not None and len(ref_scale) == len(self.full_shape):
-            shape_kwargs["scale"] = ref_scale
+        # None is add_shapes' own default (unit scale).
+        shape_scale = (ref_scale if ref_scale is not None
+                       and len(ref_scale) == len(self.full_shape) else None)
 
         layer = self.viewer.add_shapes(
             name=ROI_LAYER_NAME,
@@ -366,7 +366,7 @@ class OverlayROIPanel:
             edge_color="yellow",
             face_color=[1, 1, 0, 0.08],
             edge_width=3,
-            **shape_kwargs,
+            scale=shape_scale,
         )
 
         self._roi_reset_drawing_state()
