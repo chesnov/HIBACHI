@@ -60,40 +60,10 @@ from sklearn.decomposition import PCA
 
 
 def _core_is_elongated(coords_local, spacing, max_aspect, ndim):
-    """PCA elongation test, largest principal axis over smallest.
-
-    The rule is the original one -- ``sqrt(ev[0] / ev[-1]) > max_aspect``, in
-    physical units -- with one correction: a DEGENERATE smallest axis is judged
-    on the axes that remain instead of being rejected outright.
-
-    The previous code rejected whenever the smallest eigenvalue was near zero,
-    on the reasoning that a vanishing axis means "an (effectively) 1-voxel-thick
-    line". That holds when two axes vanish. When only ONE does, the core is
-    coplanar -- a flat sheet, not a line -- and a perfectly round disc lying in
-    a single z plane was being thrown away as maximally elongated. Measured on
-    an 11-plane stack: a 197-voxel circular disc one plane thick scored
-    identically to a 1x1x200 line. Single-plane cores are the common case in a
-    stack that shallow, not a rare degeneracy: of 125 labels in the reported
-    volume, 55 were only one or two planes deep.
-
-    So the number of non-degenerate axes is counted, and elongation is measured
-    across those:
-
-    * two or more left -> ``sqrt(ev[0] / ev[k-1])`` over the non-degenerate
-      axes. With nothing degenerate this is exactly the original expression, so
-      isotropic data is unaffected; coplanar cores fall back to their in-plane
-      elongation, which is the thing actually being asked about.
-    * fewer than two   -> all the spread is on one axis (or none). That IS a
-      line, and is rejected as before.
-
-    Deliberately NOT changed to ``ev[0] / ev[1]``, which looks like the natural
-    "is it stretched out" measure but under-rejects badly here: with a 1 um z
-    step against 0.106 um pixels, ev[1] is often the z axis inflated by the
-    coarse spacing alone, and a 2x4x120 process scores 7.3 instead of 31.
-
-    Fewer than 11 voxels -> not judged (False), as before. Same rule used by the
-    first-pass check and the recovery re-check.
-    """
+    """PCA elongation test with correct handling of the degenerate case.
+    A near-zero smallest principal axis means an (effectively) 1-voxel-thick
+    line, i.e. maximally elongated -> True. Fewer than 11 voxels -> not judged
+    (False). Same rule used by the first-pass check and the recovery re-check."""
     if coords_local.shape[0] <= 10:
         return False
     try:
@@ -102,38 +72,10 @@ def _core_is_elongated(coords_local, spacing, max_aspect, ndim):
         ev = np.sort(np.abs(pca.explained_variance_))[::-1]
     except Exception:
         return False
-    if ev.size == 0 or ev[0] <= 1e-12:
-        # No spread at all; nothing to judge.
-        return False
-    # Degeneracy relative to the largest axis, so the test does not depend on
-    # the units the spacing happens to be in. An axis carrying ~1e-9 of the
-    # leading variance contributes no shape information.
-    # A core confined to ONE plane of a stack is a slice, not a core, and is
-    # rejected here.
-    #
-    # This function previously rejected any core with a degenerate smallest
-    # axis, on the reasoning that a vanishing axis means a line. I changed that
-    # to judge the remaining axes instead, because in principle a coplanar core
-    # is a flat sheet rather than a line. On a real z-stack that was wrong and
-    # made placement markedly worse: 56% of the somas it produced were one
-    # plane thick, every one of them past the configured aspect limit, and they
-    # sat wherever the intensity percentile happened to cut -- typically
-    # hugging a cell's edge rather than its middle. The blanket rejection was
-    # doing real work.
-    #
-    # It is a rank-3 judgement only. In 2D every core is "coplanar" by
-    # definition, so the rule would reject everything; there the two in-plane
-    # axes are all there is and the original largest-over-smallest test is
-    # exactly right. That distinction is what the earlier version got wrong in
-    # the other direction.
-    degenerate = ev <= ev[0] * 1e-9
-    if ndim >= 3 and degenerate.any():
+    smallest = ev[-1]
+    if smallest <= 1e-12:
         return True
-    non_degenerate = ev[~degenerate]
-    if non_degenerate.size < 2:
-        return True
-    return (math.sqrt(non_degenerate[0])
-            / math.sqrt(non_degenerate[-1])) > max_aspect
+    return (math.sqrt(ev[0]) / math.sqrt(smallest)) > max_aspect
 
 
 def _finalize_core(coords, dt_vals, spacing, min_seed_vol, max_aspect, ndim):
@@ -300,11 +242,6 @@ def get_min_distance_pixels(
                                 min_pixels=3, label=label)
 
 
-#: Largest footprint radius, in voxels, allowed on any one axis. A physical
-#: separation divided by a very fine in-plane spacing can ask for a footprint
-#: bigger than the image; this bounds the array that gets built (and pickled to
-#: every worker) rather than letting one parameter allocate unboundedly.
-_MAX_FOOTPRINT_RADIUS = 64
 
 
 def peak_separation_radii(spacing, physical_distance, ndim):
@@ -320,7 +257,7 @@ def peak_separation_radii(spacing, physical_distance, ndim):
     radii = []
     for sp in list(spacing)[:ndim]:
         r = int(round(float(physical_distance) / float(sp)))
-        radii.append(max(1, min(r, _MAX_FOOTPRINT_RADIUS)))
+        radii.append(max(1, r))
     return tuple(radii)
 
 
@@ -821,7 +758,6 @@ def extract_soma_masks(
         ratios_to_process: DT thresholds relative to max DT.
         intensity_percentiles_to_process: Intensity thresholds.
         min_physical_peak_separation: Minimum global distance between seeds (um).
-        seeding_min_distance_um: Override for internal peak splitting.
         max_allowed_core_aspect_ratio: Max elongation (PCA ratio).
         ref_vol_percentile_lower/upper: Population bounds for thickness calculation.
         ref_thickness_percentile_lower: Percentile to set min accepted thickness.
