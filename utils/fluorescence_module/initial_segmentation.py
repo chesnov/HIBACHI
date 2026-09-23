@@ -27,6 +27,8 @@ from tqdm import tqdm
 try:
     from . import resource_budget
     from .dim_utils import (
+        open_worker_memmap,
+        worker_memmap_handle,
         binary_structure,
         chunk_read_write_slices,
         min_inplane_spacing,
@@ -37,6 +39,8 @@ try:
 except ImportError:  # pragma: no cover - direct script execution
     import resource_budget
     from dim_utils import (
+        open_worker_memmap,
+        worker_memmap_handle,
         binary_structure,
         chunk_read_write_slices,
         min_inplane_spacing,
@@ -192,8 +196,8 @@ def _crest_gated_response(scale_res, block, sigma, delta_factor: float = 2.0):
 
 def _process_block_worker(
     chunk_info: Tuple[Tuple[slice, ...], Tuple[slice, ...]],
-    input_memmap_info: Tuple[str, Tuple[int, ...], Any],
-    output_memmap_info: Tuple[str, Tuple[int, ...], Any],
+    input_memmap_info: Tuple[str, int, Tuple[int, ...], str],
+    output_memmap_info: Tuple[str, int, Tuple[int, ...], str],
     sigmas_voxel_2d: List[float],
     black_ridges: bool,
     frangi_alpha: float,
@@ -219,13 +223,8 @@ def _process_block_worker(
     result_block = None
     try:
         read_slices, write_slices = chunk_info
-        input_path, input_shape, input_dtype = input_memmap_info
-        output_path, output_shape, output_dtype = output_memmap_info
-
-        input_memmap = np.memmap(input_path, dtype=input_dtype, mode='r',
-                                 shape=input_shape)
-        output_memmap = np.memmap(output_path, dtype=output_dtype, mode='r+',
-                                  shape=output_shape)
+        input_memmap = open_worker_memmap(input_memmap_info, mode='r')
+        output_memmap = open_worker_memmap(output_memmap_info, mode='r+')
 
         block_data = input_memmap[read_slices].astype(np.float32)
 
@@ -701,7 +700,12 @@ def enhance_tubular_structures_blocked(
     overlap_px = max(_ENHANCE_MIN_OVERLAP_PX,
                      math.ceil(max(sigmas_voxel_2d) * 4))
     
-    input_info = (volume.filename, volume.shape, volume.dtype) if isinstance(volume, np.memmap) else None
+    # Offset-aware and view-refusing; see `worker_memmap_handle`. The former
+    # (filename, shape, dtype) triple read a tifffile memmap from byte 0 of the
+    # TIFF, i.e. every voxel shifted by the header, and a crop view as a block
+    # from the start of the file. Anything that cannot be reopened exactly is
+    # copied to disk below, which was already the path for in-RAM input.
+    input_info = worker_memmap_handle(volume)
     dump_dir = None
     if input_info is None:
         dump_dir = _get_safe_temp_dir(temp_root_path, 'input_dump')
@@ -709,10 +713,13 @@ def enhance_tubular_structures_blocked(
         input_mm = np.memmap(dump_path, dtype=volume.dtype, mode='w+', shape=volume.shape)
         input_mm[:] = volume[:]
         input_mm.flush()
-        input_info = (dump_path, volume.shape, volume.dtype)
+        input_info = worker_memmap_handle(input_mm)
+        if input_info is None:  # a fresh whole-file memmap always qualifies
+            raise RuntimeError(f"could not hand {dump_path} to the vesselness workers")
 
     worker_func = partial(_process_block_worker, input_memmap_info=input_info, 
-                          output_memmap_info=(output_path, volume.shape, np.float32),
+                          output_memmap_info=(output_path, 0, tuple(volume.shape),
+                                              np.dtype(np.float32).str),
                           sigmas_voxel_2d=sigmas_voxel_2d, 
                           black_ridges=black_ridges, frangi_alpha=frangi_alpha, 
                           frangi_beta=frangi_beta, frangi_gamma=frangi_gamma)

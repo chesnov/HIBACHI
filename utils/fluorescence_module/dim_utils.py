@@ -31,6 +31,8 @@ entries in both cases, which is why several helpers index ``[-2:]`` rather than
 ``[1:]`` -- the latter silently drops Y in 2D.
 """
 
+import mmap
+import os
 import sys
 from typing import Dict, List, Optional, Sequence, Tuple, Union
 
@@ -418,3 +420,58 @@ def tile_target_contains(target: Sequence[int], point: Sequence[float]) -> bool:
     """
     n = len(target) // 2
     return all(target[k] <= point[k] < target[k + n] for k in range(n))
+
+
+# --------------------------------------------------------------------------
+# Handing an on-disk array to worker processes
+# --------------------------------------------------------------------------
+#: (path, byte offset, shape, dtype string) -- everything needed to map the
+#: same bytes again in another process.
+MemmapHandle = Tuple[str, int, Tuple[int, ...], str]
+
+
+def open_worker_memmap(handle: MemmapHandle, mode: str = "r") -> np.memmap:
+    """Map the array a `worker_memmap_handle` describes."""
+    path, offset, shape, dtype = handle
+    return np.memmap(path, dtype=np.dtype(dtype), mode=mode,
+                     offset=int(offset), shape=tuple(shape))
+
+
+def worker_memmap_handle(arr) -> Optional[MemmapHandle]:
+    """A handle a worker can reopen to get exactly ``arr``, or None.
+
+    Workers used to reopen an array from ``(filename, shape, dtype)`` alone.
+    That is only right when the data starts at byte 0 of the file and the
+    array is the whole mapping. Neither holds in general:
+
+    * ``tifffile.memmap`` maps the pixel data AFTER the TIFF header (368 bytes
+      for a typical stack), so a worker reading from byte 0 saw every voxel
+      shifted by 184 positions, header bytes included.
+    * A crop or other view of a memmap keeps the parent's ``filename`` (and
+      ``offset``), so a worker read a crop-shaped block from the start of the
+      file -- the wrong region entirely.
+
+    Returns a handle only for a whole, C-contiguous memmap whose buffer is the
+    file mapping itself, and only after reopening it here and checking that a
+    spread of elements match. Anything else returns None, and the caller takes
+    its existing in-process or copy-to-disk path, which is always correct.
+    """
+    if not isinstance(arr, np.memmap):
+        return None
+    if not isinstance(arr.base, mmap.mmap) or not arr.flags.c_contiguous:
+        return None  # a view into another array, or a strided layout
+    path = getattr(arr, "filename", None)
+    if not path or not os.path.exists(path):
+        return None
+    handle: MemmapHandle = (str(path), int(arr.offset), tuple(int(s) for s in arr.shape),
+                            np.dtype(arr.dtype).str)
+    try:
+        reopened = open_worker_memmap(handle)
+        flat_a, flat_b = arr.reshape(-1), reopened.reshape(-1)
+        n = flat_a.size
+        idx = np.unique(np.linspace(0, n - 1, num=min(n, 257)).astype(np.int64))
+        same = bool(np.array_equal(flat_a[idx], flat_b[idx]))
+        del reopened
+    except Exception:
+        return None
+    return handle if same else None

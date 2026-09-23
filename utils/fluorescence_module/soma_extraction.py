@@ -38,6 +38,8 @@ from tqdm import tqdm
 try:
     from . import resource_budget
     from .dim_utils import (
+        open_worker_memmap,
+        worker_memmap_handle,
         generate_tiles,
         normalise_spacing,
         pixels_from_physical,
@@ -47,6 +49,8 @@ try:
 except ImportError:  # pragma: no cover - direct script execution
     import resource_budget
     from dim_utils import (
+        open_worker_memmap,
+        worker_memmap_handle,
         generate_tiles,
         normalise_spacing,
         pixels_from_physical,
@@ -706,10 +710,8 @@ def _soma_worker_init(seg_info, int_info) -> None:
     for _v in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS",
                "VECLIB_MAXIMUM_THREADS", "NUMEXPR_NUM_THREADS"):
         os.environ[_v] = "1"
-    _WORKER_IMAGES["seg"] = np.memmap(seg_info[0], dtype=seg_info[2],
-                                      mode="r", shape=seg_info[1])
-    _WORKER_IMAGES["int"] = np.memmap(int_info[0], dtype=int_info[2],
-                                      mode="r", shape=int_info[1])
+    _WORKER_IMAGES["seg"] = open_worker_memmap(seg_info)
+    _WORKER_IMAGES["int"] = open_worker_memmap(int_info)
 
 
 def _soma_worker(task):
@@ -946,14 +948,14 @@ def extract_soma_masks(
     # Parallel generation needs both images on disk so each worker can map them
     # instead of receiving bounding boxes through a pipe. When either is a plain
     # in-RAM array -- a direct caller, or a test -- generation stays in-process.
-    def _memmap_info(arr):
-        fn = getattr(arr, "filename", None)
-        if fn and os.path.exists(fn):
-            return (fn, tuple(arr.shape), np.dtype(arr.dtype))
-        return None
-
-    _seg_info = _memmap_info(segmentation_mask)
-    _int_info = _memmap_info(intensity_image)
+    # `worker_memmap_handle` carries the byte offset and refuses views. The
+    # former (filename, shape, dtype) triple made every worker read the image
+    # from byte 0 of its file: for a TIFF opened with tifffile.memmap -- which
+    # is how the app opens every image -- that shifted all intensities by the
+    # header size, so the pool computed cores from the wrong pixels (223 somas
+    # instead of 190 on the test stack) while in-process runs were correct.
+    _seg_info = worker_memmap_handle(segmentation_mask)
+    _int_info = worker_memmap_handle(intensity_image)
     _gen_workers = _plan.workers if (_seg_info and _int_info) else 1
     _gen_workers = max(1, min(_gen_workers, len(valid_labels)))
     if _gen_workers > 1 and not _plan.fits:
