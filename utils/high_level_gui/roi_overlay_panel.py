@@ -738,13 +738,25 @@ def add_overlay_roi_panel(viewer, sample_name: str, sample_dirs: Sequence[str],
     try:
         from .app_launch import (
             _compact_button, _give_layer_list_room, _lock_panel_height,
-            _section_header,
+            _section_header, add_side_panel_section, ensure_side_panel,
         )
     except Exception:
         _compact_button = None
         _section_header = None
         _lock_panel_height = None
         _give_layer_list_room = None
+        add_side_panel_section = None
+        ensure_side_panel = None
+
+    # In the viewer's scrollable side panel when there is one (see
+    # app_launch.add_side_panel_section): the section header then names it,
+    # so the in-panel caption is left out.
+    side = None
+    if ensure_side_panel is not None:
+        try:
+            side = ensure_side_panel(viewer)
+        except Exception:
+            side = None
 
     def _button(text: str, tooltip: str) -> QPushButton:
         if _compact_button is not None:
@@ -758,7 +770,7 @@ def add_overlay_roi_panel(viewer, sample_name: str, sample_dirs: Sequence[str],
     outer.setContentsMargins(6, 4, 6, 6)
     outer.setSpacing(4)
 
-    if _section_header is not None:
+    if _section_header is not None and side is None:
         outer.addWidget(_section_header("Shared sub-region (ROI)"))
 
     btn_draw = _button(
@@ -800,7 +812,13 @@ def add_overlay_roi_panel(viewer, sample_name: str, sample_dirs: Sequence[str],
     outer.addWidget(btn_show)
     outer.addWidget(btn_clear)
 
-    dock = viewer.window.add_dock_widget(container, area="left", name="ROI")
+    dock = None
+    if side is not None:
+        dock = add_side_panel_section(viewer, "Shared region (ROI)", container,
+                                      "overlay_roi")
+    in_side_panel = dock is not None
+    if not in_side_panel:
+        dock = viewer.window.add_dock_widget(container, area="left", name="ROI")
 
     # Keep the panel alive for as long as the dock exists.
     #
@@ -822,8 +840,9 @@ def add_overlay_roi_panel(viewer, sample_name: str, sample_dirs: Sequence[str],
     except Exception as exc:
         print(f"Could not load saved ROI: {exc}")
 
-    if _lock_panel_height is not None:
-        _lock_panel_height(container, dock)
-    if _give_layer_list_room is not None:
-        _give_layer_list_room(viewer, dock)
+    if not in_side_panel:
+        if _lock_panel_height is not None:
+            _lock_panel_height(container, dock)
+        if _give_layer_list_room is not None:
+            _give_layer_list_room(viewer, dock)
     return dock, panel

@@ -91,6 +91,73 @@ def log_dir() -> Path:
 # Module state (so configure_logging is idempotent and file handles survive)
 # --------------------------------------------------------------------------- #
 _configured = False
+
+#: One log file of this size is kept per writer before it rotates.
+_MAX_BYTES = 5 * 1024 * 1024
+
+
+def _is_worker_process() -> bool:
+    """True inside a multiprocessing (or loky) worker.
+
+    On Windows, and wherever the start method is "spawn", a worker re-imports
+    the main module -- and segment.py configures logging at import. Every
+    worker therefore used to open ``hibachi-app.log`` too, and Windows will
+    not rename a file another process holds open, so the main process's
+    rotation failed with WinError 32 and printed a "Logging error" block for
+    every message after it. The process name is set before the main module
+    is re-imported, so it is reliable here.
+    """
+    try:
+        import multiprocessing
+        return multiprocessing.current_process().name != "MainProcess"
+    except Exception:
+        return False
+
+
+class _TolerantRotatingFileHandler(logging.handlers.RotatingFileHandler):
+    """Rotating handler that skips a rotation it is not allowed to do.
+
+    Windows refuses to rename an open file, so any other program holding the
+    log -- antivirus, a search indexer, an editor -- used to turn every later
+    message into a traceback on stderr. A failed rotation now just continues
+    in the current file and is tried again later; the size cap is exceeded
+    for a while rather than logging being lost or flooded.
+    """
+
+    _retry_after = 0.0
+
+    def shouldRollover(self, record) -> bool:
+        if time.time() < self._retry_after:
+            return False
+        return super().shouldRollover(record)
+
+    def doRollover(self) -> None:
+        try:
+            super().doRollover()
+        except OSError:
+            self._retry_after = time.time() + 60.0
+            if self.stream is None:
+                try:
+                    self.stream = self._open()
+                except OSError:
+                    pass
+
+
+def _trim_worker_log(path: Path) -> None:
+    """Keep the shared worker log bounded. Main process only, at startup.
+
+    Workers append to one file and never rename it (several of them write at
+    once, and none may hold a file another is renaming), so it is rotated
+    here, before any worker exists.
+    """
+    try:
+        if path.exists() and path.stat().st_size > _MAX_BYTES:
+            old = path.with_name(path.name + ".1")
+            if old.exists():
+                old.unlink()
+            path.rename(old)
+    except OSError:
+        pass
 _fault_file = None          # keep the faulthandler file object alive for the
                             # whole process; faulthandler writes to its fd.
 _LOG_FORMAT = "%(asctime)s %(levelname)-7s [%(processName)s/%(threadName)s] %(name)s: %(message)s"
@@ -129,11 +196,21 @@ def configure_logging(role: str = "app", level: int = logging.DEBUG) -> Path:
 
     formatter = logging.Formatter(_LOG_FORMAT, datefmt=_DATE_FORMAT)
 
-    log_path = directory / f"hibachi-{role}.log"
+    worker = _is_worker_process()
     try:
-        file_handler = logging.handlers.RotatingFileHandler(
-            log_path, maxBytes=5 * 1024 * 1024, backupCount=5, encoding="utf-8"
-        )
+        if worker:
+            # Append-only, and never the main process's file: see
+            # _is_worker_process. `delay` opens the file on the first record,
+            # so a worker that logs nothing holds nothing open.
+            log_path = directory / "hibachi-worker.log"
+            file_handler = logging.FileHandler(log_path, mode="a",
+                                               encoding="utf-8", delay=True)
+        else:
+            log_path = directory / f"hibachi-{role}.log"
+            _trim_worker_log(directory / "hibachi-worker.log")
+            file_handler = _TolerantRotatingFileHandler(
+                log_path, maxBytes=_MAX_BYTES, backupCount=5, encoding="utf-8"
+            )
         file_handler.setLevel(level)
         file_handler.setFormatter(formatter)
         root.addHandler(file_handler)
@@ -150,7 +227,12 @@ def configure_logging(role: str = "app", level: int = logging.DEBUG) -> Path:
         root.addHandler(console)
 
     # Third-party chatter: keep the file readable.
-    for noisy in ("numba", "matplotlib", "PIL", "vispy", "OpenGL", "urllib3", "asyncio"):
+    # napari's slicer writes several multi-kilobyte DEBUG lines on EVERY slice
+    # change: scrolling a stack filled the 5 MB log in minutes (constant
+    # rotation) and spent CPU formatting them on each wheel tick. Its warnings
+    # and errors still come through.
+    for noisy in ("numba", "matplotlib", "PIL", "vispy", "OpenGL", "urllib3",
+                  "asyncio", "napari", "in_n_out", "app_model"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
 
     logging.captureWarnings(True)  # route warnings.warn(...) into logging

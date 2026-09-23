@@ -73,7 +73,9 @@ from typing import Any, Dict, List, Optional
 _CREATE_NO_WINDOW = 0x08000000 if sys.platform.startswith("win") else 0
 
 #: Bump when the cache's meaning changes, so old entries are ignored.
-_CACHE_VERSION = 2
+#: 3: Intel Arc 1xxT/1xxV/"Arc Graphics" are integrated (earlier verdicts
+#:    treated them as discrete and must not be reused).
+_CACHE_VERSION = 3
 _CACHE_FILE = "gpu_probe.json"
 
 #: The probe imports Qt and vispy and opens a context: a few seconds normally.
@@ -266,7 +268,15 @@ def classify_adapter(raw: Dict[str, Any]) -> Adapter:
     elif vendor == "nvidia":
         kind = "discrete"
     elif vendor == "intel":
-        kind = "discrete" if re.search(r"\barc\b", low) else "integrated"
+        # Only the Arc A- and B-series CARDS are discrete (A770, A370M, B580,
+        # Pro A60M, ...). "Arc 140T", "Arc 130V", "Arc Graphics" are the
+        # graphics built into Core Ultra processors: integrated. Treating every
+        # "Arc" as discrete hid the second GPU on such laptops, so no
+        # preference was set and no notice shown while the viewer sat on the
+        # integrated chip.
+        discrete_arc = re.search(
+            r"\barc\b\W*(?:\(tm\))?\s*(?:pro\s*)?[ab]\d{2,3}m?\b", low)
+        kind = "discrete" if discrete_arc else "integrated"
     elif vendor == "amd":
         # AMD APUs report a bare "Radeon(TM) Graphics" / "Radeon Vega 8 Graphics"
         # / "Radeon 780M"; discrete cards carry a model family (RX, Pro, FirePro).

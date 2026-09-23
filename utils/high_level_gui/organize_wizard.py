@@ -185,21 +185,55 @@ def detect_raw(raw_dir: str) -> Dict[str, object]:
     }
 
 
+#: A channel folder: `Channel_<n>` or `Channel_<n>_<label>`. The ONE pattern
+#: every function here uses to find channel folders. The label is optional
+#: since `channel_target_name` drops an uninformative one, and the functions
+#: used to disagree about that: `existing_channel_indices` accepted a bare
+#: `Channel_0`, while re-setup's `reset_multichannel_project` and the
+#: synthetic-channel purge still required the underscore -- so re-setup never
+#: deleted a bare channel folder, and the old channels survived next to the
+#: new ones.
+_CHANNEL_DIR_RE = re.compile(r"(?i)^channel_(\d+)(?:_|$)")
+
+
+#: Preset labels that say nothing about the channel. A preset label is a config
+#: filename stem, and `default.yaml` is the canonical reference config -- so
+#: "default" means "no custom config was chosen", which is true of every
+#: channel in the common case and therefore distinguishes none of them.
+_UNINFORMATIVE_PRESETS = {"default"}
+
+
 def channel_target_name(channel_idx: int, preset_key: str) -> str:
-    """Mirror the historical naming: 'Channel_0_Microglia' from preset 'Microglia (3D)'."""
-    first = preset_key.split()[0] if preset_key else f"ch{channel_idx}"
+    """'Channel_0_Microglia' from preset 'Microglia (3D)'; 'Channel_0' from 'default'.
+
+    The preset label is appended only when it carries information. Using the
+    reference config for every channel produced `Channel_0_default`,
+    `Channel_1_default` ... -- a suffix that is identical everywhere, tells you
+    nothing, and then leaked into analysis column headers.
+
+    Note the folder may now be a bare `Channel_<n>`, so anything parsing these
+    names must not require a trailing underscore (see
+    `existing_channel_indices`).
+    """
+    first = preset_key.split()[0] if preset_key else ""
     # keep it filesystem-safe
-    first = re.sub(r"[^A-Za-z0-9_-]", "", first) or f"ch{channel_idx}"
+    first = re.sub(r"[^A-Za-z0-9_-]", "", first)
+    if not first or first.lower() in _UNINFORMATIVE_PRESETS:
+        return f"Channel_{channel_idx}"
     return f"Channel_{channel_idx}_{first}"
 
 
 def existing_channel_indices(project_dir: str) -> List[int]:
-    """Channel indices already extracted, parsed from Channel_<n>_* folder names."""
+    """Channel indices already extracted, from `Channel_<n>` or `Channel_<n>_*`."""
     out: List[int] = []
     try:
         for item in os.listdir(project_dir):
             if os.path.isdir(os.path.join(project_dir, item)):
-                m = re.match(r"(?i)channel_(\d+)_", item)
+                # The trailing underscore is optional: a channel whose preset
+                # carried no information is a bare `Channel_<n>`. Requiring it
+                # made such a project read as single-channel, because
+                # project_view_window derives `is_multi` from this.
+                m = _CHANNEL_DIR_RE.match(item)
                 if m:
                     out.append(int(m.group(1)))
     except OSError:
@@ -212,8 +246,9 @@ def reset_multichannel_project(project_dir: str) -> List[str]:
     Delete the organized structure so the project can be set up from scratch,
     WITHOUT touching the raw source images.
 
-    Removes every Channel_* subfolder (each contains that channel's extracted
-    images, configs, and processed outputs). Returns the list of removed paths.
+    Removes every channel folder, `Channel_<n>` and `Channel_<n>_<label>`
+    alike (see _CHANNEL_DIR_RE). Each holds that channel's extracted images,
+    configs and processed outputs. Returns the list of removed paths.
     Raw images (.tif/.tiff/.czi files sitting directly in project_dir) are left
     in place -- they are the source the wizard re-extracts from.
     """
@@ -224,7 +259,7 @@ def reset_multichannel_project(project_dir: str) -> List[str]:
         return removed
     for item in entries:
         full = os.path.join(project_dir, item)
-        if os.path.isdir(full) and re.match(r"(?i)channel_\d+_", item):
+        if os.path.isdir(full) and _CHANNEL_DIR_RE.match(item):
             shutil.rmtree(full, ignore_errors=True)
             removed.append(full)
     return removed
@@ -323,7 +358,7 @@ def purge_derived_artifacts(project_dir: str) -> List[str]:
         entries = []
     for item in entries:
         full = os.path.join(project_dir, item)
-        if (os.path.isdir(full) and re.match(r"(?i)channel_\d+_", item)
+        if (os.path.isdir(full) and _CHANNEL_DIR_RE.match(item)
                 and is_synthetic_channel(full)):
             shutil.rmtree(full, ignore_errors=True)
             removed.append(full)

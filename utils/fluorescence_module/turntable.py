@@ -1042,6 +1042,16 @@ def add_turntable_button(viewer):
     placement of add_channel_visibility_toggle so the two controls sit together.
     Returns the QDockWidget (or None on failure)."""
     container = make_turntable_widget(viewer)
+    # A section of the viewer's scrollable side panel when there is one, so
+    # the multi-channel overlay gets the same single scrolling column as the
+    # segmentation viewer; a separate dock otherwise, as before.
+    try:
+        from ..high_level_gui.app_launch import add_side_panel_section
+        side = add_side_panel_section(viewer, "Movie", container, "rotation")
+        if side is not None:
+            return side
+    except Exception:
+        logger.debug("side panel unavailable; docking the movie button", exc_info=True)
     dock = viewer.window.add_dock_widget(container, area="left", name="Movie")
 
     # Sit it directly beneath the layer list.

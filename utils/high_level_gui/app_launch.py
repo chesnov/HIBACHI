@@ -612,6 +612,12 @@ def build_scrollable_side_panel(viewer, sections) -> Any:
              if d.isVisible() and window.dockWidgetArea(d) == Qt.RightDockWidgetArea]
 
     dock = viewer.window.add_dock_widget(scroll, area="left", name="Side panel")
+    # Registered on the napari Window (a plain object; the Viewer model does
+    # not accept new attributes) so that helpers adding controls later --
+    # add_channel_visibility_toggle, the movie recorder, the overlay ROI panel
+    # -- append sections here instead of docking separately.
+    viewer.window._hibachi_side_panel = {"dock": dock, "column": column,
+                                         "fit": _fit_width}
 
     def _keep_right_width() -> None:
         try:
@@ -633,6 +639,43 @@ def build_scrollable_side_panel(viewer, sections) -> Any:
                 s.set_expanded(not s.is_expanded())
         napari_dock.visibilityChanged.connect(_redirect)
     return dock
+
+
+def ensure_side_panel(viewer):
+    """The viewer's scrollable side panel, created on first use. None if napari's
+    layer docks cannot be found (callers then dock separately, as before)."""
+    window = getattr(viewer, "window", None)
+    panel = getattr(window, "_hibachi_side_panel", None)
+    if panel is not None:
+        return panel
+    if build_scrollable_side_panel(viewer, []) is None:
+        return None
+    return getattr(window, "_hibachi_side_panel", None)
+
+
+def add_side_panel_section(viewer, title: str, widget: QWidget, key: str,
+                           expanded: bool = True):
+    """Add `widget` as a collapsible section of the side panel.
+
+    Returns the side panel's dock, or None if there is no side panel -- the
+    caller then docks `widget` on its own, exactly as before. Every viewer that
+    adds controls through the shared helpers (the segmentation viewer and the
+    multi-channel overlay alike) therefore gets ONE left column that scrolls as
+    a whole, instead of separate docks whose summed minimum heights can make
+    the window taller than the screen.
+    """
+    panel = ensure_side_panel(viewer)
+    if panel is None:
+        return None
+    try:
+        widget.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+        panel["column"].addWidget(CollapsibleSection(title, widget, key, expanded))
+        panel["fit"]()
+        QTimer.singleShot(0, panel["fit"])
+    except Exception:
+        log.debug("could not add %r to the side panel", title, exc_info=True)
+        return None
+    return panel["dock"]
 
 
 def make_channel_visibility_button(viewer) -> QPushButton:
@@ -689,6 +732,9 @@ def add_channel_visibility_toggle(viewer):
     lay.setContentsMargins(5, 3, 5, 3)
     lay.addWidget(btn)
 
+    side = add_side_panel_section(viewer, "Channels", container, "channels")
+    if side is not None:
+        return side
     dock = viewer.window.add_dock_widget(container, area="left", name="Channels")
     # Cap it and move it to sit directly below the layer list.
     _lock_panel_height(container, dock)
