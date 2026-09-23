@@ -202,9 +202,8 @@ execute_soma_extraction:
         intensity and distance thresholds, keeping the tightest core. Choose
         'elongated' for spindle- or fibre-shaped cells with no compact body:
         it seeds each fibre along its full length, following the local fibre
-        direction, and reads only Intensity Percentiles and Min Seed Size --
-        every other parameter below is hidden. Every scale it uses is derived
-        from the objects' measured fibre radius.
+        direction, and reads only Intensity Percentiles and Min Seed Size.
+        Every scale it uses is derived from the objects' measured fibre radius.
     ratios_to_process:
       label: Ratios to Process (Peeling; comma-sep floats)
       type: list

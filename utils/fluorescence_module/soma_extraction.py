@@ -1333,9 +1333,7 @@ def extract_soma_masks(
 
     # 2. Absolute Mode Initialization & Profiling
     print(f"  Absolute Mode Enforced: Processing {len(valid_labels)} labels...")
-    print(f"  Soma shape: {soma_shape}" + (
-        " (one seed per fibre; reads only the intensity percentiles and the "
-        "min seed size)" if elongated else ""))
+    print(f"  Soma shape: {soma_shape}")
     print(f"  Thresh: Min Volume = {min_seed_vol} {unit}s")
     print(f"  Thresh: Thickness = [{absolute_min_thickness_um:.2f} - {absolute_max_thickness_um:.2f}] µm")
     print(f"  Thresh: Peak Separation = {min_physical_peak_separation:.2f} µm")

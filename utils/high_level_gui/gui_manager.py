@@ -3091,16 +3091,14 @@ class DynamicGUIManager(QObject):
             # choice, matching how the absolute-threshold switch behaves. It
             # also rebuilds the kind dropdown against the new channel's
             # available artifacts.
-            if self.current_step_method:
-                self.create_step_widgets(self.current_step_method)
+            self._rebuild_step_widgets_later()
 
         def _kind_changed(_index: int, key=config_key) -> None:
             self.parameter_changed(
                 key, "soma_source_artifact",
                 kind_box.currentData() or DEFAULT_SOURCE_KIND)
             # Rebuilt for the note line, which names the chosen artifact.
-            if self.current_step_method:
-                self.create_step_widgets(self.current_step_method)
+            self._rebuild_step_widgets_later()
 
         box.currentIndexChanged.connect(_changed)
         if kind_box is not None:
@@ -3145,23 +3143,23 @@ class DynamicGUIManager(QObject):
         if pconf.get("description"):
             box.setToolTip(str(pconf["description"]))
         layout.addWidget(box)
-        if current == "elongated":
-            note = QLabel("Elongated: one seed per fibre, full length. Only "
-                          "Intensity Percentiles and Min Seed Size apply; the "
-                          "other soma parameters are hidden.")
-            note.setWordWrap(True)
-            note.setStyleSheet("color: #666; font-style: italic;")
-            layout.addWidget(note)
 
         def _changed(_index: int, key=config_key) -> None:
             self.parameter_changed(key, "soma_shape", box.currentData() or "compact")
-            # Rebuild so the hidden parameters appear or disappear with the
-            # choice, as the soma-source dropdown does.
-            if self.current_step_method:
-                self.create_step_widgets(self.current_step_method)
+            self._rebuild_step_widgets_later()
 
         box.currentIndexChanged.connect(_changed)
         return current == "elongated"
+
+    def _rebuild_step_widgets_later(self) -> None:
+        """Rebuild the parameter panel on the next event-loop turn.
+
+        For controls whose change alters which parameters are shown. Rebuilding
+        removes the dock holding the control, so doing it inside the control's
+        own signal deletes the sender mid-emission and Qt segfaults on return.
+        Deferred for the same reason as the absolute-threshold switch."""
+        QTimer.singleShot(0, lambda: self.current_step_method and
+                          self.create_step_widgets(self.current_step_method))
 
     def create_step_widgets(self, step_method_name: str) -> None:
         """Generates parameter widgets for the given step."""
