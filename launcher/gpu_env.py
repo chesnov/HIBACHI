@@ -520,11 +520,13 @@ def assess(adapters: List[Adapter], gl: GLInfo, remote: bool, vm: bool,
     if usable:
         rep.mode, rep.reason = "hardware", f"{gl.renderer}"
         discrete = [a for a in real if a.kind == "discrete" and a.has_driver]
-        integrated = [a for a in real if a.kind == "integrated"]
         on = _gl_vendor(gl)
-        wrong = (discrete and integrated
-                 and on in {a.vendor for a in integrated}
-                 and on not in {a.vendor for a in discrete})
+        # Evidence, not the adapter list: a discrete GPU exists, and OpenGL is
+        # being served by a DIFFERENT vendor's chip. That is only possible on
+        # a machine with a second GPU, whether or not the adapter query
+        # managed to list it (PowerShell can be blocked or slow).
+        wrong = bool(discrete and on != "other"
+                     and on not in {a.vendor for a in discrete})
         if wrong:
             d = discrete[0]
             exe = exe_paths[0] if exe_paths else "pythonw.exe"
@@ -546,8 +548,9 @@ def assess(adapters: List[Adapter], gl: GLInfo, remote: bool, vm: bool,
                 message=(f"This computer has a {d.name}, but HIBACHI's viewer is "
                          f"drawing with {gl.renderer}. Large 3D images will be "
                          "slow and use more memory.\n\n"
-                         "Windows was asked to use the faster chip for HIBACHI, "
-                         f"but the graphics driver overrides that. To fix it:\n{how}\n\n"
+                         "HIBACHI asks Windows to use the faster chip, but a "
+                         "setting in the graphics driver (or one made earlier in "
+                         f"Windows) takes precedence. To fix it:\n{how}\n\n"
                          "Then restart HIBACHI.")))
         return rep
 
@@ -842,6 +845,14 @@ def prepare(state_dir: str, executable: Optional[str] = None,
     exe = os.path.abspath(executable or sys.executable)
     adapters, vm = _query_adapters()
     remote = _is_remote_session()
+    if not adapters:
+        log("adapter query returned nothing (PowerShell blocked or slow?); "
+            "using the NVIDIA driver's own inventory")
+    # The adapter list must not be the only way to know a discrete GPU exists:
+    # the NVIDIA driver answers for itself, and the Settings tab already
+    # trusts that answer.
+    known = {a.name.lower() for a in adapters}
+    adapters = adapters + [a for a in nvidia_gpus() if a.name.lower() not in known]
 
     # Before the probe, which then reports what the preference achieved.
     written = ensure_high_performance_gpu(adapters, interpreter_paths(exe))
@@ -860,6 +871,23 @@ def prepare(state_dir: str, executable: Optional[str] = None,
     gl = probe_opengl(exe)
     log(f"OpenGL probe: {gl.status} {gl.renderer!r} {gl.version!r} "
         f"in {time.time() - started:.1f}s {gl.detail}")
+
+    # A discrete GPU exists but a different vendor's chip answered: this is a
+    # two-GPU machine even if the adapter query could not show it. Ask for the
+    # high-performance GPU now, and probe again to see whether it took.
+    discrete = [a for a in adapters if a.kind == "discrete" and a.has_driver]
+    on = _gl_vendor(gl)
+    if (not written and gl.status == "ok" and discrete and on != "other"
+            and on not in {a.vendor for a in discrete}):
+        seen = adapters + [Adapter(name=short_renderer(gl.renderer) or "integrated GPU",
+                                   vendor=on, kind="integrated")]
+        written = ensure_high_performance_gpu(seen, interpreter_paths(exe))
+        if written:
+            log(f"OpenGL is on {gl.renderer!r} although {discrete[0].name} is "
+                f"present; asked Windows to use the high-performance GPU for "
+                f"{', '.join(written)}")
+            gl = probe_opengl(exe)
+            log(f"OpenGL probe after the preference: {gl.status} {gl.renderer!r}")
     rep = assess(adapters, gl, remote, vm, interpreter_paths(exe))
     rep.gpu_preference_set = written
     if rep.mode != "unchanged":           # inconclusive results are not cached
