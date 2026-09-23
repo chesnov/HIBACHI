@@ -862,8 +862,16 @@ def prepare(state_dir: str, executable: Optional[str] = None,
     path = os.path.join(state_dir, _CACHE_FILE)
     fp = _fingerprint(adapters, exe, remote)
     cache = _load_cache(path)
-    if cache.get("fingerprint") == fp and cache.get("report") and not written:
-        rep = _report_from_dict(cache["report"])
+    # A verdict of "on the slower chip" is never reused. What fixes it -- a
+    # program setting in NVIDIA Control Panel or AMD Software -- changes none
+    # of what the fingerprint sees, so a cached copy would keep reporting the
+    # old GPU after the user had already followed the notice's instructions.
+    # Re-probing costs a few seconds per start, only while the problem lasts.
+    cached = cache.get("report") if cache.get("fingerprint") == fp else None
+    stale = bool(cached) and any(
+        i.get("id") == "wrong_gpu" for i in (cached.get("issues") or []))
+    if cached and not written and not stale:
+        rep = _report_from_dict(cached)
         rep.from_cache = True
         return rep
 
