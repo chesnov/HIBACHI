@@ -872,6 +872,150 @@ def _piece_width(vox, spacing, C, S, seg_um):
     return worst
 
 
+def _split_at_lines(vox, resp, C, S, spacing, r, levels):
+    """Split an accepted piece wherever it holds more than one fibre line.
+
+    The width test cannot see two fibres that touch: two lines 2 r across each
+    are together about as wide as the 4 r limit, and at a junction narrower
+    still. The number of lines can be seen. In each stretch of length 10 r
+    along the piece (the same stretches the width test uses), the ridge
+    response is profiled ACROSS the local fibre direction (maximum over depth
+    and along the stretch). Two lines are two peaks at least 2 r apart with a
+    real dip between them; "real" means one of the configured percentile
+    levels lies above the valley and at or below both peaks, so the dip is as
+    deep as a peeling step and no new threshold is introduced.
+
+    Each peak marks a band of voxels within r/2 of it. Lines are followed from
+    stretch to stretch by linking each band to at most one band in the next
+    stretch, the closest sideways and less than r off. Through a fork the stem
+    therefore continues into its best-aligned arm, and only the diverging arm
+    becomes a line of its own; two fibres side by side stay two lines. A
+    watershed on the ridge response inside the piece then divides it between
+    the lines along the darkest path. A piece with one line in every stretch
+    is returned unchanged. A diverging arm becoming its own seed is
+    acceptable: step 4 can re-merge what belongs together, but cannot
+    separate two fibres sharing one seed.
+
+    `vox` is in the coordinates of the `resp`, `C`, `S` crop; `levels` are the
+    percentile thresholds in use. Returns a list of voxel arrays in the same
+    coordinates.
+    """
+    from skimage.segmentation import watershed
+
+    spacing = np.asarray(spacing, float)
+    levels = np.sort(np.asarray(levels, float))
+    yx = vox[:, 1:] * spacing[1:]
+    v = resp[tuple(vox.T)].astype(np.float64)
+    d = np.c_[C[tuple(vox.T)], S[tuple(vox.T)]].mean(0)
+    d /= np.linalg.norm(d) + 1e-9
+    along = yx @ d
+    seg = _ALONG_SMOOTH_R * r
+    nb = max(1, int(np.ceil(np.ptp(along) / seg)))
+    edges = np.linspace(along.min(), along.max() + 1e-6, nb + 1)
+    stretch = np.clip(np.searchsorted(edges, along, side="right") - 1, 0, nb - 1)
+    px = float(spacing[-1])
+    win = max(1, int(round(r / px)))              # peak neighbourhood, +-r
+    band = 0.5 * r
+
+    peaks_per = [None] * nb
+    across_per = [None] * nb
+    for b in range(nb):
+        m = stretch == b
+        if m.sum() < 5:
+            continue
+        dl = np.c_[C[tuple(vox[m].T)], S[tuple(vox[m].T)]].mean(0)
+        dl /= np.linalg.norm(dl) + 1e-9
+        p = yx[m] @ np.array([-dl[1], dl[0]])
+        across_per[b] = (m, p)
+        bins = np.floor((p - p.min()) / px).astype(np.int64)
+        prof = np.full(int(bins.max()) + 1, -np.inf)
+        np.maximum.at(prof, bins, v[m])
+        filled = np.where(np.isfinite(prof), prof, 0.0)   # an empty bin is a gap
+        is_max = (filled >= ndimage.maximum_filter1d(filled, 2 * win + 1, mode="constant")) \
+            & np.isfinite(prof)
+        cand = np.nonzero(is_max)[0]
+        # Strongest first; drop any within 2 r of a stronger one.
+        cand = cand[np.argsort(-filled[cand])]
+        kept = []
+        for c in cand:
+            if all(abs(int(c) - k) * px >= 2 * r for k in kept):
+                kept.append(int(c))
+        kept.sort()
+        # Keep only neighbours separated by a real dip.
+        lines = [kept[0]] if kept else []
+        for c in kept[1:]:
+            prev = lines[-1]
+            valley = filled[prev:c + 1].min()
+            low = min(filled[prev], filled[c])
+            if np.any((levels > valley) & (levels <= low)):
+                lines.append(c)
+            elif filled[c] > filled[prev]:
+                lines[-1] = c
+        peaks_per[b] = [p.min() + (c + 0.5) * px for c in lines]
+
+    n_lines = [len(x) if x else 0 for x in peaks_per]
+    if max(n_lines) < 2:
+        return [vox]
+
+    lo = vox.min(0)
+    hi = vox.max(0) + 1
+    shape = tuple(hi - lo)
+    loc = vox - lo
+    perp = np.array([-d[1], d[0]])
+
+    # One band per peak per stretch, and its sideways position.
+    bands = []                                    # (stretch, voxel indices, lateral um)
+    for b in range(nb):
+        if not peaks_per[b]:
+            continue
+        m, p = across_per[b]
+        rows = np.nonzero(m)[0]
+        for c in peaks_per[b]:
+            idx = rows[np.abs(p - c) <= band]
+            if idx.size:
+                bands.append((b, idx, float(yx[idx].mean(0) @ perp)))
+
+    # Follow each line from stretch to stretch: a band links to at most one
+    # band in the next stretch, the closest sideways and less than r off.
+    # Through a fork the stem therefore continues into its best-aligned arm
+    # and only the diverging arm starts a new line; two fibres side by side
+    # stay two lines. Greedy on sideways offset, smallest first.
+    uf = list(range(len(bands)))
+
+    def _root(i):
+        while uf[i] != i:
+            uf[i] = uf[uf[i]]
+            i = uf[i]
+        return i
+
+    links = []
+    for i, (bi, _, li) in enumerate(bands):
+        for j, (bj, _, lj) in enumerate(bands):
+            if bj == bi + 1 and abs(li - lj) < r:
+                links.append((abs(li - lj), i, j))
+    has_next, has_prev = set(), set()
+    for _off, i, j in sorted(links):
+        if i in has_next or j in has_prev:
+            continue
+        has_next.add(i); has_prev.add(j)
+        uf[_root(i)] = _root(j)
+    roots = sorted({_root(i) for i in range(len(bands))})
+    if len(roots) < 2:
+        return [vox]
+    markers = np.zeros(shape, np.int32)
+    for k, rt in enumerate(roots, 1):
+        for i, (_b, idx, _l) in enumerate(bands):
+            if _root(i) == rt:
+                markers[tuple(loc[idx].T)] = k
+    n = len(roots)
+    mask = np.zeros(shape, bool)
+    mask[tuple(loc.T)] = True
+    box = tuple(slice(a, b_) for a, b_ in zip(lo, hi))
+    ws = watershed(-np.asarray(resp[box], np.float32), markers, mask=mask)
+    parts = [np.argwhere(ws == k) + lo for k in range(1, n + 1)]
+    return [pt for pt in parts if len(pt)] or [vox]
+
+
 # ---- tiling ------------------------------------------------------------------ #
 def _tile_targets(box, tile):
     """The tiles' own regions: `box` cut into blocks of `tile`, each voxel in
@@ -1096,16 +1240,19 @@ def _elongated_label_candidates(lbl, sl, segmentation_mask, intensity_image,
                     open_[tuple(vox.T)] = False
                     if not in_target[tuple(vox.T)].any():
                         continue  # a neighbouring tile owns this piece
-                    # Join with whatever a neighbouring tile already wrote for
-                    # the same fibre; claim only voxels still free.
-                    gb = vox + np.array([c.start for c in bc])
-                    gidx = tuple(gb.T)
-                    have = piece_mm[gidx]
-                    nid = uf.new()
-                    for other in np.unique(have[have > 0]):
-                        uf.union(nid, int(other))
-                    free = have == 0
-                    piece_mm[tuple(gb[free].T)] = nid
+                    for part in _split_at_lines(vox, resp, C, S, sp, r, thresholds):
+                        if len(part) < params.min_seed_vol:
+                            diag["cores_too_small"] += 1
+                            continue
+                        # Join with whatever a neighbouring tile already wrote
+                        # for the same fibre; claim only voxels still free.
+                        gb = part + np.array([c.start for c in bc])
+                        have = piece_mm[tuple(gb.T)]
+                        nid = uf.new()
+                        for other in np.unique(have[have > 0]):
+                            uf.union(nid, int(other))
+                        free = have == 0
+                        piece_mm[tuple(gb[free].T)] = nid
             del obj, resp, C, S, open_, in_target
         piece_mm.flush()
 
