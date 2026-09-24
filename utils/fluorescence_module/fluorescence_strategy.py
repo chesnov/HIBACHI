@@ -13,7 +13,8 @@ import pandas as pd
 import yaml  # type: ignore
 import tifffile as tiff
 
-from ..high_level_gui.processing_strategies import ProcessingStrategy, StepDefinition
+from ..high_level_gui.processing_strategies import (
+    ProcessingStrategy, StepDefinition, copy_artifact, open_artifact_for_writing)
 from ..high_level_gui.display_pyramid import contrast_limits_for
 
 # Attempt imports of specific 3D segmentation modules
@@ -362,10 +363,8 @@ class FluorescenceStrategy(ProcessingStrategy):
                 # the dtype range" reasoning below still holds.
                 corrected_dtype = np.dtype(
                     getattr(image_stack, "dtype", np.float32)).newbyteorder("=")
-                corrected = np.memmap(
-                    corrected_path, dtype=corrected_dtype, mode="w+",
-                    shape=self.image_shape,
-                )
+                corrected = open_artifact_for_writing(
+                    corrected_path, corrected_dtype, self.image_shape)
                 _, illum_report = correct_illumination(
                     image_stack, self.spacing_checked,
                     block_um=block_um, max_gain=max_gain,
@@ -417,7 +416,7 @@ class FluorescenceStrategy(ProcessingStrategy):
             # Store state and persist result
             self.intermediate_state['segmentation_threshold'] = seg_threshold
             self.intermediate_state['original_volume_ref'] = image_stack
-            shutil.copyfile(temp_dat_path, persistent_raw_dat_path)
+            copy_artifact(temp_dat_path, persistent_raw_dat_path)
 
             if viewer is not None:
                 display_data = np.memmap(
@@ -485,12 +484,11 @@ class FluorescenceStrategy(ProcessingStrategy):
                 raise RuntimeError("apply_hull_trimming failed.")
 
             # Persist Trimmed Segmentation
-            shutil.copyfile(temp_dat_path, trimmed_seg_path)
+            copy_artifact(temp_dat_path, trimmed_seg_path)
 
             # Persist Edge Mask
-            edge_memmap = np.memmap(
-                edge_mask_path, dtype=bool, mode='w+', shape=self.image_shape
-            )
+            edge_memmap = open_artifact_for_writing(
+                edge_mask_path, bool, self.image_shape)
             if hull_boundary_mask is not None:
                 # A memmap now, not an in-RAM array: step 2 used to build the
                 # boundary as two full-volume boolean arrays purely to hand
@@ -624,14 +622,12 @@ class FluorescenceStrategy(ProcessingStrategy):
             if isinstance(cell_bodies, np.memmap):
                 temp_cb_path = cell_bodies.filename
                 self._close_memmap(cell_bodies)
-                shutil.copyfile(temp_cb_path, cell_bodies_path)
+                copy_artifact(temp_cb_path, cell_bodies_path)
                 if os.path.exists(temp_cb_path):
                     os.remove(temp_cb_path)
             else:
-                cb_memmap = np.memmap(
-                    cell_bodies_path, dtype=cell_bodies.dtype, mode='w+',
-                    shape=cell_bodies.shape
-                )
+                cb_memmap = open_artifact_for_writing(
+                    cell_bodies_path, cell_bodies.dtype, cell_bodies.shape)
                 cb_memmap[:] = cell_bodies[:]
                 self._close_memmap(cb_memmap)
                 del cell_bodies
@@ -753,10 +749,8 @@ class FluorescenceStrategy(ProcessingStrategy):
                 memmap_dir=temp_chunk_dir,
             )
 
-            final_memmap = np.memmap(
-                final_seg_path, dtype=np.int32, mode='w+',
-                shape=self.image_shape
-            )
+            final_memmap = open_artifact_for_writing(
+                final_seg_path, np.int32, self.image_shape)
             # `final_separated_cells` is a memmap over a file in
             # `temp_chunk_dir`. Step 4 used to materialise the whole label
             # volume in RAM to return it, which was the pipeline's hard ceiling

@@ -10,6 +10,56 @@ from typing import Dict, List, Any, Tuple, TypedDict, Optional, Sequence, Union
 import numpy as np
 import yaml  # type: ignore
 
+
+# --------------------------------------------------------------------------- #
+# Rewriting a step's output file while an old viewer layer still maps it
+# --------------------------------------------------------------------------- #
+# Re-running a step keeps its layers so they update in place (see
+# `cleanup_step`). Those layers memory-map the step's output files, and on
+# Windows a file with an open mapping can be neither deleted nor truncated:
+# cleanup's delete fails, and re-creating the file with mode "w+" or copying
+# over it (both truncate) then fails with "[Errno 22] Invalid argument"
+# (ERROR_USER_MAPPED_FILE). Rewriting it in place, without truncating, is
+# allowed, and the kept layer sees the new data through its own mapping.
+
+def open_artifact_for_writing(path: str, dtype: Any, shape: Sequence[int]) -> np.memmap:
+    """`np.memmap(path, dtype, mode="w+", shape)`, even over a mapped file.
+
+    If truncating fails and the file already has exactly this size, it is
+    opened in place and zero-filled, which is what "w+" would have produced.
+    Any other failure is raised unchanged.
+    """
+    try:
+        return np.memmap(path, dtype=dtype, mode="w+", shape=tuple(shape))
+    except OSError:
+        need = int(np.prod(shape)) * np.dtype(dtype).itemsize
+        if not (os.path.exists(path) and os.path.getsize(path) == need):
+            raise
+    mm = np.memmap(path, dtype=dtype, mode="r+", shape=tuple(shape))
+    mm[...] = 0
+    return mm
+
+
+def copy_artifact(src: str, dst: str) -> None:
+    """`shutil.copyfile(src, dst)`, even over a mapped file.
+
+    If truncating `dst` fails and it already has `src`'s size, its contents
+    are overwritten in place. Any other failure is raised unchanged.
+    """
+    import shutil
+    try:
+        shutil.copyfile(src, dst)
+        return
+    except OSError:
+        if not (os.path.exists(dst) and os.path.getsize(dst) == os.path.getsize(src)):
+            raise
+    with open(src, "rb") as fin, open(dst, "r+b") as fout:
+        while True:
+            chunk = fin.read(64 * 1024 * 1024)
+            if not chunk:
+                break
+            fout.write(chunk)
+
 # Suppress the Napari/vispy GL_MAX_TEXTURE_SIZE downsampling notice.
 # This fires asynchronously from the Qt event loop after layer data is uploaded
 # to the GPU, so a catch_warnings() context manager around add_*() calls cannot
