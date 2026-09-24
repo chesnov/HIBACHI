@@ -710,7 +710,13 @@ SOMA_SHAPES = ("compact", "elongated")
 # which the result did not change on the spindle test stack:
 #   along-fibre smoothing  10 r   (flat from 5 r to 32 r)
 #   single-fibre width      4 r   (flat from 3 r to 6 r; 8 r starts accepting
-#                                  two fibres side by side)
+#                                  two fibres side by side). This decides only
+#                                  which level a piece is accepted at; a fused
+#                                  pair (about 4 r) is split afterwards by
+#                                  `_split_at_lines`, which counts 2 r widths.
+#                                  Tightening it to 3 r instead sent such pairs
+#                                  up a level, where the dimmer fibre fell below
+#                                  threshold and was lost.
 #   direction averaging     2 r   (stabilises the local direction estimate)
 _ALONG_SMOOTH_R = 10.0
 _WIDTH_LIMIT_R = 4.0
@@ -872,7 +878,7 @@ def _piece_width(vox, spacing, C, S, seg_um):
     return worst
 
 
-def _split_at_lines(vox, resp, C, S, spacing, r, levels):
+def _split_at_lines(vox, resp, C, S, spacing, r, levels, min_size):
     """Split an accepted piece wherever it holds more than one fibre line.
 
     The width test cannot see two fibres that touch: two lines 2 r across each
@@ -885,6 +891,11 @@ def _split_at_lines(vox, resp, C, S, spacing, r, levels):
     levels lies above the valley and at or below both peaks, so the dip is as
     deep as a peeling step and no new threshold is introduced.
 
+    Brightness cannot show two fibres fused with no dip between them, but
+    width can: a stretch k fibre-widths (2 r) wide holds at least k lines, and
+    when fewer peaks are found the k lines are placed at equal-count positions
+    across it.
+
     Each peak marks a band of voxels within r/2 of it. Lines are followed from
     stretch to stretch by linking each band to at most one band in the next
     stretch, the closest sideways and less than r off. Through a fork the stem
@@ -895,6 +906,11 @@ def _split_at_lines(vox, resp, C, S, spacing, r, levels):
     is returned unchanged. A diverging arm becoming its own seed is
     acceptable: step 4 can re-merge what belongs together, but cannot
     separate two fibres sharing one seed.
+
+    A part smaller than `min_size` is not a seed of its own and is not
+    dropped either: it goes back to the neighbouring part it touches most, so
+    splitting never loses voxels, and if no part reaches `min_size` the piece
+    is returned whole, as it was accepted.
 
     `vox` is in the coordinates of the `resp`, `C`, `S` crop; `levels` are the
     percentile thresholds in use. Returns a list of voxel arrays in the same
@@ -951,7 +967,16 @@ def _split_at_lines(vox, resp, C, S, spacing, r, levels):
                 lines.append(c)
             elif filled[c] > filled[prev]:
                 lines[-1] = c
-        peaks_per[b] = [p.min() + (c + 0.5) * px for c in lines]
+        peaks = [p.min() + (c + 0.5) * px for c in lines]
+        # Two fibres fused with no dip between them show one peak but are two
+        # fibre-widths wide. A stretch k widths wide holds at least k lines;
+        # when brightness shows fewer, they are placed at equal-count positions
+        # across it and the watershed divides them midway.
+        w = float(np.percentile(p, 95) - np.percentile(p, 5))
+        k = int(np.floor(w / (2 * r) + 0.5))
+        if k > len(peaks):
+            peaks = list(np.quantile(p, (np.arange(k) + 0.5) / k))
+        peaks_per[b] = peaks
 
     n_lines = [len(x) if x else 0 for x in peaks_per]
     if max(n_lines) < 2:
@@ -1012,8 +1037,22 @@ def _split_at_lines(vox, resp, C, S, spacing, r, levels):
     mask[tuple(loc.T)] = True
     box = tuple(slice(a, b_) for a, b_ in zip(lo, hi))
     ws = watershed(-np.asarray(resp[box], np.float32), markers, mask=mask)
-    parts = [np.argwhere(ws == k) + lo for k in range(1, n + 1)]
-    return [pt for pt in parts if len(pt)] or [vox]
+    # Parts below min_size rejoin the big part they share most faces with,
+    # smallest first, until every remaining part is a seed in its own right.
+    sizes = np.bincount(ws.ravel(), minlength=n + 1)
+    big = [k for k in range(1, n + 1) if sizes[k] >= min_size]
+    if len(big) < 2:
+        return [vox]
+    struct = ndimage.generate_binary_structure(3, 1)
+    for k in sorted((k for k in range(1, n + 1) if 0 < sizes[k] < min_size),
+                    key=lambda k: sizes[k]):
+        ring = ndimage.binary_dilation(ws == k, structure=struct) & mask & (ws != k)
+        touch = np.bincount(ws[ring], minlength=n + 1)
+        touch[0] = 0
+        if touch.any():
+            ws[ws == k] = int(np.argmax(touch))
+    parts = [np.argwhere(ws == k) + lo for k in np.unique(ws[mask]) if k > 0]
+    return parts if len(parts) >= 2 else [vox]
 
 
 # ---- tiling ------------------------------------------------------------------ #
@@ -1235,15 +1274,17 @@ def _elongated_label_candidates(lbl, sl, segmentation_mask, intensity_image,
                         diag["cores_too_small"] += 1
                         open_[tuple(vox.T)] = False
                         continue
-                    if _piece_width(vox, sp, C, S, _ALONG_SMOOTH_R * r) > _WIDTH_LIMIT_R * r:
+                    if (p != percentiles[-1] and
+                            _piece_width(vox, sp, C, S, _ALONG_SMOOTH_R * r) > _WIDTH_LIMIT_R * r):
                         continue  # several fibres: look again one level up
+                    # At the top level there is no level up; a piece still too
+                    # wide is split by `_split_at_lines` rather than dropped,
+                    # since a fibre left without any seed cannot be recovered.
                     open_[tuple(vox.T)] = False
                     if not in_target[tuple(vox.T)].any():
                         continue  # a neighbouring tile owns this piece
-                    for part in _split_at_lines(vox, resp, C, S, sp, r, thresholds):
-                        if len(part) < params.min_seed_vol:
-                            diag["cores_too_small"] += 1
-                            continue
+                    for part in _split_at_lines(vox, resp, C, S, sp, r, thresholds,
+                                                params.min_seed_vol):
                         # Join with whatever a neighbouring tile already wrote
                         # for the same fibre; claim only voxels still free.
                         gb = part + np.array([c.start for c in bc])
