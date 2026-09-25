@@ -121,9 +121,11 @@ object-sized intermediates (ridge response, direction, the joined pieces) are
 kept as memmaps in the step's temp folder and deleted afterwards. The ridge
 response and direction are computed with a halo covering every filter's full
 reach, so they do not depend on where tiles fall, and the percentile
-thresholds are computed exactly over the whole object. A fibre crossing a tile
-boundary is found by both tiles and the two pieces are joined, so fibres are
-not cut into a seed per tile.
+thresholds are computed exactly over the whole object. Each tile decides only
+the voxels in its own region, where it sees a full margin of context around
+them, and pieces touching across a tile boundary are joined, so fibres are not
+cut into a seed per tile -- and strands a tile could only half see near its
+edge are not welded together.
 
 Lowering **Min Seed Size** adds seeds on dim fibres; raising it gives fewer,
 longer, cleaner seeds.

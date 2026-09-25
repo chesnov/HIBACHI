@@ -1124,9 +1124,9 @@ def _elongated_label_candidates(lbl, sl, segmentation_mask, intensity_image,
     3. The percentile thresholds over the whole object, exactly
        (`_exact_percentiles`).
     4. Peeling, per tile plus an overlap margin of one along-fibre smoothing
-       reach. A fibre crossing a tile boundary is found by both tiles, and
-       pieces that share voxels are joined into one seed, so fibres are not
-       cut at tile boundaries.
+       reach. Each tile writes only its own region, where it sees the full
+       margin of context, and pieces touching across a tile boundary are then
+       joined into one seed, so fibres are not cut at tile boundaries.
 
     Config inputs: the intensity percentiles and min_fragment_size. Every
     scale derives from r (see the constants above).
@@ -1285,17 +1285,36 @@ def _elongated_label_candidates(lbl, sl, segmentation_mask, intensity_image,
                         continue  # a neighbouring tile owns this piece
                     for part in _split_at_lines(vox, resp, C, S, sp, r, thresholds,
                                                 params.min_seed_vol):
-                        # Join with whatever a neighbouring tile already wrote
-                        # for the same fibre; claim only voxels still free.
-                        gb = part + np.array([c.start for c in bc])
-                        have = piece_mm[tuple(gb.T)]
-                        nid = uf.new()
-                        for other in np.unique(have[have > 0]):
-                            uf.union(nid, int(other))
-                        free = have == 0
-                        piece_mm[tuple(gb[free].T)] = nid
+                        # Only this tile's own region is written: every voxel
+                        # is decided by the tile that sees at least the full
+                        # margin of context around it. Near its edge a tile
+                        # can accept one piece covering two strands that the
+                        # neighbour, seeing more, keeps apart; joining pieces
+                        # by overlap there welded such strands into one seed.
+                        # Pieces are joined across tile boundaries afterwards,
+                        # where they touch.
+                        own = in_target[tuple(part.T)]
+                        if own.any():
+                            gb = part[own] + np.array([c.start for c in bc])
+                            piece_mm[tuple(gb.T)] = uf.new()
             del obj, resp, C, S, open_, in_target
         piece_mm.flush()
+
+        # Join pieces that touch face to face across a tile boundary: the same
+        # fibre continuing from one tile's region into the next.
+        for ax in range(3):
+            starts = sorted({t[ax].start for t in targets} - {box[ax].start})
+            for b in starts:
+                lo_face = [slice(None)] * 3
+                hi_face = [slice(None)] * 3
+                lo_face[ax] = slice(b - box[ax].start - 1, b - box[ax].start)
+                hi_face[ax] = slice(b - box[ax].start, b - box[ax].start + 1)
+                a_ = np.asarray(piece_mm[tuple(lo_face)]).ravel()
+                b_ = np.asarray(piece_mm[tuple(hi_face)]).ravel()
+                both = (a_ > 0) & (b_ > 0) & (a_ != b_)
+                if both.any():
+                    for x, y in np.unique(np.c_[a_[both], b_[both]], axis=0):
+                        uf.union(int(x), int(y))
 
         # ---- assemble one candidate per joined fibre ------------------------
         coords, best = {}, {}
