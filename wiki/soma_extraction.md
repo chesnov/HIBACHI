@@ -73,6 +73,11 @@ percentiles are doing the work by default.
 *   **elongated** is for spindle- or fibre-shaped cells with no compact body,
     such as oligodendrocyte processes running in a bundle. It gives one seed per
     fibre, running the fibre's full length.
+*   **none** skips soma identification and cell splitting, for analyses that
+    only need the channel's total area or per-object measurements of what
+    artifact removal left. Step 3 writes an empty soma mask and the trimmed
+    segmentation as the final one, so the app moves straight on to feature
+    calculation; step 4 has nothing to do.
 
 Why a separate mode: on fibres, brightness varies as much *along* a fibre as it
 dips *between* touching fibres, so every intensity or distance threshold breaks
@@ -89,11 +94,24 @@ does separate them is direction. Elongated mode, per object:
 4.  peels **upward** through the intensity percentiles: a connected piece that
     is only one fibre wide (at most 4 *r* across the local direction, measured
     in short stretches so curvature does not count as width) is accepted whole;
-    a wider piece is looked at again one level up, inside itself only.
+    a wider piece is looked at again one level up, inside itself only;
+5.  splits an accepted piece that still holds more than one fibre line. Two
+    touching fibres are together no wider than the width limit, so the width
+    test cannot see them, but their number can be counted: across each stretch,
+    two ridge peaks at least 2 *r* apart with a dip between them as deep as one
+    of your percentile steps are two lines. Two fibres fused with no dip show
+    one peak but are twice as wide, so a stretch *k* fibre-widths (2 *r*) wide
+    counts as at least *k* lines. Lines are followed from stretch to
+    stretch, so through a fork the stem continues into its best-aligned arm and
+    only the diverging arm becomes a separate seed (step 4 can re-merge what
+    belongs together; it cannot separate two fibres sharing one seed). A
+    split-off part smaller than **Min Seed Size** rejoins the part it touches
+    most, so a short side strand becomes its own seed only when it reaches that
+    size; a piece still too wide at the top percentile is split rather than
+    dropped.
 
 It reads only **Intensity Percentiles** (as thresholds on the ridge response)
-and **Min Seed Size**; the other parameters on this page are hidden while it is
-selected. The fixed multiples of *r* sit in the middle of ranges where the
+and **Min Seed Size**. The fixed multiples of *r* sit in the middle of ranges where the
 result did not change on the test stack (smoothing flat from 5 *r* to 32 *r*,
 width limit flat from 3 *r* to 6 *r*).
 
@@ -239,7 +257,7 @@ resolves as one core — or leave it, since Step 4 can re-merge a modest over-sp
 
 | Parameter | Type | 3D default | 2D default | Notes |
 | :--- | :--- | :--- | :--- | :--- |
-| **Soma shape** (`soma_shape`) | `compact` / `elongated` | `compact` | `compact` | `elongated` seeds fibre-shaped cells full length; see *Soma shape* above. |
+| **Soma shape** (`soma_shape`) | `compact` / `elongated` / `none` | `compact` | `compact` | `elongated` seeds fibre-shaped cells full length; `none` skips soma identification and cell splitting; see *Soma shape* above. |
 | **Ratios to Process** (`ratios_to_process`) | list of float | `0.3, 0.4, 0.5, 0.6` | `0.3, 0.4, 0.5, 0.6` | DT-peeling thresholds. Lower = larger core. Leave empty to use percentiles only. |
 | **Intensity Percentiles** (`intensity_percentiles_to_process`) | list of int | `99 … 1` (21 values) | `99 … 1` (21 values) | Brightness thresholds. Higher = smaller core. Override ratios where they compete. |
 | **Min Seed Size** (`min_fragment_size`) | int | `2500` **voxels** | `500` **pixels** | Smallest core kept. Labelled "Min Seed Size" (3D) / "Min Fragment Size" (2D). |

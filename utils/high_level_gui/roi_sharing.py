@@ -474,6 +474,29 @@ def roi_record_from_polygons(
     }
 
 
+def z_subsection_record(full_shape: Sequence[int], z_first: int,
+                        z_last: int) -> Dict[str, Any]:
+    """ROI record for planes `z_first`..`z_last` (inclusive) of the whole frame.
+
+    A z-subsection is an ordinary region whose outline is the entire image on
+    its first and last plane, so it goes through the same record, crop and
+    config code as a drawn region and appears among the sample's regions. The
+    outline sits one pixel outside the frame so every pixel centre is inside
+    it and nothing is masked.
+    """
+    full_shape = tuple(int(v) for v in full_shape)
+    if len(full_shape) != 3:
+        raise ValueError("A z-subsection needs a 3D image.")
+    depth, h, w = full_shape
+    if not (0 <= z_first < z_last < depth):
+        raise ValueError(
+            f"Planes must satisfy 0 <= first < last < {depth}; "
+            f"got {z_first} to {z_last}.")
+    frame = [[-1.0, -1.0], [-1.0, float(w)], [float(h), float(w)], [float(h), -1.0]]
+    return roi_record_from_polygons({int(z_first): frame, int(z_last): frame},
+                                    full_shape)
+
+
 # --------------------------------------------------------------------------- #
 # Locating each channel's ROI directory
 # --------------------------------------------------------------------------- #

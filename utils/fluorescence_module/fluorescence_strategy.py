@@ -530,6 +530,49 @@ class FluorescenceStrategy(ProcessingStrategy):
                 del hull_boundary_mask
             gc.collect()
 
+    def _soma_shape(self, params: Optional[Dict] = None) -> str:
+        """Step 3's soma shape, from `params` or else the live config.
+
+        `params.get`, not `_require`: the parameter is neutral_default, so a
+        config from before it existed has no such key and means "compact".
+        """
+        if params is None:
+            block = self.config.get(self.get_config_key("execute_soma_extraction"), {}) or {}
+            pconf = (block.get("parameters", {}) or {}).get("soma_shape")
+            value = pconf.get("value") if isinstance(pconf, dict) else pconf
+        else:
+            value = params.get("soma_shape")
+        return str(value or "compact")
+
+    def skipped_steps(self) -> List[int]:
+        # With soma_shape "none", step 3 writes step 4's artifact itself.
+        if self._soma_shape() != "none":
+            return []
+        methods = [s["method"] for s in self.get_step_definitions()]
+        return [methods.index("execute_cell_separation")]
+
+    def _quantify_whole_objects(self, viewer, trimmed_seg_path: str,
+                                cell_bodies_path: str) -> bool:
+        """soma_shape "none": no somas, no splitting.
+
+        Writes an empty soma mask, and the trimmed segmentation as the final
+        one, so every object from artifact removal is quantified whole. Both
+        artifacts exist afterwards, so resume, batch runs and everything
+        downstream of step 4 treat steps 3 and 4 as done.
+        """
+        final_seg_path = self.get_checkpoint_files()["final_segmentation"]
+        empty = open_artifact_for_writing(cell_bodies_path, np.int32, self.image_shape)
+        empty.flush()
+        del empty
+        copy_artifact(trimmed_seg_path, final_seg_path)
+        print("  Soma shape 'none': no soma identification or cell splitting; "
+              "objects from artifact removal are quantified whole.")
+        if viewer is not None:
+            self._add_layer_safely(
+                viewer, np.memmap(final_seg_path, dtype=np.int32, mode="r",
+                                  shape=self.image_shape), "Final segmentation")
+        return True
+
     def execute_soma_extraction(
         self, viewer, image_stack: Any, params: Dict
     ) -> bool:
@@ -581,6 +624,10 @@ class FluorescenceStrategy(ProcessingStrategy):
                     )
                     self._add_layer_safely(viewer, cb_display, "Cell bodies")
                 return True
+
+            if self._soma_shape(params) == "none":
+                return self._quantify_whole_objects(
+                    viewer, trimmed_seg_path, cell_bodies_path)
 
             cell_bodies = extract_soma_masks(
                 trimmed_labels_memmap, image_stack, self.spacing_checked,
@@ -676,6 +723,13 @@ class FluorescenceStrategy(ProcessingStrategy):
 
         if not os.path.exists(trimmed_seg_path) or not os.path.exists(cell_bodies_path):
             return False
+        if self._soma_shape() == "none":
+            # Nothing to split. Normally step 3 already wrote this; re-running
+            # step 4 on its own must produce the same thing.
+            copy_artifact(trimmed_seg_path, final_seg_path)
+            print("  Soma shape 'none': objects from artifact removal are "
+                  "quantified whole.")
+            return True
 
         trimmed_labels_memmap = None
         cell_bodies_ref = None

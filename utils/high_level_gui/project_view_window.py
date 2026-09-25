@@ -60,6 +60,12 @@ class ProjectViewWindow(QMainWindow):
          "projection or one chosen z \u2014 and delete everything computed from "
          "the stack. Applies to every channel of the checked samples. The "
          "original source files are never touched."),
+        ("z_subsection", "Z Subsection\u2026", "selection",
+         lambda self: self._z_subsection_selected,
+         "Make a region from a range of z-planes of the checked stacks, for "
+         "every channel of each checked sample under one shared name. It "
+         "appears among the sample's regions and is processed like one; the "
+         "full image and its results are kept."),
         ("set_config", "Set New Channel Config\u2026", "selection",
          lambda self: self.set_channel_config,
          "Choose a YAML config template and apply its processing parameters "
@@ -329,6 +335,8 @@ class ProjectViewWindow(QMainWindow):
         # Collapse rewrites a whole image, so a region row is not a valid
         # target: enabled when at least one FULL-IMAGE row is checked.
         self._actions["collapse"].setEnabled(
+            any(not is_roi_leaf(k) for k in checked))
+        self._actions["z_subsection"].setEnabled(
             any(not is_roi_leaf(k) for k in checked))
 
         # Set Config applies per-channel, so it is only valid when the checked
@@ -1729,6 +1737,115 @@ class ProjectViewWindow(QMainWindow):
                                 summary + "\n\n" + "\n".join(errors[:6]))
         else:
             QMessageBox.information(self, "Collapsed to 2D", summary)
+
+    def _z_subsection_selected(self) -> None:
+        """Create a z-plane region on every channel of the checked samples."""
+        if self._content_view is None:
+            return
+        from PyQt5.QtWidgets import (  # type: ignore
+            QDialog, QDialogButtonBox, QFormLayout, QLineEdit, QSpinBox,
+        )
+        from . import roi_sharing as rs
+
+        by_sample: dict = {}
+        for sample, _channel, folder, depth in self._collapse_targets(
+                self._content_view.checked_folders()):
+            by_sample.setdefault(sample, []).append((folder, depth))
+        stacks = {s: ch for s, ch in by_sample.items()
+                  if all(d > 1 for _f, d in ch)}
+        if not stacks:
+            QMessageBox.information(
+                self, "Z Subsection",
+                "None of the checked images is a stack." if by_sample
+                else "Check one or more image rows first.")
+            return
+        depth = min(d for ch in stacks.values() for _f, d in ch)
+
+        # Planes are numbered from 0, as in the viewer's slider and the
+        # Collapse dialog; both ends are included.
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Z Subsection")
+        form = QFormLayout(dlg)
+        first, last = QSpinBox(), QSpinBox()
+        for spin in (first, last):
+            spin.setRange(0, depth - 1)
+            spin.setPrefix("z = ")
+        last.setValue(depth - 1)
+        name = QLineEdit()
+        form.addRow("First plane", first)
+        form.addRow("Last plane", last)
+        form.addRow("Region name", name)
+        edited = {"name": False}
+
+        def _default_name() -> None:
+            if not edited["name"]:
+                name.blockSignals(True)
+                name.setText(f"z {first.value()}-{last.value()}")
+                name.blockSignals(False)
+        name.textEdited.connect(lambda _t: edited.update(name=True))
+        first.valueChanged.connect(lambda _v: _default_name())
+        last.valueChanged.connect(lambda _v: _default_name())
+        _default_name()
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(dlg.accept)
+        buttons.rejected.connect(dlg.reject)
+        form.addRow(buttons)
+        while True:
+            if dlg.exec_() != QDialog.Accepted:
+                return
+            z0, z1, roi_name = first.value(), last.value(), name.text().strip()
+            if z0 < z1 and roi_name:
+                break
+            QMessageBox.warning(
+                self, "Z Subsection",
+                "The last plane must come after the first, and the region "
+                "needs a name.")
+
+        plans, problems = [], []
+        for sample, channels in stacks.items():
+            info = rs.describe_channel(channels[0][0])
+            shape = rs._image_shape(info["tif"]) if info else None
+            if not shape or len(shape) != 3:
+                problems.append(f"{sample}: not a usable stack")
+                continue
+            try:
+                record = rs.z_subsection_record(shape, z0, z1)
+            except ValueError as exc:
+                problems.append(f"{sample}: {exc}")
+                continue
+            plan = rs.plan_roi_propagation(
+                [f for f, _d in channels], shape, roi_name=roi_name)
+            plans.append((sample, plan, record))
+
+        # Replacing an existing region of this name deletes its results.
+        replacing = [(s, p) for s, p, _r in plans
+                     if any(e.get("status") == rs.REPLACE for e in p)]
+        if replacing:
+            detail = "\n\n".join(f"{s}:\n{rs.summarize_plan(p)}"
+                                   for s, p in replacing[:4])
+            if QMessageBox.question(
+                    self, "Z Subsection",
+                    f"A region named \u201c{roi_name}\u201d already exists.\n\n"
+                    f"{detail}\n\nReplace it?",
+                    QMessageBox.Yes | QMessageBox.No,
+                    QMessageBox.No) != QMessageBox.Yes:
+                return
+
+        for sample, plan, record in plans:
+            result = rs.apply_roi_propagation(plan, record)
+            problems.extend(f"{sample}: {e['error']}" for e in result["errors"])
+            problems.extend(
+                f"{sample}/{e.get('channel', '?')}: {e.get('reason', 'skipped')}"
+                for e in result["skipped"])
+
+        try:
+            self._content_view.refresh()
+        except Exception:
+            pass
+        if problems:
+            QMessageBox.warning(self, "Z Subsection",
+                                "Some regions were not created:\n\n"
+                                + "\n".join(problems[:8]))
 
     def _pick_sources(self, pending: list) -> list:
         """Checkbox list of unorganized images. Returns the chosen source keys."""

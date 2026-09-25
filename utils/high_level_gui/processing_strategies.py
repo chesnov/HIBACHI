@@ -717,6 +717,15 @@ class ProcessingStrategy(abc.ABC):
         pass
 
     @abc.abstractmethod
+    def skipped_steps(self) -> List[int]:
+        """0-based indices of steps the current config makes pass-throughs.
+
+        Their artifact is written by an earlier step, so the GUI moves past
+        them instead of stopping to ask for them to be processed. None by
+        default.
+        """
+        return []
+
     def cleanup_step_artifacts(self, viewer: Optional[Any], step_number: int) -> None:
         """
         Cleans up files and viewer layers created by a specific step.

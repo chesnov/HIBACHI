@@ -197,6 +197,7 @@ execute_soma_extraction:
       options:
       - compact
       - elongated
+      - none
       description: >-
         'compact' finds a round core per cell (nuclei, cell bodies) by peeling
         intensity and distance thresholds, keeping the tightest core. Choose
@@ -204,6 +205,9 @@ execute_soma_extraction:
         it seeds each fibre along its full length, following the local fibre
         direction, and reads only Intensity Percentiles and Min Seed Size.
         Every scale it uses is derived from the objects' measured fibre radius.
+        'none' skips soma identification and cell splitting: every object left
+        by artifact removal is quantified whole, which is all a total-area
+        analysis needs.
     ratios_to_process:
       label: Ratios to Process (Peeling; comma-sep floats)
       type: list

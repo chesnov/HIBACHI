@@ -52,6 +52,17 @@ A polygon smaller than `MIN_CROP_PX` (10 px on a side) is rejected.
 
 ---
 
+## A range of z-planes
+
+To keep only some planes of a stack (say z 11 to 45) there is nothing to draw:
+check the images in the project window and choose **Selection → Z
+Subsection…**. Pick the first and last plane (numbered from 0, as in the
+viewer's slider; both are kept) and a name, which defaults to `z 11-45`. Every
+channel of each checked sample gets the region under that one name, exactly as
+a shared drawn region would, and the full image and its results are untouched.
+Underneath it is an ordinary region whose outline is the whole frame on its
+first and last plane, so everything below applies to it.
+
 ## What gets created
 
 A region lives beside the full image's results:

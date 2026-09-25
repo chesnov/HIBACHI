@@ -2851,6 +2851,18 @@ class DynamicGUIManager(QObject):
                     pass
             else:
                 self.current_step["value"] += 1
+                # Pass-through steps (their artifact was just written by this
+                # one) are shown and stepped over rather than waiting to be
+                # processed.
+                skipped = set(self.strategy.skipped_steps())
+                while (self.current_step["value"] < self.num_steps
+                       and self.current_step["value"] in skipped):
+                    try:
+                        self.strategy.load_checkpoint_data(
+                            self.viewer, self.current_step["value"] + 1)
+                    except Exception:
+                        log.exception("Could not show a skipped step's result")
+                    self.current_step["value"] += 1
                 if self.current_step["value"] < self.num_steps:
                     next_step = self.processing_steps[self.current_step["value"]]
                     self.create_step_widgets(next_step)
@@ -3116,8 +3128,8 @@ class DynamicGUIManager(QObject):
     )
 
     def _add_soma_shape_widget(self, layout, config_key: str,
-                               parameters: Dict[str, Any]) -> bool:
-        """The soma-shape dropdown. Returns True when 'elongated' is selected.
+                               parameters: Dict[str, Any]) -> str:
+        """The soma-shape dropdown. Returns the selected shape.
 
         Built like the soma-source dropdown: the definition may exist only in
         the reference (a project set up before the parameter existed), in
@@ -3149,7 +3161,7 @@ class DynamicGUIManager(QObject):
             self._rebuild_step_widgets_later()
 
         box.currentIndexChanged.connect(_changed)
-        return current == "elongated"
+        return current
 
     def _rebuild_step_widgets_later(self) -> None:
         """Rebuild the parameter panel on the next event-loop turn.
@@ -3247,10 +3259,10 @@ class DynamicGUIManager(QObject):
             seeded_externally = self._add_soma_source_widget(
                 scroll_l, config_key, parameters)
         # Soma shape only matters when this channel finds its own somas.
-        elongated = False
+        soma_shape = "compact"
         if (not seeded_externally
                 and self._param_defined(config_key, "soma_shape", parameters)):
-            elongated = self._add_soma_shape_widget(
+            soma_shape = self._add_soma_shape_widget(
                 scroll_l, config_key, parameters)
 
         if isinstance(parameters, dict):
@@ -3275,7 +3287,9 @@ class DynamicGUIManager(QObject):
                 # control that cannot affect the result invites tuning it.
                 if seeded_externally:
                     continue
-                if elongated and pname in self._ELONGATED_HIDDEN:
+                if soma_shape == "none":
+                    continue  # no parameter of this step applies
+                if soma_shape == "elongated" and pname in self._ELONGATED_HIDDEN:
                     continue
                 # Mutually exclusive parameter filtering
                 if pname in["scale_profiles", "scale_profiles_percentile"] and is_absolute:
