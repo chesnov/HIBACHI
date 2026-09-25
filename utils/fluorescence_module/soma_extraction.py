@@ -971,6 +971,40 @@ def _paths_from_skeleton(pts, half_w, bshape, spacing, r, obj_lookup):
     # spacing (2 r); more than that is a step onto a neighbouring fibre. Each
     # branch is used once, so paths are chains; longest-first lets clear
     # fibres claim their continuations before short fragments can.
+    # Inside a contact the skeleton is bent towards the junction, which sits
+    # between the fibres rather than on either one's centre line. So near a
+    # junction a path's own voxels are dropped -- those within the contact's
+    # size, twice the mask's half-width there -- and the two sides are joined
+    # by a straight segment: on either side of a contact a fibre is locally
+    # straight, so that follows its real course instead of a jog towards the
+    # contact point. The same trim applies where a path ends at a junction.
+    zone_pts, zone_w = {}, {}
+    for i in np.nonzero(node_of >= 0)[0]:
+        zn = zone.find(int(node_of[i]))
+        zone_pts.setdefault(zn, []).append(xyz_all[i])
+        zone_w[zn] = max(zone_w.get(zn, 0.0), float(half_w[i]))
+    for k in bridge:
+        zn = zone.find(edges[k][0])
+        for i in edges[k][2]:
+            zone_pts.setdefault(zn, []).append(xyz_all[i])
+            zone_w[zn] = max(zone_w.get(zn, 0.0), float(half_w[i]))
+    zone_pts = {zn: np.array(v) for zn, v in zone_pts.items()}
+
+    def trim_tail(path_vox, zn):
+        """Drop the path's last voxels that lie inside contact `zn`."""
+        if zn < 0 or zn not in zone_pts:
+            return path_vox
+        reach = 2.0 * zone_w[zn]
+        zp = zone_pts[zn]
+        keep = len(path_vox)
+        floor = max(2, len(path_vox) // 2)       # never trim more than half
+        while keep > floor:
+            d = np.min(np.linalg.norm(zp - path_vox[keep - 1] * sp, axis=1))
+            if d >= reach:
+                break
+            keep -= 1
+        return path_vox[:keep]
+
     incident = {}                       # zone -> [(lane, end index 0 | -1)]
     for li, (za, zb, v) in enumerate(lanes):
         if za >= 0:
@@ -1015,12 +1049,14 @@ def _paths_from_skeleton(pts, half_w, bshape, spacing, r, obj_lookup):
                 if best is None or cost < best[0]:
                     best = (cost, li, v, e)
             if best is None:
-                return path_vox
+                return trim_tail(path_vox, zone_id)
             _c, li, v, e = best
             used[li] = True
-            link = _line_voxels(path_vox[-1], v[0])
+            tail = trim_tail(path_vox, zone_id)
+            lead = trim_tail(v[::-1], zone_id)[::-1]
+            link = _line_voxels(tail[-1], lead[0])
             link = link[obj_lookup(link)]
-            path_vox = np.concatenate([path_vox, link, v])
+            path_vox = np.concatenate([tail, link, lead])
             za, zb = lanes[li][0], lanes[li][1]
             zone_id = zb if e == 0 else za
         return path_vox
@@ -1164,8 +1200,15 @@ def _elongated_label_candidates(lbl, sl, segmentation_mask, intensity_image,
         return [], diag
     diag["cores_evaluated"] = len(paths)
 
-    # ---- pass 3: each path widened into a tube of radius r, per tile --------
-    th = [int(np.ceil(r / s)) + 2 for s in sp]
+    # ---- pass 3: each path widened to the mask's own width, per tile ---------
+    # Around each path voxel the seed takes the mask's in-plane half-width at
+    # that voxel as its radius, so it has the mask's cross-section along the
+    # fibre -- a fixed radius made seeds narrower than wide fibres and notched
+    # where neighbouring tubes met. The nearest path still wins, so seeds never
+    # overlap. The halo covers the widest half-width twice -- once to reach the
+    # nearest path voxel, once more for that voxel's own width to be measured
+    # with the background around it in view -- so each tile is exact.
+    th = [int(np.ceil((2.0 * max(r, dt_max) + float(sp.max())) / s)) + 2 for s in sp]
     if not is_stack:
         th[0] = 0
     in_box = lambda t: tuple(slice(a.start - b.start, a.stop - b.start) for a, b in zip(t, box))
@@ -1193,12 +1236,17 @@ def _elongated_label_candidates(lbl, sl, segmentation_mask, intensity_image,
                     continue
                 lab_img = np.zeros(obj.shape, np.int32)
                 lab_img[tuple((path_vox[sel] - c0).T)] = path_lab[sel]
+                w_img = np.zeros(obj.shape, np.float32)
+                for z in range(obj.shape[0]):
+                    if obj[z].any():
+                        w_img[z] = ndimage.distance_transform_edt(obj[z], sampling=sp[1:])
                 dist, idx = ndimage.distance_transform_edt(lab_img == 0, sampling=sp,
                                                            return_indices=True)
-                seedt = np.where(obj & (dist <= r), lab_img[tuple(idx)], 0)[loc]
+                reach = w_img[tuple(idx)] + float(sp.max())
+                seedt = np.where(obj & (dist <= reach), lab_img[tuple(idx)], 0)[loc]
                 piece_mm[in_box(tg)] = seedt
                 counts += np.bincount(seedt.ravel(), minlength=counts.size)[:counts.size]
-                del lab_img, dist, idx, obj
+                del lab_img, w_img, dist, idx, reach, obj
             return counts
 
         # A path too short to make a seed must not take tube voxels from its
