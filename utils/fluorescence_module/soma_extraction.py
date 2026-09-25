@@ -1078,6 +1078,153 @@ def _local(inner, outer):
                  for i, o in zip(inner, outer))
 
 
+def _touching_pairs(seeds, bshape):
+    """{(a, b): contact voxel coords of a} for seeds touching face to face."""
+    lin = np.concatenate([np.ravel_multi_index(s_.T, bshape) for s_ in seeds])
+    sid = np.concatenate([np.full(len(s_), i) for i, s_ in enumerate(seeds)])
+    order = np.argsort(lin)
+    lin, sid = lin[order], sid[order]
+    coords = np.array(np.unravel_index(lin, bshape)).T
+    out = {}
+    for ax in range(3):
+        stride = int(np.prod(bshape[ax + 1:]))
+        ok = coords[:, ax] + 1 < bshape[ax]
+        nb = lin[ok] + stride
+        pos = np.searchsorted(lin, nb)
+        pos = np.minimum(pos, lin.size - 1)
+        hit = lin[pos] == nb
+        a_ = sid[ok][hit]
+        b_ = sid[pos[hit]]
+        diff = a_ != b_
+        for (x, y), c in zip(zip(a_[diff], b_[diff]), coords[ok][hit][diff]):
+            key = (int(min(x, y)), int(max(x, y)))
+            out.setdefault(key, []).append(c)
+    return {k: np.array(v) for k, v in out.items()}
+
+
+def _arms(vox, centre, sp, r):
+    """Arms of a seed leaving a junction: its voxels in the ring 3 r .. 10 r
+    around `centre`, split into connected groups. Returns a list of (ring
+    voxel coords, unit direction from the centre), small specks ignored."""
+    ph = vox * sp
+    dist = np.linalg.norm(ph - centre, axis=1)
+    ring = vox[(dist >= 3 * r) & (dist <= _ALONG_SMOOTH_R * r)]
+    if not len(ring):
+        return []
+    lo = ring.min(0)
+    grid = np.zeros(tuple(ring.max(0) - lo + 1), bool)
+    grid[tuple((ring - lo).T)] = True
+    lab, n = ndimage.label(grid, structure=np.ones((3, 3, 3)))
+    speck = np.pi * r ** 3 / float(np.prod(sp))      # a fibre cross-section, r long
+    arms = []
+    for k in range(1, n + 1):
+        vk = np.argwhere(lab == k) + lo
+        if len(vk) < speck:
+            continue
+        v = (vk * sp).mean(0) - centre
+        arms.append((vk, v / (np.linalg.norm(v) + 1e-9)))
+    return arms
+
+
+def _reassign_at_junctions(seeds, bshape, spacing, r, resp):
+    """Give a junction's continuation to the strand it continues straightest.
+
+    Where one seed passes through a junction (two arms) and a touching seed
+    ends there (one arm), three arms meet, and the pair pointing most nearly
+    opposite each other is the one fibre going straight through. If that pair
+    includes the ending seed's arm, the continuation is its own: the passing
+    seed is cut at the junction and its far side handed over, and the
+    junction core is divided along the bright ridge (watershed on `resp`) so
+    both stay connected. Tile pieces cannot decide this -- a tile often sees
+    only the strand that bends into the junction -- so it is decided once all
+    seeds are known. Pairs where both seeds pass through (side by side, or a
+    crossing) or both end are left alone. Scales: 3 r to 10 r around the
+    contact, as elsewhere multiples of the fibre radius.
+    """
+    from skimage.segmentation import watershed
+    sp = np.asarray(spacing, float)
+    seeds = [np.asarray(s_) for s_ in seeds]
+    if len(seeds) < 2:
+        return seeds
+    # A junction is where one seed ENDS beside another, so candidates are the
+    # seeds' end tips, not the middle of their contact -- seeds side by side
+    # touch along a whole stretch before they reach a junction.
+    touching = _touching_pairs(seeds, bshape)
+    neighbours = {}
+    for a, b in touching:
+        neighbours.setdefault(a, set()).add(b)
+        neighbours.setdefault(b, set()).add(a)
+
+    def tips(vox):
+        ph = vox * sp
+        yx = ph[:, 1:]
+        mu = yx.mean(0)
+        _w, e = np.linalg.eigh(np.cov((yx - mu).T)) if len(yx) > 2 else (None, np.eye(2))
+        al = (yx - mu) @ e[:, -1]
+        out = []
+        for sel in (al <= al.min() + 2 * r, al >= al.max() - 2 * r):
+            out.append(ph[sel].mean(0))
+        return out
+
+    changed = set()
+    candidates = []
+    for end in sorted(neighbours):
+        if len(seeds[end]) < 10:
+            continue
+        for t in tips(seeds[end]):
+            for pas in sorted(neighbours[end]):
+                if np.min(np.linalg.norm(seeds[pas] * sp - t, axis=1)) <= 3 * r:
+                    candidates.append((end, pas, t))
+    for end, pas, centre in candidates:
+        if end in changed or pas in changed:
+            continue
+        arms_e = _arms(seeds[end], centre, sp, r)
+        arms_p = _arms(seeds[pas], centre, sp, r)
+        if len(arms_e) != 1 or len(arms_p) != 2:
+            continue
+        arm_e = arms_e[0]
+        straight_own = float(arms_p[0][1] @ arms_p[1][1])
+        with_end = [float(arm_e[1] @ arms_p[k][1]) for k in (0, 1)]
+        k = int(np.argmin(with_end))
+        if with_end[k] >= straight_own:
+            continue                    # the passing seed already goes straightest
+        # Cut the passing seed at the junction core; the side holding arm k
+        # goes to the ending seed.
+        pv = seeds[pas]
+        core = np.linalg.norm(pv * sp - centre, axis=1) < 3 * r
+        rest = pv[~core]
+        if not len(rest):
+            continue
+        lo = pv.min(0)
+        grid = np.zeros(tuple(pv.max(0) - lo + 1), bool)
+        grid[tuple((rest - lo).T)] = True
+        lab, _n = ndimage.label(grid, structure=np.ones((3, 3, 3)))
+        side_k = lab[tuple((arms_p[k][0][0] - lo))]
+        side_o = lab[tuple((arms_p[1 - k][0][0] - lo))]
+        if side_k == 0 or side_o == 0 or side_k == side_o:
+            continue                    # still joined around: no clean cut
+        moved = np.argwhere(lab == side_k) + lo
+        kept = np.argwhere(lab == side_o) + lo
+        other = np.argwhere((lab > 0) & (lab != side_k) & (lab != side_o)) + lo
+        # Junction core (and any stray remainder) divided along the ridge.
+        region = np.vstack([pv[core], other]) if len(other) else pv[core]
+        allv = np.vstack([seeds[end], moved, kept, region])
+        lo2 = allv.min(0)
+        shape2 = tuple(allv.max(0) - lo2 + 1)
+        markers = np.zeros(shape2, np.int32)
+        markers[tuple((kept - lo2).T)] = 1
+        markers[tuple((np.vstack([seeds[end], moved]) - lo2).T)] = 2
+        mask = markers > 0
+        mask[tuple((region - lo2).T)] = True
+        box2 = tuple(slice(int(q0), int(q0 + n_)) for q0, n_ in zip(lo2, shape2))
+        ws = watershed(-np.asarray(resp[box2], np.float32), markers, mask=mask)
+        reg_lab = ws[tuple((region - lo2).T)]
+        seeds[pas] = np.vstack([kept, region[reg_lab == 1]])
+        seeds[end] = np.vstack([seeds[end], moved, region[reg_lab != 1]])
+        changed.update((pas, end))
+    return seeds
+
+
 def _resolve_tile_pieces(pieces, bshape, spacing, r, min_size, resp):
     """Reconcile pieces found by overlapping tiles into one seed per fibre.
 
@@ -1553,8 +1700,9 @@ def _elongated_label_candidates(lbl, sl, segmentation_mask, intensity_image,
                         d_ = np.c_[C[tuple(part.T)], S[tuple(part.T)]].mean(0)
                         found.append((part + np.array([c.start for c in bc]), t_index, d_))
             del obj, resp, C, S, open_, in_target
-        for k, vox_k in enumerate(_resolve_tile_pieces(
-                found, bshape, sp, r, params.min_seed_vol, resp_mm), 1):
+        resolved = _resolve_tile_pieces(found, bshape, sp, r, params.min_seed_vol, resp_mm)
+        resolved = _reassign_at_junctions(resolved, bshape, sp, r, resp_mm)
+        for k, vox_k in enumerate(resolved, 1):
             piece_mm[tuple(vox_k.T)] = k
             uf.new()
         del found
