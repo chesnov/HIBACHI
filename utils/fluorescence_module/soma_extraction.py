@@ -1078,6 +1078,153 @@ def _local(inner, outer):
                  for i, o in zip(inner, outer))
 
 
+def _resolve_tile_pieces(pieces, bshape, spacing, r, min_size):
+    """Reconcile pieces found by overlapping tiles into one seed per fibre.
+
+    Each tile finds pieces in its own region plus a margin, so neighbouring
+    tiles both find the fibres crossing their shared boundary. `pieces` is a
+    list of (coords, tile index, direction), coords relative to the object's
+    box. Every pair of pieces from different tiles that overlaps is compared
+    along the local fibre direction:
+
+    * the same line -- neither extends a fibre diameter (2 r) sideways beyond
+      the other where they overlap: joined, the same fibre continuing;
+    * one covers an extra line the other tile resolved separately -- a tile
+      near its edge sees only part of the picture and can accept one piece
+      across two strands: the coarser piece is dissolved. Each of its voxels
+      goes to the nearest of the finer tile's lines, so those strands continue
+      along its whole length; what lies 2 r or more from all of them becomes a
+      strand of its own if it reaches `min_size`, else joins the nearest.
+
+    The finer division wins because a merge is the error the next step cannot
+    undo, while an extra split it can re-merge. Independent of the order the
+    tiles were processed in, and no voxel is dropped. Returns a list of voxel
+    arrays (box-relative), one per resolved seed.
+    """
+    sp = np.asarray(spacing, float)
+    coords = [np.asarray(c, np.int64) for c, _t, _d in pieces]
+    tiles = [t for _c, t, _d in pieces]
+    dirs = [np.asarray(d, float) for _c, _t, d in pieces]
+    n = len(coords)
+    if n == 0:
+        return []
+
+    # Overlapping pairs, from voxels found by more than one piece.
+    lin = np.concatenate([np.ravel_multi_index(c.T, bshape) for c in coords])
+    pid = np.concatenate([np.full(len(c), i) for i, c in enumerate(coords)])
+    order = np.argsort(lin, kind="stable")
+    lin, pid = lin[order], pid[order]
+    dup = np.nonzero(lin[1:] == lin[:-1])[0]
+    pairs = set()
+    for k in dup:
+        a, b = int(pid[k]), int(pid[k + 1])
+        if a != b and tiles[a] != tiles[b]:
+            pairs.add((min(a, b), max(a, b)))
+    if not pairs:
+        return coords
+
+    def frame(i):
+        d = dirs[i] / (np.linalg.norm(dirs[i]) + 1e-9)
+        return d, np.array([-d[1], d[0]])
+
+    def lateral(i, d, perp):
+        yx = coords[i][:, 1:] * sp[1:]
+        return yx @ d, yx @ perp
+
+    parent = list(range(n))
+
+    def find(a):
+        while parent[a] != a:
+            parent[a] = parent[parent[a]]
+            a = parent[a]
+        return a
+
+    def union(a, b):
+        a, b = find(a), find(b)
+        if a != b:
+            parent[max(a, b)] = min(a, b)
+
+    finer_of = {}                       # coarse piece -> finer pieces it spans
+    for a, b in sorted(pairs):
+        d, perp = frame(a)
+        al_a, la_a = lateral(a, d, perp)
+        al_b, la_b = lateral(b, d, perp)
+        both = np.intersect1d(np.ravel_multi_index(coords[a].T, bshape),
+                              np.ravel_multi_index(coords[b].T, bshape))
+        ov = np.array(np.unravel_index(both, bshape)).T
+        al_o = (ov[:, 1:] * sp[1:]) @ d
+        lo, hi = al_o.min() - _ALONG_SMOOTH_R * r, al_o.max() + _ALONG_SMOOTH_R * r
+        sa = (al_a >= lo) & (al_a <= hi)
+        sb = (al_b >= lo) & (al_b <= hi)
+        ma, mb = float(np.median(la_a[sa])), float(np.median(la_b[sb]))
+        a_extends = float(np.percentile(np.abs(la_a[sa] - mb), 95)) >= 2 * r
+        b_extends = float(np.percentile(np.abs(la_b[sb] - ma), 95)) >= 2 * r
+        if not a_extends and not b_extends:
+            union(a, b)
+        elif a_extends and not b_extends:
+            finer_of.setdefault(a, []).append(b)
+        elif b_extends and not a_extends:
+            finer_of.setdefault(b, []).append(a)
+        # both extend: two different lines crossing -- neither joined.
+
+    # Dissolve coarse pieces onto the finer lines they span.
+    extra = []
+    dissolved = set()
+    for p_, fine in finer_of.items():
+        d, perp = frame(p_)
+        al_p, la_p = lateral(p_, d, perp)
+        lines, owners = [], []
+        for f in fine:
+            al_f, la_f = lateral(f, d, perp)
+            m = (al_f >= al_p.min() - _ALONG_SMOOTH_R * r) & (al_f <= al_p.max() + _ALONG_SMOOTH_R * r)
+            pos = float(np.median(la_f[m] if m.any() else la_f))
+            close = [k for k, q in enumerate(lines) if abs(q - pos) < r]
+            if close:                   # the same line found twice: one fibre
+                union(owners[close[0]], f)
+            else:
+                lines.append(pos)
+                owners.append(f)
+        rest = np.min(np.abs(la_p[:, None] - np.array(lines)[None, :]), axis=1) >= 2 * r
+        new_owner = None
+        if rest.sum() >= min_size:
+            lines.append(float(np.median(la_p[rest])))
+            new_owner = len(coords) + len(extra)
+            extra.append([])
+            owners.append(new_owner)
+        nearest = np.argmin(np.abs(la_p[:, None] - np.array(lines)[None, :]), axis=1)
+        for k, own in enumerate(owners):
+            vox = coords[p_][nearest == k]
+            if not len(vox):
+                continue
+            if own == new_owner:
+                extra[own - len(coords)] = vox
+            else:
+                coords[own] = np.concatenate([coords[own], vox])
+        dissolved.add(p_)
+
+    groups = {}
+    for i in range(n):
+        if i not in dissolved:
+            groups.setdefault(find(i), []).append(coords[i])
+    seeds = [np.unique(np.concatenate(g), axis=0) for g in groups.values()]
+    seeds += [np.asarray(e) for e in extra if len(e)]
+
+    # A voxel still claimed by two seeds -- only where two different lines
+    # cross -- stays with the first; seeds must not overlap.
+    lin_all = np.concatenate([np.ravel_multi_index(s_.T, bshape) for s_ in seeds])
+    sid = np.concatenate([np.full(len(s_), i) for i, s_ in enumerate(seeds)])
+    order = np.argsort(lin_all, kind="stable")
+    lin_s, sid_s = lin_all[order], sid[order]
+    keep = np.ones(lin_s.size, bool)
+    dup = np.nonzero(lin_s[1:] == lin_s[:-1])[0]
+    keep[dup + 1] = False
+    final = [[] for _ in seeds]
+    vox_all = np.array(np.unravel_index(lin_s[keep], bshape)).T
+    for i in range(len(seeds)):
+        final[i] = vox_all[sid_s[keep] == i]
+    return [f for f in final if len(f)]
+
+
 class _Union:
     def __init__(self):
         self.p = [0]
@@ -1124,9 +1271,11 @@ def _elongated_label_candidates(lbl, sl, segmentation_mask, intensity_image,
     3. The percentile thresholds over the whole object, exactly
        (`_exact_percentiles`).
     4. Peeling, per tile plus an overlap margin of one along-fibre smoothing
-       reach. Each tile writes only its own region, where it sees the full
-       margin of context, and pieces touching across a tile boundary are then
-       joined into one seed, so fibres are not cut at tile boundaries.
+       reach. A fibre crossing a tile boundary is found by both tiles; the
+       pieces are reconciled afterwards by `_resolve_tile_pieces`, which joins
+       pieces on the same line and dissolves a piece that spans strands a
+       neighbouring tile resolved, so fibres are neither cut at tile
+       boundaries nor welded together there.
 
     Config inputs: the intensity percentiles and min_fragment_size. Every
     scale derives from r (see the constants above).
@@ -1251,7 +1400,8 @@ def _elongated_label_candidates(lbl, sl, segmentation_mask, intensity_image,
         uf = _Union()
         pad = (int(np.ceil(3 * sL_px * sp[-1] / sp[0])) + 1 if is_stack else 0,
                int(np.ceil(3 * sL_px)) + 2, int(np.ceil(3 * sL_px)) + 2)
-        for tg in targets:
+        found = []
+        for t_index, tg in enumerate(targets):
             crop = _grow(tg, pad, box)
             loc = _local(tg, crop)
             obj = np.asarray(seg[crop]) == lbl
@@ -1285,36 +1435,18 @@ def _elongated_label_candidates(lbl, sl, segmentation_mask, intensity_image,
                         continue  # a neighbouring tile owns this piece
                     for part in _split_at_lines(vox, resp, C, S, sp, r, thresholds,
                                                 params.min_seed_vol):
-                        # Only this tile's own region is written: every voxel
-                        # is decided by the tile that sees at least the full
-                        # margin of context around it. Near its edge a tile
-                        # can accept one piece covering two strands that the
-                        # neighbour, seeing more, keeps apart; joining pieces
-                        # by overlap there welded such strands into one seed.
-                        # Pieces are joined across tile boundaries afterwards,
-                        # where they touch.
-                        own = in_target[tuple(part.T)]
-                        if own.any():
-                            gb = part[own] + np.array([c.start for c in bc])
-                            piece_mm[tuple(gb.T)] = uf.new()
+                        # Collected as found, margin included; reconciled
+                        # across tiles once every tile is done
+                        # (`_resolve_tile_pieces`).
+                        d_ = np.c_[C[tuple(part.T)], S[tuple(part.T)]].mean(0)
+                        found.append((part + np.array([c.start for c in bc]), t_index, d_))
             del obj, resp, C, S, open_, in_target
+        for k, vox_k in enumerate(_resolve_tile_pieces(
+                found, bshape, sp, r, params.min_seed_vol), 1):
+            piece_mm[tuple(vox_k.T)] = k
+            uf.new()
+        del found
         piece_mm.flush()
-
-        # Join pieces that touch face to face across a tile boundary: the same
-        # fibre continuing from one tile's region into the next.
-        for ax in range(3):
-            starts = sorted({t[ax].start for t in targets} - {box[ax].start})
-            for b in starts:
-                lo_face = [slice(None)] * 3
-                hi_face = [slice(None)] * 3
-                lo_face[ax] = slice(b - box[ax].start - 1, b - box[ax].start)
-                hi_face[ax] = slice(b - box[ax].start, b - box[ax].start + 1)
-                a_ = np.asarray(piece_mm[tuple(lo_face)]).ravel()
-                b_ = np.asarray(piece_mm[tuple(hi_face)]).ravel()
-                both = (a_ > 0) & (b_ > 0) & (a_ != b_)
-                if both.any():
-                    for x, y in np.unique(np.c_[a_[both], b_[both]], axis=0):
-                        uf.union(int(x), int(y))
 
         # ---- assemble one candidate per joined fibre ------------------------
         coords, best = {}, {}
