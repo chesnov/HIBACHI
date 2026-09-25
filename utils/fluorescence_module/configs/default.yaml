@@ -202,9 +202,10 @@ execute_soma_extraction:
         'compact' finds a round core per cell (nuclei, cell bodies) by peeling
         intensity and distance thresholds, keeping the tightest core. Choose
         'elongated' for spindle- or fibre-shaped cells with no compact body:
-        it seeds each fibre along its full length, following the local fibre
-        direction, and reads only Intensity Percentiles and Min Seed Size.
-        Every scale it uses is derived from the objects' measured fibre radius.
+        it traces each fibre through the mask's skeleton and seeds it along
+        its full length, never letting a seed branch onto a neighbour, and
+        reads only Min Seed Size. Every scale it uses is derived from the
+        objects' measured fibre radius.
         'none' skips soma identification and cell splitting: every object left
         by artifact removal is quantified whole, which is all a total-area
         analysis needs.

@@ -705,354 +705,14 @@ def _generate_label_candidates(
 #: had before the setting existed, and stays the default.
 SOMA_SHAPES = ("compact", "elongated")
 
-# Every scale below is a multiple of the object's measured fibre radius r, so
-# none of them is a parameter. The multiples sit in the middle of ranges over
-# which the result did not change on the spindle test stack:
-#   along-fibre smoothing  10 r   (flat from 5 r to 32 r)
-#   single-fibre width      4 r   (flat from 3 r to 6 r; 8 r starts accepting
-#                                  two fibres side by side). This decides only
-#                                  which level a piece is accepted at; a fused
-#                                  pair (about 4 r) is split afterwards by
-#                                  `_split_at_lines`, which counts 2 r widths.
-#                                  Tightening it to 3 r instead sent such pairs
-#                                  up a level, where the dimmer fibre fell below
-#                                  threshold and was lost.
-#   direction averaging     2 r   (stabilises the local direction estimate)
-_ALONG_SMOOTH_R = 10.0
-_WIDTH_LIMIT_R = 4.0
-_DIRECTION_AVG_R = 2.0
-
-
-# ---- exact percentiles with bounded memory -------------------------------- #
-def _sortable_keys(v: np.ndarray) -> np.ndarray:
-    """float32 values as uint32 keys that sort in the same order (IEEE-754:
-    flip the sign bit of non-negatives, every bit of negatives)."""
-    u = np.ascontiguousarray(v, dtype=np.float32).view(np.uint32)
-    neg = (u >> 31).astype(bool)
-    return np.where(neg, ~u, u | np.uint32(0x80000000))
-
-
-def _key_to_float(k: int) -> np.float32:
-    k = np.uint32(k)
-    u = (k ^ np.uint32(0x80000000)) if (k >> np.uint32(31)) else ~k
-    return np.array([u], dtype=np.uint32).view(np.float32)[0]
-
-
-def _exact_percentiles(chunks, percentiles):
-    """`np.percentile(all_values, p)` (method 'linear') for each p, where
-    `chunks()` yields the values piecewise, holding at most one chunk and two
-    65,536-bin histograms. Order statistics are found exactly by selecting on
-    the sortable integer form of the floats, 16 bits per pass; the
-    interpolation is numpy's own, so the result is bit-identical."""
-    import numpy.lib._function_base_impl as _fb
-    n = 0
-    hi = np.zeros(65536, np.int64)
-    for v in chunks():
-        if v.size:
-            n += v.size
-            hi += np.bincount(_sortable_keys(v) >> np.uint32(16), minlength=65536)
-    if n == 0:
-        return [np.float32(0)] * len(percentiles)
-    method = _fb._QuantileMethods["linear"]
-    plan = []
-    for p in percentiles:
-        vi = float(np.asanyarray(method["get_virtual_index"](n, np.float64(p) / 100.0)))
-        lo_i = min(max(int(np.floor(vi)), 0), n - 1)
-        hi_i = min(lo_i + 1, n - 1) if vi < n - 1 else n - 1
-        if vi >= n - 1:
-            lo_i = n - 1
-        gamma = float(method["fix_gamma"](np.asanyarray(vi - np.floor(vi)), np.asanyarray(vi)))
-        plan.append((lo_i, hi_i, gamma))
-    ranks = sorted({r for lo_i, hi_i, _ in plan for r in (lo_i, hi_i)})
-    cum = np.cumsum(hi)
-    prefix = {r: int(np.searchsorted(cum, r, side="right")) for r in ranks}
-    below = {r: int(cum[prefix[r]] - hi[prefix[r]]) for r in ranks}
-    lows = {pf: np.zeros(65536, np.int64) for pf in set(prefix.values())}
-    for v in chunks():
-        if not v.size:
-            continue
-        k = _sortable_keys(v); top = k >> np.uint32(16)
-        for pf, h in lows.items():
-            sel = k[top == pf]
-            if sel.size:
-                h += np.bincount(sel & np.uint32(0xFFFF), minlength=65536)
-    value = {}
-    for r in ranks:
-        pf = prefix[r]; c = np.cumsum(lows[pf])
-        low = int(np.searchsorted(c, r - below[r], side="right"))
-        value[r] = _key_to_float((pf << 16) | low)
-    out = []
-    for lo_i, hi_i, gamma in plan:
-        out.append(np.float32(_fb._lerp(value[lo_i], value[hi_i], gamma)))
-    return out
-
-
-# ---- the three per-tile operators ------------------------------------------ #
-def _ridge_and_direction(img, planes, spacing, r, is_stack):
-    """Bright-ridge strength and the along-fibre direction, plane by plane.
-
-    2D Hessian at sigma = r, per plane, as step 1's tubularity filter works.
-    Strength is minus the most negative eigenvalue (the curvature ACROSS a
-    bright line), clipped at 0 and scale-normalised. The direction along the
-    fibre is the eigenvector of the other eigenvalue:
-    arctan2(2*Hrc, Hrr - Hcc) / 2 is the angle of the eigenvector of the
-    LARGER eigenvalue, which on a bright ridge points along it. It is averaged
-    over 2 r in the doubled-angle representation, weighted by strength, so it
-    is stable and has no 180-degree ambiguity. Returns R and the unit vector
-    (C, S) in (row, col) order.
-    """
-    from skimage.feature import hessian_matrix
-    s_px = max(0.5, r / float(spacing[-1]))
-    R = np.zeros(img.shape, np.float32)
-    C = np.zeros(img.shape, np.float32)
-    S = np.zeros(img.shape, np.float32)
-    for z in planes:
-        Hrr, Hrc, Hcc = hessian_matrix(np.asarray(img[z], np.float32), sigma=s_px,
-                                       order="rc", use_gaussian_derivatives=True)
-        tr = Hrr + Hcc
-        disc = np.sqrt(((Hrr - Hcc) / 2.0) ** 2 + Hrc ** 2)
-        R[z] = np.maximum(0.0, -(tr / 2.0 - disc)) * s_px ** 2
-        th = 0.5 * np.arctan2(2.0 * Hrc, Hrr - Hcc)
-        c2 = ndimage.gaussian_filter(np.cos(2 * th) * R[z], _DIRECTION_AVG_R * s_px)
-        s2 = ndimage.gaussian_filter(np.sin(2 * th) * R[z], _DIRECTION_AVG_R * s_px)
-        a = 0.5 * np.arctan2(s2, c2)
-        C[z], S[z] = np.cos(a), np.sin(a)
-    if is_stack:  # smooth across planes at the same physical scale
-        R = ndimage.gaussian_filter1d(R, r / float(spacing[0]), axis=0)
-    return R, C, S
-
-
-def _along_fibre_smooth(R, C, S, where, spacing, sigma_um):
-    """Gaussian average of R along each voxel's own fibre direction, for the
-    voxels in `where`: a straight line of +-3 sigma, linear interpolation."""
-    zz, yy, xx = np.nonzero(where)
-    s_px = sigma_um / float(spacing[-1])
-    ts = np.arange(-3 * s_px, 3 * s_px + 1, max(1.0, s_px / 4))
-    w = np.exp(-0.5 * (ts / s_px) ** 2)
-    w /= w.sum()
-    dy = C[zz, yy, xx].astype(np.float64)
-    dx = S[zz, yy, xx].astype(np.float64)
-    ny, nx = R.shape[1], R.shape[2]
-    acc = np.zeros(zz.size, np.float32)
-    for t, wt in zip(ts, w):
-        # Bilinear sample within the voxel's own plane. The whole and
-        # fractional parts of the offset come from t*d alone, never from the
-        # absolute position, so a voxel gets bit-identical values whichever
-        # tile crop it is computed in. Edges clamp, as mode="nearest".
-        oy, ox = t * dy, t * dx
-        fy, fx = np.floor(oy), np.floor(ox)
-        wy, wx = oy - fy, ox - fx
-        y0 = np.clip(yy + fy.astype(np.int64), 0, ny - 1)
-        y1 = np.clip(yy + fy.astype(np.int64) + 1, 0, ny - 1)
-        x0 = np.clip(xx + fx.astype(np.int64), 0, nx - 1)
-        x1 = np.clip(xx + fx.astype(np.int64) + 1, 0, nx - 1)
-        v = ((1 - wy) * ((1 - wx) * R[zz, y0, x0] + wx * R[zz, y0, x1])
-             + wy * ((1 - wx) * R[zz, y1, x0] + wx * R[zz, y1, x1]))
-        acc += np.float32(wt) * v.astype(np.float32)
-    out = np.zeros(R.shape, np.float32)
-    out[zz, yy, xx] = acc
-    return out
-
-
-def _piece_width(vox, spacing, C, S, seg_um):
-    """Widest in-plane spread across the local fibre direction (5-95 pct).
-
-    Measured in stretches of length seg_um along the piece, each against the
-    direction of its own voxels, so a curved fibre is not mistaken for a wide
-    one."""
-    yx = vox[:, 1:] * spacing[1:]
-    d = np.c_[C[tuple(vox.T)], S[tuple(vox.T)]].mean(0)
-    d /= np.linalg.norm(d) + 1e-9
-    along = yx @ d
-    nb = max(1, int(np.ceil(np.ptp(along) / seg_um)))
-    edges = np.linspace(along.min(), along.max() + 1e-6, nb + 1)
-    worst = 0.0
-    for b in range(nb):
-        m = (along >= edges[b]) & (along < edges[b + 1])
-        if m.sum() < 5:
-            continue
-        dl = np.c_[C[tuple(vox[m].T)], S[tuple(vox[m].T)]].mean(0)
-        dl /= np.linalg.norm(dl) + 1e-9
-        p = yx[m] @ np.array([-dl[1], dl[0]])
-        worst = max(worst, float(np.percentile(p, 95) - np.percentile(p, 5)))
-    return worst
-
-
-def _split_at_lines(vox, resp, C, S, spacing, r, levels, min_size):
-    """Split an accepted piece wherever it holds more than one fibre line.
-
-    The width test cannot see two fibres that touch: two lines 2 r across each
-    are together about as wide as the 4 r limit, and at a junction narrower
-    still. The number of lines can be seen. In each stretch of length 10 r
-    along the piece (the same stretches the width test uses), the ridge
-    response is profiled ACROSS the local fibre direction (maximum over depth
-    and along the stretch). Two lines are two peaks at least 2 r apart with a
-    real dip between them; "real" means one of the configured percentile
-    levels lies above the valley and at or below both peaks, so the dip is as
-    deep as a peeling step and no new threshold is introduced.
-
-    Brightness cannot show two fibres fused with no dip between them, but
-    width can: a stretch k fibre-widths (2 r) wide holds at least k lines, and
-    when fewer peaks are found the k lines are placed at equal-count positions
-    across it.
-
-    Each peak marks a band of voxels within r/2 of it. Lines are followed from
-    stretch to stretch by linking each band to at most one band in the next
-    stretch, the closest sideways and less than r off. Through a fork the stem
-    therefore continues into its best-aligned arm, and only the diverging arm
-    becomes a line of its own; two fibres side by side stay two lines. A
-    watershed on the ridge response inside the piece then divides it between
-    the lines along the darkest path. A piece with one line in every stretch
-    is returned unchanged. A diverging arm becoming its own seed is
-    acceptable: step 4 can re-merge what belongs together, but cannot
-    separate two fibres sharing one seed.
-
-    A part smaller than `min_size` is not a seed of its own and is not
-    dropped either: it goes back to the neighbouring part it touches most, so
-    splitting never loses voxels, and if no part reaches `min_size` the piece
-    is returned whole, as it was accepted.
-
-    `vox` is in the coordinates of the `resp`, `C`, `S` crop; `levels` are the
-    percentile thresholds in use. Returns a list of voxel arrays in the same
-    coordinates.
-    """
-    from skimage.segmentation import watershed
-
-    spacing = np.asarray(spacing, float)
-    levels = np.sort(np.asarray(levels, float))
-    yx = vox[:, 1:] * spacing[1:]
-    v = resp[tuple(vox.T)].astype(np.float64)
-    d = np.c_[C[tuple(vox.T)], S[tuple(vox.T)]].mean(0)
-    d /= np.linalg.norm(d) + 1e-9
-    along = yx @ d
-    seg = _ALONG_SMOOTH_R * r
-    nb = max(1, int(np.ceil(np.ptp(along) / seg)))
-    edges = np.linspace(along.min(), along.max() + 1e-6, nb + 1)
-    stretch = np.clip(np.searchsorted(edges, along, side="right") - 1, 0, nb - 1)
-    px = float(spacing[-1])
-    win = max(1, int(round(r / px)))              # peak neighbourhood, +-r
-    band = 0.5 * r
-
-    peaks_per = [None] * nb
-    across_per = [None] * nb
-    for b in range(nb):
-        m = stretch == b
-        if m.sum() < 5:
-            continue
-        dl = np.c_[C[tuple(vox[m].T)], S[tuple(vox[m].T)]].mean(0)
-        dl /= np.linalg.norm(dl) + 1e-9
-        p = yx[m] @ np.array([-dl[1], dl[0]])
-        across_per[b] = (m, p)
-        bins = np.floor((p - p.min()) / px).astype(np.int64)
-        prof = np.full(int(bins.max()) + 1, -np.inf)
-        np.maximum.at(prof, bins, v[m])
-        filled = np.where(np.isfinite(prof), prof, 0.0)   # an empty bin is a gap
-        is_max = (filled >= ndimage.maximum_filter1d(filled, 2 * win + 1, mode="constant")) \
-            & np.isfinite(prof)
-        cand = np.nonzero(is_max)[0]
-        # Strongest first; drop any within 2 r of a stronger one.
-        cand = cand[np.argsort(-filled[cand])]
-        kept = []
-        for c in cand:
-            if all(abs(int(c) - k) * px >= 2 * r for k in kept):
-                kept.append(int(c))
-        kept.sort()
-        # Keep only neighbours separated by a real dip.
-        lines = [kept[0]] if kept else []
-        for c in kept[1:]:
-            prev = lines[-1]
-            valley = filled[prev:c + 1].min()
-            low = min(filled[prev], filled[c])
-            if np.any((levels > valley) & (levels <= low)):
-                lines.append(c)
-            elif filled[c] > filled[prev]:
-                lines[-1] = c
-        peaks = [p.min() + (c + 0.5) * px for c in lines]
-        # Two fibres fused with no dip between them show one peak but are two
-        # fibre-widths wide. A stretch k widths wide holds at least k lines;
-        # when brightness shows fewer, they are placed at equal-count positions
-        # across it and the watershed divides them midway.
-        w = float(np.percentile(p, 95) - np.percentile(p, 5))
-        k = int(np.floor(w / (2 * r) + 0.5))
-        if k > len(peaks):
-            peaks = list(np.quantile(p, (np.arange(k) + 0.5) / k))
-        peaks_per[b] = peaks
-
-    n_lines = [len(x) if x else 0 for x in peaks_per]
-    if max(n_lines) < 2:
-        return [vox]
-
-    lo = vox.min(0)
-    hi = vox.max(0) + 1
-    shape = tuple(hi - lo)
-    loc = vox - lo
-    perp = np.array([-d[1], d[0]])
-
-    # One band per peak per stretch, and its sideways position.
-    bands = []                                    # (stretch, voxel indices, lateral um)
-    for b in range(nb):
-        if not peaks_per[b]:
-            continue
-        m, p = across_per[b]
-        rows = np.nonzero(m)[0]
-        for c in peaks_per[b]:
-            idx = rows[np.abs(p - c) <= band]
-            if idx.size:
-                bands.append((b, idx, float(yx[idx].mean(0) @ perp)))
-
-    # Follow each line from stretch to stretch: a band links to at most one
-    # band in the next stretch, the closest sideways and less than r off.
-    # Through a fork the stem therefore continues into its best-aligned arm
-    # and only the diverging arm starts a new line; two fibres side by side
-    # stay two lines. Greedy on sideways offset, smallest first.
-    uf = list(range(len(bands)))
-
-    def _root(i):
-        while uf[i] != i:
-            uf[i] = uf[uf[i]]
-            i = uf[i]
-        return i
-
-    links = []
-    for i, (bi, _, li) in enumerate(bands):
-        for j, (bj, _, lj) in enumerate(bands):
-            if bj == bi + 1 and abs(li - lj) < r:
-                links.append((abs(li - lj), i, j))
-    has_next, has_prev = set(), set()
-    for _off, i, j in sorted(links):
-        if i in has_next or j in has_prev:
-            continue
-        has_next.add(i); has_prev.add(j)
-        uf[_root(i)] = _root(j)
-    roots = sorted({_root(i) for i in range(len(bands))})
-    if len(roots) < 2:
-        return [vox]
-    markers = np.zeros(shape, np.int32)
-    for k, rt in enumerate(roots, 1):
-        for i, (_b, idx, _l) in enumerate(bands):
-            if _root(i) == rt:
-                markers[tuple(loc[idx].T)] = k
-    n = len(roots)
-    mask = np.zeros(shape, bool)
-    mask[tuple(loc.T)] = True
-    box = tuple(slice(a, b_) for a, b_ in zip(lo, hi))
-    ws = watershed(-np.asarray(resp[box], np.float32), markers, mask=mask)
-    # Parts below min_size rejoin the big part they share most faces with,
-    # smallest first, until every remaining part is a seed in its own right.
-    sizes = np.bincount(ws.ravel(), minlength=n + 1)
-    big = [k for k in range(1, n + 1) if sizes[k] >= min_size]
-    if len(big) < 2:
-        return [vox]
-    struct = ndimage.generate_binary_structure(3, 1)
-    for k in sorted((k for k in range(1, n + 1) if 0 < sizes[k] < min_size),
-                    key=lambda k: sizes[k]):
-        ring = ndimage.binary_dilation(ws == k, structure=struct) & mask & (ws != k)
-        touch = np.bincount(ws[ring], minlength=n + 1)
-        touch[0] = 0
-        if touch.any():
-            ws[ws == k] = int(np.argmax(touch))
-    parts = [np.argwhere(ws == k) + lo for k in np.unique(ws[mask]) if k > 0]
-    return parts if len(parts) >= 2 else [vox]
+# Elongated mode reads the fibres from the MASK: its skeleton gives their
+# course, its width their number. Every scale is a multiple of the object's
+# fibre radius r, measured from the mask:
+_ARM_WINDOW_R = 10.0   # an arm's direction is taken over this length of branch
+_CORE_R = 2.0          # junctions joined by a branch shorter than one fibre
+#                        width (2 r) lie inside one contact: one junction zone
+_RIBBON_R = 1.5        # a branch whose in-plane half-width exceeds 1.5 r is a
+#                        ribbon of several fibres fused side by side
 
 
 # ---- tiling ------------------------------------------------------------------ #
@@ -1078,419 +738,9 @@ def _local(inner, outer):
                  for i, o in zip(inner, outer))
 
 
-def _touching_pairs(seeds, bshape):
-    """{(a, b): contact voxel coords of a} for seeds touching face to face."""
-    lin = np.concatenate([np.ravel_multi_index(s_.T, bshape) for s_ in seeds])
-    sid = np.concatenate([np.full(len(s_), i) for i, s_ in enumerate(seeds)])
-    order = np.argsort(lin)
-    lin, sid = lin[order], sid[order]
-    coords = np.array(np.unravel_index(lin, bshape)).T
-    out = {}
-    for ax in range(3):
-        stride = int(np.prod(bshape[ax + 1:]))
-        ok = coords[:, ax] + 1 < bshape[ax]
-        nb = lin[ok] + stride
-        pos = np.searchsorted(lin, nb)
-        pos = np.minimum(pos, lin.size - 1)
-        hit = lin[pos] == nb
-        a_ = sid[ok][hit]
-        b_ = sid[pos[hit]]
-        diff = a_ != b_
-        for (x, y), c in zip(zip(a_[diff], b_[diff]), coords[ok][hit][diff]):
-            key = (int(min(x, y)), int(max(x, y)))
-            out.setdefault(key, []).append(c)
-    return {k: np.array(v) for k, v in out.items()}
-
-
-def _arms(vox, centre, sp, r):
-    """Arms of a seed leaving a junction: its voxels in the ring 3 r .. 10 r
-    around `centre`, split into connected groups. Returns a list of (ring
-    voxel coords, unit direction from the centre), small specks ignored."""
-    ph = vox * sp
-    dist = np.linalg.norm(ph - centre, axis=1)
-    ring = vox[(dist >= 3 * r) & (dist <= _ALONG_SMOOTH_R * r)]
-    if not len(ring):
-        return []
-    lo = ring.min(0)
-    grid = np.zeros(tuple(ring.max(0) - lo + 1), bool)
-    grid[tuple((ring - lo).T)] = True
-    lab, n = ndimage.label(grid, structure=np.ones((3, 3, 3)))
-    speck = np.pi * r ** 3 / float(np.prod(sp))      # a fibre cross-section, r long
-    arms = []
-    for k in range(1, n + 1):
-        vk = np.argwhere(lab == k) + lo
-        if len(vk) < speck:
-            continue
-        v = (vk * sp).mean(0) - centre
-        arms.append((vk, v / (np.linalg.norm(v) + 1e-9)))
-    return arms
-
-
-def _reassign_at_junctions(seeds, bshape, spacing, r, resp):
-    """Give a junction's continuation to the strand it continues straightest.
-
-    Where one seed passes through a junction (two arms) and a touching seed
-    ends there (one arm), three arms meet, and the pair pointing most nearly
-    opposite each other is the one fibre going straight through. If that pair
-    includes the ending seed's arm, the continuation is its own: the passing
-    seed is cut at the junction and its far side handed over, and the
-    junction core is divided along the bright ridge (watershed on `resp`) so
-    both stay connected. Tile pieces cannot decide this -- a tile often sees
-    only the strand that bends into the junction -- so it is decided once all
-    seeds are known. Pairs where both seeds pass through (side by side, or a
-    crossing) or both end are left alone. Scales: 3 r to 10 r around the
-    contact, as elsewhere multiples of the fibre radius.
-    """
-    from skimage.segmentation import watershed
-    sp = np.asarray(spacing, float)
-    seeds = [np.asarray(s_) for s_ in seeds]
-    if len(seeds) < 2:
-        return seeds
-    # A junction is where one seed ENDS beside another, so candidates are the
-    # seeds' end tips, not the middle of their contact -- seeds side by side
-    # touch along a whole stretch before they reach a junction.
-    touching = _touching_pairs(seeds, bshape)
-    neighbours = {}
-    for a, b in touching:
-        neighbours.setdefault(a, set()).add(b)
-        neighbours.setdefault(b, set()).add(a)
-
-    def tips(vox):
-        ph = vox * sp
-        yx = ph[:, 1:]
-        mu = yx.mean(0)
-        _w, e = np.linalg.eigh(np.cov((yx - mu).T)) if len(yx) > 2 else (None, np.eye(2))
-        al = (yx - mu) @ e[:, -1]
-        out = []
-        for sel in (al <= al.min() + 2 * r, al >= al.max() - 2 * r):
-            out.append(ph[sel].mean(0))
-        return out
-
-    changed = set()
-    candidates = []
-    for end in sorted(neighbours):
-        if len(seeds[end]) < 10:
-            continue
-        for t in tips(seeds[end]):
-            for pas in sorted(neighbours[end]):
-                if np.min(np.linalg.norm(seeds[pas] * sp - t, axis=1)) <= 3 * r:
-                    candidates.append((end, pas, t))
-    for end, pas, centre in candidates:
-        if end in changed or pas in changed:
-            continue
-        arms_e = _arms(seeds[end], centre, sp, r)
-        arms_p = _arms(seeds[pas], centre, sp, r)
-        if len(arms_e) != 1 or len(arms_p) != 2:
-            continue
-        arm_e = arms_e[0]
-        straight_own = float(arms_p[0][1] @ arms_p[1][1])
-        with_end = [float(arm_e[1] @ arms_p[k][1]) for k in (0, 1)]
-        k = int(np.argmin(with_end))
-        if with_end[k] >= straight_own:
-            continue                    # the passing seed already goes straightest
-        # Cut the passing seed at the junction core; the side holding arm k
-        # goes to the ending seed.
-        pv = seeds[pas]
-        core = np.linalg.norm(pv * sp - centre, axis=1) < 3 * r
-        rest = pv[~core]
-        if not len(rest):
-            continue
-        lo = pv.min(0)
-        grid = np.zeros(tuple(pv.max(0) - lo + 1), bool)
-        grid[tuple((rest - lo).T)] = True
-        lab, _n = ndimage.label(grid, structure=np.ones((3, 3, 3)))
-        side_k = lab[tuple((arms_p[k][0][0] - lo))]
-        side_o = lab[tuple((arms_p[1 - k][0][0] - lo))]
-        if side_k == 0 or side_o == 0 or side_k == side_o:
-            continue                    # still joined around: no clean cut
-        moved = np.argwhere(lab == side_k) + lo
-        kept = np.argwhere(lab == side_o) + lo
-        other = np.argwhere((lab > 0) & (lab != side_k) & (lab != side_o)) + lo
-        # Junction core (and any stray remainder) divided along the ridge.
-        region = np.vstack([pv[core], other]) if len(other) else pv[core]
-        allv = np.vstack([seeds[end], moved, kept, region])
-        lo2 = allv.min(0)
-        shape2 = tuple(allv.max(0) - lo2 + 1)
-        markers = np.zeros(shape2, np.int32)
-        markers[tuple((kept - lo2).T)] = 1
-        markers[tuple((np.vstack([seeds[end], moved]) - lo2).T)] = 2
-        mask = markers > 0
-        mask[tuple((region - lo2).T)] = True
-        box2 = tuple(slice(int(q0), int(q0 + n_)) for q0, n_ in zip(lo2, shape2))
-        ws = watershed(-np.asarray(resp[box2], np.float32), markers, mask=mask)
-        reg_lab = ws[tuple((region - lo2).T)]
-        seeds[pas] = np.vstack([kept, region[reg_lab == 1]])
-        seeds[end] = np.vstack([seeds[end], moved, region[reg_lab != 1]])
-        changed.update((pas, end))
-    return seeds
-
-
-def _resolve_tile_pieces(pieces, bshape, spacing, r, min_size, resp):
-    """Reconcile pieces found by overlapping tiles into one seed per fibre.
-
-    Each tile finds pieces in its own region plus a margin, so neighbouring
-    tiles both find the fibres crossing their shared boundary. `pieces` is a
-    list of (coords, tile index, direction), coords relative to the object's
-    box. Every pair of pieces from different tiles that overlaps is compared
-    along the local fibre direction:
-
-    * the same line -- neither reaches more than half a fibre diameter (r)
-      past the other's edge, sideways, where they overlap: joined, the same
-      fibre continuing;
-    * one covers an extra line the other tile resolved separately -- a tile
-      near its edge sees only part of the picture and can accept one piece
-      across two strands: the coarser piece is dissolved. It is divided by a
-      watershed on the ridge response `resp` (box-shaped), flooded from the
-      finer tile's strands where they lie inside it, so each strand continues
-      along its own path through it and every region stays connected to its
-      strand. (Giving each voxel to the strand nearest sideways instead left
-      islands of one seed inside another and let a seed switch strands where
-      they drift.) Parts of it lying 2 r or more from every strand seed a
-      strand of their own if they reach `min_size`.
-
-    The finer division wins because a merge is the error the next step cannot
-    undo, while an extra split it can re-merge. Independent of the order the
-    tiles were processed in, and no voxel is dropped. Returns a list of voxel
-    arrays (box-relative), one per resolved seed.
-    """
-    sp = np.asarray(spacing, float)
-    coords = [np.asarray(c, np.int64) for c, _t, _d in pieces]
-    tiles = [t for _c, t, _d in pieces]
-    dirs = [np.asarray(d, float) for _c, _t, d in pieces]
-    n = len(coords)
-    if n == 0:
-        return []
-
-    # Overlapping pairs, from voxels found by more than one piece.
-    lin = np.concatenate([np.ravel_multi_index(c.T, bshape) for c in coords])
-    pid = np.concatenate([np.full(len(c), i) for i, c in enumerate(coords)])
-    order = np.argsort(lin, kind="stable")
-    lin, pid = lin[order], pid[order]
-    dup = np.nonzero(lin[1:] == lin[:-1])[0]
-    pairs = set()
-    for k in dup:
-        a, b = int(pid[k]), int(pid[k + 1])
-        if a != b and tiles[a] != tiles[b]:
-            pairs.add((min(a, b), max(a, b)))
-    if not pairs:
-        return coords
-
-    def frame(i):
-        d = dirs[i] / (np.linalg.norm(dirs[i]) + 1e-9)
-        return d, np.array([-d[1], d[0]])
-
-    def lateral(i, d, perp):
-        yx = coords[i][:, 1:] * sp[1:]
-        return yx @ d, yx @ perp
-
-    parent = list(range(n))
-
-    def find(a):
-        while parent[a] != a:
-            parent[a] = parent[parent[a]]
-            a = parent[a]
-        return a
-
-    def union(a, b):
-        a, b = find(a), find(b)
-        if a != b:
-            parent[max(a, b)] = min(a, b)
-
-    finer_of = {}                       # coarse piece -> finer pieces it spans
-    same_line = []                      # joined only once dissolution is decided
-    for a, b in sorted(pairs):
-        d, perp = frame(a)
-        al_a, la_a = lateral(a, d, perp)
-        al_b, la_b = lateral(b, d, perp)
-        both = np.intersect1d(np.ravel_multi_index(coords[a].T, bshape),
-                              np.ravel_multi_index(coords[b].T, bshape))
-        ov = np.array(np.unravel_index(both, bshape)).T
-        al_o = (ov[:, 1:] * sp[1:]) @ d
-        lo, hi = al_o.min() - _ALONG_SMOOTH_R * r, al_o.max() + _ALONG_SMOOTH_R * r
-        sa = (al_a >= lo) & (al_a <= hi)
-        sb = (al_b >= lo) & (al_b <= hi)
-        # Edge against edge: a piece covering an extra strand reaches about a
-        # whole fibre (2 r) past the other's edge on that side; two versions
-        # of the same line differ by less than r. The cut is midway, at r.
-        # (Measuring from the other's centre instead flagged two identical
-        # two-fibre-wide pieces as each extending beyond the other.)
-        a_lo, a_hi = np.percentile(la_a[sa], [5, 95])
-        b_lo, b_hi = np.percentile(la_b[sb], [5, 95])
-        a_extends = max(a_hi - b_hi, b_lo - a_lo) >= r
-        b_extends = max(b_hi - a_hi, a_lo - b_lo) >= r
-        if not a_extends and not b_extends:
-            same_line.append((a, b))
-        elif a_extends and not b_extends:
-            finer_of.setdefault(a, []).append(b)
-        elif b_extends and not a_extends:
-            finer_of.setdefault(b, []).append(a)
-        # both extend: two different lines crossing -- neither joined.
-
-    # Dissolve coarse pieces onto the finer strands they span.
-    from skimage.segmentation import watershed
-    extra = []
-    dissolved = set()
-    owned = {}                          # voxel (linear) -> owner it was given to
-
-    def give(own, vox):
-        if own >= len(coords):
-            prev = extra[own - len(coords)]
-            extra[own - len(coords)] = vox if prev is None else np.concatenate([prev, vox])
-        else:
-            coords[own] = np.concatenate([coords[own], vox])
-        for v in np.ravel_multi_index(vox.T, bshape):
-            owned[int(v)] = own
-    for p_, fine in finer_of.items():
-        d, perp = frame(p_)
-        pc = coords[p_]
-        al_p, la_p = lateral(p_, d, perp)
-        lo_p = pc.min(0)
-        hi_p = pc.max(0) + 1
-        shape_p = tuple(hi_p - lo_p)
-        mask_p = np.zeros(shape_p, bool)
-        mask_p[tuple((pc - lo_p).T)] = True
-        lin_p = np.ravel_multi_index(pc.T, bshape)
-        markers = np.zeros(shape_p, np.int32)
-        owners, lines = [], []
-        for f in fine:
-            al_f, la_f = lateral(f, d, perp)
-            m = (al_f >= al_p.min() - _ALONG_SMOOTH_R * r) & (al_f <= al_p.max() + _ALONG_SMOOTH_R * r)
-            pos = float(np.median(la_f[m] if m.any() else la_f))
-            close = [k for k, q in enumerate(lines) if abs(q - pos) < r]
-            if close:                   # the same strand found twice: one fibre
-                union(owners[close[0]], f)
-                k = close[0]
-            else:
-                lines.append(pos)
-                owners.append(f)
-                k = len(owners) - 1
-            inside = np.isin(np.ravel_multi_index(coords[f].T, bshape), lin_p)
-            markers[tuple((coords[f][inside] - lo_p).T)] = k + 1
-        # Parts far from every strand start strands of their own.
-        far = np.min(np.abs(la_p[:, None] - np.array(lines)[None, :]), axis=1) >= 2 * r
-        if far.any():
-            far_mask = np.zeros(shape_p, bool)
-            far_mask[tuple((pc[far] - lo_p).T)] = True
-            comp, nc = ndimage.label(far_mask, structure=ndimage.generate_binary_structure(3, 1))
-            for c_ in range(1, nc + 1):
-                cm = comp == c_
-                if cm.sum() >= min_size:
-                    owners.append(len(coords) + len(extra))
-                    extra.append(None)
-                    markers[cm & (markers == 0)] = len(owners)
-        if not markers.any():
-            continue                    # nothing to flood from: keep it whole
-        box_p = tuple(slice(int(a0), int(b0)) for a0, b0 in zip(lo_p, hi_p))
-        ws = watershed(-np.asarray(resp[box_p], np.float32), markers, mask=mask_p)
-        for k, own in enumerate(owners, 1):
-            vox = np.argwhere(ws == k) + lo_p
-            if not len(vox):
-                continue
-            give(own, vox)
-        dissolved.add(p_)
-
-    # A piece on the same line as a dissolved one is just as merged, even if it
-    # never met the finer strands itself: divide it the same way, flooding
-    # from the regions the dissolved piece was divided into where they lie
-    # inside it, and so on along the chain.
-    partners = {}
-    for a, b in same_line:
-        partners.setdefault(a, set()).add(b)
-        partners.setdefault(b, set()).add(a)
-    queue = [q for p_ in list(dissolved) for q in partners.get(p_, ())]
-    while queue:
-        g = queue.pop()
-        if g in dissolved:
-            continue
-        lin_g = np.ravel_multi_index(coords[g].T, bshape)
-        by_owner = {}
-        for i_v, v in enumerate(lin_g):
-            o = owned.get(int(v))
-            if o is not None:
-                by_owner.setdefault(o, []).append(i_v)
-        if len(by_owner) < 2:
-            continue                    # meets only one strand: an ordinary join
-        pc = coords[g]
-        lo_p = pc.min(0)
-        hi_p = pc.max(0) + 1
-        shape_p = tuple(hi_p - lo_p)
-        mask_p = np.zeros(shape_p, bool)
-        mask_p[tuple((pc - lo_p).T)] = True
-        markers = np.zeros(shape_p, np.int32)
-        owners = list(by_owner)
-        for k, o in enumerate(owners, 1):
-            markers[tuple((pc[by_owner[o]] - lo_p).T)] = k
-        box_p = tuple(slice(int(a0), int(b0)) for a0, b0 in zip(lo_p, hi_p))
-        ws = watershed(-np.asarray(resp[box_p], np.float32), markers, mask=mask_p)
-        for k, o in enumerate(owners, 1):
-            vox = np.argwhere(ws == k) + lo_p
-            if len(vox):
-                give(o, vox)
-        dissolved.add(g)
-        queue.extend(q for q in partners.get(g, ()) if q not in dissolved)
-
-    # Joins between surviving pieces only: a dissolved piece must not bridge
-    # the pieces it overlapped into one seed -- that welds strands through it.
-    for a, b in same_line:
-        if a not in dissolved and b not in dissolved:
-            union(a, b)
-
-    groups = {}
-    for i in range(n):
-        if i not in dissolved:
-            groups.setdefault(find(i), []).append(coords[i])
-    seeds = [np.unique(np.concatenate(g), axis=0) for g in groups.values()]
-    seeds += [np.asarray(e) for e in extra if e is not None and len(e)]
-
-    # A voxel still claimed by two seeds goes to the one most of its
-    # uncontested neighbours belong to, so no seed is left with islands of
-    # another inside it; seeds must not overlap.
-    lin_all = np.concatenate([np.ravel_multi_index(s_.T, bshape) for s_ in seeds])
-    sid = np.concatenate([np.full(len(s_), i) for i, s_ in enumerate(seeds)])
-    order = np.argsort(lin_all, kind="stable")
-    lin_s, sid_s = lin_all[order], sid[order]
-    claim = {}
-    for v, i in zip(lin_s, sid_s):
-        claim.setdefault(int(v), []).append(int(i))
-    contested = {v: c for v, c in claim.items() if len(set(c)) > 1}
-    label_of = {v: c[0] for v, c in claim.items() if len(set(c)) == 1}
-    strides = np.array([bshape[1] * bshape[2], bshape[2], 1])
-    for _round in range(8):             # a few passes settle fronts inward
-        if not contested:
-            break
-        settled = {}
-        for v, cands in contested.items():
-            z_, y_, x_ = np.unravel_index(v, bshape)
-            votes = {}
-            for dz, dy, dx in ((1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, -1, 0), (0, 0, 1), (0, 0, -1)):
-                zz, yy, xx = z_ + dz, y_ + dy, x_ + dx
-                if 0 <= zz < bshape[0] and 0 <= yy < bshape[1] and 0 <= xx < bshape[2]:
-                    o = label_of.get(int(zz * strides[0] + yy * strides[1] + xx))
-                    if o in cands:
-                        votes[o] = votes.get(o, 0) + 1
-            if votes:
-                settled[v] = max(votes, key=votes.get)
-        if not settled:
-            break
-        label_of.update(settled)
-        for v in settled:
-            del contested[v]
-    for v, cands in contested.items():  # no voting neighbour at all
-        label_of[v] = cands[0]
-    lin_k = np.fromiter(label_of.keys(), np.int64, len(label_of))
-    sid_k = np.fromiter(label_of.values(), np.int64, len(label_of))
-    vox_all = np.array(np.unravel_index(lin_k, bshape)).T
-    final = [vox_all[sid_k == i] for i in range(len(seeds))]
-    return [f for f in final if len(f)]
-
-
 class _Union:
-    def __init__(self):
-        self.p = [0]
-
-    def new(self):
-        self.p.append(len(self.p))
-        return len(self.p) - 1
+    def __init__(self, n):
+        self.p = list(range(n))
 
     def find(self, a):
         while self.p[a] != a:
@@ -1504,66 +754,333 @@ class _Union:
             self.p[max(a, b)] = min(a, b)
 
 
+# ---- the skeleton graph -------------------------------------------------------- #
+_OFFSETS_26 = np.array([(dz, dy, dx) for dz in (-1, 0, 1) for dy in (-1, 0, 1)
+                        for dx in (-1, 0, 1) if (dz, dy, dx) != (0, 0, 0)])
+
+
+def _skeleton_graph(pts, bshape):
+    """Graph of a 26-connected skeleton given as voxel coordinates.
+
+    Voxels with three or more skeleton neighbours are junction voxels; touching
+    ones form one junction (so the small false junctions thinning leaves on a
+    diagonal staircase become a junction with two arms, which the pairing
+    simply passes through). Returns (node_of_voxel, n_nodes, edges): each edge
+    is (node_a, node_b, ordered voxel indices from a to b, including the end
+    voxels); node -1 marks a free end, and a closed loop has both ends -1.
+    """
+    n = len(pts)
+    lin = np.ravel_multi_index(pts.T, bshape)
+    order = np.argsort(lin)
+    lin_s = lin[order]
+    nbrs = [[] for _ in range(n)]
+    for off in _OFFSETS_26:
+        q = pts + off
+        ok = np.all((q >= 0) & (q < np.asarray(bshape)), axis=1)
+        ql = np.full(n, -1, np.int64)
+        ql[ok] = np.ravel_multi_index(q[ok].T, bshape)
+        pos = np.searchsorted(lin_s, ql)
+        pos = np.minimum(pos, n - 1)
+        hit = ok & (lin_s[pos] == ql)
+        for i, j in zip(np.nonzero(hit)[0], order[pos[hit]]):
+            nbrs[i].append(int(j))
+    deg = np.array([len(x) for x in nbrs])
+    junction = deg >= 3
+    uf = _Union(n)
+    for i in np.nonzero(junction)[0]:
+        for j in nbrs[i]:
+            if junction[j]:
+                uf.union(int(i), j)
+    node_of = np.full(n, -1, np.int64)
+    roots = {}
+    for i in np.nonzero(junction)[0]:
+        rt = uf.find(int(i))
+        node_of[i] = roots.setdefault(rt, len(roots))
+    n_nodes = len(roots)
+    is_node = junction | (deg <= 1)
+    visited = np.zeros(n, bool)
+    edges = []
+    for start in np.nonzero(is_node)[0]:
+        for first in nbrs[start]:
+            if junction[start] and junction[first] and node_of[first] == node_of[start]:
+                continue
+            if not is_node[first] and visited[first]:
+                continue
+            chain = [int(start)]
+            prev, cur = int(start), int(first)
+            while not is_node[cur]:
+                visited[cur] = True
+                chain.append(cur)
+                nxt = [j for j in nbrs[cur] if j != prev]
+                if not nxt:
+                    break
+                prev, cur = cur, nxt[0]
+            chain.append(cur)
+            a_node = int(node_of[start]) if junction[start] else -1
+            b_node = int(node_of[cur]) if junction[cur] else -1
+            if len(chain) == 2 and is_node[chain[0]] and is_node[chain[1]]:
+                if chain[0] > chain[1]:
+                    continue            # a direct node-node link, recorded once
+            edges.append((a_node, b_node, np.array(chain)))
+    # Closed loops with no junction on them.
+    for i in np.nonzero(~is_node & ~visited)[0]:
+        if visited[i]:
+            continue
+        chain = [int(i)]
+        visited[i] = True
+        prev, cur = int(i), nbrs[i][0]
+        while cur != i and not visited[cur]:
+            visited[cur] = True
+            chain.append(int(cur))
+            nxt = [j for j in nbrs[cur] if j != prev]
+            if not nxt:
+                break
+            prev, cur = cur, nxt[0]
+        edges.append((-1, -1, np.array(chain)))
+    return node_of, n_nodes, edges
+
+
+def _arc_points(xyz, dist_from_start):
+    """Cumulative arc length along an ordered polyline (physical units)."""
+    seg = np.linalg.norm(np.diff(xyz, axis=0), axis=1) if len(xyz) > 1 else np.zeros(0)
+    arc = np.r_[0.0, np.cumsum(seg)]
+    return arc
+
+
+def _arm(xyz, r):
+    """An arm leaving its junction: `xyz` ordered from the junction outward.
+    Returns (anchor, direction): the direction from 2 r to 10 r along the arm,
+    so the bending right at the junction does not count."""
+    arc = _arc_points(xyz, None)
+    L = arc[-1]
+    i0 = int(np.searchsorted(arc, min(2 * r, 0.25 * L)))
+    i1 = int(np.searchsorted(arc, min(_ARM_WINDOW_R * r, L)))
+    i1 = min(max(i1, i0 + 1), len(xyz) - 1)
+    i0 = min(i0, i1 - 1) if i1 > 0 else 0
+    d = xyz[i1] - xyz[i0]
+    nrm = np.linalg.norm(d)
+    if nrm == 0:
+        d = xyz[-1] - xyz[0]
+        nrm = np.linalg.norm(d) or 1.0
+    return xyz[0], d / nrm
+
+
+def _line_voxels(p0, p1):
+    """Voxels on the straight segment from p0 to p1, in order along it."""
+    n = int(np.max(np.abs(p1 - p0))) + 1
+    t = np.linspace(0.0, 1.0, n)[:, None]
+    v = np.round(p0 + (p1 - p0) * t).astype(np.int64)
+    keep = np.r_[True, np.any(np.diff(v, axis=0) != 0, axis=1)]
+    return v[keep]
+
+
+def _paths_from_skeleton(pts, half_w, bshape, spacing, r, obj_lookup):
+    """Decompose a mask skeleton into fibre paths, each a chain, never a tree.
+
+    `pts` are skeleton voxels (box coordinates), `half_w` the mask's in-plane
+    half-width at each. Steps: prune spurs (end branches shorter than the
+    half-width where they leave); merge junctions joined by a branch shorter
+    than one fibre width into one junction zone (they lie inside one
+    contact); split ribbons (branches wider than one fibre) into k parallel
+    lanes, k = half-width / r; then trace fibres through the zones, each
+    branch used once, so every path is a chain (see the tracing comment
+    below). A bridge between fibres -- a touch point, a ladder rung, which
+    meets them at an angle -- is never taken as a continuation and is left as
+    a short path of its own. Branch length is not used to call something a
+    bridge: in a dense bundle most fibre stretches between two touch points
+    are short too. `obj_lookup(coords)` says which voxel
+    coordinates lie in the object's mask. Returns a list of voxel arrays, one
+    line per path.
+    """
+    sp = np.asarray(spacing, float)
+    if len(pts) == 0:
+        return []
+    node_of, n_nodes, edges = _skeleton_graph(pts, bshape)
+    xyz_all = pts * sp
+
+    def length(e):
+        return float(_arc_points(xyz_all[e[2]], None)[-1])
+
+    # ---- prune spurs: end branches shorter than the half-width they leave ---
+    for _it in range(3):
+        at_node = {}
+        for k, e in enumerate(edges):
+            for nd in (e[0], e[1]):
+                if nd >= 0:
+                    at_node.setdefault(nd, []).append(k)
+        drop = set()
+        for k, (na, nb, ch) in enumerate(edges):
+            if (na >= 0) == (nb >= 0):
+                continue                # both ends free, or both at junctions
+            nd, jv = (na, ch[0]) if na >= 0 else (nb, ch[-1])
+            if len(at_node.get(nd, ())) >= 3 and length(edges[k]) <= float(half_w[jv]):
+                drop.add(k)
+        if not drop:
+            break
+        edges = [e for k, e in enumerate(edges) if k not in drop]
+
+    # ---- junctions inside one contact form one zone ---------------------------
+    bridge = set()
+    for k, (na, nb, ch) in enumerate(edges):
+        if na >= 0 and nb >= 0 and na != nb and length(edges[k]) <= _CORE_R * r:
+            bridge.add(k)
+    zone = _Union(max(n_nodes, 1))
+    for k in bridge:
+        zone.union(edges[k][0], edges[k][1])
+
+    # Each non-bridge branch becomes one or more lanes (ordered voxel arrays).
+    lanes = []                          # (zone_a or -1, zone_b or -1, voxels)
+    for k, (na, nb, ch) in enumerate(edges):
+        if k in bridge:
+            continue
+        za = zone.find(na) if na >= 0 else -1
+        zb = zone.find(nb) if nb >= 0 else -1
+        v = pts[ch]
+        w = half_w[ch]
+        kk = int(round(float(np.median(w)) / r)) if float(np.median(w)) > _RIBBON_R * r else 1
+        if kk <= 1 or len(ch) < 3:
+            lanes.append((za, zb, v))
+            continue
+        # Ribbon: kk lanes, spaced evenly across its local width, in-plane.
+        xyz = xyz_all[ch]
+        arc = _arc_points(xyz, None)
+        lane_pts = [[] for _ in range(kk)]
+        for i in range(len(ch)):
+            j0 = int(np.searchsorted(arc, arc[i] - 2 * r))
+            j1 = min(len(ch) - 1, int(np.searchsorted(arc, arc[i] + 2 * r)))
+            t = xyz[j1] - xyz[j0]
+            t2 = t[1:] / (np.linalg.norm(t[1:]) + 1e-9)
+            nrm = np.array([0.0, -t2[1], t2[0]])
+            for j in range(kk):
+                off = ((j + 0.5) / kk * 2.0 - 1.0) * float(w[i])
+                q = np.round((xyz[i] + off * nrm) / sp).astype(np.int64)
+                lane_pts[j].append(q)
+        for j in range(kk):
+            q = np.array(lane_pts[j])
+            q = q[np.all((q >= 0) & (q < np.asarray(bshape)), axis=1)]
+            q = q[obj_lookup(q)] if len(q) else q
+            if len(q) >= 2:
+                lanes.append((za, zb, q))
+
+    # ---- trace fibres through the zones ---------------------------------------
+    # Each branch between two contacts is short, too short a baseline for its
+    # own direction to decide a junction. So fibres are traced: starting from
+    # the longest unused branch, a path is extended through each junction onto
+    # the branch that stays closest to the line of the path's OWN last 10 r --
+    # a long baseline -- provided it deviates sideways by less than one fibre
+    # spacing (2 r); more than that is a step onto a neighbouring fibre. Each
+    # branch is used once, so paths are chains; longest-first lets clear
+    # fibres claim their continuations before short fragments can.
+    incident = {}                       # zone -> [(lane, end index 0 | -1)]
+    for li, (za, zb, v) in enumerate(lanes):
+        if za >= 0:
+            incident.setdefault(za, []).append((li, 0))
+        if zb >= 0:
+            incident.setdefault(zb, []).append((li, -1))
+    lane_len = [float(_arc_points(v * sp, None)[-1]) for _za, _zb, v in lanes]
+    used = np.zeros(len(lanes), bool)
+    win = _ARM_WINDOW_R * r
+
+    def head(coords_xyz):
+        """End point and direction of a path over its last `win`."""
+        arc = _arc_points(coords_xyz[::-1], None)
+        i1 = min(int(np.searchsorted(arc, win)), len(coords_xyz) - 1)
+        d = coords_xyz[-1] - coords_xyz[-1 - i1] if i1 > 0 else np.zeros(3)
+        nrm = np.linalg.norm(d)
+        return coords_xyz[-1], (d / nrm if nrm > 0 else None)
+
+    def extend(path_vox, zone_id):
+        """Grow an ordered path (voxels) from its last voxel at `zone_id`."""
+        while zone_id >= 0:
+            p_end, u = head(path_vox * sp)
+            if u is None:
+                return path_vox
+            best = None
+            for li, e in incident.get(zone_id, ()):
+                if used[li]:
+                    continue
+                v = lanes[li][2]
+                v = v if e == 0 else v[::-1]
+                xyz = v * sp
+                arc = _arc_points(xyz, None)
+                q = xyz[min(int(np.searchsorted(arc, win)), len(xyz) - 1)]
+                w = q - p_end
+                fwd = float(w @ u)
+                if fwd <= 0:
+                    continue
+                lat = float(np.linalg.norm(w - fwd * u))
+                if lat >= 2 * r:
+                    continue            # a step onto a neighbouring fibre
+                cost = lat / fwd
+                if best is None or cost < best[0]:
+                    best = (cost, li, v, e)
+            if best is None:
+                return path_vox
+            _c, li, v, e = best
+            used[li] = True
+            link = _line_voxels(path_vox[-1], v[0])
+            link = link[obj_lookup(link)]
+            path_vox = np.concatenate([path_vox, link, v])
+            za, zb = lanes[li][0], lanes[li][1]
+            zone_id = zb if e == 0 else za
+        return path_vox
+
+    paths = []
+    for li in np.argsort(lane_len)[::-1]:
+        if used[li]:
+            continue
+        used[li] = True
+        za, zb, v = lanes[li]
+        fwd_path = extend(v, zb)                     # grow past the far end
+        back = extend(fwd_path[::-1], za)            # then past the near end
+        paths.append(np.unique(back, axis=0))
+    return paths
+
+
 def _elongated_label_candidates(lbl, sl, segmentation_mask, intensity_image,
                                 params: "_CandidateParams"):
-    """Seeds for spindle- or fibre-shaped cells, one per fibre, full length.
+    """Seeds for spindle- or fibre-shaped cells, from the MASK's skeleton.
 
-    Thresholding intensity cannot give these: brightness varies as much along
-    a fibre as it dips between touching fibres, so pieces break into stubs
-    before they separate. What does separate them is direction. This works on
-    a ridge response smoothed ALONG each fibre, and peels with the opposite
-    preference to compact mode: ascending through the configured percentiles,
-    a connected piece only one fibre wide is accepted whole, and a wider piece
-    (several fibres merged) is re-examined one level up, inside itself only.
+    The mask carries what is needed: its skeleton gives each fibre's course and
+    its width tells how many fibres a stretch holds. A plain skeleton merges
+    fibres -- every touch point is a junction, a ladder of fibres joined by
+    bridges is a loop, fibres fused side by side are one branch -- so it is
+    decomposed into paths that can never branch (`_paths_from_skeleton`):
+    bridges carry no fibre, ribbons are split into lanes, and at every
+    junction the arms are paired one-to-one by straightness. Each path becomes
+    one seed: a tube of radius r around it, clipped to the mask, the nearest
+    path winning where tubes meet, so neighbouring seeds never overlap.
 
-    Tiled, with the same pinned tile shape as compact mode, so working memory
-    is one tile plus its halo whatever the object's size. Four passes over the
-    tiles; everything object-sized lives in disk memmaps in the step's temp
-    folder, not in RAM:
+    Tiled like compact mode. Dense work (distance transforms, skeleton, tubes)
+    runs per tile with a halo wide enough to be exact inside the tile; what
+    crosses tiles is only the skeleton -- about one voxel per voxel of fibre
+    length -- so the graph is built and paired for the whole object at once.
 
-    1. Fibre radius r: median inscribed radius on the object's centre lines.
-       Each tile's distance transform is recomputed with a larger halo until
-       it is exact inside the tile.
-    2. Ridge response and direction, with a halo covering every filter's full
-       reach, so both are identical to a whole-object computation; written to
-       disk.
-    3. The percentile thresholds over the whole object, exactly
-       (`_exact_percentiles`).
-    4. Peeling, per tile plus an overlap margin of one along-fibre smoothing
-       reach. A fibre crossing a tile boundary is found by both tiles; the
-       pieces are reconciled afterwards by `_resolve_tile_pieces`, which joins
-       pieces on the same line and dissolves a piece that spans strands a
-       neighbouring tile resolved, so fibres are neither cut at tile
-       boundaries nor welded together there.
-
-    Config inputs: the intensity percentiles and min_fragment_size. Every
-    scale derives from r (see the constants above).
+    Config input: min_fragment_size (voxels per seed). Every scale derives
+    from the object's fibre radius r (see the constants above).
     """
     import shutil
     import tempfile
+    from skimage.morphology import skeletonize
 
     diag = {"cores_evaluated": 0, "cores_too_small": 0, "thickness_rejected": 0,
             "aspect_ratio_rejected": 0, "spatial_overlap_rejected": 0,
             "pushed_and_dropped": 0}
-    percentiles = sorted(s["val"] for s in params.strategies if s["type"] == "Int")
-    if not percentiles:
-        return [], diag
 
-    # One code path for both ranks: a plane is a stack of one.
     is_stack = params.ndim == 3
     seg = segmentation_mask if is_stack else segmentation_mask[None]
-    inten = intensity_image if is_stack else intensity_image[None]
     box = tuple(sl) if is_stack else (slice(0, 1),) + tuple(sl)
     tile = tuple(int(t) for t in params.tile_size)
     tile = tile if is_stack else (1,) + tile
     sp = np.asarray(params.spacing, float)
     sp = sp if is_stack else np.r_[1.0, sp]
     image_bounds = tuple(slice(0, n) for n in seg.shape)
-    struct = ndimage.generate_binary_structure(3, 1)
     targets = list(_tile_targets(box, tile))
+    bshape = tuple(b.stop - b.start for b in box)
+    boff = np.array([b.start for b in box])
 
-    # ---- pass 1: fibre radius, object planes, voxel count -------------------
-    ridge_vals, obj_planes, n_obj = [], np.zeros(seg.shape[0], bool), 0
+    # ---- pass 1: fibre radius and the object's thickest point ---------------
+    ridge_vals, dt_max = [], 0.0
     for tg in targets:
         h_um = 5.0
         while True:
@@ -1586,149 +1103,141 @@ def _elongated_label_candidates(lbl, sl, segmentation_mask, intensity_image,
             continue
         ridge = obj & (dt >= ndimage.maximum_filter(dt, size=3)) & (dt > 0)
         ridge_vals.append(dt[loc][ridge[loc]].astype(np.float32))
-        o = obj[loc]
-        obj_planes[tg[0].start:tg[0].stop] |= o.any(axis=(1, 2))
-        n_obj += int(o.sum())
+        dt_max = max(dt_max, float(dt[loc].max()))
         del obj, dt, ridge
     rv = np.concatenate(ridge_vals) if ridge_vals else np.zeros(0, np.float32)
-    if n_obj == 0 or rv.size == 0:
+    if rv.size == 0:
         return [], diag
     r = float(np.median(rv))
     del ridge_vals, rv
     if not (r > 0):
         return [], diag
 
-    s_px = max(0.5, r / float(sp[-1]))
-    sL_px = _ALONG_SMOOTH_R * r / float(sp[-1])
-    hess_px = int(4 * s_px + 0.5)                     # gaussian truncate = 4
-    dir_px = int(4 * _DIRECTION_AVG_R * s_px + 0.5)
-    along_px = int(np.ceil(3 * sL_px)) + 1            # line reach + interpolation
-    halo_xy = max(hess_px + dir_px, hess_px + along_px) + 2
-    halo_z = (int(4 * r / float(sp[0]) + 0.5) + 1) if is_stack else 0
-    # Region the response may read from: the object's box, in-plane widened
-    # by the along-fibre reach so fibres ending at the box still see real
-    # image; across planes only the box.
-    reach_px = int(np.ceil(3 * sL_px)) + 2
-    read_bounds = (
-        slice(box[0].start, box[0].stop),
-        slice(max(0, box[1].start - reach_px), min(seg.shape[1], box[1].stop + reach_px)),
-        slice(max(0, box[2].start - reach_px), min(seg.shape[2], box[2].stop + reach_px)),
-    )
-    bshape = tuple(b.stop - b.start for b in box)
-    boff = np.array([b.start for b in box])
-    in_box = lambda t: tuple(slice(a.start - b.start, a.stop - b.start) for a, b in zip(t, box))
+    # ---- pass 2: skeleton and in-plane half-width, exact per tile ------------
+    # Thinning reaches as far as the object is thick, so a halo of a few times
+    # its thickest radius (and at least one arm window) makes each tile's
+    # skeleton the object's own inside the tile.
+    h_um = max(4.0 * dt_max, _ARM_WINDOW_R * r)
+    halo = [int(np.ceil(h_um / s)) + 2 for s in sp]
+    if not is_stack:
+        halo[0] = 0
+    sk_pts, sk_w = [], []
+    for tg in targets:
+        crop = _grow(tg, halo, image_bounds)
+        loc = _local(tg, crop)
+        obj = np.asarray(seg[crop]) == lbl
+        if not obj[loc].any():
+            continue
+        sk = skeletonize(obj[0])[None] if not is_stack else skeletonize(obj)
+        sk = sk.astype(bool)
+        # In-plane half-width: a flat ribbon is one fibre deep, so the 3D
+        # distance to the background would see its depth, not its width.
+        w2 = np.zeros(obj.shape, np.float32)
+        for z in range(obj.shape[0]):
+            if obj[z].any():
+                w2[z] = ndimage.distance_transform_edt(obj[z], sampling=sp[1:])
+        if obj.shape[0] > 1:
+            w2 = ndimage.maximum_filter1d(w2, size=3, axis=0)
+        inner = sk[loc]
+        q = np.argwhere(inner)
+        if len(q):
+            sk_pts.append((q + np.array([t.start for t in tg]) - boff).astype(np.int64))
+            sk_w.append(w2[loc][inner].astype(np.float32))
+        del obj, sk, w2
+    if not sk_pts:
+        return [], diag
+    pts = np.concatenate(sk_pts)
+    half_w = np.concatenate(sk_w)
+    del sk_pts, sk_w
 
+    def obj_lookup(coords):
+        coords = np.asarray(coords, np.int64)
+        if not len(coords):
+            return np.zeros(0, bool)
+        g = coords + boff
+        return np.asarray(seg[tuple(g.T)]) == lbl
+
+    # ---- the whole object's graph, decomposed into paths --------------------
+    paths = _paths_from_skeleton(pts, half_w, bshape, sp, r, obj_lookup)
+    del pts, half_w
+    if not paths:
+        return [], diag
+    diag["cores_evaluated"] = len(paths)
+
+    # ---- pass 3: each path widened into a tube of radius r, per tile --------
+    th = [int(np.ceil(r / s)) + 2 for s in sp]
+    if not is_stack:
+        th[0] = 0
+    in_box = lambda t: tuple(slice(a.start - b.start, a.stop - b.start) for a, b in zip(t, box))
     workdir = tempfile.mkdtemp(prefix=f"elongated_{lbl}_", dir=params.temp_dir)
     try:
-        resp_mm = np.memmap(os.path.join(workdir, "resp.dat"), np.float32, "w+", shape=bshape)
-        c_mm = np.memmap(os.path.join(workdir, "c.dat"), np.float32, "w+", shape=bshape)
-        s_mm = np.memmap(os.path.join(workdir, "s.dat"), np.float32, "w+", shape=bshape)
-        plane_list = np.nonzero(obj_planes)[0]
+        piece_mm = np.memmap(os.path.join(workdir, "seeds.dat"), np.int32, "w+", shape=bshape)
 
-        # ---- pass 2: ridge response and direction, exact per tile ----------
-        for tg in targets:
-            crop = _grow(tg, (halo_z, halo_xy, halo_xy), read_bounds)
-            loc = _local(tg, crop)
-            obj_t = np.asarray(seg[tg]) == lbl
-            if not obj_t.any():
-                continue
-            img = np.asarray(inten[crop], np.float32)
-            planes = [z - crop[0].start for z in plane_list
-                      if crop[0].start <= z < crop[0].stop]
-            R, C, S = _ridge_and_direction(img, planes, sp, r, is_stack)
-            del img
-            where = np.zeros(R.shape, bool)
-            where[loc] = obj_t
-            resp = _along_fibre_smooth(R, C, S, where, sp, _ALONG_SMOOTH_R * r)
-            resp_mm[in_box(tg)] = resp[loc]
-            c_mm[in_box(tg)] = C[loc]
-            s_mm[in_box(tg)] = S[loc]
-            del R, C, S, resp, where
-        resp_mm.flush(); c_mm.flush(); s_mm.flush()
-
-        # ---- pass 3: percentile thresholds over the whole object -----------
-        def _values():
+        def build_tubes(path_list):
+            """Tubes for `path_list` into piece_mm; returns voxel count per label."""
+            path_lab = np.concatenate([np.full(len(p_), k + 1, np.int32)
+                                       for k, p_ in enumerate(path_list)])
+            path_vox = np.concatenate(path_list)
+            counts = np.zeros(len(path_list) + 1, np.int64)
             for tg in targets:
-                o = np.asarray(seg[tg]) == lbl
-                if o.any():
-                    yield np.asarray(resp_mm[in_box(tg)])[o]
-        thresholds = _exact_percentiles(_values, percentiles)
+                crop = _grow(tg, th, box)
+                loc = _local(tg, crop)
+                obj = np.asarray(seg[crop]) == lbl
+                if not obj[loc].any():
+                    continue
+                c0 = np.array([c.start for c in crop]) - boff
+                c1 = np.array([c.stop for c in crop]) - boff
+                sel = np.all((path_vox >= c0) & (path_vox < c1), axis=1)
+                if not sel.any():
+                    piece_mm[in_box(tg)] = 0
+                    continue
+                lab_img = np.zeros(obj.shape, np.int32)
+                lab_img[tuple((path_vox[sel] - c0).T)] = path_lab[sel]
+                dist, idx = ndimage.distance_transform_edt(lab_img == 0, sampling=sp,
+                                                           return_indices=True)
+                seedt = np.where(obj & (dist <= r), lab_img[tuple(idx)], 0)[loc]
+                piece_mm[in_box(tg)] = seedt
+                counts += np.bincount(seedt.ravel(), minlength=counts.size)[:counts.size]
+                del lab_img, dist, idx, obj
+            return counts
 
-        # ---- pass 4: peeling per tile + overlap, joined across tiles -------
-        piece_mm = np.memmap(os.path.join(workdir, "pieces.dat"), np.int32, "w+", shape=bshape)
-        uf = _Union()
-        pad = (int(np.ceil(3 * sL_px * sp[-1] / sp[0])) + 1 if is_stack else 0,
-               int(np.ceil(3 * sL_px)) + 2, int(np.ceil(3 * sL_px)) + 2)
-        found = []
-        for t_index, tg in enumerate(targets):
-            crop = _grow(tg, pad, box)
-            loc = _local(tg, crop)
-            obj = np.asarray(seg[crop]) == lbl
-            if not obj[loc].any():
-                continue
-            bc = in_box(crop)
-            resp = np.asarray(resp_mm[bc]); C = np.asarray(c_mm[bc]); S = np.asarray(s_mm[bc])
-            in_target = np.zeros(obj.shape, bool)
-            in_target[loc] = True
-            open_ = obj.copy()
-            for p, thr in zip(percentiles, thresholds):
-                core = (resp >= thr) & open_
-                lab, _n = ndimage.label(core, structure=struct)
-                for i, psl in enumerate(ndimage.find_objects(lab), 1):
-                    if psl is None:
-                        continue
-                    diag["cores_evaluated"] += 1
-                    vox = np.argwhere(lab[psl] == i) + np.array([q.start for q in psl])
-                    if len(vox) < params.min_seed_vol:
-                        diag["cores_too_small"] += 1
-                        open_[tuple(vox.T)] = False
-                        continue
-                    if (p != percentiles[-1] and
-                            _piece_width(vox, sp, C, S, _ALONG_SMOOTH_R * r) > _WIDTH_LIMIT_R * r):
-                        continue  # several fibres: look again one level up
-                    # At the top level there is no level up; a piece still too
-                    # wide is split by `_split_at_lines` rather than dropped,
-                    # since a fibre left without any seed cannot be recovered.
-                    open_[tuple(vox.T)] = False
-                    if not in_target[tuple(vox.T)].any():
-                        continue  # a neighbouring tile owns this piece
-                    for part in _split_at_lines(vox, resp, C, S, sp, r, thresholds,
-                                                params.min_seed_vol):
-                        # Collected as found, margin included; reconciled
-                        # across tiles once every tile is done
-                        # (`_resolve_tile_pieces`).
-                        d_ = np.c_[C[tuple(part.T)], S[tuple(part.T)]].mean(0)
-                        found.append((part + np.array([c.start for c in bc]), t_index, d_))
-            del obj, resp, C, S, open_, in_target
-        resolved = _resolve_tile_pieces(found, bshape, sp, r, params.min_seed_vol, resp_mm)
-        resolved = _reassign_at_junctions(resolved, bshape, sp, r, resp_mm)
-        for k, vox_k in enumerate(resolved, 1):
-            piece_mm[tuple(vox_k.T)] = k
-            uf.new()
-        del found
+        # A path too short to make a seed must not take tube voxels from its
+        # neighbours: drop it and rebuild, until every tube reaches the size.
+        min_vol = max(1, params.min_seed_vol)
+        for _round in range(4):
+            counts = build_tubes(paths)
+            small = [k for k in range(len(paths)) if counts[k + 1] < min_vol]
+            diag["cores_too_small"] += len(small)
+            if not small:
+                break
+            paths = [p_ for k, p_ in enumerate(paths) if counts[k + 1] >= min_vol]
+            if not paths:
+                break
+        if not paths:
+            del piece_mm
+            return [], diag
+        counts = build_tubes(paths) if small else counts
         piece_mm.flush()
 
-        # ---- assemble one candidate per joined fibre ------------------------
+        # ---- one candidate per path ------------------------------------------
+        keep = counts >= min_vol
+        keep[0] = False
         coords, best = {}, {}
         for tg in targets:
             ids = np.asarray(piece_mm[in_box(tg)])
             if not ids.any():
                 continue
-            rsp = np.asarray(resp_mm[in_box(tg)])
-            vox = np.argwhere(ids > 0)
-            roots = np.array([uf.find(int(i)) for i in ids[tuple(vox.T)]])
-            vals = rsp[tuple(vox.T)]
-            g = vox + boff + np.array([t.start - b.start for t, b in zip(tg, box)])
-            for rt in np.unique(roots):
-                m = roots == rt
-                coords.setdefault(rt, []).append(g[m].astype(np.int32))
-                k = int(np.argmax(vals[m]))
-                if rt not in best or vals[m][k] > best[rt][0]:
-                    best[rt] = (float(vals[m][k]), g[m][k])
+            vox = np.argwhere(keep[ids])
+            if not len(vox):
+                continue
+            lab_v = ids[tuple(vox.T)]
+            g = vox + np.array([t.start for t in tg])
+            for rt in np.unique(lab_v):
+                coords.setdefault(int(rt), []).append(g[lab_v == rt].astype(np.int32))
         candidates = []
         for rt in sorted(coords):
             cc = np.concatenate(coords[rt])
-            pk = best[rt][1]
+            pk = cc[len(cc) // 2]
             if not is_stack:
                 cc, pk = cc[:, 1:], pk[1:]
             candidates.append({
@@ -1742,7 +1251,7 @@ def _elongated_label_candidates(lbl, sl, segmentation_mask, intensity_image,
                 "dt_vals": np.zeros(len(cc), np.float32),
                 "rank_vals": np.zeros(len(cc), np.float32),
             })
-        del resp_mm, c_mm, s_mm, piece_mm
+        del piece_mm
         return candidates, diag
     finally:
         shutil.rmtree(workdir, ignore_errors=True)

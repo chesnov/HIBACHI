@@ -3122,7 +3122,8 @@ class DynamicGUIManager(QObject):
     #: another channel: an editable control that cannot affect the result
     #: invites tuning it.
     _ELONGATED_HIDDEN = (
-        "ratios_to_process", "intensity_smooth_um", "intensity_weight",
+        "ratios_to_process", "intensity_percentiles_to_process",
+        "intensity_smooth_um", "intensity_weight",
         "min_physical_peak_separation", "absolute_min_thickness_um",
         "absolute_max_thickness_um", "max_allowed_core_aspect_ratio",
     )
