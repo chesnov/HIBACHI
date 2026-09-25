@@ -1078,7 +1078,7 @@ def _local(inner, outer):
                  for i, o in zip(inner, outer))
 
 
-def _resolve_tile_pieces(pieces, bshape, spacing, r, min_size):
+def _resolve_tile_pieces(pieces, bshape, spacing, r, min_size, resp):
     """Reconcile pieces found by overlapping tiles into one seed per fibre.
 
     Each tile finds pieces in its own region plus a margin, so neighbouring
@@ -1087,14 +1087,19 @@ def _resolve_tile_pieces(pieces, bshape, spacing, r, min_size):
     box. Every pair of pieces from different tiles that overlaps is compared
     along the local fibre direction:
 
-    * the same line -- neither extends a fibre diameter (2 r) sideways beyond
-      the other where they overlap: joined, the same fibre continuing;
+    * the same line -- neither reaches more than half a fibre diameter (r)
+      past the other's edge, sideways, where they overlap: joined, the same
+      fibre continuing;
     * one covers an extra line the other tile resolved separately -- a tile
       near its edge sees only part of the picture and can accept one piece
-      across two strands: the coarser piece is dissolved. Each of its voxels
-      goes to the nearest of the finer tile's lines, so those strands continue
-      along its whole length; what lies 2 r or more from all of them becomes a
-      strand of its own if it reaches `min_size`, else joins the nearest.
+      across two strands: the coarser piece is dissolved. It is divided by a
+      watershed on the ridge response `resp` (box-shaped), flooded from the
+      finer tile's strands where they lie inside it, so each strand continues
+      along its own path through it and every region stays connected to its
+      strand. (Giving each voxel to the strand nearest sideways instead left
+      islands of one seed inside another and let a seed switch strands where
+      they drift.) Parts of it lying 2 r or more from every strand seed a
+      strand of their own if they reach `min_size`.
 
     The finer division wins because a merge is the error the next step cannot
     undo, while an extra split it can re-merge. Independent of the order the
@@ -1145,6 +1150,7 @@ def _resolve_tile_pieces(pieces, bshape, spacing, r, min_size):
             parent[max(a, b)] = min(a, b)
 
     finer_of = {}                       # coarse piece -> finer pieces it spans
+    same_line = []                      # joined only once dissolution is decided
     for a, b in sorted(pairs):
         d, perp = frame(a)
         al_a, la_a = lateral(a, d, perp)
@@ -1156,72 +1162,178 @@ def _resolve_tile_pieces(pieces, bshape, spacing, r, min_size):
         lo, hi = al_o.min() - _ALONG_SMOOTH_R * r, al_o.max() + _ALONG_SMOOTH_R * r
         sa = (al_a >= lo) & (al_a <= hi)
         sb = (al_b >= lo) & (al_b <= hi)
-        ma, mb = float(np.median(la_a[sa])), float(np.median(la_b[sb]))
-        a_extends = float(np.percentile(np.abs(la_a[sa] - mb), 95)) >= 2 * r
-        b_extends = float(np.percentile(np.abs(la_b[sb] - ma), 95)) >= 2 * r
+        # Edge against edge: a piece covering an extra strand reaches about a
+        # whole fibre (2 r) past the other's edge on that side; two versions
+        # of the same line differ by less than r. The cut is midway, at r.
+        # (Measuring from the other's centre instead flagged two identical
+        # two-fibre-wide pieces as each extending beyond the other.)
+        a_lo, a_hi = np.percentile(la_a[sa], [5, 95])
+        b_lo, b_hi = np.percentile(la_b[sb], [5, 95])
+        a_extends = max(a_hi - b_hi, b_lo - a_lo) >= r
+        b_extends = max(b_hi - a_hi, a_lo - b_lo) >= r
         if not a_extends and not b_extends:
-            union(a, b)
+            same_line.append((a, b))
         elif a_extends and not b_extends:
             finer_of.setdefault(a, []).append(b)
         elif b_extends and not a_extends:
             finer_of.setdefault(b, []).append(a)
         # both extend: two different lines crossing -- neither joined.
 
-    # Dissolve coarse pieces onto the finer lines they span.
+    # Dissolve coarse pieces onto the finer strands they span.
+    from skimage.segmentation import watershed
     extra = []
     dissolved = set()
+    owned = {}                          # voxel (linear) -> owner it was given to
+
+    def give(own, vox):
+        if own >= len(coords):
+            prev = extra[own - len(coords)]
+            extra[own - len(coords)] = vox if prev is None else np.concatenate([prev, vox])
+        else:
+            coords[own] = np.concatenate([coords[own], vox])
+        for v in np.ravel_multi_index(vox.T, bshape):
+            owned[int(v)] = own
     for p_, fine in finer_of.items():
         d, perp = frame(p_)
+        pc = coords[p_]
         al_p, la_p = lateral(p_, d, perp)
-        lines, owners = [], []
+        lo_p = pc.min(0)
+        hi_p = pc.max(0) + 1
+        shape_p = tuple(hi_p - lo_p)
+        mask_p = np.zeros(shape_p, bool)
+        mask_p[tuple((pc - lo_p).T)] = True
+        lin_p = np.ravel_multi_index(pc.T, bshape)
+        markers = np.zeros(shape_p, np.int32)
+        owners, lines = [], []
         for f in fine:
             al_f, la_f = lateral(f, d, perp)
             m = (al_f >= al_p.min() - _ALONG_SMOOTH_R * r) & (al_f <= al_p.max() + _ALONG_SMOOTH_R * r)
             pos = float(np.median(la_f[m] if m.any() else la_f))
             close = [k for k, q in enumerate(lines) if abs(q - pos) < r]
-            if close:                   # the same line found twice: one fibre
+            if close:                   # the same strand found twice: one fibre
                 union(owners[close[0]], f)
+                k = close[0]
             else:
                 lines.append(pos)
                 owners.append(f)
-        rest = np.min(np.abs(la_p[:, None] - np.array(lines)[None, :]), axis=1) >= 2 * r
-        new_owner = None
-        if rest.sum() >= min_size:
-            lines.append(float(np.median(la_p[rest])))
-            new_owner = len(coords) + len(extra)
-            extra.append([])
-            owners.append(new_owner)
-        nearest = np.argmin(np.abs(la_p[:, None] - np.array(lines)[None, :]), axis=1)
-        for k, own in enumerate(owners):
-            vox = coords[p_][nearest == k]
+                k = len(owners) - 1
+            inside = np.isin(np.ravel_multi_index(coords[f].T, bshape), lin_p)
+            markers[tuple((coords[f][inside] - lo_p).T)] = k + 1
+        # Parts far from every strand start strands of their own.
+        far = np.min(np.abs(la_p[:, None] - np.array(lines)[None, :]), axis=1) >= 2 * r
+        if far.any():
+            far_mask = np.zeros(shape_p, bool)
+            far_mask[tuple((pc[far] - lo_p).T)] = True
+            comp, nc = ndimage.label(far_mask, structure=ndimage.generate_binary_structure(3, 1))
+            for c_ in range(1, nc + 1):
+                cm = comp == c_
+                if cm.sum() >= min_size:
+                    owners.append(len(coords) + len(extra))
+                    extra.append(None)
+                    markers[cm & (markers == 0)] = len(owners)
+        if not markers.any():
+            continue                    # nothing to flood from: keep it whole
+        box_p = tuple(slice(int(a0), int(b0)) for a0, b0 in zip(lo_p, hi_p))
+        ws = watershed(-np.asarray(resp[box_p], np.float32), markers, mask=mask_p)
+        for k, own in enumerate(owners, 1):
+            vox = np.argwhere(ws == k) + lo_p
             if not len(vox):
                 continue
-            if own == new_owner:
-                extra[own - len(coords)] = vox
-            else:
-                coords[own] = np.concatenate([coords[own], vox])
+            give(own, vox)
         dissolved.add(p_)
+
+    # A piece on the same line as a dissolved one is just as merged, even if it
+    # never met the finer strands itself: divide it the same way, flooding
+    # from the regions the dissolved piece was divided into where they lie
+    # inside it, and so on along the chain.
+    partners = {}
+    for a, b in same_line:
+        partners.setdefault(a, set()).add(b)
+        partners.setdefault(b, set()).add(a)
+    queue = [q for p_ in list(dissolved) for q in partners.get(p_, ())]
+    while queue:
+        g = queue.pop()
+        if g in dissolved:
+            continue
+        lin_g = np.ravel_multi_index(coords[g].T, bshape)
+        by_owner = {}
+        for i_v, v in enumerate(lin_g):
+            o = owned.get(int(v))
+            if o is not None:
+                by_owner.setdefault(o, []).append(i_v)
+        if len(by_owner) < 2:
+            continue                    # meets only one strand: an ordinary join
+        pc = coords[g]
+        lo_p = pc.min(0)
+        hi_p = pc.max(0) + 1
+        shape_p = tuple(hi_p - lo_p)
+        mask_p = np.zeros(shape_p, bool)
+        mask_p[tuple((pc - lo_p).T)] = True
+        markers = np.zeros(shape_p, np.int32)
+        owners = list(by_owner)
+        for k, o in enumerate(owners, 1):
+            markers[tuple((pc[by_owner[o]] - lo_p).T)] = k
+        box_p = tuple(slice(int(a0), int(b0)) for a0, b0 in zip(lo_p, hi_p))
+        ws = watershed(-np.asarray(resp[box_p], np.float32), markers, mask=mask_p)
+        for k, o in enumerate(owners, 1):
+            vox = np.argwhere(ws == k) + lo_p
+            if len(vox):
+                give(o, vox)
+        dissolved.add(g)
+        queue.extend(q for q in partners.get(g, ()) if q not in dissolved)
+
+    # Joins between surviving pieces only: a dissolved piece must not bridge
+    # the pieces it overlapped into one seed -- that welds strands through it.
+    for a, b in same_line:
+        if a not in dissolved and b not in dissolved:
+            union(a, b)
 
     groups = {}
     for i in range(n):
         if i not in dissolved:
             groups.setdefault(find(i), []).append(coords[i])
     seeds = [np.unique(np.concatenate(g), axis=0) for g in groups.values()]
-    seeds += [np.asarray(e) for e in extra if len(e)]
+    seeds += [np.asarray(e) for e in extra if e is not None and len(e)]
 
-    # A voxel still claimed by two seeds -- only where two different lines
-    # cross -- stays with the first; seeds must not overlap.
+    # A voxel still claimed by two seeds goes to the one most of its
+    # uncontested neighbours belong to, so no seed is left with islands of
+    # another inside it; seeds must not overlap.
     lin_all = np.concatenate([np.ravel_multi_index(s_.T, bshape) for s_ in seeds])
     sid = np.concatenate([np.full(len(s_), i) for i, s_ in enumerate(seeds)])
     order = np.argsort(lin_all, kind="stable")
     lin_s, sid_s = lin_all[order], sid[order]
-    keep = np.ones(lin_s.size, bool)
-    dup = np.nonzero(lin_s[1:] == lin_s[:-1])[0]
-    keep[dup + 1] = False
-    final = [[] for _ in seeds]
-    vox_all = np.array(np.unravel_index(lin_s[keep], bshape)).T
-    for i in range(len(seeds)):
-        final[i] = vox_all[sid_s[keep] == i]
+    claim = {}
+    for v, i in zip(lin_s, sid_s):
+        claim.setdefault(int(v), []).append(int(i))
+    contested = {v: c for v, c in claim.items() if len(set(c)) > 1}
+    label_of = {v: c[0] for v, c in claim.items() if len(set(c)) == 1}
+    strides = np.array([bshape[1] * bshape[2], bshape[2], 1])
+    for _round in range(8):             # a few passes settle fronts inward
+        if not contested:
+            break
+        settled = {}
+        for v, cands in contested.items():
+            z_, y_, x_ = np.unravel_index(v, bshape)
+            votes = {}
+            for dz, dy, dx in ((1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, -1, 0), (0, 0, 1), (0, 0, -1)):
+                zz, yy, xx = z_ + dz, y_ + dy, x_ + dx
+                if 0 <= zz < bshape[0] and 0 <= yy < bshape[1] and 0 <= xx < bshape[2]:
+                    o = label_of.get(int(zz * strides[0] + yy * strides[1] + xx))
+                    if o in cands:
+                        votes[o] = votes.get(o, 0) + 1
+            if votes:
+                settled[v] = max(votes, key=votes.get)
+        if not settled:
+            break
+        label_of.update(settled)
+        for v in settled:
+            del contested[v]
+    for v, cands in contested.items():  # no voting neighbour at all
+        label_of[v] = cands[0]
+    lin_k = np.fromiter(label_of.keys(), np.int64, len(label_of))
+    sid_k = np.fromiter(label_of.values(), np.int64, len(label_of))
+    vox_all = np.array(np.unravel_index(lin_k, bshape)).T
+    final = [vox_all[sid_k == i] for i in range(len(seeds))]
     return [f for f in final if len(f)]
 
 
@@ -1442,7 +1554,7 @@ def _elongated_label_candidates(lbl, sl, segmentation_mask, intensity_image,
                         found.append((part + np.array([c.start for c in bc]), t_index, d_))
             del obj, resp, C, S, open_, in_target
         for k, vox_k in enumerate(_resolve_tile_pieces(
-                found, bshape, sp, r, params.min_seed_vol), 1):
+                found, bshape, sp, r, params.min_seed_vol, resp_mm), 1):
             piece_mm[tuple(vox_k.T)] = k
             uf.new()
         del found
