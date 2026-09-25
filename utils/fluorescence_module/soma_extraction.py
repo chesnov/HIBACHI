@@ -1069,8 +1069,131 @@ def _paths_from_skeleton(pts, half_w, bshape, spacing, r, obj_lookup):
         za, zb, v = lanes[li]
         fwd_path = extend(v, zb)                     # grow past the far end
         back = extend(fwd_path[::-1], za)            # then past the near end
-        paths.append(np.unique(back, axis=0))
-    return paths
+        keep = np.r_[True, np.any(np.diff(back, axis=0) != 0, axis=1)]
+        paths.append(back[keep])                     # ordered along the fibre
+    return _stitch_paths(paths, sp, r, obj_lookup)
+
+
+def _stitch_paths(paths, sp, r, obj_lookup):
+    """Join traced paths that are consecutive pieces of one fibre.
+
+    Only a path's two ENDS are ever joined, never places where paths touch
+    along their sides -- that is how side-by-side fibres and bridges were
+    welded before. And only LONG paths decide: a path shorter than the
+    direction window (10 r) has no usable direction, and such fragments sit
+    precisely at intersections, where the decision matters most. A long end
+    is its end point plus the direction of its last 10 r. Two long ends from
+    different paths are candidates if they are within 10 r, the straight
+    segment between them stays inside the mask, they continue each other
+    (point towards each other), and each end's extended line passes within
+    one fibre spacing (2 r) of the other end. Every end ranks its candidates
+    by how far off-line they are; a pair is joined only if each is the
+    other's first choice, and never so as to close a loop. Joined paths keep
+    their outer ends and directions, so this repeats until nothing changes.
+    Tiny paths are placed afterwards: one lying along an accepted bridge
+    joins that fibre (split between two bridges it straddles); any other
+    stays a seed of its own. Returns the paths, ordered along their fibres.
+    """
+    win = _ARM_WINDOW_R * r
+    paths = [np.asarray(p_) for p_ in paths if len(p_)]
+
+    def arc(pv):
+        xyz = pv * sp
+        return np.r_[0.0, np.cumsum(np.linalg.norm(np.diff(xyz, axis=0), axis=1))]
+
+    def end_geom(pv):
+        """(end point, outward direction) at the path's last voxel."""
+        xyz = pv * sp
+        a = arc(pv)
+        j = int(np.searchsorted(a, a[-1] - win))
+        d = xyz[-1] - xyz[min(j, len(xyz) - 2)]
+        n = np.linalg.norm(d)
+        return xyz[-1], (d / n if n > 0 else None)
+
+    long_ = [pv for pv in paths if arc(pv)[-1] >= win]
+    tiny = [pv for pv in paths if arc(pv)[-1] < win]
+    bridges = []                        # (voxels, index into long_ of the joined path)
+
+    for _round in range(64):
+        ends = []                       # (path index, which end 0|1, point, direction)
+        for i, pv in enumerate(long_):
+            for which, seq in ((0, pv[::-1]), (1, pv)):
+                pt, d = end_geom(seq)
+                if d is not None:
+                    ends.append((i, which, pt, d))
+        cand = {}
+        for a in range(len(ends)):
+            ia, wa, pa, da = ends[a]
+            for b in range(a + 1, len(ends)):
+                ib, wb, pb, db = ends[b]
+                if ia == ib:
+                    continue            # both ends of one path: a loop
+                g = pb - pa
+                dist = float(np.linalg.norm(g))
+                if dist > win:
+                    continue
+                if float(da @ db) >= 0 or (dist > 0 and (float(g @ da) < 0 or float(-g @ db) < 0)):
+                    continue            # they do not continue each other
+                lat_a = float(np.linalg.norm(g - (g @ da) * da))
+                lat_b = float(np.linalg.norm(-g - (-g @ db) * db))
+                if lat_a >= 2 * r or lat_b >= 2 * r:
+                    continue            # off-line: a step onto another fibre
+                seg_v = _line_voxels(np.round(pa / sp).astype(np.int64),
+                                     np.round(pb / sp).astype(np.int64))
+                if len(seg_v) and not bool(np.all(obj_lookup(seg_v))):
+                    continue            # would cross background
+                cost = lat_a + lat_b + r * (1.0 + float(da @ db))
+                cand.setdefault(a, []).append((cost, b))
+                cand.setdefault(b, []).append((cost, a))
+        best = {e: min(c)[1] for e, c in cand.items()}
+        pairs = [(a, b) for a, b in best.items() if a < b and best.get(b) == a]
+        if not pairs:
+            break
+        # Join each mutual pair; a path joined twice this round waits.
+        taken = set()
+        merged = []
+        drop = set()
+        for a, b in pairs:
+            ia, wa, pa, _ = ends[a]
+            ib, wb, pb, _ = ends[b]
+            if ia in taken or ib in taken:
+                continue
+            taken.update((ia, ib))
+            pa_seq = long_[ia] if wa == 1 else long_[ia][::-1]      # joined end last
+            pb_seq = long_[ib] if wb == 0 else long_[ib][::-1]      # joined end first
+            seg_v = _line_voxels(pa_seq[-1], pb_seq[0])
+            merged.append(np.concatenate([pa_seq, seg_v, pb_seq]))
+            bridges.append(seg_v)
+            drop.update((ia, ib))
+        long_ = [pv for i, pv in enumerate(long_) if i not in drop] + merged
+
+    # Tiny paths lying along an accepted bridge join that fibre.
+    if bridges and tiny:
+        br_xyz = [bv * sp for bv in bridges]
+        # Each bridge now lies inside exactly one joined path.
+        path_sets = [set(map(tuple, pv.tolist())) for pv in long_]
+        owner_of_bridge = []
+        for bv in bridges:
+            key = set(map(tuple, bv.tolist()))
+            owner_of_bridge.append(next(i for i, ps in enumerate(path_sets) if key <= ps))
+        extra = {i: [] for i in range(len(long_))}
+        keep_tiny = []
+        for tv in tiny:
+            txyz = tv * sp
+            dist = np.stack([np.min(np.linalg.norm(txyz[:, None, :] - bx[None, :, :], axis=2), axis=1)
+                             for bx in br_xyz], axis=1)            # voxel x bridge
+            near = dist.min(1) <= r
+            if near.mean() < 0.5:
+                keep_tiny.append(tv)    # not on any accepted bridge: its own seed
+                continue
+            nb = np.argmin(dist, axis=1)
+            for k in np.unique(nb[near]):
+                extra[owner_of_bridge[k]].append(tv[near & (nb == k)])
+            if (~near).any():
+                keep_tiny.append(tv[~near])
+        long_ = [np.concatenate([pv] + extra[i]) if extra[i] else pv for i, pv in enumerate(long_)]
+        tiny = keep_tiny
+    return long_ + tiny
 
 
 def _elongated_label_candidates(lbl, sl, segmentation_mask, intensity_image,
