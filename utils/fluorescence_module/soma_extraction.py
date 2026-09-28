@@ -717,8 +717,6 @@ _HAIR_K = 4.0          # an end branch no longer than 4 half-widths where it
 #                        leaves is a hair -- a bump of the mask -- not a fibre
 _MAX_TURN_DEG = 30.0   # a fibre continues through a contact onto a branch
 #                        that turns it by less than this
-_LANE_SHARE = 2        # two fibres touching over a stretch share one skeleton
-#                        branch, so a branch may carry up to two paths
 
 
 # ---- tiling ------------------------------------------------------------------ #
@@ -880,7 +878,7 @@ def _line_voxels(p0, p1):
     return v[keep]
 
 
-def _remove_hairs(edges, half_w, length):
+def _remove_hairs(edges, half_w, length, xyz, r):
     """Remove the skeleton's hairs and merge what they leave behind.
 
     A rough mask surface gives its skeleton a hair every few fibre widths,
@@ -889,9 +887,22 @@ def _remove_hairs(edges, half_w, length):
     where they leave are removed, shortest first, never taking a node below
     two branches; a node left with one branch becomes a free end; the two
     branches of a node left with two are merged into one, so a fibre that only
-    had hairs on it becomes one long branch. `edges` as from `_skeleton_graph`,
-    `length(edge)` its physical length.
+    had hairs on it becomes one long branch -- but only if they continue each
+    other, turning by less than _MAX_TURN_DEG (each branch's direction taken
+    from 2 r to 10 r out, as `_arm`). The node a hair leaves behind can just
+    as well be where two DIFFERENT fibres meet at an angle; merging those
+    without looking welds the fibres into one, which no later step can undo.
+    A node that fails the test stays a junction, and the tracer decides there
+    by the same rule. `edges` as from `_skeleton_graph`, `length(edge)` its
+    physical length, `xyz` the skeleton voxels in microns.
     """
+
+    def continues(c1, c2):
+        """Do branch c1 (ending at the node) and c2 (starting there) continue
+        each other?"""
+        _, d1 = _arm(xyz[c1[::-1]], r)
+        _, d2 = _arm(xyz[c2], r)
+        return math.degrees(math.acos(max(-1.0, min(1.0, -float(d1 @ d2))))) < _MAX_TURN_DEG
     E = {i: e for i, e in enumerate(edges)}
     nxt = len(edges)
     inc = {}                            # node -> ids of the edges ending there
@@ -942,6 +953,8 @@ def _remove_hairs(edges, half_w, length):
                 a1, b1, c1 = b1, a1, c1[::-1]
             if a2 != nd:
                 a2, b2, c2 = b2, a2, c2[::-1]
+            if not continues(c1, c2):
+                continue                # a corner between two fibres: keep the junction
             if len(c2) and len(c1) and c1[-1] == c2[0]:
                 c2 = c2[1:]
             remove(i)
@@ -963,9 +976,8 @@ def _paths_from_skeleton(pts, half_w, bshape, spacing, r, obj_lookup):
     junctions joined by a branch shorter than one fibre width into one
     junction zone (they lie inside one contact); split ribbons (branches
     wider than one fibre) into k parallel lanes, k = half-width / r; then
-    trace fibres through the zones, each branch carried by at most
-    _LANE_SHARE paths, so every path is a chain (see the tracing comment
-    below). A bridge between fibres -- a touch point, a ladder rung, which
+    trace fibres through the zones, each branch used once, so every path is
+    a chain (see the tracing comment below). A bridge between fibres -- a touch point, a ladder rung, which
     meets them at an angle -- is never taken as a continuation and is left as
     a short path of its own. Branch length is not used to call something a
     bridge: in a dense bundle most fibre stretches between two touch points
@@ -983,7 +995,7 @@ def _paths_from_skeleton(pts, half_w, bshape, spacing, r, obj_lookup):
         return float(_arc_points(xyz_all[e[2]], None)[-1])
 
     # ---- remove hairs --------------------------------------------------------
-    edges = _remove_hairs(edges, half_w, length)
+    edges = _remove_hairs(edges, half_w, length, xyz_all, r)
 
     # ---- junctions inside one contact form one zone ---------------------------
     bridge = set()
@@ -1047,11 +1059,13 @@ def _paths_from_skeleton(pts, half_w, bshape, spacing, r, obj_lookup):
     # candidate branch without its bends into this contact and the next one.
     # Decided on the untrimmed skeleton, a straight fibre looks like a turn
     # at every contact, and a bundle breaks at every contact.
-    # Where two fibres touch over a stretch they share one skeleton branch, so
-    # a branch may carry up to _LANE_SHARE paths (never the same path twice);
-    # a path can otherwise start only on a branch no path has taken.
-    # Longest-first lets clear fibres claim their continuations before short
-    # fragments can.
+    # Each branch is used once, so paths are chains. Where two fibres touch
+    # over a stretch they share one skeleton branch; letting a second path
+    # run along it let that path follow the other fibre's route well past the
+    # contact -- two seeds interleaved on one fibre, and fibres swapped at the
+    # contact -- so one of the two fibres ends there instead. Step 4 can join
+    # the pieces; it cannot undo a swap. Longest-first lets clear fibres claim
+    # their continuations before short fragments can.
     zone_pts, zone_w = {}, {}
     for i in np.nonzero(node_of >= 0)[0]:
         zn = zone.find(int(node_of[i]))
@@ -1087,9 +1101,6 @@ def _paths_from_skeleton(pts, half_w, bshape, spacing, r, obj_lookup):
             incident.setdefault(zb, []).append((li, -1))
     lane_len = [float(_arc_points(v * sp, None)[-1]) for _za, _zb, v in lanes]
     used = np.zeros(len(lanes), bool)
-    users = np.zeros(len(lanes), int)       # paths running along each lane
-    owner = np.full(len(lanes), -1)         # the first of them
-    cur = [-1]                              # the path being traced
     win = _ARM_WINDOW_R * r
 
     def head(coords_xyz):
@@ -1108,7 +1119,7 @@ def _paths_from_skeleton(pts, half_w, bshape, spacing, r, obj_lookup):
                 return path_vox
             best = None
             for li, e in incident.get(zone_id, ()):
-                if used[li] and not (users[li] < _LANE_SHARE and owner[li] != cur[0]):
+                if used[li]:
                     continue
                 v = lanes[li][2]
                 v = v if e == 0 else v[::-1]
@@ -1132,9 +1143,6 @@ def _paths_from_skeleton(pts, half_w, bshape, spacing, r, obj_lookup):
                 return trim_tail(path_vox, zone_id)
             _c, li, v, e = best
             used[li] = True
-            users[li] += 1
-            if owner[li] < 0:
-                owner[li] = cur[0]
             tail = trim_tail(path_vox, zone_id)
             lead = trim_tail(v[::-1], zone_id)[::-1]
             link = _line_voxels(tail[-1], lead[0])
@@ -1149,9 +1157,6 @@ def _paths_from_skeleton(pts, half_w, bshape, spacing, r, obj_lookup):
         if used[li]:
             continue
         used[li] = True
-        cur[0] = len(paths)
-        users[li] += 1
-        owner[li] = cur[0]
         za, zb, v = lanes[li]
         fwd_path = extend(v, zb)                     # grow past the far end
         back = extend(fwd_path[::-1], za)            # then past the near end
@@ -1261,9 +1266,8 @@ def _elongated_label_candidates(lbl, sl, segmentation_mask, intensity_image,
     bridges is a loop, fibres fused side by side are one branch -- so it is
     decomposed into paths that can never branch (`_paths_from_skeleton`):
     hairs are removed, bridges carry no fibre, ribbons are split into lanes,
-    a branch two touching fibres share may carry both, and at every junction
-    a fibre continues onto its straightest branch, judged on the geometry
-    with the bends into the contacts removed. Each path becomes
+    and at every junction a fibre continues onto its straightest branch,
+    judged on the geometry with the bends into the contacts removed. Each path becomes
     one seed: a tube of radius r around it, clipped to the mask, the nearest
     path winning where tubes meet, so neighbouring seeds never overlap.
 
