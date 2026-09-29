@@ -212,6 +212,8 @@ class OutputStream(QObject):
 # =============================================================================
 
 import atexit
+import subprocess
+from contextlib import contextmanager
 
 # Cancellation lives in `resource_budget` (fluorescence_module) rather than in a
 # module of its own: it is the other half of the same question -- a budget says
@@ -336,6 +338,129 @@ def _terminate_new_children(baseline_pids: set) -> None:
             pass
 
 
+# ---------------------------------------------------------------------------
+# Keeping the machine awake while a run is in progress
+# ---------------------------------------------------------------------------
+# A multi-hour batch on a laptop, or on a desktop with a default power plan, is
+# otherwise suspended once the user stops touching it. That stalls the run and
+# can corrupt a step that was mid-write when the OS suspended it.
+#
+# Usage: wrap the long computation.
+#
+#     with keep_awake("batch processing"):
+#         ...
+#
+# Reference-counted and process-global, so a batch and an interactive step that
+# overlap do not release each other's hold, and safe to call from any thread.
+# Callers outside this module (the batch dialog, the setup wizard) import it
+# lazily inside the method that uses it: this module pulls in napari, which the
+# wizard's pure logic deliberately avoids at import time.
+#
+# Best-effort by design: if the platform mechanism is missing, processing
+# proceeds and the machine simply behaves as before. It blocks IDLE sleep only.
+# The display may still turn off, and neither a closed laptop lid nor a manual
+# Sleep is overridden -- those are the user's explicit choice, set in the OS
+# power settings.
+#
+# Per platform:
+#   Windows  SetThreadExecutionState. The state belongs to the CALLING THREAD
+#            and lapses when that thread exits, so a small dedicated daemon
+#            thread owns it; acquiring from a Qt worker would otherwise drop
+#            the hold the moment that worker finished, or release from a thread
+#            that never set it.
+#   macOS    `caffeinate -i -w <pid>`; -w ends it if this process dies.
+#   Linux    `systemd-inhibit` around a `tail --pid` that ends with this
+#            process, so a crash cannot leak the lock. Absent on non-systemd
+#            systems, where this quietly does nothing.
+
+_ES_CONTINUOUS = 0x80000000
+_ES_SYSTEM_REQUIRED = 0x00000001
+
+_awake_lock = threading.Lock()
+_awake_count = 0
+_awake_stop: Optional[threading.Event] = None      # Windows keeper thread
+_awake_proc: Optional[subprocess.Popen] = None     # macOS / Linux helper
+
+
+def _win_keeper(stop: threading.Event) -> None:
+    """Owns the Windows execution state for exactly as long as `stop` is unset."""
+    import ctypes
+    kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+    kernel32.SetThreadExecutionState(_ES_CONTINUOUS | _ES_SYSTEM_REQUIRED)
+    stop.wait()
+    kernel32.SetThreadExecutionState(_ES_CONTINUOUS)
+
+
+def _awake_begin(reason: str) -> None:
+    global _awake_stop, _awake_proc
+    try:
+        if sys.platform == "win32":
+            _awake_stop = threading.Event()
+            threading.Thread(target=_win_keeper, args=(_awake_stop,),
+                             name="keep-awake", daemon=True).start()
+        elif sys.platform == "darwin":
+            _awake_proc = subprocess.Popen(
+                ["caffeinate", "-i", "-w", str(os.getpid())],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        else:
+            exe = shutil.which("systemd-inhibit")
+            if exe:
+                _awake_proc = subprocess.Popen(
+                    [exe, "--what=sleep:idle", "--who=HIBACHI",
+                     f"--why={reason}", "--mode=block",
+                     "tail", f"--pid={os.getpid()}", "-f", "/dev/null"],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception as exc:  # never let a power hint break processing
+        log.warning("Could not prevent sleep: %s", exc)
+
+
+def _awake_end() -> None:
+    global _awake_stop, _awake_proc
+    try:
+        if _awake_stop is not None:
+            _awake_stop.set()
+        if _awake_proc is not None:
+            _awake_proc.terminate()
+    except Exception:
+        pass
+    _awake_stop = None
+    _awake_proc = None
+
+
+def acquire_keep_awake(reason: str = "HIBACHI is processing") -> None:
+    """Start (or add a holder to) the block on idle sleep. Pair with `release_keep_awake`."""
+    global _awake_count
+    with _awake_lock:
+        _awake_count += 1
+        if _awake_count == 1:
+            _awake_begin(reason)
+
+
+def release_keep_awake() -> None:
+    """Drop one holder; sleep is allowed again when the last one goes."""
+    global _awake_count
+    with _awake_lock:
+        if _awake_count == 0:
+            return
+        _awake_count -= 1
+        if _awake_count == 0:
+            _awake_end()
+
+
+@contextmanager
+def keep_awake(reason: str = "HIBACHI is processing"):
+    """Block idle sleep for the duration of the `with` body."""
+    acquire_keep_awake(reason)
+    try:
+        yield
+    finally:
+        release_keep_awake()
+
+
+# Safety net for an exit that skips the `finally` above.
+atexit.register(_awake_end)
+
+
 class StepWorker(QThread):
     """
     Executes a processing step in a separate thread to keep the GUI responsive.
@@ -357,6 +482,13 @@ class StepWorker(QThread):
         self.params = params
 
     def run(self) -> None:
+        # Held for the life of the step and released however it ends (success,
+        # error, cancel). Done here rather than around `start()` so an orphaned
+        # worker that keeps running after its window closes is still covered.
+        with keep_awake("HIBACHI is processing"):
+            self._run_step()
+
+    def _run_step(self) -> None:
         lifecycle("worker.run.start", {"step": self.step_index})
         try:
             success = self.strategy.execute_step(

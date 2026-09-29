@@ -102,6 +102,7 @@ class BatchProgressDialog(QDialog):
         self._reader = None
         self._cancelled = False
         self._finished = False
+        self._awake = False  # holding the keep-awake block
         self._counts = (0, 0, 0)
         self._spin_idx = 0
 
@@ -176,6 +177,11 @@ class BatchProgressDialog(QDialog):
     # ---- lifecycle ------------------------------------------------------ #
     def start(self) -> None:
         """Spawn the worker process and begin streaming progress."""
+        # Held by the GUI process, which outlives the batch child. Released in
+        # `_release_awake`, called from every terminal path (`_finish` and
+        # `closeEvent`), so a batch that dies or is cancelled cannot leave the
+        # machine unable to sleep.
+        self._acquire_awake()
         try:
             self._ctx = mp.get_context("spawn")
             self._queue = self._ctx.Queue()
@@ -301,10 +307,31 @@ class BatchProgressDialog(QDialog):
         except Exception:
             pass
 
+    def _acquire_awake(self) -> None:
+        """Stop the machine idling into sleep mid-batch. Best-effort."""
+        try:
+            # Lazy: gui_manager imports napari; see the note beside keep_awake.
+            from .gui_manager import acquire_keep_awake
+            acquire_keep_awake("HIBACHI batch processing")
+            self._awake = True
+        except Exception:
+            pass
+
+    def _release_awake(self) -> None:
+        """Allow the machine to sleep again. Idempotent."""
+        if self._awake:
+            self._awake = False
+            try:
+                from .gui_manager import release_keep_awake
+                release_keep_awake()
+            except Exception:
+                pass
+
     def _finish(self, cancelled: bool) -> None:
         if self._finished:
             return
         self._finished = True
+        self._release_awake()
         self._spin_timer.stop()
         self.spinner.setText("•")
 
@@ -346,5 +373,6 @@ class BatchProgressDialog(QDialog):
                 self._reader.wait(1500)
             self._kill_process()
             self._finished = True
+            self._release_awake()
             self.finished_batch.emit(0, 0, 0, True)
         super().closeEvent(event)

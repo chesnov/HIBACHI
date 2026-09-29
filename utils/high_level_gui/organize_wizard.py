@@ -688,6 +688,14 @@ if _HAVE_QT:
             return self._cancel_requested
 
         def run(self) -> None:
+            # Whole-slide extraction can run for many minutes. Imported here, not
+            # at module level: gui_manager pulls in napari, and this module's
+            # logic is kept importable without it. Without it, no power hint.
+            try:
+                from .gui_manager import acquire_keep_awake, release_keep_awake
+            except Exception:
+                acquire_keep_awake = release_keep_awake = lambda *a: None
+            acquire_keep_awake("HIBACHI project setup")
             try:
                 for index, (ch_idx, preset, target) in enumerate(self.plan):
                     self.current_step = index
@@ -726,6 +734,7 @@ if _HAVE_QT:
                 traceback.print_exc()
                 self.error = f"{type(exc).__name__}: {exc}"
             finally:
+                release_keep_awake()
                 self.done.emit()
 
 
