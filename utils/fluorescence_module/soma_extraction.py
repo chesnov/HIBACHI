@@ -717,6 +717,8 @@ _HAIR_K = 4.0          # an end branch no longer than 4 half-widths where it
 #                        leaves is a hair -- a bump of the mask -- not a fibre
 _MAX_TURN_DEG = 30.0   # a fibre continues through a contact onto a branch
 #                        that turns it by less than this
+_STACK_K = 2.0         # a mask column more than this many single-fibre heights
+#                        tall holds two fibres stacked in z
 
 
 # ---- tiling ------------------------------------------------------------------ #
@@ -876,6 +878,58 @@ def _line_voxels(p0, p1):
     v = np.round(p0 + (p1 - p0) * t).astype(np.int64)
     keep = np.r_[True, np.any(np.diff(v, axis=0) != 0, axis=1)]
     return v[keep]
+
+
+def _z_run_length(obj):
+    """Length (voxels) of the run of object voxels along z through each voxel;
+    0 outside the object."""
+    Z = obj.shape[0]
+    up = np.zeros(obj.shape, np.int16)
+    dn = np.zeros(obj.shape, np.int16)
+    for z in range(Z):
+        up[z] = np.where(obj[z], (up[z - 1] + 1) if z else 1, 0)
+    for z in range(Z - 1, -1, -1):
+        dn[z] = np.where(obj[z], (dn[z + 1] + 1) if z < Z - 1 else 1, 0)
+    return np.where(obj, up + dn - 1, 0)
+
+
+def _cut_stacked_fibres(obj, inten, h0, noise):
+    """The mask with every column that holds two stacked fibres cut between them.
+
+    Two fibres lying one above the other merge, where they touch, into one
+    mask column about twice a fibre's height. Thinning such a column leaves a
+    single centre line in its middle, between the fibres, and bends both
+    fibres into it -- so the fibres swap, or break, at the contact. Cut first,
+    each fibre keeps a centre line of its own. A run of object voxels along z
+    longer than _STACK_K x `h0` (the object's single-fibre column height) is
+    cut once, two voxels thick (so no diagonal step reconnects the halves):
+    at the intensity valley between the run's two brightest maxima, where
+    `inten` shows two maxima that stand out of the noise, else at the run's
+    middle. `inten` is the intensity crop, averaged over 3 x 3 in-plane;
+    `noise` the noise of that average (0: no intensity).
+    """
+    from scipy.signal import find_peaks
+    pad = np.pad(obj, ((1, 1), (0, 0), (0, 0))).astype(np.int8)
+    d = np.diff(pad, axis=0).transpose(1, 2, 0)
+    starts = np.argwhere(d == 1)                # (y, x, first z), sorted like ends
+    ends = np.argwhere(d == -1)                 # (y, x, z after the last)
+    tall = np.nonzero(ends[:, 2] - starts[:, 2] > _STACK_K * h0)[0]
+    if not len(tall):
+        return obj
+    out = obj.copy()
+    for i in tall:
+        y, x, a = starts[i]
+        b = ends[i, 2]
+        zc = a + int(round((b - a) / 2))
+        if inten is not None and noise > 0:
+            prof = inten[a:b, max(0, y - 1):y + 2, max(0, x - 1):x + 2].mean(axis=(1, 2))
+            prof = ndimage.gaussian_filter1d(prof.astype(np.float64), 1.0)
+            pk, _ = find_peaks(prof, prominence=3.0 * noise, distance=max(2, int(h0) // 2))
+            if len(pk) >= 2:
+                i0, i1 = sorted(pk[np.argsort(prof[pk])[-2:]])
+                zc = a + i0 + int(np.argmin(prof[i0:i1 + 1]))
+        out[max(a, zc - 1):min(b, zc + 1), y, x] = False
+    return out
 
 
 def _remove_hairs(edges, half_w, length, xyz, r):
@@ -1261,7 +1315,10 @@ def _elongated_label_candidates(lbl, sl, segmentation_mask, intensity_image,
     """Seeds for spindle- or fibre-shaped cells, from the MASK's skeleton.
 
     The mask carries what is needed: its skeleton gives each fibre's course and
-    its width tells how many fibres a stretch holds. A plain skeleton merges
+    its width -- and in a stack its height -- tells how many fibres a stretch
+    holds. Where two fibres lie one above the other the mask is cut between
+    them before skeletonizing, at the intensity valley where there is one;
+    that is the only use of the intensity image. A plain skeleton merges
     fibres -- every touch point is a junction, a ladder of fibres joined by
     bridges is a loop, fibres fused side by side are one branch -- so it is
     decomposed into paths that can never branch (`_paths_from_skeleton`):
@@ -1300,7 +1357,11 @@ def _elongated_label_candidates(lbl, sl, segmentation_mask, intensity_image,
     boff = np.array([b.start for b in box])
 
     # ---- pass 1: fibre radius and the object's thickest point ---------------
+    # In a stack also the single-fibre column height -- how many slices one
+    # fibre spans, at the same centre-line voxels -- and the noise of the
+    # intensity around the object, which the stacked-fibre cut uses.
     ridge_vals, dt_max = [], 0.0
+    col_vals, bg_n, bg_s, bg_ss = [], 0, 0.0, 0.0
     for tg in targets:
         h_um = 5.0
         while True:
@@ -1324,6 +1385,13 @@ def _elongated_label_candidates(lbl, sl, segmentation_mask, intensity_image,
         ridge = obj & (dt >= ndimage.maximum_filter(dt, size=3)) & (dt > 0)
         ridge_vals.append(dt[loc][ridge[loc]].astype(np.float32))
         dt_max = max(dt_max, float(dt[loc].max()))
+        if is_stack:
+            col_vals.append(_z_run_length(obj)[loc][ridge[loc]])
+            if intensity_image is not None:
+                bg = np.asarray(intensity_image[tg])[np.asarray(seg[tg]) == 0].astype(np.float64)
+                bg_n += bg.size
+                bg_s += float(bg.sum())
+                bg_ss += float((bg * bg).sum())
         del obj, dt, ridge
     rv = np.concatenate(ridge_vals) if ridge_vals else np.zeros(0, np.float32)
     if rv.size == 0:
@@ -1332,11 +1400,18 @@ def _elongated_label_candidates(lbl, sl, segmentation_mask, intensity_image,
     del ridge_vals, rv
     if not (r > 0):
         return [], diag
+    h0 = float(np.median(np.concatenate(col_vals))) if col_vals else 0.0
+    noise = 0.0
+    if bg_n > 1:
+        var = max(0.0, bg_ss / bg_n - (bg_s / bg_n) ** 2)
+        noise = math.sqrt(var) / 3.0            # noise of a 3 x 3 in-plane mean
 
     # ---- pass 2: skeleton and in-plane half-width, exact per tile ------------
     # Thinning reaches as far as the object is thick, so a halo of a few times
     # its thickest radius (and at least one arm window) makes each tile's
-    # skeleton the object's own inside the tile.
+    # skeleton the object's own inside the tile. In a stack the mask is first
+    # cut between fibres stacked in z (`_cut_stacked_fibres`); only the
+    # skeleton sees the cut -- the half-width, links and seeds use the mask.
     h_um = max(4.0 * dt_max, _ARM_WINDOW_R * r)
     halo = [int(np.ceil(h_um / s)) + 2 for s in sp]
     if not is_stack:
@@ -1348,7 +1423,16 @@ def _elongated_label_candidates(lbl, sl, segmentation_mask, intensity_image,
         obj = np.asarray(seg[crop]) == lbl
         if not obj[loc].any():
             continue
-        sk = skeletonize(obj[0])[None] if not is_stack else skeletonize(obj)
+        if not is_stack:
+            sk = skeletonize(obj[0])[None]
+        elif h0 >= 1:
+            inten = None
+            if intensity_image is not None and noise > 0:
+                inten = np.asarray(intensity_image[crop], np.float32)
+            sk = skeletonize(_cut_stacked_fibres(obj, inten, h0, noise))
+            del inten
+        else:
+            sk = skeletonize(obj)
         sk = sk.astype(bool)
         # In-plane half-width: a flat ribbon is one fibre deep, so the 3D
         # distance to the background would see its depth, not its width.
