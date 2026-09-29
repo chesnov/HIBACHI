@@ -723,6 +723,21 @@ _STACK_LOW_K = 1.25    # ... and next to such columns, one at least this tall
 #                        still holds part of both
 _STACK_FOLLOW_UM = 5.0 # a stacked contact is followed this far beyond its
 #                        clearly stacked columns
+# Sigmoid correction (`_fix_sigmoids`): a fibre's course is judged over this
+# long a stretch on either side of a place (long-range direction), leaving out
+# this much right at the place ...
+_SIG_WINDOW_UM = 10.0
+_SIG_GAP_UM = 1.0
+_SIG_STEP_UM = 0.44    # ... at places this far apart along a path;
+_SIG_MAX_DEG = 20.0    # courses within this angle are parallel ...
+_SIG_MIN_SHIFT_UM = 0.5  # ... and one shifted sideways by more than this onto the
+#                        other is a sigmoid step, if
+_SIG_END_NEAR_UM = 3.0 # another fibre ends within this distance of the step,
+_SIG_MIN_FIBRE_UM = 8.0  # at least this long (a crumb has no course of its own),
+_SIG_MAX_MISS_UM = 1.0 # whose course continues the new track to within this,
+_SIG_MARGIN_UM = 0.1   # better than the path's own old course by this margin,
+#                        and whose thickness matches the new track as well
+_SIG_PASSES = 3        # repeated on the corrected paths at most this often
 
 
 # ---- tiling ------------------------------------------------------------------ #
@@ -1079,7 +1094,9 @@ def _paths_from_skeleton(pts, half_w, bshape, spacing, r, obj_lookup):
     junction zone (they lie inside one contact); split ribbons (branches
     wider than one fibre) into k parallel lanes, k = half-width / r; then
     trace fibres through the zones, each branch used once, so every path is
-    a chain (see the tracing comment below). A bridge between fibres -- a touch point, a ladder rung, which
+    a chain (see the tracing comment below); join pieces end to end
+    (`_stitch_paths`); and undo sigmoid switches between parallel fibres
+    (`_fix_sigmoids`). A bridge between fibres -- a touch point, a ladder rung, which
     meets them at an angle -- is never taken as a continuation and is left as
     a short path of its own. Branch length is not used to call something a
     bridge: in a dense bundle most fibre stretches between two touch points
@@ -1264,7 +1281,137 @@ def _paths_from_skeleton(pts, half_w, bshape, spacing, r, obj_lookup):
         back = extend(fwd_path[::-1], za)            # then past the near end
         keep = np.r_[True, np.any(np.diff(back, axis=0) != 0, axis=1)]
         paths.append(back[keep])                     # ordered along the fibre
-    return _stitch_paths(paths, sp, r, obj_lookup)
+    paths = _stitch_paths(paths, sp, r, obj_lookup)
+    return _fix_sigmoids(paths, pts, half_w, sp, obj_lookup)
+
+
+def _fix_sigmoids(paths, pts, half_w, sp, obj_lookup):
+    """Undo sigmoid switches: a path that slides sideways from one straight
+    course onto a parallel one where another fibre touches it.
+
+    Two fibres that touch either stay parallel, or one ends where it touches
+    the other. The tracer can instead lead one fibre along an S-shaped step
+    onto the other's course, so that one seed ends abruptly and its
+    neighbour carries on along the track that was its. Such a step shows
+    along the path as two parallel courses (within _SIG_MAX_DEG, each fitted
+    over _SIG_WINDOW_UM) shifted sideways by more than _SIG_MIN_SHIFT_UM. A
+    kink -- a sideways step of one fibre, an artefact of the mask -- looks the
+    same, so the step is only corrected when the other fibre is there:
+    another path of at least _SIG_MIN_FIBRE_UM ends within _SIG_END_NEAR_UM of
+    the step, its own course over its last _SIG_WINDOW_UM continues the new
+    track to within _SIG_MAX_MISS_UM and better than the path's old course
+    does, and its thickness (the mask's half-width) matches the new track at
+    least as well. Then the path ends at the step, and the other fibre is
+    joined to the new track by a straight segment. Every path is examined in
+    both directions; a path takes part in one correction per pass, and the
+    passes repeat on the corrected paths, at most _SIG_PASSES times.
+    """
+    from scipy.spatial import cKDTree
+    sp = np.asarray(sp, float)
+    tree = cKDTree(pts * sp)
+
+    def thickness(xyz):
+        return float(np.median(half_w[tree.query(xyz)[1]]))
+
+    def arc(xyz):
+        return np.r_[0.0, np.cumsum(np.linalg.norm(np.diff(xyz, axis=0), axis=1))]
+
+    def fit(xyz):
+        c = xyz.mean(0)
+        return c, np.linalg.svd(xyz - c, full_matrices=False)[2][0]
+
+    def towards(u, frm, to):
+        return u if u @ (to - frm) >= 0 else -u
+
+    def miss(c, u, xyz):
+        w = xyz - c
+        f = w @ u
+        w, f = w[f > 0], f[f > 0]
+        return float(np.median(np.linalg.norm(w - np.outer(f, u), axis=1))) if len(f) else None
+
+    W, D = _SIG_WINDOW_UM, _SIG_GAP_UM
+    cos_max = np.cos(np.radians(_SIG_MAX_DEG))
+
+    def one_pass(P):
+        X = [p_ * sp for p_ in P]
+        ends = []
+        for i, x in enumerate(X):
+            if len(x) >= 6:
+                ends += [(i, 0, x[0]), (i, 1, x[-1])]
+        if not ends:
+            return P, 0
+        etree = cKDTree(np.array([e[2] for e in ends]))
+        touched, out, n_fixed = set(), list(P), 0
+        for i, x0 in enumerate(X):
+            if i in touched or len(x0) < 30:
+                continue
+            best = None
+            for rev in (False, True):
+                x = x0[::-1] if rev else x0
+                a = arc(x)
+                for s in np.arange(D + 3.0, a[-1] - D - 3.0, _SIG_STEP_UM):
+                    A = x[(a >= s - W) & (a <= s - D)]
+                    B = x[(a >= s + D) & (a <= s + W)]
+                    if len(A) < 8 or len(B) < 8:
+                        continue
+                    cA, uA = fit(A)
+                    cB, uB = fit(B)
+                    uA = towards(uA, A.mean(0), B.mean(0))
+                    uB = towards(uB, A.mean(0), B.mean(0))
+                    if np.degrees(np.arccos(np.clip(uA @ uB, -1, 1))) > _SIG_MAX_DEG:
+                        continue
+                    p = x[min(np.searchsorted(a, s), len(x) - 1)]
+                    m = (uA + uB) / np.linalg.norm(uA + uB)
+                    d = (cB + ((p - cB) @ uB) * uB) - (cA + ((p - cA) @ uA) * uA)
+                    if float(np.linalg.norm(d - (d @ m) * m)) < _SIG_MIN_SHIFT_UM:
+                        continue
+                    for k in etree.query_ball_point(p, _SIG_END_NEAR_UM):
+                        j, which, _pe = ends[k]
+                        if j == i or j in touched:
+                            continue
+                        q = X[j] if which == 1 else X[j][::-1]      # towards its end at the step
+                        aq = arc(q)
+                        Q = q[aq >= aq[-1] - W]
+                        if len(Q) < 8 or aq[-1] < _SIG_MIN_FIBRE_UM:
+                            continue
+                        cQ, uQ = fit(Q)
+                        uQ = towards(uQ, Q[0], Q[-1])
+                        if uQ @ uB < cos_max:
+                            continue                                # not heading along the new track
+                        ahead = B[(B - q[-1]) @ uQ > 0]
+                        if len(ahead) < 5:
+                            continue
+                        mQ, mA = miss(cQ, uQ, ahead), miss(cA, uA, ahead)
+                        if mQ is None or mA is None or mQ > _SIG_MAX_MISS_UM or mQ >= mA - _SIG_MARGIN_UM:
+                            continue
+                        tA, tB, tQ = thickness(A), thickness(B), thickness(Q)
+                        if abs(tQ - tB) > abs(tA - tB):
+                            continue
+                        if best is None or mA - mQ > best[0]:
+                            best = (mA - mQ, s, j, which, rev)
+            if best is None:
+                continue
+            _score, s, j, which, rev = best
+            Pi = P[i][::-1] if rev else P[i]
+            a = arc(Pi * sp)
+            ia = int(np.searchsorted(a, s - D))
+            ib = int(np.searchsorted(a, s + D))
+            head, tail = Pi[:ia], Pi[ib:]
+            q = P[j] if which == 1 else P[j][::-1]
+            link = _line_voxels(q[-1], tail[0])
+            link = link[obj_lookup(link)] if len(link) else link
+            out[i] = head
+            out[j] = np.concatenate([q, link, tail])
+            touched.update((i, j))
+            n_fixed += 1
+        return [o for o in out if len(o)], n_fixed
+
+    P = [np.asarray(p_) for p_ in paths]
+    for _pass in range(_SIG_PASSES):
+        P, n_fixed = one_pass(P)
+        if not n_fixed:
+            break
+    return P
 
 
 def _stitch_paths(paths, sp, r, obj_lookup):
