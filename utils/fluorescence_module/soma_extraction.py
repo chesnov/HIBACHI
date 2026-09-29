@@ -719,6 +719,10 @@ _MAX_TURN_DEG = 30.0   # a fibre continues through a contact onto a branch
 #                        that turns it by less than this
 _STACK_K = 2.0         # a mask column more than this many single-fibre heights
 #                        tall holds two fibres stacked in z
+_STACK_LOW_K = 1.25    # ... and next to such columns, one at least this tall
+#                        still holds part of both
+_STACK_FOLLOW_UM = 5.0 # a stacked contact is followed this far beyond its
+#                        clearly stacked columns
 
 
 # ---- tiling ------------------------------------------------------------------ #
@@ -893,42 +897,86 @@ def _z_run_length(obj):
     return np.where(obj, up + dn - 1, 0)
 
 
-def _cut_stacked_fibres(obj, inten, h0, noise):
-    """The mask with every column that holds two stacked fibres cut between them.
+def _cut_stacked_fibres(obj, inten, h0, noise, spacing_yx):
+    """The mask with every contact of two stacked fibres cut between them.
 
-    Two fibres lying one above the other merge, where they touch, into one
-    mask column about twice a fibre's height. Thinning such a column leaves a
-    single centre line in its middle, between the fibres, and bends both
-    fibres into it -- so the fibres swap, or break, at the contact. Cut first,
-    each fibre keeps a centre line of its own. A run of object voxels along z
-    longer than _STACK_K x `h0` (the object's single-fibre column height) is
-    cut once, two voxels thick (so no diagonal step reconnects the halves):
-    at the intensity valley between the run's two brightest maxima, where
-    `inten` shows two maxima that stand out of the noise, else at the run's
-    middle. `inten` is the intensity crop, averaged over 3 x 3 in-plane;
-    `noise` the noise of that average (0: no intensity).
+    Two fibres lying one above the other merge, where they touch, into mask
+    columns up to about twice a fibre's height. Thinning such a stretch leaves
+    a single centre line between the fibres and bends both into it -- so the
+    fibres swap, or break, at the contact. Cut first, each fibre keeps a
+    centre line of its own.
+
+    The cut has to separate the whole contact: a cut with a hole lets
+    thinning join the fibres through the hole, and cuts at different heights
+    in neighbouring columns leave a diagonal step between them. So, working
+    on runs of object voxels along z: runs longer than _STACK_K x `h0` (the
+    object's single-fibre column height) are clearly two fibres; the contact
+    is followed from them into neighbouring runs at least _STACK_LOW_K x `h0`
+    long that overlap them in depth, up to _STACK_FOLLOW_UM beyond them; and
+    every run of the contact is cut at one smooth height -- the median over
+    the clearly stacked runs around it of their own cut heights: the
+    intensity valley between the run's two brightest maxima where `inten`
+    shows two maxima that stand out of the noise, else the run's middle. The
+    cut is 3 voxels thick, and never within 2 voxels of a run's top or bottom,
+    where it would only shave a single fibre. `inten`: the intensity crop
+    (None: no intensity); `noise`: the noise of its 3 x 3 in-plane mean.
     """
     from scipy.signal import find_peaks
+    from scipy.spatial import cKDTree
     pad = np.pad(obj, ((1, 1), (0, 0), (0, 0))).astype(np.int8)
     d = np.diff(pad, axis=0).transpose(1, 2, 0)
     starts = np.argwhere(d == 1)                # (y, x, first z), sorted like ends
     ends = np.argwhere(d == -1)                 # (y, x, z after the last)
-    tall = np.nonzero(ends[:, 2] - starts[:, 2] > _STACK_K * h0)[0]
-    if not len(tall):
+    y, x, a = starts[:, 0], starts[:, 1], starts[:, 2]
+    b = ends[:, 2]
+    n = b - a
+    stacked = n > _STACK_K * h0
+    if not stacked.any():
         return obj
-    out = obj.copy()
-    for i in tall:
-        y, x, a = starts[i]
-        b = ends[i, 2]
-        zc = a + int(round((b - a) / 2))
+    # cut height of each clearly stacked run
+    sidx = np.nonzero(stacked)[0]
+    target = np.empty(len(sidx))
+    for k, i in enumerate(sidx):
+        t = a[i] + int(round(n[i] / 2))
         if inten is not None and noise > 0:
-            prof = inten[a:b, max(0, y - 1):y + 2, max(0, x - 1):x + 2].mean(axis=(1, 2))
+            prof = inten[a[i]:b[i], max(0, y[i] - 1):y[i] + 2, max(0, x[i] - 1):x[i] + 2].mean(axis=(1, 2))
             prof = ndimage.gaussian_filter1d(prof.astype(np.float64), 1.0)
             pk, _ = find_peaks(prof, prominence=3.0 * noise, distance=max(2, int(h0) // 2))
             if len(pk) >= 2:
                 i0, i1 = sorted(pk[np.argsort(prof[pk])[-2:]])
-                zc = a + i0 + int(np.argmin(prof[i0:i1 + 1]))
-        out[max(a, zc - 1):min(b, zc + 1), y, x] = False
+                t = a[i] + i0 + int(np.argmin(prof[i0:i1 + 1]))
+        target[k] = t
+    # follow each contact from its clearly stacked runs into the runs next to them
+    by_column = {}
+    for i in np.nonzero(n >= _STACK_LOW_K * h0)[0]:
+        by_column.setdefault((y[i], x[i]), []).append(i)
+    stacked_xy = cKDTree(np.c_[y[sidx], x[sidx]].astype(float))
+    reach = _STACK_FOLLOW_UM / spacing_yx
+    contact = set(sidx.tolist())
+    frontier = list(contact)
+    while frontier:
+        nxt = []
+        for i in frontier:
+            for dy in (-1, 0, 1):
+                for dx in (-1, 0, 1):
+                    for j in by_column.get((y[i] + dy, x[i] + dx), ()):
+                        if j in contact or min(b[i], b[j]) - max(a[i], a[j]) <= 0:
+                            continue            # already in, or no overlap in depth
+                        if stacked_xy.query([y[j], x[j]])[0] > reach:
+                            continue
+                        contact.add(j)
+                        nxt.append(j)
+        frontier = nxt
+    # one smooth cut through the whole contact
+    out = obj.copy()
+    for i in sorted(contact):
+        near = stacked_xy.query_ball_point([y[i], x[i]], r=4.0)
+        if not near:
+            near = [stacked_xy.query([y[i], x[i]])[1]]
+        t = int(round(np.median(target[near])))
+        if t - 1 < a[i] + 2 or t + 1 > b[i] - 3:
+            continue                            # would only shave a single fibre
+        out[t - 1:t + 2, y[i], x[i]] = False
     return out
 
 
@@ -1429,7 +1477,7 @@ def _elongated_label_candidates(lbl, sl, segmentation_mask, intensity_image,
             inten = None
             if intensity_image is not None and noise > 0:
                 inten = np.asarray(intensity_image[crop], np.float32)
-            sk = skeletonize(_cut_stacked_fibres(obj, inten, h0, noise))
+            sk = skeletonize(_cut_stacked_fibres(obj, inten, h0, noise, float(sp[1])))
             del inten
         else:
             sk = skeletonize(obj)
