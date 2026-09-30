@@ -723,13 +723,15 @@ _STACK_LOW_K = 1.25    # ... and next to such columns, one at least this tall
 #                        still holds part of both
 _STACK_FOLLOW_UM = 5.0 # a stacked contact is followed this far beyond its
 #                        clearly stacked columns
-_STITCH_LAT_R = 2.0    # path ends are one fibre if each end's line passes within this many r of the other
-_STITCH_LAT2_R = 3.0   # ... or, once nothing more joins at that limit, within this many r: a mask
-#                        bump at a break moves an end sideways by a little over one fibre width.
-#                        Only for long pieces that continue each other (next constant, and
-#                        _MAX_TURN_DEG): a short piece is a fragment of a dense bundle, too short
-#                        for its own direction or offset to mean anything
-_STITCH_LONG_R = 45.0  # a piece at least this long (45 r, about 20 um) has a course of its own
+# Break mending (`_stitch_paths`, second phase): two pieces of one fibre whose ends a contact has
+# bent are judged on their COURSES -- each piece's path from _JOIN_SKIP_UM to _JOIN_WINDOW_UM back
+# from its end, leaving out the bend itself --
+_JOIN_SKIP_UM = 2.0
+_JOIN_WINDOW_UM = 12.0
+_JOIN_MIN_UM = 6.0     # a course needs at least this much path to have a direction
+_JOIN_SHIFT_R = 4.0    # the two courses may be this far (in r) off one line, midway between the ends
+_JOIN_MASK_GAP_R = 3.0 # and the straight link between the ends may leave the mask for this far (in r)
+_JOIN_OVERLAP_R = 4.0  # pieces may overlap this far (in r) along the fibre, if they lie on one line (< 2 r apart)
 # Sigmoid correction (`_fix_sigmoids`): a fibre's course is judged over this
 # long a stretch on either side of a place (long-range direction), leaving out
 # this much right at the place ...
@@ -1421,6 +1423,26 @@ def _fix_sigmoids(paths, pts, half_w, sp, obj_lookup):
     return P
 
 
+def _end_course(pv, which, sp):
+    """The course of a path's end: (end point, centroid, outward direction), all in
+    physical units, from the stretch of the path between _JOIN_SKIP_UM and
+    _JOIN_WINDOW_UM back from the end (`which`: 0 the first voxel, 1 the last). None if
+    that stretch is shorter than _JOIN_MIN_UM."""
+    x = pv * sp
+    if which == 0:
+        x = x[::-1]
+    back = float(np.sum(np.linalg.norm(np.diff(x, axis=0), axis=1))) - np.r_[
+        0.0, np.cumsum(np.linalg.norm(np.diff(x, axis=0), axis=1))]
+    sel = (back >= _JOIN_SKIP_UM) & (back <= _JOIN_WINDOW_UM)
+    if sel.sum() < 4 or back[sel].max() - back[sel].min() < _JOIN_MIN_UM:
+        return None
+    c = x[sel].mean(0)
+    u = np.linalg.svd(x[sel] - c, full_matrices=False)[2][0]
+    if u @ (x[-1] - c) < 0:
+        u = -u
+    return x[-1], c, u
+
+
 def _stitch_paths(paths, sp, r, obj_lookup):
     """Join traced paths that are consecutive pieces of one fibre.
 
@@ -1439,11 +1461,8 @@ def _stitch_paths(paths, sp, r, obj_lookup):
     a loop. Joined paths keep their outer ends and directions, so this repeats
     until nothing changes. Returns the paths, ordered along their fibres.
 
-    A second, looser pass follows (_STITCH_LAT2_R r instead of _STITCH_LAT_R r)
-    for a break that a bump of the mask leaves slightly off-line. It is meant
-    for two long pieces of one fibre, so it takes only pieces at least
-    _STITCH_LONG_R r long whose ends continue each other within _MAX_TURN_DEG;
-    the short pieces of a dense bundle stay as the first pass left them.
+    A second phase then mends breaks whose ends a contact has bent, comparing the
+    pieces left on their courses rather than on their ends (see the comment there).
     """
     win = _ARM_WINDOW_R * r
     paths = [np.asarray(p_) for p_ in paths if len(p_)]
@@ -1463,66 +1482,138 @@ def _stitch_paths(paths, sp, r, obj_lookup):
 
     chains = list(paths)
 
-    # Joining runs at the strict lateral limit until nothing more joins; only then at the
-    # looser one, so every join the strict limit makes is made first and the loose limit
-    # sees only the ends that are still free.
-    for lat_r in (_STITCH_LAT_R, _STITCH_LAT2_R):
-        for _round in range(64):
-            ends = []                       # (path index, which end 0|1, point, direction)
-            for i, pv in enumerate(chains):
-                for which, seq in ((0, pv[::-1]), (1, pv)):
-                    pt, d = end_geom(seq)
-                    if d is not None:
-                        ends.append((i, which, pt, d))
-            clen = [float(arc(pv)[-1]) for pv in chains]
-            cand = {}
-            for a in range(len(ends)):
-                ia, wa, pa, da = ends[a]
-                for b in range(a + 1, len(ends)):
-                    ib, wb, pb, db = ends[b]
-                    if ia == ib:
-                        continue            # both ends of one path: a loop
-                    if lat_r > _STITCH_LAT_R and (clen[ia] < _STITCH_LONG_R * r or clen[ib] < _STITCH_LONG_R * r):
-                        continue            # loose tier: fragments of a bundle stay as they are
-                    g = pb - pa
-                    dist = float(np.linalg.norm(g))
-                    if dist > win:
-                        continue
-                    if float(da @ db) >= 0 or (dist > 0 and (float(g @ da) < 0 or float(-g @ db) < 0)):
-                        continue            # they do not continue each other
-                    if lat_r > _STITCH_LAT_R and -float(da @ db) < math.cos(math.radians(_MAX_TURN_DEG)):
-                        continue            # loose tier: only a straight continuation
-                    lat_a = float(np.linalg.norm(g - (g @ da) * da))
-                    lat_b = float(np.linalg.norm(-g - (-g @ db) * db))
-                    if lat_a >= lat_r * r or lat_b >= lat_r * r:
-                        continue            # off-line: a step onto another fibre
-                    seg_v = _line_voxels(np.round(pa / sp).astype(np.int64),
-                                         np.round(pb / sp).astype(np.int64))
-                    if len(seg_v) and not bool(np.all(obj_lookup(seg_v))):
-                        continue            # would cross background
-                    cost = lat_a + lat_b + r * (1.0 + float(da @ db))
-                    cand.setdefault(a, []).append((cost, b))
-                    cand.setdefault(b, []).append((cost, a))
-            best = {e: min(c)[1] for e, c in cand.items()}
-            pairs = [(a, b) for a, b in best.items() if a < b and best.get(b) == a]
-            if not pairs:
-                break
-            # Join each mutual pair; a path joined twice this round waits.
-            taken = set()
-            merged = []
-            drop = set()
-            for a, b in pairs:
-                ia, wa, pa, _ = ends[a]
-                ib, wb, pb, _ = ends[b]
-                if ia in taken or ib in taken:
+    for _round in range(64):
+        ends = []                       # (path index, which end 0|1, point, direction)
+        for i, pv in enumerate(chains):
+            for which, seq in ((0, pv[::-1]), (1, pv)):
+                pt, d = end_geom(seq)
+                if d is not None:
+                    ends.append((i, which, pt, d))
+        cand = {}
+        for a in range(len(ends)):
+            ia, wa, pa, da = ends[a]
+            for b in range(a + 1, len(ends)):
+                ib, wb, pb, db = ends[b]
+                if ia == ib:
+                    continue            # both ends of one path: a loop
+                g = pb - pa
+                dist = float(np.linalg.norm(g))
+                if dist > win:
                     continue
-                taken.update((ia, ib))
-                pa_seq = chains[ia] if wa == 1 else chains[ia][::-1]      # joined end last
-                pb_seq = chains[ib] if wb == 0 else chains[ib][::-1]      # joined end first
-                seg_v = _line_voxels(pa_seq[-1], pb_seq[0])
-                merged.append(np.concatenate([pa_seq, seg_v, pb_seq]))
-                drop.update((ia, ib))
-            chains = [pv for i, pv in enumerate(chains) if i not in drop] + merged
+                if float(da @ db) >= 0 or (dist > 0 and (float(g @ da) < 0 or float(-g @ db) < 0)):
+                    continue            # they do not continue each other
+                lat_a = float(np.linalg.norm(g - (g @ da) * da))
+                lat_b = float(np.linalg.norm(-g - (-g @ db) * db))
+                if lat_a >= 2 * r or lat_b >= 2 * r:
+                    continue            # off-line: a step onto another fibre
+                seg_v = _line_voxels(np.round(pa / sp).astype(np.int64),
+                                     np.round(pb / sp).astype(np.int64))
+                if len(seg_v) and not bool(np.all(obj_lookup(seg_v))):
+                    continue            # would cross background
+                cost = lat_a + lat_b + r * (1.0 + float(da @ db))
+                cand.setdefault(a, []).append((cost, b))
+                cand.setdefault(b, []).append((cost, a))
+        best = {e: min(c)[1] for e, c in cand.items()}
+        pairs = [(a, b) for a, b in best.items() if a < b and best.get(b) == a]
+        if not pairs:
+            break
+        # Join each mutual pair; a path joined twice this round waits.
+        taken = set()
+        merged = []
+        drop = set()
+        for a, b in pairs:
+            ia, wa, pa, _ = ends[a]
+            ib, wb, pb, _ = ends[b]
+            if ia in taken or ib in taken:
+                continue
+            taken.update((ia, ib))
+            pa_seq = chains[ia] if wa == 1 else chains[ia][::-1]      # joined end last
+            pb_seq = chains[ib] if wb == 0 else chains[ib][::-1]      # joined end first
+            seg_v = _line_voxels(pa_seq[-1], pb_seq[0])
+            merged.append(np.concatenate([pa_seq, seg_v, pb_seq]))
+            drop.update((ia, ib))
+        chains = [pv for i, pv in enumerate(chains) if i not in drop] + merged
+
+
+    # ---- second phase: mend the breaks a contact left in a fibre -----------------
+    # Near a contact the mask's bumps and the crossing fibres bend a piece's last few
+    # microns, so its END direction and position can be off by more than a fibre width
+    # while the fibre's course a little further back is straight and continues on the
+    # other side. The pieces still free after the rounds above are therefore compared on
+    # their courses (`_end_course`): two ends within 10 r of each other, continuing each
+    # other within _MAX_TURN_DEG, whose courses are off one line by less than
+    # _JOIN_SHIFT_R r midway between them, with the mask missing along the straight link
+    # for no more than _JOIN_MASK_GAP_R r. As before, a pair is joined only if each is the
+    # other's first choice and never so as to close a loop.
+    from scipy.spatial import cKDTree
+    cos_turn = math.cos(math.radians(_MAX_TURN_DEG))
+    for _round in range(64):
+        ends = []                       # (path index, which end 0|1, end point, centroid, direction)
+        for i, pv in enumerate(chains):
+            for which in (0, 1):
+                c = _end_course(pv, which, sp)
+                if c is not None:
+                    ends.append((i, which) + c)
+        if len(ends) < 2:
+            break
+        tree = cKDTree(np.array([e[2] for e in ends]))
+        cand = {}
+        for a, b in sorted(tree.query_pairs(win)):
+            ia, wa, ea, ca, ua = ends[a]
+            ib, wb, eb, cb, ub = ends[b]
+            if ia == ib or -float(ua @ ub) < cos_turn:
+                continue
+            g = eb - ea
+            n = ua - ub
+            n = n / np.linalg.norm(n)
+            mid = 0.5 * (ea + eb)
+            shift = float(np.linalg.norm((ca + ua * (((mid - ca) @ n) / (ua @ n)))
+                                         - (cb + ub * (((mid - cb) @ n) / (ub @ n)))))
+            if shift >= _JOIN_SHIFT_R * r:
+                continue                # off-line: a step onto another fibre
+            ahead = min(float(g @ ua), float(-g @ ub))
+            if ahead < 0 and (-ahead > _JOIN_OVERLAP_R * r or shift >= 2.0 * r):
+                continue                # overlapping along the fibre but not on one line: two fibres side by side
+            link = _line_voxels(np.round(ea / sp).astype(np.int64), np.round(eb / sp).astype(np.int64))
+            gone = ~obj_lookup(link)
+            if gone.any():
+                step = np.r_[0.0, np.linalg.norm(np.diff(link * sp, axis=0), axis=1)]
+                run = longest = 0.0
+                for k in range(1, len(link)):
+                    run = run + step[k] if gone[k] else 0.0
+                    longest = max(longest, run)
+                if longest > _JOIN_MASK_GAP_R * r:
+                    continue            # the mask is missing for too long between them
+            cost = shift + 0.3 * float(np.linalg.norm(g))
+            cand.setdefault(a, []).append((cost, b))
+            cand.setdefault(b, []).append((cost, a))
+        best = {e: min(c)[1] for e, c in cand.items()}
+        pairs = [(a, b) for a, b in best.items() if a < b and best.get(b) == a]
+        if not pairs:
+            break
+        taken, merged, drop = set(), [], set()
+        for a, b in sorted(pairs):
+            ia, wa = ends[a][:2]
+            ib, wb = ends[b][:2]
+            if ia in taken or ib in taken:
+                continue
+            taken.update((ia, ib))
+            pa_seq = chains[ia] if wa == 1 else chains[ia][::-1]      # joined end last
+            pb_seq = chains[ib] if wb == 0 else chains[ib][::-1]      # joined end first
+            # Pieces that overlap along the fibre are cut where they cross midway between
+            # the ends, so the joined path runs on without doubling back.
+            ea, ua, eb, ub = ends[a][2], ends[a][4], ends[b][2], ends[b][4]
+            n = (ua - ub) / np.linalg.norm(ua - ub)
+            mid = 0.5 * (ea + eb)
+            ka = np.nonzero((pa_seq * sp - mid) @ n <= 0)[0]
+            kb = np.nonzero((pb_seq * sp - mid) @ n >= 0)[0]
+            if len(ka) and len(kb):
+                pa_seq, pb_seq = pa_seq[:ka[-1] + 1], pb_seq[kb[0]:]
+            link = _line_voxels(pa_seq[-1], pb_seq[0])
+            link = link[obj_lookup(link)]
+            merged.append(np.concatenate([pa_seq, link, pb_seq]))
+            drop.update((ia, ib))
+        chains = [pv for i, pv in enumerate(chains) if i not in drop] + merged
 
     return chains
 
