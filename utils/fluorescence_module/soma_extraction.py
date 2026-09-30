@@ -738,6 +738,20 @@ _SIG_MAX_MISS_UM = 1.0 # whose course continues the new track to within this,
 _SIG_MARGIN_UM = 0.1   # better than the path's own old course by this margin,
 #                        and whose thickness matches the new track as well
 _SIG_PASSES = 3        # repeated on the corrected paths at most this often
+# Fold removal (`_unfold_paths`): where a path doubles back, following a bulge
+# of the mask rather than the fibre, the folded stretch is re-drawn along the
+# fluorescence.
+_FOLD_COURSE_UM = 5.0  # the fibre's course, from the path within this distance
+_FOLD_MIN_UM = 0.2     # a fold goes back along the course by more than this
+_FOLD_MARGIN_UM = 2.0  # re-drawn this far either side of the fold
+_FOLD_STEP_UM = 0.3    # the re-drawn centre line is sampled this finely,
+_FOLD_SMOOTH_UM = 1.5  # smoothed along the fibre over this,
+_FOLD_SECTION_UM = 3.0 # then each sample is moved, in the cross-section across
+#                        the course over this distance either side,
+_FOLD_RADIUS_UM = 1.0  # to the brightest part of the fibre within this radius
+_FOLD_TOP = 0.3        # (the brightest 30% of the object's voxels there),
+_FOLD_SHIFT_SMOOTH_UM = 0.6  # the moves smoothed along the fibre over this
+_FOLD_MAX_SHIFT_UM = 1.0     # and never more than this
 
 
 # ---- tiling ------------------------------------------------------------------ #
@@ -1414,6 +1428,154 @@ def _fix_sigmoids(paths, pts, half_w, sp, obj_lookup):
     return P
 
 
+def _unfold_paths(paths, boff, seg, lbl, intensity, sp, bg):
+    """Re-draw the stretches where a path folds back on itself.
+
+    The mask can carry a bulge that the fibre does not -- an artefact of the
+    segmentation -- and its skeleton then dips into the bulge and doubles back
+    to rejoin the fibre: a Z in the path, and in the seed built around it,
+    that the fluorescence does not show. A fold is found by following the
+    path's progress along its own course (the direction of the path within
+    _FOLD_COURSE_UM, carried from point to point): wherever the path goes back
+    over ground it has covered by more than _FOLD_MIN_UM, it folds. Only
+    those stretches, and _FOLD_MARGIN_UM either side, are re-drawn: the path
+    without the fold, parametrized by progress along the fibre so the jump the
+    fold leaves is spread over the distance travelled, smoothed, then each
+    point moved to the brightest part of the fibre's cross-section (see the
+    _FOLD_ constants). Everywhere else the path is left exactly as traced, so
+    no seed changes but those with a fold. Paths are in box coordinates
+    (`boff` their offset); `seg == lbl` is the object; `bg` the intensity of
+    its surroundings.
+    """
+    sp = np.asarray(sp, float)
+    boff = np.asarray(boff, np.int64)
+    rad = [int(np.ceil((_FOLD_RADIUS_UM + 0.3) / s_)) for s_ in sp]
+
+    def in_obj(v):
+        g = np.asarray(v, np.int64) + boff
+        ok = np.all((g >= 0) & (g < np.asarray(seg.shape)), axis=1)
+        out = np.zeros(len(g), bool)
+        if ok.any():
+            out[ok] = np.asarray(seg[tuple(g[ok].T)]) == lbl
+        return out
+
+    def redraw(P):
+        if len(P) < 8:
+            return P
+        X = P * sp
+        a = np.r_[0.0, np.cumsum(np.linalg.norm(np.diff(X, axis=0), axis=1))]
+        if a[-1] < 1.0:
+            return P
+        # progress along the fibre's course; points that go back over it fold
+        keep = np.ones(len(X), bool)
+        progs = np.zeros(len(X))
+        u_prev, prog, far = None, 0.0, 0.0
+        for i in range(1, len(X)):
+            lo = np.searchsorted(a, a[i] - _FOLD_COURSE_UM)
+            hi = np.searchsorted(a, a[i] + _FOLD_COURSE_UM)
+            seg_ = X[lo:hi]
+            if len(seg_) >= 3:
+                u = np.linalg.svd(seg_ - seg_.mean(0), full_matrices=False)[2][0]
+                if u_prev is None:
+                    if u @ (X[-1] - X[0]) < 0:
+                        u = -u
+                elif u @ u_prev < 0:
+                    u = -u
+                u_prev = u
+            if u_prev is None:
+                continue
+            prog += float((X[i] - X[i - 1]) @ u_prev)
+            if prog <= far:
+                keep[i] = False
+            else:
+                far = prog
+            progs[i] = prog
+        if keep.all():
+            return P
+        fold = np.nonzero(~keep)[0]
+        groups = [g_ for g_ in np.split(fold, np.nonzero(np.diff(fold) > 1)[0] + 1)
+                  if progs[max(g_[0] - 1, 0)] - progs[g_].min() > _FOLD_MIN_UM]
+        if not groups:
+            return P                            # voxel-level jitter only
+        Xk, pk = X[keep], progs[keep]
+        if len(Xk) < 4 or pk[-1] - pk[0] < 1.0:
+            return P
+        ss = np.arange(pk[0], pk[-1] + 1e-9, _FOLD_STEP_UM)
+        C = np.stack([np.interp(ss, pk, Xk[:, k]) for k in range(3)], 1)
+        C = np.stack([ndimage.gaussian_filter1d(C[:, i], _FOLD_SMOOTH_UM / _FOLD_STEP_UM, mode='nearest')
+                      for i in range(3)], 1)
+        shifts = np.zeros_like(C)
+        ok = np.zeros(len(ss), bool)
+        for k, s_ in enumerate(ss):
+            lo = np.searchsorted(ss, s_ - _FOLD_SECTION_UM)
+            hi = np.searchsorted(ss, s_ + _FOLD_SECTION_UM)
+            seg_ = C[lo:hi]
+            if len(seg_) < 3:
+                continue
+            t = np.linalg.svd(seg_ - seg_.mean(0), full_matrices=False)[2][0]
+            g = np.round(C[k] / sp).astype(int) + boff
+            win = tuple(slice(max(0, g[i] - r_), g[i] + r_ + 1) for i, r_ in enumerate(rad))
+            m = np.asarray(seg[win]) == lbl
+            if not m.any():
+                continue
+            w = np.asarray(intensity[win], np.float32)[m] - bg
+            vox = np.argwhere(m) + np.array([w_.start for w_ in win])
+            xyz = (vox - boff) * sp
+            d = xyz - C[k]
+            al = d @ t
+            pe = d - np.outer(al, t)
+            sel = (np.abs(al) <= 0.2) & (np.linalg.norm(pe, axis=1) <= _FOLD_RADIUS_UM) & (w > 0)
+            if sel.sum() < 4:
+                continue
+            ws = w[sel]
+            top = ws >= np.quantile(ws, 1 - _FOLD_TOP)
+            cen = (xyz[sel][top] * ws[top, None]).sum(0) / ws[top].sum()
+            dv = cen - C[k]
+            shifts[k] = dv - (dv @ t) * t
+            ok[k] = True
+        if ok.sum() < 3:
+            return P
+        sig = _FOLD_SHIFT_SMOOTH_UM / _FOLD_STEP_UM
+        sm = np.stack([ndimage.gaussian_filter1d(shifts[:, i], sig, mode='nearest') for i in range(3)], 1)
+        wt = ndimage.gaussian_filter1d(ok.astype(float), sig, mode='nearest')
+        sm = np.where(wt[:, None] > 0, sm / np.maximum(wt[:, None], 1e-6), 0)
+        n = np.linalg.norm(sm, axis=1)
+        sm = np.where((n > _FOLD_MAX_SHIFT_UM)[:, None], sm * (_FOLD_MAX_SHIFT_UM / np.maximum(n, 1e-9))[:, None], sm)
+        V = np.round((C + sm) / sp).astype(np.int64)
+        V = np.where(in_obj(V)[:, None], V, np.round(C / sp).astype(np.int64))
+        spans = [(progs[max(g_[0] - 1, 0)] - _FOLD_MARGIN_UM,
+                  max(progs[g_[-1]], progs[max(g_[0] - 1, 0)]) + _FOLD_MARGIN_UM) for g_ in groups]
+        pts_out, last = [], -1
+        for i in range(len(P)):
+            inside = [j for j, (lo_, hi_) in enumerate(spans) if lo_ <= progs[i] <= hi_]
+            if inside:
+                if inside[0] != last:
+                    lo_, hi_ = spans[inside[0]]
+                    pts_out.extend(list(V[(ss >= lo_) & (ss <= hi_)]))
+                    last = inside[0]
+            else:
+                pts_out.append(P[i])
+        V = np.array(pts_out, dtype=np.int64)
+        pieces = [V[:1]]
+        for p0, p1 in zip(V[:-1], V[1:]):
+            if np.any(p0 != p1):
+                lv = _line_voxels(p0, p1)
+                lv = lv[in_obj(lv)] if len(lv) else lv
+                pieces.append(lv[1:] if len(lv) else p1[None])
+        Q = np.concatenate(pieces)
+        return Q[np.r_[True, np.any(np.diff(Q, axis=0) != 0, axis=1)]]
+
+    out = []
+    for pv in paths:
+        P = np.asarray(pv)
+        if len(P) < 2:
+            out.append(P)
+            continue
+        cut = np.r_[0, np.nonzero(np.abs(np.diff(P, axis=0)).max(1) > 3)[0] + 1, len(P)]
+        out.append(np.concatenate([redraw(P[a_:b_]) for a_, b_ in zip(cut[:-1], cut[1:])]))
+    return out
+
+
 def _stitch_paths(paths, sp, r, obj_lookup):
     """Join traced paths that are consecutive pieces of one fibre.
 
@@ -1661,6 +1823,8 @@ def _elongated_label_candidates(lbl, sl, segmentation_mask, intensity_image,
     del pts, half_w
     if not paths:
         return [], diag
+    if is_stack and intensity_image is not None and bg_n > 1:
+        paths = _unfold_paths(paths, boff, seg, lbl, intensity_image, sp, bg_s / bg_n)
     diag["cores_evaluated"] = len(paths)
 
     # ---- pass 3: each path widened to the mask's own width, per tile ---------
