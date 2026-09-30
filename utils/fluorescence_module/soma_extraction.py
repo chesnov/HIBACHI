@@ -715,6 +715,8 @@ _RIBBON_R = 1.5        # a branch whose in-plane half-width exceeds 1.5 r is a
 #                        ribbon of several fibres fused side by side
 _HAIR_K = 4.0          # an end branch no longer than 4 half-widths where it
 #                        leaves is a hair -- a bump of the mask -- not a fibre
+_LAYER_HOP_R = 3.5     # a lane that changes a path's depth by more than this many r leaves its fibre layer
+_LAYER_SAME_R = 1.5    # one that changes it by less than this many r stays in it
 _MAX_TURN_DEG = 30.0   # a fibre continues through a contact onto a branch
 #                        that turns it by less than this
 _STACK_K = 2.0         # a mask column more than this many single-fibre heights
@@ -731,6 +733,9 @@ _JOIN_WINDOW_UM = 12.0
 _JOIN_MIN_UM = 6.0     # a course needs at least this much path to have a direction
 _JOIN_SHIFT_R = 4.0    # the two courses may be this far (in r) off one line, midway between the ends
 _JOIN_MASK_GAP_R = 3.0 # and the straight link between the ends may leave the mask for this far (in r)
+_JOIN_FAR_R = 20.0     # a second, longer reach (in r), across a stretch the mask may miss altogether,
+_JOIN_FAR_TURN_DEG = 15.0  # but only for pieces that continue each other this straight ...
+_JOIN_FAR_SHIFT_R = 2.5    # ... and lie this close (in r) to one line
 _JOIN_OVERLAP_R = 4.0  # pieces may overlap this far (in r) along the fibre, if they lie on one line (< 2 r apart)
 # Sigmoid correction (`_fix_sigmoids`): a fibre's course is judged over this
 # long a stretch on either side of a place (long-range direction), leaving out
@@ -746,9 +751,7 @@ _SIG_MIN_FIBRE_UM = 8.0  # at least this long (a crumb has no course of its own)
 _SIG_MAX_MISS_UM = 1.0 # whose course continues the new track to within this,
 _SIG_MARGIN_UM = 0.1   # better than the path's own old course by this margin,
 #                        and whose thickness matches the new track as well
-_SIG_PASSES = 2        # repeated on the corrected paths at most this often. A third pass re-cuts the
-#                        head a second pass left, at the far end of a bundle of fused fibres, and
-#                        hands that bundle's tail to the fibre that merely ends beside it
+_SIG_PASSES = 3        # repeated on the corrected paths at most this often
 
 
 # ---- tiling ------------------------------------------------------------------ #
@@ -1248,6 +1251,7 @@ def _paths_from_skeleton(pts, half_w, bshape, spacing, r, obj_lookup):
             if u is None:
                 return path_vox
             best = None
+            cands = []
             for li, e in incident.get(zone_id, ()):
                 if used[li]:
                     continue
@@ -1267,8 +1271,18 @@ def _paths_from_skeleton(pts, half_w, bshape, spacing, r, obj_lookup):
                 if math.degrees(math.atan2(lat, fwd)) >= _MAX_TURN_DEG:
                     continue            # a step onto another fibre
                 cost = lat / fwd
-                if best is None or cost < best[0]:
-                    best = (cost, li, v, e)
+                dz = abs(float(w[0]))               # depth change onto this lane (um)
+                cands.append((cost, li, v, e, dz))
+            if cands:
+                # A fibre's depth is the least certain of its coordinates (a fibre is ~8
+                # slices tall), so a small drift in z can make a hop onto the fibre
+                # layer below look like a straight continuation. Where a lane that stays
+                # in the path's own layer is also open, the path does not hop layers.
+                level = [c for c in cands if c[4] <= _LAYER_SAME_R * r]
+                pick = min(cands)
+                if level and pick[4] > _LAYER_HOP_R * r:
+                    pick = min(level)
+                best = pick[:4]
             if best is None:
                 return trim_tail(path_vox, zone_id)
             _c, li, v, e = best
@@ -1293,7 +1307,9 @@ def _paths_from_skeleton(pts, half_w, bshape, spacing, r, obj_lookup):
         keep = np.r_[True, np.any(np.diff(back, axis=0) != 0, axis=1)]
         paths.append(back[keep])                     # ordered along the fibre
     paths = _stitch_paths(paths, sp, r, obj_lookup)
-    return _fix_sigmoids(paths, pts, half_w, sp, obj_lookup)
+    paths = _fix_sigmoids(paths, pts, half_w, sp, obj_lookup)
+    # The sigmoid fixes trim and re-join paths, so some ends are final only now: mend again.
+    return _mend_breaks(paths, sp, r, obj_lookup)
 
 
 def _fix_sigmoids(paths, pts, half_w, sp, obj_lookup):
@@ -1445,6 +1461,101 @@ def _end_course(pv, which, sp):
     return x[-1], c, u
 
 
+def _mend_breaks(chains, sp, r, obj_lookup):
+    """Join the pieces of one fibre that a contact left apart, comparing them on their
+    courses rather than on their ends (see the comment below). Returns the paths."""
+    # ---- second phase: mend the breaks a contact left in a fibre -----------------
+    # Near a contact the mask's bumps and the crossing fibres bend a piece's last few
+    # microns, so its END direction and position can be off by more than a fibre width
+    # while the fibre's course a little further back is straight and continues on the
+    # other side. The pieces still free after the rounds above are therefore compared on
+    # their courses (`_end_course`): two ends within 10 r of each other, continuing each
+    # other within _MAX_TURN_DEG, whose courses are off one line by less than
+    # _JOIN_SHIFT_R r midway between them, with the mask missing along the straight link
+    # for no more than _JOIN_MASK_GAP_R r. As before, a pair is joined only if each is the
+    # other's first choice and never so as to close a loop.
+    from scipy.spatial import cKDTree
+    win = _ARM_WINDOW_R * r
+    cos_turn = math.cos(math.radians(_MAX_TURN_DEG))
+    # Two reaches, the shorter first. Within 10 r the mask may be missing along the link for
+    # up to _JOIN_MASK_GAP_R r. Within _JOIN_FAR_R r it may be missing altogether -- a stretch
+    # of the fibre the segmentation did not label -- but then the two pieces must continue
+    # each other much more straightly.
+    tiers = ((win, _JOIN_MASK_GAP_R * r, cos_turn, _JOIN_SHIFT_R * r),
+             (_JOIN_FAR_R * r, _JOIN_FAR_R * r, math.cos(math.radians(_JOIN_FAR_TURN_DEG)),
+              _JOIN_FAR_SHIFT_R * r))
+    for reach, mask_gap, tier_cos, tier_shift in tiers:
+        for _round in range(64):
+            ends = []                       # (path index, which end 0|1, end point, centroid, direction)
+            for i, pv in enumerate(chains):
+                for which in (0, 1):
+                    c = _end_course(pv, which, sp)
+                    if c is not None:
+                        ends.append((i, which) + c)
+            if len(ends) < 2:
+                break
+            tree = cKDTree(np.array([e[2] for e in ends]))
+            cand = {}
+            for a, b in sorted(tree.query_pairs(reach)):
+                ia, wa, ea, ca, ua = ends[a]
+                ib, wb, eb, cb, ub = ends[b]
+                if ia == ib or -float(ua @ ub) < tier_cos:
+                    continue
+                g = eb - ea
+                n = ua - ub
+                n = n / np.linalg.norm(n)
+                mid = 0.5 * (ea + eb)
+                shift = float(np.linalg.norm((ca + ua * (((mid - ca) @ n) / (ua @ n)))
+                                             - (cb + ub * (((mid - cb) @ n) / (ub @ n)))))
+                if shift >= tier_shift:
+                    continue                # off-line: a step onto another fibre
+                ahead = min(float(g @ ua), float(-g @ ub))
+                if ahead < 0 and (-ahead > _JOIN_OVERLAP_R * r or shift >= 2.0 * r):
+                    continue                # overlapping along the fibre but not on one line: two fibres side by side
+                link = _line_voxels(np.round(ea / sp).astype(np.int64), np.round(eb / sp).astype(np.int64))
+                gone = ~obj_lookup(link)
+                if gone.any():
+                    step = np.r_[0.0, np.linalg.norm(np.diff(link * sp, axis=0), axis=1)]
+                    run = longest = 0.0
+                    for k in range(1, len(link)):
+                        run = run + step[k] if gone[k] else 0.0
+                        longest = max(longest, run)
+                    if longest > mask_gap:
+                        continue            # the mask is missing for too long between them
+                cost = shift + 0.3 * float(np.linalg.norm(g))
+                cand.setdefault(a, []).append((cost, b))
+                cand.setdefault(b, []).append((cost, a))
+            best = {e: min(c)[1] for e, c in cand.items()}
+            pairs = [(a, b) for a, b in best.items() if a < b and best.get(b) == a]
+            if not pairs:
+                break
+            taken, merged, drop = set(), [], set()
+            for a, b in sorted(pairs):
+                ia, wa = ends[a][:2]
+                ib, wb = ends[b][:2]
+                if ia in taken or ib in taken:
+                    continue
+                taken.update((ia, ib))
+                pa_seq = chains[ia] if wa == 1 else chains[ia][::-1]      # joined end last
+                pb_seq = chains[ib] if wb == 0 else chains[ib][::-1]      # joined end first
+                # Pieces that overlap along the fibre are cut where they cross midway between
+                # the ends, so the joined path runs on without doubling back.
+                ea, ua, eb, ub = ends[a][2], ends[a][4], ends[b][2], ends[b][4]
+                n = (ua - ub) / np.linalg.norm(ua - ub)
+                mid = 0.5 * (ea + eb)
+                ka = np.nonzero((pa_seq * sp - mid) @ n <= 0)[0]
+                kb = np.nonzero((pb_seq * sp - mid) @ n >= 0)[0]
+                if len(ka) and len(kb):
+                    pa_seq, pb_seq = pa_seq[:ka[-1] + 1], pb_seq[kb[0]:]
+                link = _line_voxels(pa_seq[-1], pb_seq[0])
+                link = link[obj_lookup(link)]
+                merged.append(np.concatenate([pa_seq, link, pb_seq]))
+                drop.update((ia, ib))
+            chains = [pv for i, pv in enumerate(chains) if i not in drop] + merged
+
+    return chains
+
+
 def _stitch_paths(paths, sp, r, obj_lookup):
     """Join traced paths that are consecutive pieces of one fibre.
 
@@ -1537,87 +1648,7 @@ def _stitch_paths(paths, sp, r, obj_lookup):
         chains = [pv for i, pv in enumerate(chains) if i not in drop] + merged
 
 
-    # ---- second phase: mend the breaks a contact left in a fibre -----------------
-    # Near a contact the mask's bumps and the crossing fibres bend a piece's last few
-    # microns, so its END direction and position can be off by more than a fibre width
-    # while the fibre's course a little further back is straight and continues on the
-    # other side. The pieces still free after the rounds above are therefore compared on
-    # their courses (`_end_course`): two ends within 10 r of each other, continuing each
-    # other within _MAX_TURN_DEG, whose courses are off one line by less than
-    # _JOIN_SHIFT_R r midway between them, with the mask missing along the straight link
-    # for no more than _JOIN_MASK_GAP_R r. As before, a pair is joined only if each is the
-    # other's first choice and never so as to close a loop.
-    from scipy.spatial import cKDTree
-    cos_turn = math.cos(math.radians(_MAX_TURN_DEG))
-    for _round in range(64):
-        ends = []                       # (path index, which end 0|1, end point, centroid, direction)
-        for i, pv in enumerate(chains):
-            for which in (0, 1):
-                c = _end_course(pv, which, sp)
-                if c is not None:
-                    ends.append((i, which) + c)
-        if len(ends) < 2:
-            break
-        tree = cKDTree(np.array([e[2] for e in ends]))
-        cand = {}
-        for a, b in sorted(tree.query_pairs(win)):
-            ia, wa, ea, ca, ua = ends[a]
-            ib, wb, eb, cb, ub = ends[b]
-            if ia == ib or -float(ua @ ub) < cos_turn:
-                continue
-            g = eb - ea
-            n = ua - ub
-            n = n / np.linalg.norm(n)
-            mid = 0.5 * (ea + eb)
-            shift = float(np.linalg.norm((ca + ua * (((mid - ca) @ n) / (ua @ n)))
-                                         - (cb + ub * (((mid - cb) @ n) / (ub @ n)))))
-            if shift >= _JOIN_SHIFT_R * r:
-                continue                # off-line: a step onto another fibre
-            ahead = min(float(g @ ua), float(-g @ ub))
-            if ahead < 0 and (-ahead > _JOIN_OVERLAP_R * r or shift >= 2.0 * r):
-                continue                # overlapping along the fibre but not on one line: two fibres side by side
-            link = _line_voxels(np.round(ea / sp).astype(np.int64), np.round(eb / sp).astype(np.int64))
-            gone = ~obj_lookup(link)
-            if gone.any():
-                step = np.r_[0.0, np.linalg.norm(np.diff(link * sp, axis=0), axis=1)]
-                run = longest = 0.0
-                for k in range(1, len(link)):
-                    run = run + step[k] if gone[k] else 0.0
-                    longest = max(longest, run)
-                if longest > _JOIN_MASK_GAP_R * r:
-                    continue            # the mask is missing for too long between them
-            cost = shift + 0.3 * float(np.linalg.norm(g))
-            cand.setdefault(a, []).append((cost, b))
-            cand.setdefault(b, []).append((cost, a))
-        best = {e: min(c)[1] for e, c in cand.items()}
-        pairs = [(a, b) for a, b in best.items() if a < b and best.get(b) == a]
-        if not pairs:
-            break
-        taken, merged, drop = set(), [], set()
-        for a, b in sorted(pairs):
-            ia, wa = ends[a][:2]
-            ib, wb = ends[b][:2]
-            if ia in taken or ib in taken:
-                continue
-            taken.update((ia, ib))
-            pa_seq = chains[ia] if wa == 1 else chains[ia][::-1]      # joined end last
-            pb_seq = chains[ib] if wb == 0 else chains[ib][::-1]      # joined end first
-            # Pieces that overlap along the fibre are cut where they cross midway between
-            # the ends, so the joined path runs on without doubling back.
-            ea, ua, eb, ub = ends[a][2], ends[a][4], ends[b][2], ends[b][4]
-            n = (ua - ub) / np.linalg.norm(ua - ub)
-            mid = 0.5 * (ea + eb)
-            ka = np.nonzero((pa_seq * sp - mid) @ n <= 0)[0]
-            kb = np.nonzero((pb_seq * sp - mid) @ n >= 0)[0]
-            if len(ka) and len(kb):
-                pa_seq, pb_seq = pa_seq[:ka[-1] + 1], pb_seq[kb[0]:]
-            link = _line_voxels(pa_seq[-1], pb_seq[0])
-            link = link[obj_lookup(link)]
-            merged.append(np.concatenate([pa_seq, link, pb_seq]))
-            drop.update((ia, ib))
-        chains = [pv for i, pv in enumerate(chains) if i not in drop] + merged
-
-    return chains
+    return _mend_breaks(chains, sp, r, obj_lookup)
 
 
 def _elongated_label_candidates(lbl, sl, segmentation_mask, intensity_image,
