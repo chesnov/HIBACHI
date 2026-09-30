@@ -723,6 +723,13 @@ _STACK_LOW_K = 1.25    # ... and next to such columns, one at least this tall
 #                        still holds part of both
 _STACK_FOLLOW_UM = 5.0 # a stacked contact is followed this far beyond its
 #                        clearly stacked columns
+_STITCH_LAT_R = 2.0    # path ends are one fibre if each end's line passes within this many r of the other
+_STITCH_LAT2_R = 3.0   # ... or, once nothing more joins at that limit, within this many r: a mask
+#                        bump at a break moves an end sideways by a little over one fibre width.
+#                        Only for long pieces that continue each other (next constant, and
+#                        _MAX_TURN_DEG): a short piece is a fragment of a dense bundle, too short
+#                        for its own direction or offset to mean anything
+_STITCH_LONG_R = 45.0  # a piece at least this long (45 r, about 20 um) has a course of its own
 # Sigmoid correction (`_fix_sigmoids`): a fibre's course is judged over this
 # long a stretch on either side of a place (long-range direction), leaving out
 # this much right at the place ...
@@ -1431,6 +1438,12 @@ def _stitch_paths(paths, sp, r, obj_lookup):
     joined only if each is the other's first choice, and never so as to close
     a loop. Joined paths keep their outer ends and directions, so this repeats
     until nothing changes. Returns the paths, ordered along their fibres.
+
+    A second, looser pass follows (_STITCH_LAT2_R r instead of _STITCH_LAT_R r)
+    for a break that a bump of the mask leaves slightly off-line. It is meant
+    for two long pieces of one fibre, so it takes only pieces at least
+    _STITCH_LONG_R r long whose ends continue each other within _MAX_TURN_DEG;
+    the short pieces of a dense bundle stay as the first pass left them.
     """
     win = _ARM_WINDOW_R * r
     paths = [np.asarray(p_) for p_ in paths if len(p_)]
@@ -1450,57 +1463,66 @@ def _stitch_paths(paths, sp, r, obj_lookup):
 
     chains = list(paths)
 
-    for _round in range(64):
-        ends = []                       # (path index, which end 0|1, point, direction)
-        for i, pv in enumerate(chains):
-            for which, seq in ((0, pv[::-1]), (1, pv)):
-                pt, d = end_geom(seq)
-                if d is not None:
-                    ends.append((i, which, pt, d))
-        cand = {}
-        for a in range(len(ends)):
-            ia, wa, pa, da = ends[a]
-            for b in range(a + 1, len(ends)):
-                ib, wb, pb, db = ends[b]
-                if ia == ib:
-                    continue            # both ends of one path: a loop
-                g = pb - pa
-                dist = float(np.linalg.norm(g))
-                if dist > win:
+    # Joining runs at the strict lateral limit until nothing more joins; only then at the
+    # looser one, so every join the strict limit makes is made first and the loose limit
+    # sees only the ends that are still free.
+    for lat_r in (_STITCH_LAT_R, _STITCH_LAT2_R):
+        for _round in range(64):
+            ends = []                       # (path index, which end 0|1, point, direction)
+            for i, pv in enumerate(chains):
+                for which, seq in ((0, pv[::-1]), (1, pv)):
+                    pt, d = end_geom(seq)
+                    if d is not None:
+                        ends.append((i, which, pt, d))
+            clen = [float(arc(pv)[-1]) for pv in chains]
+            cand = {}
+            for a in range(len(ends)):
+                ia, wa, pa, da = ends[a]
+                for b in range(a + 1, len(ends)):
+                    ib, wb, pb, db = ends[b]
+                    if ia == ib:
+                        continue            # both ends of one path: a loop
+                    if lat_r > _STITCH_LAT_R and (clen[ia] < _STITCH_LONG_R * r or clen[ib] < _STITCH_LONG_R * r):
+                        continue            # loose tier: fragments of a bundle stay as they are
+                    g = pb - pa
+                    dist = float(np.linalg.norm(g))
+                    if dist > win:
+                        continue
+                    if float(da @ db) >= 0 or (dist > 0 and (float(g @ da) < 0 or float(-g @ db) < 0)):
+                        continue            # they do not continue each other
+                    if lat_r > _STITCH_LAT_R and -float(da @ db) < math.cos(math.radians(_MAX_TURN_DEG)):
+                        continue            # loose tier: only a straight continuation
+                    lat_a = float(np.linalg.norm(g - (g @ da) * da))
+                    lat_b = float(np.linalg.norm(-g - (-g @ db) * db))
+                    if lat_a >= lat_r * r or lat_b >= lat_r * r:
+                        continue            # off-line: a step onto another fibre
+                    seg_v = _line_voxels(np.round(pa / sp).astype(np.int64),
+                                         np.round(pb / sp).astype(np.int64))
+                    if len(seg_v) and not bool(np.all(obj_lookup(seg_v))):
+                        continue            # would cross background
+                    cost = lat_a + lat_b + r * (1.0 + float(da @ db))
+                    cand.setdefault(a, []).append((cost, b))
+                    cand.setdefault(b, []).append((cost, a))
+            best = {e: min(c)[1] for e, c in cand.items()}
+            pairs = [(a, b) for a, b in best.items() if a < b and best.get(b) == a]
+            if not pairs:
+                break
+            # Join each mutual pair; a path joined twice this round waits.
+            taken = set()
+            merged = []
+            drop = set()
+            for a, b in pairs:
+                ia, wa, pa, _ = ends[a]
+                ib, wb, pb, _ = ends[b]
+                if ia in taken or ib in taken:
                     continue
-                if float(da @ db) >= 0 or (dist > 0 and (float(g @ da) < 0 or float(-g @ db) < 0)):
-                    continue            # they do not continue each other
-                lat_a = float(np.linalg.norm(g - (g @ da) * da))
-                lat_b = float(np.linalg.norm(-g - (-g @ db) * db))
-                if lat_a >= 2 * r or lat_b >= 2 * r:
-                    continue            # off-line: a step onto another fibre
-                seg_v = _line_voxels(np.round(pa / sp).astype(np.int64),
-                                     np.round(pb / sp).astype(np.int64))
-                if len(seg_v) and not bool(np.all(obj_lookup(seg_v))):
-                    continue            # would cross background
-                cost = lat_a + lat_b + r * (1.0 + float(da @ db))
-                cand.setdefault(a, []).append((cost, b))
-                cand.setdefault(b, []).append((cost, a))
-        best = {e: min(c)[1] for e, c in cand.items()}
-        pairs = [(a, b) for a, b in best.items() if a < b and best.get(b) == a]
-        if not pairs:
-            break
-        # Join each mutual pair; a path joined twice this round waits.
-        taken = set()
-        merged = []
-        drop = set()
-        for a, b in pairs:
-            ia, wa, pa, _ = ends[a]
-            ib, wb, pb, _ = ends[b]
-            if ia in taken or ib in taken:
-                continue
-            taken.update((ia, ib))
-            pa_seq = chains[ia] if wa == 1 else chains[ia][::-1]      # joined end last
-            pb_seq = chains[ib] if wb == 0 else chains[ib][::-1]      # joined end first
-            seg_v = _line_voxels(pa_seq[-1], pb_seq[0])
-            merged.append(np.concatenate([pa_seq, seg_v, pb_seq]))
-            drop.update((ia, ib))
-        chains = [pv for i, pv in enumerate(chains) if i not in drop] + merged
+                taken.update((ia, ib))
+                pa_seq = chains[ia] if wa == 1 else chains[ia][::-1]      # joined end last
+                pb_seq = chains[ib] if wb == 0 else chains[ib][::-1]      # joined end first
+                seg_v = _line_voxels(pa_seq[-1], pb_seq[0])
+                merged.append(np.concatenate([pa_seq, seg_v, pb_seq]))
+                drop.update((ia, ib))
+            chains = [pv for i, pv in enumerate(chains) if i not in drop] + merged
 
     return chains
 
