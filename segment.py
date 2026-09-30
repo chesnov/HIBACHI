@@ -115,6 +115,59 @@ except ImportError:
     sys.exit(1)
 
 # -----------------------------------------------------------------------------
+# 2b. napari hover-status guard (3D view)
+# -----------------------------------------------------------------------------
+# napari 0.5.6 computes the status-bar value under the cursor on a background thread.
+# In the 3D view, when the camera looks almost exactly along a data axis, a ray can be
+# assigned to only one face of the image's bounding box. napari treats "no hit" only if
+# BOTH faces are missing, so it passes None on and fails with
+#   TypeError: 'NoneType' object is not subscriptable
+# (napari/utils/geometry.py, face_coordinate_from_bounding_box). The background thread
+# catches it and pops up an error notification, and a later focus change in
+# napari/_qt/qt_event_loop.py::_focus_changed -- which walks the notification widgets --
+# has taken the whole process down with a native SIGSEGV.
+# Two guards, both purely about the cosmetic status bar:
+#   1. a ray that finds only one face counts as "does not intersect", like a miss;
+#   2. whatever else goes wrong computing the hover status is logged once and skipped,
+#      instead of raising a notification.
+def _harden_napari_hover():
+    import napari.layers.base.base as _layer_base
+    from napari.components.viewer_model import ViewerModel
+
+    _find_front_back_face = _layer_base.find_front_back_face
+
+    def _find_front_back_face_safe(click_pos, bounding_box, view_dir):
+        front, back = _find_front_back_face(click_pos, bounding_box, view_dir)
+        if front is None or back is None:
+            return None, None
+        return front, back
+
+    _layer_base.find_front_back_face = _find_front_back_face_safe
+
+    _calc_status = ViewerModel._calc_status_from_cursor
+    _reported = set()
+
+    def _calc_status_safe(self):
+        try:
+            return _calc_status(self)
+        except Exception as exc:                      # noqa: BLE001
+            key = (type(exc).__name__, str(exc))
+            if key not in _reported:
+                _reported.add(key)
+                log.warning("napari hover status failed (%s: %s); skipping the status "
+                            "update instead of raising a notification.", *key)
+            return None
+
+    ViewerModel._calc_status_from_cursor = _calc_status_safe
+
+
+try:
+    _harden_napari_hover()
+    log.info("Applied napari hover-status guard.")
+except Exception as e:
+    log.warning("Could not apply napari hover guard: %s", e)
+
+# -----------------------------------------------------------------------------
 # 3. Global Exception Handling
 # -----------------------------------------------------------------------------
 def global_exception_hook(exctype, value, tb):
