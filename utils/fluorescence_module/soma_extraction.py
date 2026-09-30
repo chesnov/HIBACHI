@@ -746,7 +746,9 @@ _SIG_MIN_FIBRE_UM = 8.0  # at least this long (a crumb has no course of its own)
 _SIG_MAX_MISS_UM = 1.0 # whose course continues the new track to within this,
 _SIG_MARGIN_UM = 0.1   # better than the path's own old course by this margin,
 #                        and whose thickness matches the new track as well
-_SIG_PASSES = 3        # repeated on the corrected paths at most this often
+_SIG_PASSES = 2        # repeated on the corrected paths at most this often. A third pass re-cuts the
+#                        head a second pass left, at the far end of a bundle of fused fibres, and
+#                        hands that bundle's tail to the fibre that merely ends beside it
 
 
 # ---- tiling ------------------------------------------------------------------ #
