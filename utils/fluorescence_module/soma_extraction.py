@@ -733,9 +733,8 @@ _JOIN_WINDOW_UM = 12.0
 _JOIN_MIN_UM = 6.0     # a course needs at least this much path to have a direction
 _JOIN_SHIFT_R = 4.0    # the two courses may be this far (in r) off one line, midway between the ends
 _JOIN_MASK_GAP_R = 3.0 # and the straight link between the ends may leave the mask for this far (in r)
-_JOIN_FAR_R = 20.0     # a second, longer reach (in r), across a stretch the mask may miss altogether,
-_JOIN_FAR_TURN_DEG = 15.0  # but only for pieces that continue each other this straight ...
-_JOIN_FAR_SHIFT_R = 2.5    # ... and lie this close (in r) to one line
+_JOIN_FAR_R = 20.0     # a second, longer reach (in r), for pieces the mask still joins: the same tests, but
+_JOIN_FAR_TURN_DEG = 15.0  # the pieces must continue each other this straight
 _JOIN_OVERLAP_R = 4.0  # pieces may overlap this far (in r) along the fibre, if they lie on one line (< 2 r apart)
 # Sigmoid correction (`_fix_sigmoids`): a fibre's course is judged over this
 # long a stretch on either side of a place (long-range direction), leaving out
@@ -1477,13 +1476,14 @@ def _mend_breaks(chains, sp, r, obj_lookup):
     from scipy.spatial import cKDTree
     win = _ARM_WINDOW_R * r
     cos_turn = math.cos(math.radians(_MAX_TURN_DEG))
-    # Two reaches, the shorter first. Within 10 r the mask may be missing along the link for
-    # up to _JOIN_MASK_GAP_R r. Within _JOIN_FAR_R r it may be missing altogether -- a stretch
-    # of the fibre the segmentation did not label -- but then the two pieces must continue
-    # each other much more straightly.
+    # Two reaches, the shorter first: within 10 r, then within _JOIN_FAR_R r, where the pieces
+    # must continue each other more straightly. At both, the mask may be missing along the
+    # straight link for at most _JOIN_MASK_GAP_R r: a longer stretch without mask means the
+    # segmentation does not connect the two pieces, and a straight line across it says nothing
+    # about which fibre they belong to.
     tiers = ((win, _JOIN_MASK_GAP_R * r, cos_turn, _JOIN_SHIFT_R * r),
-             (_JOIN_FAR_R * r, _JOIN_FAR_R * r, math.cos(math.radians(_JOIN_FAR_TURN_DEG)),
-              _JOIN_FAR_SHIFT_R * r))
+             (_JOIN_FAR_R * r, _JOIN_MASK_GAP_R * r, math.cos(math.radians(_JOIN_FAR_TURN_DEG)),
+              _JOIN_SHIFT_R * r))
     for reach, mask_gap, tier_cos, tier_shift in tiers:
         for _round in range(64):
             ends = []                       # (path index, which end 0|1, end point, centroid, direction)
