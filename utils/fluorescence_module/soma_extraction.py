@@ -1279,9 +1279,9 @@ def _paths_from_skeleton(pts, half_w, bshape, spacing, r, obj_lookup):
                 # layer below look like a straight continuation. Where a lane that stays
                 # in the path's own layer is also open, the path does not hop layers.
                 level = [c for c in cands if c[4] <= _LAYER_SAME_R * r]
-                pick = min(cands)
+                pick = min(cands, key=lambda c: c[0])       # the first of equal costs, as before
                 if level and pick[4] > _LAYER_HOP_R * r:
-                    pick = min(level)
+                    pick = min(level, key=lambda c: c[0])
                 best = pick[:4]
             if best is None:
                 return trim_tail(path_vox, zone_id)
