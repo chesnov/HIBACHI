@@ -751,6 +751,8 @@ _SIG_MAX_MISS_UM = 1.0 # whose course continues the new track to within this,
 _SIG_MARGIN_UM = 0.1   # better than the path's own old course by this margin,
 #                        and whose thickness matches the new track as well
 _SIG_PASSES = 3        # repeated on the corrected paths at most this often
+_SWAP_MIN_SHIFT_UM = 0.9  # crossing fibres (`_fix_sigmoids`): both steps are at least a fibre width (2 r),
+_SWAP_FIT_RATIO = 0.5    # and each swapped course misses by at most this fraction of what the original did
 
 
 # ---- tiling ------------------------------------------------------------------ #
@@ -1331,6 +1333,11 @@ def _fix_sigmoids(paths, pts, half_w, sp, obj_lookup):
     joined to the new track by a straight segment. Every path is examined in
     both directions; a path takes part in one correction per pass, and the
     passes repeat on the corrected paths, at most _SIG_PASSES times.
+
+    Two fibres can also cross: both paths slide onto each other's course in the
+    same place, each stepping the opposite way, so that neither ends. Then the
+    two tails are swapped: each path's old course continues the other's new
+    track (see `swap_crossings`).
     """
     from scipy.spatial import cKDTree
     sp = np.asarray(sp, float)
@@ -1432,11 +1439,95 @@ def _fix_sigmoids(paths, pts, half_w, sp, obj_lookup):
             n_fixed += 1
         return [o for o in out if len(o)], n_fixed
 
+    def steps_of(x):
+        """Places along the oriented path `x` where two parallel courses are shifted sideways."""
+        a = arc(x)
+        out = []
+        for s_ in np.arange(D + 3.0, a[-1] - D - 3.0, _SIG_STEP_UM):
+            A = x[(a >= s_ - W) & (a <= s_ - D)]
+            B = x[(a >= s_ + D) & (a <= s_ + W)]
+            if len(A) < 8 or len(B) < 8:
+                continue
+            cA, uA = fit(A)
+            cB, uB = fit(B)
+            uA = towards(uA, A.mean(0), B.mean(0))
+            uB = towards(uB, A.mean(0), B.mean(0))
+            if uA @ uB < cos_max:
+                continue
+            p_ = x[min(np.searchsorted(a, s_), len(x) - 1)]
+            m = (uA + uB) / np.linalg.norm(uA + uB)
+            d = (cB + ((p_ - cB) @ uB) * uB) - (cA + ((p_ - cA) @ uA) * uA)
+            d = d - (d @ m) * m
+            if float(np.linalg.norm(d)) < _SWAP_MIN_SHIFT_UM:
+                continue
+            out.append((s_, p_, A, B, cA, uA, d))
+        return out
+
+    def swap_crossings(P):
+        """Swap the tails of two paths that cross: both step onto each other's course at the
+        same place, the steps point opposite ways, and each path's old course continues the
+        other's new track clearly better than its own."""
+        X = [p_ * sp for p_ in P]
+        oriented = []                     # (path index, reversed, oriented xyz, steps)
+        for i, x in enumerate(X):
+            if len(x) < 30:
+                continue
+            for rev in (False, True):
+                xo = x[::-1] if rev else x
+                oriented.append((i, rev, xo, steps_of(xo)))
+        if not oriented:
+            return list(P), 0
+        owner = np.concatenate([[k] * len(o[2]) for k, o in enumerate(oriented)])
+        tree_all = cKDTree(np.vstack([o[2] for o in oriented]))
+        found = {}
+        for k1, (i, r1, _x1, L1) in enumerate(oriented):
+            for s1, p1, A1, B1, cA1, uA1, d1 in L1:
+                for hit in tree_all.query_ball_point(p1, _SIG_END_NEAR_UM):
+                    k2 = int(owner[hit])
+                    j, r2, _x2, L2 = oriented[k2]
+                    if j <= i:
+                        continue
+                    for s2, p2, A2, B2, cA2, uA2, d2 in L2:
+                        if np.linalg.norm(p2 - p1) > _SIG_END_NEAR_UM or uA1 @ uA2 <= 0 or d1 @ d2 >= 0:
+                            continue
+                        m1q, m1a = miss(cA2, uA2, B1), miss(cA1, uA1, B1)
+                        m2q, m2a = miss(cA1, uA1, B2), miss(cA2, uA2, B2)
+                        if None in (m1q, m1a, m2q, m2a):
+                            continue
+                        if (m1q > _SIG_MAX_MISS_UM or m2q > _SIG_MAX_MISS_UM
+                                or m1q > _SWAP_FIT_RATIO * m1a or m2q > _SWAP_FIT_RATIO * m2a):
+                            continue
+                        score = (m1a - m1q) + (m2a - m2q)
+                        if (i, j) not in found or score > found[(i, j)][0]:
+                            found[(i, j)] = (score, r1, s1, r2, s2)
+        touched, out, n_done = set(), list(P), 0
+        for (i, j), (_sc, r1, s1, r2, s2) in sorted(found.items(), key=lambda t: -t[1][0]):
+            if i in touched or j in touched:
+                continue
+            parts = []
+            for idx, rev, s_ in ((i, r1, s1), (j, r2, s2)):
+                Pi = P[idx][::-1] if rev else P[idx]
+                a = arc(Pi * sp)
+                parts.append((Pi[:int(np.searchsorted(a, s_ - D))], Pi[int(np.searchsorted(a, s_ + D)):]))
+            (head_i, tail_i), (head_j, tail_j) = parts
+            if not (len(head_i) and len(tail_i) and len(head_j) and len(tail_j)):
+                continue
+            new = []
+            for head, tail in ((head_i, tail_j), (head_j, tail_i)):
+                link = _line_voxels(head[-1], tail[0])
+                link = link[obj_lookup(link)] if len(link) else link
+                new.append(np.concatenate([head, link, tail]))
+            out[i], out[j] = new
+            touched.update((i, j))
+            n_done += 1
+        return [o for o in out if len(o)], n_done
+
     P = [np.asarray(p_) for p_ in paths]
     for _pass in range(_SIG_PASSES):
         P, n_fixed = one_pass(P)
         if not n_fixed:
             break
+    P, _ = swap_crossings(P)        # once: swapping the same two paths again would only undo it
     return P
 
 
