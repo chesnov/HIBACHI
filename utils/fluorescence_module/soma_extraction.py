@@ -736,6 +736,10 @@ _JOIN_MASK_GAP_R = 3.0 # and the straight link between the ends may leave the ma
 _JOIN_FAR_R = 20.0     # a second, longer reach (in r), for pieces the mask still joins: the same tests, but
 _JOIN_FAR_TURN_DEG = 15.0  # the pieces must continue each other this straight
 _JOIN_OVERLAP_R = 4.0  # pieces may overlap this far (in r) along the fibre, if they lie on one line (< 2 r apart)
+# Leftover skeleton (`_leftover_chains`): skeleton that no path of at least _CRUMB_UM covers is
+# kept as a candidate fibre piece if its longest chain is at least _SALVAGE_UM long
+_CRUMB_UM = 3.0
+_SALVAGE_UM = 8.0
 # Sigmoid correction (`_fix_sigmoids`): a fibre's course is judged over this
 # long a stretch on either side of a place (long-range direction), leaving out
 # this much right at the place ...
@@ -751,6 +755,10 @@ _SIG_MAX_MISS_UM = 1.0 # whose course continues the new track to within this,
 _SIG_MARGIN_UM = 0.1   # better than the path's own old course by this margin,
 #                        and whose thickness matches the new track as well
 _SIG_PASSES = 3        # repeated on the corrected paths at most this often
+_ORPHAN_UM = 25.0          # a free-standing piece this short is a fragment of a fibre, not a fibre (`_fix_sigmoids`):
+_ORPHAN_NEAR_UM = 3.5     # it starts within this distance of a contact where one fibre passes and another ends,
+_ORPHAN_DEPTH_UM = 1.1    # and fibres keep their order in depth across a contact (at least this far apart)
+_ORPHAN_REACH_UM = 2.2    # the fibres it is paired with lie this close (2.5 fibre widths) to each other at the contact
 _SWAP_MIN_SHIFT_UM = 0.9  # crossing fibres (`_fix_sigmoids`): both steps are at least a fibre width (2 r),
 _SWAP_FIT_RATIO = 0.5    # and each swapped course misses by at most this fraction of what the original did
 
@@ -1100,6 +1108,58 @@ def _remove_hairs(edges, half_w, length, xyz, r):
     return [E[i] for i in sorted(E)]
 
 
+def _leftover_chains(pts, paths, sp):
+    """Chains through the skeleton that no real path covers.
+
+    A bright fibre that lies on a dim one shares a ladder of very short branches
+    with it: every branch is shorter than the baseline the tracer needs to give a
+    path a direction, so the dim fibre takes one rail and the other rail is left as
+    crumbs. Skeleton voxels more than a voxel from every path of at least _CRUMB_UM
+    are grouped into connected pieces, and the longest chain through each piece
+    (found with two shortest-path searches) is returned if it is at least
+    _SALVAGE_UM long, as an ordered voxel array.
+    """
+    from scipy.sparse import coo_matrix
+    from scipy.sparse.csgraph import connected_components, dijkstra
+    from scipy.spatial import cKDTree
+
+    def plen(p):
+        return float(np.sum(np.linalg.norm(np.diff(p * sp, axis=0), axis=1))) if len(p) > 1 else 0.0
+
+    real = [p for p in paths if plen(p) >= _CRUMB_UM]
+    if not real or len(pts) == 0:
+        return []
+    covered = cKDTree(np.vstack(real) * sp)
+    keep = covered.query(pts * sp)[0] > 0.36            # more than one voxel step from every real path
+    U = pts[keep]
+    if len(U) < 8:
+        return []
+    pairs = cKDTree(U * sp).query_pairs(0.36, output_type="ndarray")
+    if not len(pairs):
+        return []
+    w = np.linalg.norm((U[pairs[:, 0]] - U[pairs[:, 1]]) * sp, axis=1)
+    G = coo_matrix((np.r_[w, w], (np.r_[pairs[:, 0], pairs[:, 1]], np.r_[pairs[:, 1], pairs[:, 0]])),
+                   shape=(len(U), len(U))).tocsr()
+    n_comp, label = connected_components(G, directed=False)
+    out = []
+    for c in range(n_comp):
+        members = np.nonzero(label == c)[0]
+        if len(members) < 8:
+            continue
+        sub = G[members][:, members]
+        d0 = dijkstra(sub, indices=0)
+        a = int(np.argmax(np.where(np.isinf(d0), -1.0, d0)))
+        d1, pred = dijkstra(sub, indices=a, return_predecessors=True)
+        b = int(np.argmax(np.where(np.isinf(d1), -1.0, d1)))
+        if d1[b] < _SALVAGE_UM:
+            continue
+        chain = [b]
+        while chain[-1] != a:
+            chain.append(int(pred[chain[-1]]))
+        out.append(U[members[chain[::-1]]])
+    return out
+
+
 def _paths_from_skeleton(pts, half_w, bshape, spacing, r, obj_lookup):
     """Decompose a mask skeleton into fibre paths, each a chain, never a tree.
 
@@ -1310,7 +1370,14 @@ def _paths_from_skeleton(pts, half_w, bshape, spacing, r, obj_lookup):
     paths = _stitch_paths(paths, sp, r, obj_lookup)
     paths = _fix_sigmoids(paths, pts, half_w, sp, obj_lookup)
     # The sigmoid fixes trim and re-join paths, so some ends are final only now: mend again.
-    return _mend_breaks(paths, sp, r, obj_lookup)
+    paths = _mend_breaks(paths, sp, r, obj_lookup)
+    # Skeleton that no path covers (see `_leftover_chains`) may still be the continuation of a
+    # fibre that ran out of branches to follow. It is attached to a path end by the same test
+    # as above, and only to a real path; whatever attaches to nothing is dropped.
+    leftover = _leftover_chains(pts, paths, sp)
+    if leftover:
+        paths = _mend_breaks(paths, sp, r, obj_lookup, extras=leftover)
+    return paths
 
 
 def _fix_sigmoids(paths, pts, half_w, sp, obj_lookup):
@@ -1338,6 +1405,12 @@ def _fix_sigmoids(paths, pts, half_w, sp, obj_lookup):
     same place, each stepping the opposite way, so that neither ends. Then the
     two tails are swapped: each path's old course continues the other's new
     track (see `swap_crossings`).
+
+    A short free-standing piece that starts at a contact where one fibre passes and
+    another ends belongs to one of the two. Fibres keep their order in depth across a
+    contact: the one above stays above. So the piece joins the incoming fibre that is on
+    the same side of the other incoming fibre as the piece is of the passing fibre's
+    continuation (see `attach_orphans`).
     """
     from scipy.spatial import cKDTree
     sp = np.asarray(sp, float)
@@ -1522,12 +1595,117 @@ def _fix_sigmoids(paths, pts, half_w, sp, obj_lookup):
             n_done += 1
         return [o for o in out if len(o)], n_done
 
+    def attach_orphans(P):
+        """Give each short free-standing piece to the incoming fibre that keeps the depth order."""
+        X = [p_ * sp for p_ in P]
+        L = [float(arc(x)[-1]) if len(x) > 1 else 0.0 for x in X]
+        ends = [(i, w, x[0] if w == 0 else x[-1]) for i, x in enumerate(X) if len(x) >= 6 for w in (0, 1)]
+        if not ends:
+            return list(P), 0
+        etree = cKDTree(np.array([e[2] for e in ends]))
+        allp = np.vstack(X)
+        owner = np.concatenate([[k] * len(x) for k, x in enumerate(X)])
+        first = np.concatenate([[0], np.cumsum([len(x) for x in X])[:-1]])
+        ptree = cKDTree(allp)
+        near = _ORPHAN_NEAR_UM
+        found = {}
+        for r, xr_all in enumerate(X):
+            if len(xr_all) < 6 or not (_SIG_MIN_FIBRE_UM <= L[r] <= _ORPHAN_UM):
+                continue
+            for wr in (0, 1):
+                xr = xr_all if wr == 0 else xr_all[::-1]                # it starts at the contact
+                if any(ends[k][0] != r for k in etree.query_ball_point(xr[-1], near)):
+                    continue                                              # its far end must be free
+                ar = arc(xr)
+                Rsel = xr[ar <= W]
+                cR, uR = fit(Rsel)
+                uR = towards(uR, Rsel[0], Rsel[-1])
+                for pk in ptree.query_ball_point(xr[0], near):
+                    i = int(owner[pk])
+                    if i == r or L[i] < 30.0:
+                        continue
+                    xi = X[i]
+                    ai = arc(xi)
+                    s_ = float(ai[pk - first[i]])
+                    if s_ < D + 3.0 or s_ > ai[-1] - D - 3.0:
+                        continue
+                    A = xi[(ai >= s_ - W) & (ai <= s_ - D)]
+                    B = xi[(ai >= s_ + D) & (ai <= s_ + W)]
+                    if len(A) < 8 or len(B) < 8:
+                        continue
+                    cA, uA = fit(A)
+                    cB, uB = fit(B)
+                    uA = towards(uA, A.mean(0), B.mean(0))
+                    uB = towards(uB, A.mean(0), B.mean(0))
+                    if uR @ uB < 0.5:
+                        continue                                          # it must leave the way the path goes on
+                    p = xi[pk - first[i]]
+                    for ek in etree.query_ball_point(p, near):
+                        q, wq, _pe = ends[ek]
+                        if q in (i, r) or L[q] < _SIG_MIN_FIBRE_UM:
+                            continue
+                        xq = X[q] if wq == 1 else X[q][::-1]              # it ends at the contact
+                        aq = arc(xq)
+                        Qsel = xq[aq >= aq[-1] - W]
+                        if len(Qsel) < 6:
+                            continue
+                        cQ, uQ = fit(Qsel)
+                        uQ = towards(uQ, Qsel[0], Qsel[-1])
+                        if uQ @ uA < 0.5:
+                            continue                                      # it must arrive the way the path comes in
+                        m = (uA + uB) / np.linalg.norm(uA + uB)
+
+                        def depth_at(c, u):
+                            return float((c + u * (((p - c) @ m) / (u @ m)))[0])
+
+                        def plane_at(c, u):
+                            return c + u * (((p - c) @ m) / (u @ m))
+
+                        def apart(c1, u1, c2, u2):
+                            d_ = plane_at(c1, u1) - plane_at(c2, u2)
+                            return float(np.linalg.norm(d_ - (d_ @ m) * m))
+
+                        if apart(cA, uA, cR, uR) > _ORPHAN_REACH_UM or apart(cQ, uQ, cB, uB) > _ORPHAN_REACH_UM:
+                            continue                                      # too far apart to be one fibre
+                        dz_in = depth_at(cA, uA) - depth_at(cQ, uQ)
+                        dz_out = depth_at(cR, uR) - depth_at(cB, uB)
+                        if abs(dz_in) < _ORPHAN_DEPTH_UM or abs(dz_out) < _ORPHAN_DEPTH_UM or dz_in * dz_out <= 0:
+                            continue                                      # no clear order, or the order is kept as it is
+                        turns = [np.degrees(np.arccos(np.clip(u1 @ u2, -1, 1))) for u1, u2 in ((uA, uR), (uQ, uB))]
+                        if max(turns) > _SIG_MAX_DEG * 2.25:
+                            continue
+                        key = (r, i, q)
+                        score = min(abs(dz_in), abs(dz_out))
+                        if key not in found or score > found[key][0]:
+                            found[key] = (score, wr, wq, s_)
+        touched, out, n_done = set(), list(P), 0
+        for (r, i, q), (_sc, wr, wq, s_) in sorted(found.items(), key=lambda kv: -kv[1][0]):
+            if {r, i, q} & touched:
+                continue
+            a = arc(X[i])
+            ia, ib = int(np.searchsorted(a, s_ - D)), int(np.searchsorted(a, s_ + D))
+            head, tail = P[i][:ia], P[i][ib:]
+            piece = P[r] if wr == 0 else P[r][::-1]
+            incoming = P[q] if wq == 1 else P[q][::-1]
+            if not (len(head) and len(tail)):
+                continue
+            new = []
+            for first_part, second_part in ((head, piece), (incoming, tail)):
+                link = _line_voxels(first_part[-1], second_part[0])
+                link = link[obj_lookup(link)] if len(link) else link
+                new.append(np.concatenate([first_part, link, second_part]))
+            out[i], out[q], out[r] = new[0], new[1], P[r][:0]
+            touched.update((r, i, q))
+            n_done += 1
+        return [o for o in out if len(o)], n_done
+
     P = [np.asarray(p_) for p_ in paths]
     for _pass in range(_SIG_PASSES):
         P, n_fixed = one_pass(P)
         if not n_fixed:
             break
     P, _ = swap_crossings(P)        # once: swapping the same two paths again would only undo it
+    P, _ = attach_orphans(P)
     return P
 
 
@@ -1551,9 +1729,14 @@ def _end_course(pv, which, sp):
     return x[-1], c, u
 
 
-def _mend_breaks(chains, sp, r, obj_lookup):
+def _mend_breaks(chains, sp, r, obj_lookup, extras=None):
     """Join the pieces of one fibre that a contact left apart, comparing them on their
-    courses rather than on their ends (see the comment below). Returns the paths."""
+    courses rather than on their ends (see the comment below). Returns the paths.
+
+    With `extras` (a list of further paths, appended after `chains`) only a pair made of one
+    extra and one real path may join, and an extra that joins none is dropped: that is how
+    leftover skeleton is attached to the fibres it continues without taking part in the
+    competition between the real paths."""
     # ---- second phase: mend the breaks a contact left in a fibre -----------------
     # Near a contact the mask's bumps and the crossing fibres bend a piece's last few
     # microns, so its END direction and position can be off by more than a fibre width
@@ -1566,6 +1749,10 @@ def _mend_breaks(chains, sp, r, obj_lookup):
     # other's first choice and never so as to close a loop.
     from scipy.spatial import cKDTree
     win = _ARM_WINDOW_R * r
+    n_real = len(chains)
+    if extras:
+        chains = list(chains) + list(extras)
+    is_extra = [i >= n_real for i in range(len(chains))]
     cos_turn = math.cos(math.radians(_MAX_TURN_DEG))
     # Two reaches, the shorter first: within 10 r, then within _JOIN_FAR_R r, where the pieces
     # must continue each other more straightly. At both, the mask may be missing along the
@@ -1576,6 +1763,8 @@ def _mend_breaks(chains, sp, r, obj_lookup):
              (_JOIN_FAR_R * r, _JOIN_MASK_GAP_R * r, math.cos(math.radians(_JOIN_FAR_TURN_DEG)),
               _JOIN_SHIFT_R * r))
     for reach, mask_gap, tier_cos, tier_shift in tiers:
+        if extras:
+            mask_gap = reach        # leftover skeleton on the far side is itself the evidence of fibre there
         for _round in range(64):
             ends = []                       # (path index, which end 0|1, end point, centroid, direction)
             for i, pv in enumerate(chains):
@@ -1590,7 +1779,7 @@ def _mend_breaks(chains, sp, r, obj_lookup):
             for a, b in sorted(tree.query_pairs(reach)):
                 ia, wa, ea, ca, ua = ends[a]
                 ib, wb, eb, cb, ub = ends[b]
-                if ia == ib or -float(ua @ ub) < tier_cos:
+                if ia == ib or -float(ua @ ub) < tier_cos or (extras and is_extra[ia] == is_extra[ib]):
                     continue
                 g = eb - ea
                 n = ua - ub
@@ -1642,8 +1831,11 @@ def _mend_breaks(chains, sp, r, obj_lookup):
                 link = link[obj_lookup(link)]
                 merged.append(np.concatenate([pa_seq, link, pb_seq]))
                 drop.update((ia, ib))
+            is_extra = [f for i, f in enumerate(is_extra) if i not in drop] + [False] * len(merged)
             chains = [pv for i, pv in enumerate(chains) if i not in drop] + merged
 
+    if extras:
+        chains = [c for c, f in zip(chains, is_extra) if not f]      # an extra that joined nothing is dropped
     return chains
 
 
