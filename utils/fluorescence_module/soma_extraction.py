@@ -759,6 +759,11 @@ _ORPHAN_UM = 25.0          # a free-standing piece this short is a fragment of a
 _ORPHAN_NEAR_UM = 3.5     # it starts within this distance of a contact where one fibre passes and another ends,
 _ORPHAN_DEPTH_UM = 1.1    # and fibres keep their order in depth across a contact (at least this far apart)
 _ORPHAN_REACH_UM = 2.2    # the fibres it is paired with lie this close (2.5 fibre widths) to each other at the contact
+_BLOB_RATIO = 1.6          # two fibres that overlap make a blob this many times the lone fibre's cross-section (`blob_handover`);
+_BLOB_MIN_UM = 2.5         # it lasts at least this long and starts within _BLOB_NEAR_UM of where a fibre ends against the path;
+_BLOB_NEAR_UM = 3.5        # the single fibre that comes out of it goes to the fibre whose depth range (top and bottom of the raw mask)
+_BLOB_EDGE_MAX = 4.0       # it matches: both edges together within this many slices, and
+_BLOB_EDGE_RATIO = 0.5     # at most this share of what the other fibre's edges differ by
 _SWAP_MIN_SHIFT_UM = 0.9  # crossing fibres (`_fix_sigmoids`): both steps are at least a fibre width (2 r),
 _SWAP_FIT_RATIO = 0.5    # and each swapped course misses by at most this fraction of what the original did
 
@@ -1368,7 +1373,7 @@ def _paths_from_skeleton(pts, half_w, bshape, spacing, r, obj_lookup):
         keep = np.r_[True, np.any(np.diff(back, axis=0) != 0, axis=1)]
         paths.append(back[keep])                     # ordered along the fibre
     paths = _stitch_paths(paths, sp, r, obj_lookup)
-    paths = _fix_sigmoids(paths, pts, half_w, sp, obj_lookup)
+    paths = _fix_sigmoids(paths, pts, half_w, sp, obj_lookup, bshape)
     # The sigmoid fixes trim and re-join paths, so some ends are final only now: mend again.
     paths = _mend_breaks(paths, sp, r, obj_lookup)
     # Skeleton that no path covers (see `_leftover_chains`) may still be the continuation of a
@@ -1380,7 +1385,7 @@ def _paths_from_skeleton(pts, half_w, bshape, spacing, r, obj_lookup):
     return paths
 
 
-def _fix_sigmoids(paths, pts, half_w, sp, obj_lookup):
+def _fix_sigmoids(paths, pts, half_w, sp, obj_lookup, bshape):
     """Undo sigmoid switches: a path that slides sideways from one straight
     course onto a parallel one where another fibre touches it.
 
@@ -1411,6 +1416,12 @@ def _fix_sigmoids(paths, pts, half_w, sp, obj_lookup):
     contact: the one above stays above. So the piece joins the incoming fibre that is on
     the same side of the other incoming fibre as the piece is of the passing fibre's
     continuation (see `attach_orphans`).
+
+    Where a fibre ends against a passing path and the mask just beyond is a double blob
+    (the two fibres overlapping), they coexist through the blob and one of them ends at its
+    end. The single fibre that comes out of the blob lies in the depth range of one of the
+    two, read off the raw mask where only one fibre is in the cross-section; that one goes on
+    along it and the other ends (see `blob_handover`).
     """
     from scipy.spatial import cKDTree
     sp = np.asarray(sp, float)
@@ -1699,6 +1710,151 @@ def _fix_sigmoids(paths, pts, half_w, sp, obj_lookup):
             n_done += 1
         return [o for o in out if len(o)], n_done
 
+    def section_stats(xyz, stride=4):
+        """(index, area um^2, top z, bottom z) of the raw mask's cross-section at points along a course."""
+        from scipy import ndimage
+        da_, db_ = 0.15, 0.18
+        ga = np.arange(-3.0, 3.0 + 1e-9, da_)
+        gb = np.arange(-5.0, 5.0 + 1e-9, db_)
+        GA, GB = np.meshgrid(ga, gb, indexing="ij")
+        out_ = []
+        for k in range(2, len(xyz) - 2, stride):
+            t = xyz[min(k + 5, len(xyz) - 1)] - xyz[max(k - 5, 0)]
+            nt = np.linalg.norm(t)
+            if nt < 1e-6:
+                continue
+            t = t / nt
+            n1 = np.array([0.0, -t[2], t[1]])
+            n1 /= np.linalg.norm(n1) + 1e-12
+            n2 = np.cross(t, n1)
+            n2 /= np.linalg.norm(n2) + 1e-12
+            vox = np.round((xyz[k][None, None, :] + GA[..., None] * n1 + GB[..., None] * n2).reshape(-1, 3) / sp).astype(np.int64)
+            ok = np.all((vox >= 0) & (vox < np.asarray(bshape)), axis=1)
+            flat = np.zeros(len(vox), bool)
+            if ok.any():
+                flat[ok] = obj_lookup(vox[ok])
+            lab, _n = ndimage.label(flat.reshape(GA.shape))
+            c = (len(ga) // 2, len(gb) // 2)
+            if lab[c] == 0:
+                continue
+            comp = (lab == lab[c]).reshape(-1)
+            zz = vox[comp, 0]
+            out_.append((k, float(comp.sum()) * da_ * db_, float(zz.min()), float(zz.max())))
+        return out_
+
+    def depth_range(stats):
+        """Depth range (top, bottom) of a course from its thinnest cross-sections, where only the one fibre is in the section."""
+        if len(stats) < 3:
+            return None
+        rows = np.array(sorted((r_[1], r_[2], r_[3]) for r_ in stats))
+        thin = rows[:max(3, int(0.4 * len(rows)))]
+        return float(np.median(thin[:, 1])), float(np.median(thin[:, 2]))
+
+    def blob_handover(P):
+        """Where a fibre ends against a passing path and a double blob follows, the single fibre
+        that comes out of the blob goes to the fibre whose depth range it matches.
+
+        The path carries on through the blob (it coexists there with the fibre that ends against
+        it) and is cut where the blob ends; the fibre that ends takes the rest. Both depth ranges
+        are those of the fibres' own courses 12 to 2 um before the contact."""
+        X = [p_ * sp for p_ in P]
+        L = [float(arc(x)[-1]) if len(x) > 1 else 0.0 for x in X]
+        ends = [(i, w, x[0] if w == 0 else x[-1]) for i, x in enumerate(X) if len(x) >= 6 for w in (0, 1)]
+        if not ends:
+            return list(P), 0
+        allp = np.vstack(X)
+        owner = np.concatenate([[k] * len(x) for k, x in enumerate(X)])
+        first = np.concatenate([[0], np.cumsum([len(x) for x in X])[:-1]])
+        ptree = cKDTree(allp)
+        found = {}
+        for q, wq, pe in ends:
+            if L[q] < _SIG_MIN_FIBRE_UM:
+                continue
+            xq = X[q] if wq == 1 else X[q][::-1]                      # it ends at the contact
+            aq = arc(xq)
+            Qsel = xq[aq >= aq[-1] - W]
+            Qc = xq[(aq >= aq[-1] - 12.0) & (aq <= aq[-1] - 2.0)]
+            if len(Qsel) < 6 or len(Qc) < 8:
+                continue
+            uQ = towards(fit(Qsel)[1], Qsel[0], Qsel[-1])
+            nearest = {}                                              # per passing path, the point nearest the tip
+            for pk in ptree.query_ball_point(pe, _BLOB_NEAR_UM):
+                o_ = int(owner[pk])
+                dd_ = float(np.linalg.norm(allp[pk] - pe))
+                if o_ != q and L[o_] >= 30.0 and (o_ not in nearest or dd_ < nearest[o_][0]):
+                    nearest[o_] = (dd_, pk)
+            for pk in [v_[1] for v_ in nearest.values()]:
+                i = int(owner[pk])
+                xi = X[i]
+                ai = arc(xi)
+                s0 = float(ai[pk - first[i]])
+                loc = xi[(ai >= s0 - 5.0) & (ai <= s0 + 5.0)]
+                if len(loc) < 6:
+                    continue
+                ui = towards(fit(loc)[1], loc[0], loc[-1])
+                d_ = float(ui @ uQ)
+                if abs(d_) < 0.5:
+                    continue
+                fwd = d_ > 0                                          # the way the fibre ending here is heading
+                xo = xi if fwd else xi[::-1]
+                ao = arc(xo)
+                s0o = s0 if fwd else float(ai[-1] - s0)
+                if ao[-1] - s0o < 12.0:
+                    continue
+                down = xo[(ao >= s0o) & (ao <= s0o + 16.0)]
+                if len(down) < 20:
+                    continue
+                st = section_stats(down)
+                if len(st) < 7:
+                    continue
+                s_k = arc(down)[np.array([r_[0] for r_ in st])]
+                ar = np.array([r_[1] for r_ in st])
+                thin_a = float(np.percentile(ar, 25))
+                big = ar >= _BLOB_RATIO * thin_a
+                near = np.nonzero(big & (s_k <= 6.0))[0]
+                if not len(near):
+                    continue
+                run_end = int(near[0])
+                while run_end + 1 < len(big) and big[run_end + 1]:
+                    run_end += 1
+                if s_k[run_end] - s_k[near[0]] < _BLOB_MIN_UM:
+                    continue
+                beyond = [b for b in range(run_end + 1, len(big)) if not big[b]]
+                if len(beyond) < 3 or s_k[beyond[0]] - s_k[run_end] > 2.0:
+                    continue                                          # no single fibre comes out of it
+                Ac = xo[(ao >= s0o - 12.0) & (ao <= s0o - 2.0)]
+                if len(Ac) < 8:
+                    continue
+                dB = depth_range([st[b] for b in beyond[:8]])
+                dQ = depth_range(section_stats(Qc))
+                dA = depth_range(section_stats(Ac))
+                if None in (dB, dQ, dA):
+                    continue
+                edgeQ = abs(dB[0] - dQ[0]) + abs(dB[1] - dQ[1])
+                edgeA = abs(dB[0] - dA[0]) + abs(dB[1] - dA[1])
+                if edgeQ > _BLOB_EDGE_MAX or edgeQ > _BLOB_EDGE_RATIO * edgeA:
+                    continue
+                gain = edgeA - edgeQ
+                if (q, i) not in found or gain > found[(q, i)][0]:
+                    found[(q, i)] = (gain, wq, fwd, s0o + float(s_k[run_end]))
+        touched, out, n_done = set(), list(P), 0
+        for (q, i), (_g, wq, fwd, s_b) in sorted(found.items(), key=lambda kv: -kv[1][0]):
+            if q in touched or i in touched:
+                continue
+            Pi = P[i] if fwd else P[i][::-1]
+            a = arc(Pi * sp)
+            head, tail = Pi[:int(np.searchsorted(a, s_b))], Pi[int(np.searchsorted(a, s_b + D)):]
+            if len(head) < 6 or len(tail) < 6:
+                continue
+            incoming = P[q] if wq == 1 else P[q][::-1]
+            link = _line_voxels(incoming[-1], tail[0])
+            link = link[obj_lookup(link)] if len(link) else link
+            out[q] = np.concatenate([incoming, link, tail])
+            out[i] = head
+            touched.update((q, i))
+            n_done += 1
+        return [o for o in out if len(o)], n_done
+
     P = [np.asarray(p_) for p_ in paths]
     for _pass in range(_SIG_PASSES):
         P, n_fixed = one_pass(P)
@@ -1706,6 +1862,7 @@ def _fix_sigmoids(paths, pts, half_w, sp, obj_lookup):
             break
     P, _ = swap_crossings(P)        # once: swapping the same two paths again would only undo it
     P, _ = attach_orphans(P)
+    P, _ = blob_handover(P)
     return P
 
 
