@@ -764,6 +764,9 @@ _BLOB_MIN_UM = 2.5         # it lasts at least this long and starts within _BLOB
 _BLOB_NEAR_UM = 3.5        # the single fibre that comes out of it goes to the fibre whose depth range (top and bottom of the raw mask)
 _BLOB_EDGE_MAX = 4.0       # it matches: both edges together within this many slices, and
 _BLOB_EDGE_RATIO = 0.5     # at most this share of what the other fibre's edges differ by
+_BLOB_COURSES = ((6, 16), (8, 20), (12, 28), (16, 32))   # or: courses taken this far before the contact (um, so that the bend into
+_BLOB_COURSE_MED = 0.2     # the contact stays out of them), extrapolated across the blob, miss it at most this share (median) of the
+_BLOB_COURSE_ALL = 0.4     # other's miss, and at most this share in every window
 _SWAP_MIN_SHIFT_UM = 0.9  # crossing fibres (`_fix_sigmoids`): both steps are at least a fibre width (2 r),
 _SWAP_FIT_RATIO = 0.5    # and each swapped course misses by at most this fraction of what the original did
 
@@ -1420,8 +1423,9 @@ def _fix_sigmoids(paths, pts, half_w, sp, obj_lookup, bshape):
     Where a fibre ends against a passing path and the mask just beyond is a double blob
     (the two fibres overlapping), they coexist through the blob and one of them ends at its
     end. The single fibre that comes out of the blob lies in the depth range of one of the
-    two, read off the raw mask where only one fibre is in the cross-section; that one goes on
-    along it and the other ends (see `blob_handover`).
+    two, read off the raw mask where only one fibre is in the cross-section, or its line,
+    from a course taken well before the contact, runs into the one far better than the other's
+    does; that one goes on along it and the other ends (see `blob_handover`).
     """
     from scipy.spatial import cKDTree
     sp = np.asarray(sp, float)
@@ -1822,19 +1826,45 @@ def _fix_sigmoids(paths, pts, half_w, sp, obj_lookup, bshape):
                 beyond = [b for b in range(run_end + 1, len(big)) if not big[b]]
                 if len(beyond) < 3 or s_k[beyond[0]] - s_k[run_end] > 2.0:
                     continue                                          # no single fibre comes out of it
+                depth_ok, gain = False, 0.0
                 Ac = xo[(ao >= s0o - 12.0) & (ao <= s0o - 2.0)]
-                if len(Ac) < 8:
+                if len(Ac) >= 8:
+                    dB = depth_range([st[b_] for b_ in beyond[:8]])
+                    dQ = depth_range(section_stats(Qc))
+                    dA = depth_range(section_stats(Ac))
+                    if None not in (dB, dQ, dA):
+                        edgeQ = abs(dB[0] - dQ[0]) + abs(dB[1] - dQ[1])
+                        edgeA = abs(dB[0] - dA[0]) + abs(dB[1] - dA[1])
+                        depth_ok = edgeQ <= _BLOB_EDGE_MAX and edgeQ <= _BLOB_EDGE_RATIO * edgeA
+                        gain = edgeA - edgeQ
+                course_ok = False
+                if not depth_ok:
+                    ad_ = arc(down)
+                    Bc = down[ad_ >= float(s_k[beyond[0]])]
+                    Bc = Bc[arc(Bc) <= 8.0] if len(Bc) > 1 else Bc
+                    ratios = []
+                    for w0_, w1_ in _BLOB_COURSES:
+                        if aq[-1] < w1_ or s0o < w1_:
+                            continue                                      # a window the path cannot supply in full is no evidence
+                        Qw = xq[(aq >= aq[-1] - w1_) & (aq <= aq[-1] - w0_)]
+                        Aw = xo[(ao >= s0o - w1_) & (ao <= s0o - w0_)]
+                        if len(Qw) < 8 or len(Aw) < 8 or len(Bc) < 8:
+                            continue
+                        cQw, uQw = fit(Qw)
+                        uQw = towards(uQw, Qw[0], Qw[-1])
+                        cAw, uAw = fit(Aw)
+                        uAw = towards(uAw, Aw[0], Aw[-1])
+                        mq_ = miss(cQw, uQw, Bc[(Bc - xq[-1]) @ uQw > 0])
+                        ma_ = miss(cAw, uAw, Bc[(Bc - xq[-1]) @ uAw > 0])
+                        if mq_ is None or ma_ is None:
+                            continue
+                        ratios.append(mq_ / max(ma_, 1e-6))
+                    course_ok = (len(ratios) >= 2 and max(ratios) <= _BLOB_COURSE_ALL
+                                 and float(np.median(ratios)) <= _BLOB_COURSE_MED)
+                    if course_ok:
+                        gain = 10.0 * (1.0 - float(np.median(ratios)))
+                if not (depth_ok or course_ok):
                     continue
-                dB = depth_range([st[b] for b in beyond[:8]])
-                dQ = depth_range(section_stats(Qc))
-                dA = depth_range(section_stats(Ac))
-                if None in (dB, dQ, dA):
-                    continue
-                edgeQ = abs(dB[0] - dQ[0]) + abs(dB[1] - dQ[1])
-                edgeA = abs(dB[0] - dA[0]) + abs(dB[1] - dA[1])
-                if edgeQ > _BLOB_EDGE_MAX or edgeQ > _BLOB_EDGE_RATIO * edgeA:
-                    continue
-                gain = edgeA - edgeQ
                 if (q, i) not in found or gain > found[(q, i)][0]:
                     found[(q, i)] = (gain, wq, fwd, s0o + float(s_k[run_end]))
         touched, out, n_done = set(), list(P), 0
