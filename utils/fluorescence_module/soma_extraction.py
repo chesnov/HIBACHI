@@ -764,6 +764,11 @@ _BLOB_MIN_UM = 2.5         # it lasts at least this long and starts within _BLOB
 _BLOB_NEAR_UM = 3.5        # the single fibre that comes out of it goes to the fibre whose depth range (top and bottom of the raw mask)
 _BLOB_EDGE_MAX = 4.0       # it matches: both edges together within this many slices, and
 _BLOB_EDGE_RATIO = 0.5     # at most this share of what the other fibre's edges differ by
+_BRIDGE_NEAR_UM = 3.5      # a fibre that goes into a blob and one that comes out of it (`bridge_blobs`): both ends within this of the path
+_BRIDGE_ALONG_UM = (4.0, 14.0)   # that runs through the blob, this far apart along it,
+_BRIDGE_TURN_DEG = 25.0    # lined up within this angle and
+_BRIDGE_SHIFT_UM = 1.8     # this far off one line,
+_BRIDGE_BLOB_SHARE = 0.6   # with at least this share of the stretch between them a blob (_BLOB_RATIO times a lone fibre's section)
 _BLOB_COURSES = ((6, 16), (8, 20), (12, 28), (16, 32))   # or: courses taken this far before the contact (um, so that the bend into
 _BLOB_COURSE_MED = 0.2     # the contact stays out of them), extrapolated across the blob, miss it at most this share (median) of the
 _BLOB_COURSE_ALL = 0.4     # other's miss, and at most this share in every window
@@ -1885,6 +1890,104 @@ def _fix_sigmoids(paths, pts, half_w, sp, obj_lookup, bshape):
             n_done += 1
         return [o for o in out if len(o)], n_done
 
+    def bridge_blobs(P):
+        """Join a fibre that goes into a double blob and one that comes out of it, on the same line."""
+        from skimage.graph import MCP_Geometric
+        X = [p_ * sp for p_ in P]
+        L = [float(arc(x)[-1]) if len(x) > 1 else 0.0 for x in X]
+        ends = [(i, w, x[0] if w == 0 else x[-1]) for i, x in enumerate(X) if len(x) >= 6 and L[i] >= _SIG_MIN_FIBRE_UM for w in (0, 1)]
+        if len(ends) < 2:
+            return list(P), 0
+        allp = np.vstack(X)
+        owner = np.concatenate([[k] * len(x) for k, x in enumerate(X)])
+        first = np.concatenate([[0], np.cumsum([len(x) for x in X])[:-1]])
+        ptree = cKDTree(allp)
+        by_path = {}
+        for a, wa, pe in ends:
+            nearest = {}
+            for pk in ptree.query_ball_point(pe, _BRIDGE_NEAR_UM):
+                o_ = int(owner[pk])
+                dd_ = float(np.linalg.norm(allp[pk] - pe))
+                if o_ != a and L[o_] >= 30.0 and (o_ not in nearest or dd_ < nearest[o_][0]):
+                    nearest[o_] = (dd_, pk - first[o_])
+            for o_, (dd_, k_) in nearest.items():
+                by_path.setdefault(o_, []).append((a, wa, pe, k_))
+        found = []
+        for i, lst in by_path.items():
+            ai = arc(X[i])
+            for u_ in range(len(lst)):
+                for v_ in range(u_ + 1, len(lst)):
+                    a, wa, ea, ka = lst[u_]
+                    b, wb, eb, kb = lst[v_]
+                    if a == b:
+                        continue
+                    along = abs(float(ai[ka] - ai[kb]))
+                    gap = float(np.linalg.norm(ea - eb))
+                    if not (_BRIDGE_ALONG_UM[0] <= along <= _BRIDGE_ALONG_UM[1]) or gap > _BRIDGE_ALONG_UM[1]:
+                        continue
+                    A_ = _end_course(P[a], wa, sp)
+                    B_ = _end_course(P[b], wb, sp)
+                    if A_ is None or B_ is None:
+                        continue
+                    ea_, ca, ua = A_
+                    eb_, cb, ub = B_
+                    g = eb_ - ea_
+                    turn = float(np.degrees(np.arccos(np.clip(-ua @ ub, -1, 1))))
+                    if turn > _BRIDGE_TURN_DEG or float(g @ ua) < 0 or float(-g @ ub) < 0:
+                        continue
+                    n_ = ua - ub
+                    n_ = n_ / np.linalg.norm(n_)
+                    mid = 0.5 * (ea_ + eb_)
+                    shift = float(np.linalg.norm((ca + ua * (((mid - ca) @ n_) / (ua @ n_))) - (cb + ub * (((mid - cb) @ n_) / (ub @ n_)))))
+                    if shift > _BRIDGE_SHIFT_UM:
+                        continue
+                    lo_, hi_ = sorted((ka, kb))
+                    st = section_stats(X[i][lo_:hi_ + 1], stride=3)
+                    ref = []
+                    for xx_, w_ in ((X[a], wa), (X[b], wb)):
+                        xo_ = xx_[::-1] if w_ == 0 else xx_
+                        ref += [r_[1] for r_ in section_stats(xo_[arc(xo_) >= arc(xo_)[-1] - 10.0], stride=3)]
+                    if len(st) < 3 or len(ref) < 4:
+                        continue
+                    lone = float(np.percentile(ref, 40))
+                    share = float(np.mean([r_[1] >= _BLOB_RATIO * lone for r_ in st]))
+                    if share < _BRIDGE_BLOB_SHARE:
+                        continue
+                    found.append((shift + 0.3 * gap, a, wa, ea, b, wb, eb, i, along, gap, turn, shift, share))
+        found.sort(key=lambda t: t[0])
+        used, out, n_done = set(), list(P), 0
+        for cost, a, wa, ea, b, wb, eb, i, along, gap, turn, shift, share in found:
+            if a in used or b in used:
+                continue
+            va = np.round(ea / sp).astype(np.int64)
+            vb = np.round(eb / sp).astype(np.int64)
+            lo = np.maximum(np.minimum(va, vb) - np.array([6, 25, 25]), 0)
+            hi = np.minimum(np.maximum(va, vb) + np.array([7, 26, 26]), np.asarray(bshape))
+            gz, gy, gx = np.meshgrid(*[np.arange(lo[k_], hi[k_]) for k_ in range(3)], indexing="ij")
+            box = np.stack([gz.ravel(), gy.ravel(), gx.ravel()], 1)
+            inside = obj_lookup(box).reshape(gz.shape)
+            costs = np.where(inside, 1.0, 12.0)                      # the mask has gaps: crossing one is allowed, at a price
+            near_i = cKDTree(X[i]).query(box * sp)[0].reshape(gz.shape) < 0.45
+            costs = np.where(inside & near_i, 4.0, costs)            # keep off the passing path's own line
+            s0, e0 = tuple(va - lo), tuple(vb - lo)
+            m_ = MCP_Geometric(costs, fully_connected=True, sampling=tuple(sp))
+            m_.find_costs([s0], [e0])
+            try:
+                route = np.array(m_.traceback(e0)) + lo
+            except ValueError:
+                continue
+            rlen = float(np.sum(np.linalg.norm(np.diff(route * sp, axis=0), axis=1)))
+            if rlen > 1.6 * gap:
+                continue
+            route = route[obj_lookup(route)]                       # only what is in the mask, like the other joins
+            pa = P[a] if wa == 1 else P[a][::-1]                   # ends at the blob
+            pb = P[b] if wb == 0 else P[b][::-1]                   # starts at the blob
+            out[a] = np.concatenate([pa, route[1:-1], pb])
+            out[b] = P[b][:0]
+            used.update((a, b))
+            n_done += 1
+        return [o for o in out if len(o)], n_done
+
     P = [np.asarray(p_) for p_ in paths]
     for _pass in range(_SIG_PASSES):
         P, n_fixed = one_pass(P)
@@ -1893,6 +1996,7 @@ def _fix_sigmoids(paths, pts, half_w, sp, obj_lookup, bshape):
     P, _ = swap_crossings(P)        # once: swapping the same two paths again would only undo it
     P, _ = attach_orphans(P)
     P, _ = blob_handover(P)
+    P, _ = bridge_blobs(P)
     return P
 
 
