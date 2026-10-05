@@ -725,6 +725,15 @@ _STACK_LOW_K = 1.25    # ... and next to such columns, one at least this tall
 #                        still holds part of both
 _STACK_FOLLOW_UM = 5.0 # a stacked contact is followed this far beyond its
 #                        clearly stacked columns
+# Necks (`_neck_lines`): two fibres that touch side by side along a thin neck. Each fibre's core is where
+# the mask is at least _NECK_CORE_R r deep; the neck between two cores is the watershed line of that depth,
+# and it is a contact between fibres if it is at least _NECK_LEN_UM long in-plane. Such a neck is cut only
+# where a seed path runs along it for at least _NECK_RUN_UM, and the cut is kept only if the mask within
+# _NECK_CHECK_UM of it ends up at least as well seeded as without it.
+_NECK_CORE_R = 0.85
+_NECK_LEN_UM = 3.0
+_NECK_RUN_UM = 2.0
+_NECK_CHECK_UM = 6.0
 # Break mending (`_stitch_paths`, second phase): two pieces of one fibre whose ends a contact has
 # bent are judged on their COURSES -- each piece's path from _JOIN_SKIP_UM to _JOIN_WINDOW_UM back
 # from its end, leaving out the bend itself --
@@ -1039,6 +1048,64 @@ def _cut_stacked_fibres(obj, inten, h0, noise, spacing_yx):
             continue                            # would only shave a single fibre
         out[t - 1:t + 2, y[i], x[i]] = False
     return out
+
+
+def _neck_lines(obj, sp, r):
+    """The thin necks between fibres that touch side by side, as voxel coordinates of `obj`.
+
+    Two fibres that run next to each other -- side by side, one above the other, or
+    diagonally offset -- merge in the mask into a cross-section of two lobes joined by a
+    neck. Thinning leaves one centre line for both, and it can run along the neck: that
+    path sits between the two fibres, neither gets a centre line of its own, and where the
+    neck ends the path steps onto one of them. `_cut_stacked_fibres` cuts only contacts
+    whose mask columns are clearly two fibres tall; a diagonal offset keeps every column
+    shorter. Here each fibre's core is where the mask is at least _NECK_CORE_R r deep
+    (physical distance to the background); the neck between two cores is the watershed line
+    of that depth between them; it is returned if it is at least _NECK_LEN_UM long in-plane,
+    i.e. the cores lie side by side. Where a single fibre only narrows, the line between its
+    two pieces is a short disc across it and is not returned. `sp`: spacing (z, y, x).
+    """
+    sp = np.asarray(sp, float)
+    dt = ndimage.distance_transform_edt(obj, sampling=sp).astype(np.float32)
+    lab, n = ndimage.label(dt >= _NECK_CORE_R * r, structure=np.ones((3, 3, 3)))
+    if n < 2:
+        return []
+    ws = watershed(-dt, lab, mask=obj, watershed_line=True)
+    del dt, lab
+    lz, ly, lx = np.nonzero(obj & (ws == 0))
+    if not len(lz):
+        return []
+    lo = np.full(len(lz), np.iinfo(np.int64).max, np.int64)
+    hi = np.zeros(len(lz), np.int64)
+    for dz in (-1, 0, 1):
+        for dy in (-1, 0, 1):
+            for dx in (-1, 0, 1):
+                z2, y2, x2 = lz + dz, ly + dy, lx + dx
+                ok = ((z2 >= 0) & (z2 < ws.shape[0]) & (y2 >= 0) & (y2 < ws.shape[1])
+                      & (x2 >= 0) & (x2 < ws.shape[2]))
+                v = np.zeros(len(lz), np.int64)
+                v[ok] = ws[z2[ok], y2[ok], x2[ok]]
+                lo = np.where(v > 0, np.minimum(lo, v), lo)
+                hi = np.maximum(hi, v)
+    del ws
+    two = np.nonzero((hi > 0) & (lo < hi))[0]          # line voxels between two cores
+    if not len(two):
+        return []
+    key = lo[two] * (n + 1) + hi[two]
+    order = np.argsort(key, kind="stable")
+    two, key = two[order], key[order]
+    bounds = np.flatnonzero(np.r_[True, key[1:] != key[:-1], True])
+    lines = []
+    for a, b in zip(bounds[:-1], bounds[1:]):
+        sel = two[a:b]
+        if len(sel) < 3:
+            continue
+        yx = np.c_[ly[sel], lx[sel]] * sp[1:]
+        yx = yx - yx.mean(0)
+        u = np.linalg.svd(yx, full_matrices=False)[2][0]
+        if float(np.ptp(yx @ u)) >= _NECK_LEN_UM:
+            lines.append(np.c_[lz[sel], ly[sel], lx[sel]].astype(np.int64))
+    return lines
 
 
 def _remove_hairs(edges, half_w, length, xyz, r):
@@ -2465,25 +2532,49 @@ def _elongated_label_candidates(lbl, sl, segmentation_mask, intensity_image,
     # skeleton the object's own inside the tile. In a stack the mask is first
     # cut between fibres stacked in z (`_cut_stacked_fibres`); only the
     # skeleton sees the cut -- the half-width, links and seeds use the mask.
+    # The necks between fibres that touch side by side are found here too
+    # (`_neck_lines`), but cut only later, where a seed path turns out to run
+    # along one (see below).
     h_um = max(4.0 * dt_max, _ARM_WINDOW_R * r)
     halo = [int(np.ceil(h_um / s)) + 2 for s in sp]
     if not is_stack:
         halo[0] = 0
-    sk_pts, sk_w = [], []
-    for tg in targets:
+    neck_lines = []                     # box coordinates, one array per neck
+
+    def skeleton_tile(tg, cut=None, find_necks=False):
+        """(skeleton points in box coordinates, their half-widths) inside tile `tg`, or None.
+        `cut`: box coordinates of neck voxels to remove before thinning."""
         crop = _grow(tg, halo, image_bounds)
         loc = _local(tg, crop)
         obj = np.asarray(seg[crop]) == lbl
         if not obj[loc].any():
-            continue
+            return None
+        c0 = np.array([c.start for c in crop]) - boff
         if not is_stack:
             sk = skeletonize(obj[0])[None]
         elif h0 >= 1:
             inten = None
             if intensity_image is not None and noise > 0:
                 inten = np.asarray(intensity_image[crop], np.float32)
-            sk = skeletonize(_cut_stacked_fibres(obj, inten, h0, noise, float(sp[1])))
+            cobj = _cut_stacked_fibres(obj, inten, h0, noise, float(sp[1]))
             del inten
+            if find_necks:
+                t0 = np.array([t.start for t in tg]) - boff
+                t1 = np.array([t.stop for t in tg]) - boff
+                for line in _neck_lines(cobj, sp, r):
+                    g = line + c0
+                    g = g[np.all((g >= t0) & (g < t1), axis=1)]     # the tile's own part
+                    if len(g):
+                        neck_lines.append(g)
+            if cut is not None:
+                q = cut - c0
+                q = q[np.all((q >= 0) & (q < np.array(cobj.shape)), axis=1)]
+                if len(q):
+                    if cobj is obj:
+                        cobj = obj.copy()
+                    cobj[tuple(q.T)] = False
+            sk = skeletonize(cobj)
+            del cobj
         else:
             sk = skeletonize(obj)
         sk = sk.astype(bool)
@@ -2497,15 +2588,12 @@ def _elongated_label_candidates(lbl, sl, segmentation_mask, intensity_image,
             w2 = ndimage.maximum_filter1d(w2, size=3, axis=0)
         inner = sk[loc]
         q = np.argwhere(inner)
-        if len(q):
-            sk_pts.append((q + np.array([t.start for t in tg]) - boff).astype(np.int64))
-            sk_w.append(w2[loc][inner].astype(np.float32))
-        del obj, sk, w2
-    if not sk_pts:
-        return [], diag
-    pts = np.concatenate(sk_pts)
-    half_w = np.concatenate(sk_w)
-    del sk_pts, sk_w
+        if not len(q):
+            return None
+        return ((q + np.array([t.start for t in tg]) - boff).astype(np.int64),
+                w2[loc][inner].astype(np.float32))
+
+    tile_skel = [skeleton_tile(tg, find_necks=is_stack and h0 >= 1) for tg in targets]
 
     def obj_lookup(coords):
         coords = np.asarray(coords, np.int64)
@@ -2514,12 +2602,31 @@ def _elongated_label_candidates(lbl, sl, segmentation_mask, intensity_image,
         g = coords + boff
         return np.asarray(seg[tuple(g.T)]) == lbl
 
-    # ---- the whole object's graph, decomposed into paths --------------------
-    paths = _paths_from_skeleton(pts, half_w, bshape, sp, r, obj_lookup)
-    del pts, half_w
+    def trace(skel):
+        """The whole object's graph, decomposed into paths."""
+        found = [t_ for t_ in skel if t_ is not None]
+        if not found:
+            return []
+        return _paths_from_skeleton(np.concatenate([t_[0] for t_ in found]),
+                                    np.concatenate([t_[1] for t_ in found]),
+                                    bshape, sp, r, obj_lookup)
+
+    def skeleton_with_cut(cut):
+        """The tiles' skeletons with `cut` removed; tiles whose halo misses it are reused."""
+        out_ = []
+        for tg, prev in zip(targets, tile_skel):
+            crop = _grow(tg, halo, image_bounds)
+            c0 = np.array([c.start for c in crop]) - boff
+            c1 = np.array([c.stop for c in crop]) - boff
+            if np.any(np.all((cut >= c0) & (cut < c1), axis=1)):
+                out_.append(skeleton_tile(tg, cut=cut))
+            else:
+                out_.append(prev)
+        return out_
+
+    paths = trace(tile_skel)
     if not paths:
         return [], diag
-    diag["cores_evaluated"] = len(paths)
 
     # ---- pass 3: each path widened to the mask's own width, per tile ---------
     # Around each path voxel the seed takes the mask's in-plane half-width at
@@ -2573,19 +2680,90 @@ def _elongated_label_candidates(lbl, sl, segmentation_mask, intensity_image,
         # A path too short to make a seed must not take tube voxels from its
         # neighbours: drop it and rebuild, until every tube reaches the size.
         min_vol = max(1, params.min_seed_vol)
-        for _round in range(4):
-            counts = build_tubes(paths)
-            small = [k for k in range(len(paths)) if counts[k + 1] < min_vol]
-            diag["cores_too_small"] += len(small)
-            if not small:
-                break
-            paths = [p_ for k, p_ in enumerate(paths) if counts[k + 1] >= min_vol]
-            if not paths:
-                break
-        if not paths:
+
+        def make_seeds(path_list):
+            """Tubes of the paths that make seeds, in piece_mm: (those paths, voxel counts,
+            how many paths were too small), or (None, None, n) if none is left."""
+            n_small = 0
+            counts_ = None
+            small_ = []
+            for _round in range(4):
+                counts_ = build_tubes(path_list)
+                small_ = [k for k in range(len(path_list)) if counts_[k + 1] < min_vol]
+                n_small += len(small_)
+                if not small_:
+                    break
+                path_list = [p_ for k, p_ in enumerate(path_list) if counts_[k + 1] >= min_vol]
+                if not path_list:
+                    return None, None, n_small
+            counts_ = build_tubes(path_list) if small_ else counts_
+            return path_list, counts_, n_small
+
+        def seeded_near(line):
+            """Seeded voxels of the mask within _NECK_CHECK_UM of the neck `line`."""
+            ext = np.ceil(_NECK_CHECK_UM / sp).astype(np.int64)
+            lo_ = np.maximum(line.min(0) - ext, 0)
+            hi_ = np.minimum(line.max(0) + ext + 1, np.asarray(bshape))
+            bx = tuple(slice(int(a_), int(b_)) for a_, b_ in zip(lo_, hi_))
+            off = np.zeros(tuple(int(b_ - a_) for a_, b_ in zip(lo_, hi_)), bool)
+            off[tuple((line - lo_).T)] = True
+            near = ndimage.distance_transform_edt(~off, sampling=sp) <= _NECK_CHECK_UM
+            near &= np.asarray(seg[tuple(slice(b_.start + o_, b_.stop + o_) for b_, o_ in zip(bx, boff))]) == lbl
+            return int((np.asarray(piece_mm[bx])[near] > 0).sum())
+
+        def carried(line, path_list):
+            """Does a seed path run along the neck `line` for at least _NECK_RUN_UM?"""
+            lo_ = line.min(0) - 1
+            hi_ = line.max(0) + 2
+            near = np.zeros(tuple(hi_ - lo_), bool)
+            near[tuple((line - lo_).T)] = True
+            near = ndimage.binary_dilation(near, structure=np.ones((3, 3, 3)))
+            for p_ in path_list:
+                inside = np.all((p_ >= lo_) & (p_ < hi_), axis=1)
+                if inside.sum() < 2:
+                    continue
+                on = np.zeros(len(p_), bool)
+                on[inside] = near[tuple((p_[inside] - lo_).T)]
+                if on.sum() < 2:
+                    continue
+                a_ = _arc_points(p_ * sp, None)
+                k_ = np.flatnonzero(on)
+                start_ = last_ = k_[0]
+                for k in k_[1:]:
+                    if a_[k] - a_[last_] > 0.5:
+                        if a_[last_] - a_[start_] >= _NECK_RUN_UM:
+                            return True
+                        start_ = k
+                    last_ = k
+                if a_[last_] - a_[start_] >= _NECK_RUN_UM:
+                    return True
+            return False
+
+        all_paths = paths
+        paths, counts, n_small = make_seeds(all_paths)
+        # A seed path that runs along a neck sits between two fibres: cut those necks and
+        # trace again, and keep each cut only where it leaves the mask around it at least as
+        # well seeded (a neck that is really a thin fibre of its own is not a neck to cut).
+        if paths is not None and neck_lines:
+            sites = [g for g in neck_lines if carried(g, paths)]
+            if sites:
+                before = [seeded_near(g) for g in sites]
+                trial_all = trace(skeleton_with_cut(np.concatenate(sites)))
+                t_paths, t_counts, t_small = make_seeds(trial_all) if trial_all else (None, None, 0)
+                after = [seeded_near(g) for g in sites] if t_paths is not None else [-1] * len(sites)
+                keep = [g for g, b_, a_ in zip(sites, before, after) if a_ >= b_]
+                if keep and len(keep) == len(sites):
+                    all_paths, paths, counts, n_small = trial_all, t_paths, t_counts, t_small
+                elif keep:
+                    all_paths = trace(skeleton_with_cut(np.concatenate(keep)))
+                    paths, counts, n_small = make_seeds(all_paths) if all_paths else (None, None, 0)
+                else:
+                    paths, counts, n_small = make_seeds(all_paths)
+        diag["cores_evaluated"] = len(all_paths)
+        diag["cores_too_small"] += n_small
+        if paths is None:
             del piece_mm
             return [], diag
-        counts = build_tubes(paths) if small else counts
         piece_mm.flush()
 
         # ---- one candidate per path ------------------------------------------
