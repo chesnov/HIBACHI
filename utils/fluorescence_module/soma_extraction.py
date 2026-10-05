@@ -774,6 +774,16 @@ _BLOB_COURSE_MED = 0.2     # the contact stays out of them), extrapolated across
 _BLOB_COURSE_ALL = 0.4     # other's miss, and at most this share in every window
 _SWAP_MIN_SHIFT_UM = 0.9  # crossing fibres (`_fix_sigmoids`): both steps are at least a fibre width (2 r),
 _SWAP_FIT_RATIO = 0.5    # and each swapped course misses by at most this fraction of what the original did
+# Bend repair (`_rejoin_at_bends`): a path that turns by more than _BEND_MIN_DEG (judged on its courses
+# _JOIN_SKIP_UM to _JOIN_WINDOW_UM either side, as in `_end_course`) where another path of at least
+# _SIG_MIN_FIBRE_UM touches it (within _JOIN_SKIP_UM, the stretch the courses leave out) and ends there
+# (up to _BEND_HOOK_UM of a hook beyond the contact is ignored) is re-paired with it if that path lines up
+# with one of the two legs to within _BEND_LINE_DEG and _BEND_LINE_RATIO of the bend, lies off that leg's
+# line by at most _JOIN_SHIFT_R r, and stays in the leg's depth layer (_LAYER_SAME_R r)
+_BEND_MIN_DEG = 20.0
+_BEND_HOOK_UM = 8.0
+_BEND_LINE_DEG = 12.0
+_BEND_LINE_RATIO = 0.5
 
 
 # ---- tiling ------------------------------------------------------------------ #
@@ -1390,7 +1400,9 @@ def _paths_from_skeleton(pts, half_w, bshape, spacing, r, obj_lookup):
     leftover = _leftover_chains(pts, paths, sp)
     if leftover:
         paths = _mend_breaks(paths, sp, r, obj_lookup, extras=leftover)
-    return paths
+    # Only now are the pieces of every fibre in place, so a bend that a greedy choice at a contact
+    # left in one path, while another path carries straight on from it, can be told apart.
+    return _rejoin_at_bends(paths, sp, r, obj_lookup)
 
 
 def _fix_sigmoids(paths, pts, half_w, sp, obj_lookup, bshape):
@@ -1998,6 +2010,132 @@ def _fix_sigmoids(paths, pts, half_w, sp, obj_lookup, bshape):
     P, _ = blob_handover(P)
     P, _ = bridge_blobs(P)
     return P
+
+
+def _rejoin_at_bends(paths, sp, r, obj_lookup):
+    """Re-pair a bend with the path that carries straight on through it.
+
+    At a contact the tracer takes paths one at a time, longest first, and each continues onto the
+    best branch left. A long path can thereby be bent onto a branch (up to _MAX_TURN_DEG) while the
+    branch that carries straight on from where it came is left to a path of its own, which then starts
+    at the contact. That shows in the finished paths as a bend of more than _BEND_MIN_DEG with a third
+    path touching it near its end and lined up with one of the two legs (within _BEND_LINE_DEG, and
+    within _BEND_LINE_RATIO of the bend) far better than the legs are with each other. It must also be
+    the same fibre as that leg: on its line to within _JOIN_SHIFT_R r, and in its depth layer
+    (_LAYER_SAME_R r), as a lane has to be to be followed (see `extend`). The touching path is then
+    joined to that leg, and the other leg is left as a path of its own, ending at the contact. Whatever
+    the touching path has beyond the contact (a hook, within _BEND_HOOK_UM) is dropped.
+
+    Every path takes part in at most one repair, and nothing is repeated. Paths with no such bend are
+    returned untouched.
+    """
+    from scipy.spatial import cKDTree
+    sp = np.asarray(sp, float)
+    P = [np.asarray(p_) for p_ in paths]
+    if not P:
+        return P
+    X = [p_ * sp for p_ in P]
+    A = [_arc_points(x, None) for x in X]
+    L = [float(a[-1]) for a in A]
+
+    def line(i, s0, s1):
+        """(centroid, direction along the path) of path i between arc positions s0 and s1, or None."""
+        a = A[i]
+        sel = (a >= s0) & (a <= s1)
+        if sel.sum() < 4 or a[sel].max() - a[sel].min() < _JOIN_MIN_UM:
+            return None
+        q = X[i][sel]
+        c = q.mean(0)
+        u = np.linalg.svd(q - c, full_matrices=False)[2][0]
+        return c, (u if u @ (q[-1] - q[0]) >= 0 else -u)
+
+    def angle(u, v):
+        return float(np.degrees(np.arccos(np.clip(u @ v, -1.0, 1.0))))
+
+    def offset(l1, l2, pt):
+        """Sideways distance (um) between two nearly parallel lines at `pt`, and its depth part."""
+        (c1, u1), (c2, u2) = l1, l2
+        m = u1 + (u2 if u1 @ u2 >= 0 else -u2)
+        m = m / np.linalg.norm(m)
+        d = (c1 + (((pt - c1) @ m) / (u1 @ m)) * u1) - (c2 + (((pt - c2) @ m) / (u2 @ m)) * u2)
+        return float(np.linalg.norm(d)), abs(float(d[0]))
+
+    # ---- bends: local maxima of the turn between the courses either side of a place ----------
+    sites = []
+    near_n = int(round(2.0 * _JOIN_SKIP_UM / _SIG_STEP_UM))
+    for i in range(len(P)):
+        if L[i] < 2.0 * _JOIN_WINDOW_UM:
+            continue
+        steps = np.arange(_JOIN_WINDOW_UM, L[i] - _JOIN_WINDOW_UM, _SIG_STEP_UM)
+        turn = np.zeros(len(steps))
+        legs = [None] * len(steps)
+        for n, s in enumerate(steps):
+            l_in = line(i, s - _JOIN_WINDOW_UM, s - _JOIN_SKIP_UM)
+            l_out = line(i, s + _JOIN_SKIP_UM, s + _JOIN_WINDOW_UM)
+            if l_in is not None and l_out is not None:
+                turn[n] = angle(l_in[1], l_out[1])
+                legs[n] = (l_in, l_out)
+        for n in np.flatnonzero(turn >= _BEND_MIN_DEG):
+            lo, hi = max(0, n - near_n), min(len(steps), n + near_n + 1)
+            if n == lo + int(np.argmax(turn[lo:hi])):
+                sites.append((i, float(steps[n]), float(turn[n]), legs[n][0], legs[n][1]))
+    if not sites:
+        return P
+
+    # ---- a path that touches a bend near its end and carries on along one of its legs ---------
+    allx = np.vstack(X)
+    owner = np.concatenate([np.full(len(x), k) for k, x in enumerate(X)])
+    index = np.concatenate([np.arange(len(x)) for x in X])
+    tree = cKDTree(allx)
+    found = []
+    for i, s, bend, l_in, l_out in sites:
+        kx = min(int(np.searchsorted(A[i], s)), len(X[i]) - 1)
+        pt = X[i][kx]
+        touch = {}
+        for m in tree.query_ball_point(pt, _JOIN_SKIP_UM):
+            j = int(owner[m])
+            if j == i or L[j] < _SIG_MIN_FIBRE_UM:
+                continue
+            d = float(np.linalg.norm(allx[m] - pt))
+            if j not in touch or d < touch[j][0]:
+                touch[j] = (d, int(index[m]))
+        for j, (_d, kk) in touch.items():
+            at_start = A[j][kk] <= _BEND_HOOK_UM
+            at_end = L[j] - A[j][kk] <= _BEND_HOOK_UM
+            if at_start == at_end:              # it passes the bend, or is too short to tell
+                continue
+            if at_start:
+                l_q = line(j, A[j][kk] + _JOIN_SKIP_UM, A[j][kk] + _JOIN_WINDOW_UM)
+            else:
+                l_q = line(j, A[j][kk] - _JOIN_WINDOW_UM, A[j][kk] - _JOIN_SKIP_UM)
+                l_q = (l_q[0], -l_q[1]) if l_q is not None else None
+            if l_q is None:                     # l_q: its line, directed from the bend into the path
+                continue
+            off_before, off_after = angle(l_q[1], l_in[1]), angle(l_q[1], -l_out[1])
+            leg, off, l_leg = (("before", off_before, l_in) if off_before < off_after
+                               else ("after", off_after, l_out))
+            if off > min(_BEND_LINE_DEG, _BEND_LINE_RATIO * bend):
+                continue
+            side, depth = offset(l_leg, l_q, pt)
+            if side <= _JOIN_SHIFT_R * r and depth <= _LAYER_SAME_R * r:
+                found.append((off / bend, i, kx, j, kk, at_start, leg))
+
+    out, touched = list(P), set()
+    for _rank, i, kx, j, kk, at_start, leg in sorted(found, key=lambda f: f[:5]):
+        if i in touched or j in touched:
+            continue
+        body = P[j][kk:][::-1] if at_start else P[j][:kk + 1]      # the touching path, ending at the bend
+        if leg == "after":
+            carried, rest = P[i][kx:], P[i][:kx + 1]
+        else:
+            carried, rest = P[i][:kx + 1][::-1], P[i][kx:]
+        link = _line_voxels(body[-1], carried[0])
+        link = link[obj_lookup(link)] if len(link) else link
+        joined = np.concatenate([body, link, carried])
+        out[j] = joined[np.r_[True, np.any(np.diff(joined, axis=0) != 0, axis=1)]]
+        out[i] = rest
+        touched.update((i, j))
+    return [o for o in out if len(o)]
 
 
 def _end_course(pv, which, sp):
