@@ -2390,20 +2390,31 @@ class ProjectViewWindow(QMainWindow):
         ``<basename>_processed_<mode>/processing_config_<mode>.yaml``; for a region
         it is the same file inside that region's own session directory, since a
         region owns its config independently of its channel.
+
+        Both the results directory and the config filename are RESOLVED, not
+        derived from the folder YAML's ``mode``. That string is not a reliable key
+        to what is on disk: a project processed before the 2D/3D modes merged has
+        its results under ``..._processed_fluorescence_2d/`` and its config as
+        ``processing_config_fluorescence_2d.yaml``, while its folder YAML has since
+        been migrated to ``mode: fluorescence``. Building the legacy names from
+        that mode found nothing, which greyed out "Export run config" for every
+        such image. ``find_processed_dir`` / ``find_config_path`` prefer the
+        unified name and fall back to the legacy ones that actually exist, the
+        same as every other reader of these files.
         """
         if not leaf_key:
             return None
+        from ..fluorescence_module.config_migration import (
+            find_config_path, find_processed_dir)
         from .project_selection import split_leaf_key
         folder, roi_name = split_leaf_key(leaf_key)
         if roi_name:
             try:
                 from .roi_sharing import roi_session_dir
                 roi_dir = roi_session_dir(folder, roi_name)
-                if not roi_dir:
-                    return None
-                mode = self.project_manager.get_image_details(folder).get('mode')
-                cfg = os.path.join(roi_dir, f"processing_config_{mode}.yaml")
-                return cfg if os.path.isfile(cfg) else None
+                # A region's directory is already resolved by roi_session_dir;
+                # only the config's filename inside it needs the fallback.
+                return find_config_path(roi_dir) if roi_dir else None
             except Exception:
                 return None
         try:
@@ -2415,10 +2426,9 @@ class ProjectViewWindow(QMainWindow):
         if not tif_file or not mode or mode in ('unknown', 'error'):
             return None
         basename = os.path.splitext(tif_file)[0]
-        path = os.path.join(
-            folder, f"{basename}_processed_{mode}", f"processing_config_{mode}.yaml"
-        )
-        return path if os.path.isfile(path) else None
+        # None when there is no run config, so callers can tell "absent" from
+        # "to be created" -- the contract this method already had.
+        return find_config_path(find_processed_dir(folder, basename))
 
     def _export_run_config(self) -> None:
         """Export one processed folder's run config verbatim (reproducibility)."""
