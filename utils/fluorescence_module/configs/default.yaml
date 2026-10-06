@@ -9,6 +9,22 @@
 # per-voxel size (spacing = extent / axis length). Omit `z` for 2D data; its
 # presence is what distinguishes a stack from a plane.
 # =============================================================================
+# Editor limits (min / max / step)
+# -----------------------------------------------------------------------------
+# Bounds come from each parameter's domain in the code, never from a particular
+# image:
+#   * min is the edge of the domain (0 = off; 1 for gain and aspect ratio; ...).
+#   * Where the domain has no upper edge, max is the control's own ceiling:
+#     1.0e+12 for floats, and 2147483647 for ints -- the largest an int control
+#     holds under every magicgui this environment allows (0.7 cannot build a
+#     larger one, and the parameter would silently vanish from the panel).
+#   * Floats step by 1.0e-05, giving the control 5 decimals: a spin box shows as
+#     many decimals as `step` has, so a coarser step rounds small values away
+#     (at step 0.1, 0.005 was stored as 0.01).
+# A parameter whose limit has another reason says so in its own comment.
+# Widening a bound never invalidates results (reconcile adopts it silently);
+# narrowing one clamps saved values and does, so bounds here only ever widen.
+# =============================================================================
 execute_raw_segmentation:
   name: Execute Raw Segmentation
   parameters:
@@ -58,8 +74,8 @@ execute_raw_segmentation:
       type: float
       value: 0.0
       min: 0.0
-      max: 10000.0
-      step: 1.0
+      max: 1.0e+12
+      step: 1.0e-05
     illumination_max_gain:
       # 1.0 means background subtraction only, the previous behaviour.
       neutral_default: true
@@ -81,14 +97,14 @@ execute_raw_segmentation:
       type: float
       value: 1.0
       min: 1.0
-      max: 20.0
-      step: 0.5
+      max: 1.0e+12
+      step: 1.0e-05
     min_size:
       label: Minimum Size (Voxels, Raw Seg - GLOBAL)
       type: int
       value: 1000
       min: 1
-      max: 50000
+      max: 2147483647
       step: 1
     trace_max_gap:
       label: Trace Gap (µm)
@@ -99,8 +115,8 @@ execute_raw_segmentation:
       type: float
       value: 0.0
       min: 0.0
-      max: 50.0
-      step: 0.5
+      max: 1.0e+12
+      step: 1.0e-05
 execute_trim_edges:
   name: Execute Edge Trimming
   parameters:
@@ -109,16 +125,18 @@ execute_trim_edges:
       type: float
       value: 0.0
       min: 0.0
-      max: 10000000
-      step: 0.1
+      max: 1.0e+12
+      step: 1.0e-05
     brightness_cutoff_factor:
       label: Brightness Cutoff Factor
       type: float
       value: 1.5
       min: 0.0
-      max: 10.0
-      step: 0.1
+      max: 1.0e+12
+      step: 1.0e-05
     hull_closing_radius:
+      # max kept at 10000: the closing materialises a (2r+1)^2 disk, so its cost
+      # grows with r alone -- about 400 MB at 10000 -- whatever the image.
       label: Hull closing radius
       type: int
       value: 1
@@ -135,7 +153,7 @@ execute_trim_edges:
       type: int
       value: 0
       min: 0
-      max: 10
+      max: 2147483647
       hint: Z-anisotropy correction. 3D only -- ignored for 2D data, which has no Z axis;
         the step logs that it skipped.
     otsu_scale_factor:
@@ -143,13 +161,14 @@ execute_trim_edges:
       type: float
       value: 0.8
       min: 0.0
-      max: 10.0
+      max: 1.0e+12
+      step: 1.0e-05
     min_size:
       label: Min Size (Post-Trim)
       type: int
       value: 20
       min: 0
-      max: 10000
+      max: 2147483647
       step: 1
       hint: Minimum object size after trimming, in voxels (3D) or pixels (2D). Unified from
         the old min_size_voxels / min_size_pixels.
@@ -244,17 +263,20 @@ execute_soma_extraction:
       type: int
       value: 150
       min: 1
-      max: 1000000
+      max: 2147483647
       step: 1
     intensity_smooth_um:
+      # A sigma far larger than the image itself makes scipy build a kernel of
+      # ~8*sigma/spacing samples and fail (MemoryError). Clamping sigma to the axis
+      # length belongs in code; no limit here can, since it depends on spacing.
       label: Intensity Smoothing (um)
       hint: Gaussian blur applied to the intensity image before percentile thresholding,
         in microns (converted per axis, so anisotropic z is handled).
       type: float
       value: 0.5
       min: 0.0
-      max: 10.0
-      step: 0.05
+      max: 1.0e+12
+      step: 1.0e-05
     intensity_weight:
       label: Seed Split Intensity Weight
       hint: How much intensity guides the splitting of a fused seed core, as dt * (1 + w
@@ -265,9 +287,11 @@ execute_soma_extraction:
       type: float
       value: 0.5
       min: 0.0
-      max: 10.0
-      step: 0.05
+      max: 1.0e+12
+      step: 1.0e-05
     min_physical_peak_separation:
+      # Same caveat as Intensity Smoothing: a separation far larger than the image
+      # becomes a filter box of separation/spacing voxels and fails (MemoryError).
       label: Min Peak Separation (um)
       type: float
       value: 2.5
@@ -279,26 +303,27 @@ execute_soma_extraction:
       type: float
       value: 0.01
       min: 1.0e-05
-      max: 10.0
+      max: 1.0e+12
       step: 1.0e-05
     absolute_max_thickness_um:
       label: Max Absolute Thickness (um)
       type: float
       value: 10.0
-      min: 0.001
-      max: 100.0
-      step: 0.001
+      min: 1.0e-05
+      max: 1.0e+12
+      step: 1.0e-05
     max_allowed_core_aspect_ratio:
       label: Max Aspect Ratio (Elongation)
       type: float
       value: 5.0
       min: 1.0
-      max: 100000.0
-      step: 0.5
+      max: 1.0e+12
+      step: 1.0e-05
 execute_cell_separation:
   name: Execute Cell Separation
   parameters:
     min_size_threshold:
+      # A voxel count, so step stays 1: whole numbers need no decimals.
       label: Min Final Cell Size
       description: >-
         Smallest accepted cell after separation, counted in voxels for a
@@ -306,30 +331,33 @@ execute_cell_separation:
       type: float
       value: 250.01
       min: 0.0
-      max: 10000000.0
+      max: 1.0e+12
       step: 1.0
     max_seed_centroid_dist:
       label: Max Seed Merge Distance (um)
       type: float
       value: 50.0
       min: 0.0
-      max: 10000.0
-      step: 0.1
+      max: 1.0e+12
+      step: 1.0e-05
     min_path_intensity_ratio:
       label: Min Path Intensity Ratio (Merge thresh)
       type: float
       value: 1.0
       min: 0.0
-      max: 100.0
-      step: 0.01
+      max: 1.0e+12
+      step: 1.0e-05
     min_local_intensity_difference:
       label: Min Local Intensity Diff (Merge thresh)
       type: float
       value: 0.0
       min: 0.0
-      max: 100.0
-      step: 0.01
+      max: 1.0e+12
+      step: 1.0e-05
     local_analysis_radius:
+      # Used as a VOXEL radius: structuring_element() receives it unconverted,
+      # although the label says um. max kept at 1000: a 3D ball of radius r is
+      # (2r+1)^3 voxels, already ~8e9 at 1000.
       label: Local Analysis Radius (um)
       type: int
       value: 10
@@ -355,6 +383,12 @@ execute_cell_separation:
         actually been applied in step 1; the run stops with a reason if it was
         not, rather than falling back to the raw image.
     intensity_weight:
+      # max is a float64 limit shared with Boundary Contrast Sharpness. The landscape
+      # is d_seeds / speed**speed_power with speed in [1e-5, dt*(1 + this)]; for any
+      # image up to this file's 1e12 um ceiling it stays finite only if
+      # speed_power*(log10(dt_max) + log10(1 + this)) < 308 and
+      # 5*speed_power + log10(d_max) < 308. This 1000 and that 20 are the largest
+      # pair that holds (21, or 1e4 here, overflows); raise one only by lowering the other.
       label: Watershed Intensity Weight
       description: >-
         How much the boundary follows the image rather than sitting midway
@@ -368,9 +402,10 @@ execute_cell_separation:
       type: float
       value: 0.01
       min: 0.0
-      max: 10.0
-      step: 0.1
+      max: 1000.0
+      step: 1.0e-05
     speed_power:
+      # max: see Watershed Intensity Weight -- the two share one float64 limit.
       # 1.5 is the value this was hardcoded to before it became a parameter,
       # so adding it to an older config changes nothing about a result.
       neutral_default: true
@@ -387,8 +422,8 @@ execute_cell_separation:
       type: float
       value: 1.5
       min: 0.0
-      max: 8.0
-      step: 0.1
+      max: 20.0
+      step: 1.0e-05
 execute_calculate_features:
   name: Execute Feature Calculation
   parameters:
@@ -397,8 +432,8 @@ execute_calculate_features:
       type: float
       value: 6.0
       min: 0
-      max: 200
-      step: 0.01
+      max: 1.0e+12
+      step: 1.0e-05
     calculate_distances:
       label: Calculate Distances
       type: bool
