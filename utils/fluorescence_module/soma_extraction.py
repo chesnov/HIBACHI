@@ -764,6 +764,8 @@ _SIG_MAX_MISS_UM = 1.0 # whose course continues the new track to within this,
 _SIG_MARGIN_UM = 0.1   # better than the path's own old course by this margin,
 #                        and whose thickness matches the new track as well
 _SIG_PASSES = 3        # repeated on the corrected paths at most this often
+_SIG_BEND_MISS_UM = 1.5  # a fibre leaving the contact on a gentle bend may miss the new track by up to this,
+_SIG_BEND_SHIFT = 0.5    # if it still lands nearer than this share of the step (halfway to the old course)
 _ORPHAN_UM = 25.0          # a free-standing piece this short is a fragment of a fibre, not a fibre (`_fix_sigmoids`):
 _ORPHAN_NEAR_UM = 3.5     # it starts within this distance of a contact where one fibre passes and another ends,
 _ORPHAN_DEPTH_UM = 1.1    # and fibres keep their order in depth across a contact (at least this far apart)
@@ -1487,8 +1489,11 @@ def _fix_sigmoids(paths, pts, half_w, sp, obj_lookup, bshape):
     another path of at least _SIG_MIN_FIBRE_UM ends within _SIG_END_NEAR_UM of
     the step, its own course over its last _SIG_WINDOW_UM continues the new
     track to within _SIG_MAX_MISS_UM and better than the path's old course
-    does, and its thickness (the mask's half-width) matches the new track at
-    least as well. Then the path ends at the step, and the other fibre is
+    does (a fibre that leaves the contact on a gentle bend misses a straight
+    line by more: up to _SIG_BEND_MISS_UM is accepted when that is less than
+    _SIG_BEND_SHIFT of the step, i.e. it lands on the new track nearer than
+    halfway to the old one), and its thickness (the mask's half-width)
+    matches the new track at least as well. Then the path ends at the step, and the other fibre is
     joined to the new track by a straight segment. Every path is examined in
     both directions; a path takes part in one correction per pass, and the
     passes repeat on the corrected paths, at most _SIG_PASSES times.
@@ -1568,7 +1573,8 @@ def _fix_sigmoids(paths, pts, half_w, sp, obj_lookup, bshape):
                     p = x[min(np.searchsorted(a, s), len(x) - 1)]
                     m = (uA + uB) / np.linalg.norm(uA + uB)
                     d = (cB + ((p - cB) @ uB) * uB) - (cA + ((p - cA) @ uA) * uA)
-                    if float(np.linalg.norm(d - (d @ m) * m)) < _SIG_MIN_SHIFT_UM:
+                    shift = float(np.linalg.norm(d - (d @ m) * m))
+                    if shift < _SIG_MIN_SHIFT_UM:
                         continue
                     for k in etree.query_ball_point(p, _SIG_END_NEAR_UM):
                         j, which, _pe = ends[k]
@@ -1587,7 +1593,14 @@ def _fix_sigmoids(paths, pts, half_w, sp, obj_lookup, bshape):
                         if len(ahead) < 5:
                             continue
                         mQ, mA = miss(cQ, uQ, ahead), miss(cA, uA, ahead)
-                        if mQ is None or mA is None or mQ > _SIG_MAX_MISS_UM or mQ >= mA - _SIG_MARGIN_UM:
+                        if mQ is None or mA is None or mQ >= mA - _SIG_MARGIN_UM:
+                            continue
+                        # A fibre that leaves the contact on a gentle bend misses a straight
+                        # extrapolation of its own course by more than _SIG_MAX_MISS_UM. It is
+                        # still accepted when it lands on the new track nearer than halfway to
+                        # the old course: then the step is the other fibre's, not a kink.
+                        if mQ > _SIG_MAX_MISS_UM and (mQ > _SIG_BEND_MISS_UM
+                                                      or mQ > _SIG_BEND_SHIFT * shift):
                             continue
                         tA, tB, tQ = thickness(A), thickness(B), thickness(Q)
                         if abs(tQ - tB) > abs(tA - tB):
