@@ -745,6 +745,7 @@ _JOIN_MASK_GAP_R = 3.0 # and the straight link between the ends may leave the ma
 _JOIN_FAR_R = 20.0     # a second, longer reach (in r), for pieces the mask still joins: the same tests, but
 _JOIN_FAR_TURN_DEG = 15.0  # the pieces must continue each other this straight
 _JOIN_OVERLAP_R = 4.0  # pieces may overlap this far (in r) along the fibre, if they lie on one line (< 2 r apart)
+_MEND_ROUTE_RATIO = 1.3  # a mend of a released leg may follow the mask on a route at most this much longer than the gap
 # Leftover skeleton (`_leftover_chains`): skeleton that no path of at least _CRUMB_UM covers is
 # kept as a candidate fibre piece if its longest chain is at least _SALVAGE_UM long
 _CRUMB_UM = 3.0
@@ -1483,7 +1484,7 @@ def _paths_from_skeleton(pts, half_w, bshape, spacing, r, obj_lookup):
     # Only now are the pieces of every fibre in place, so a bend that a greedy choice at a contact
     # left in one path, while another path carries straight on from it, can be told apart.
     paths = _rejoin_at_bends(paths, sp, r, obj_lookup)
-    return _end_depth_reversals(paths, sp, obj_lookup, bshape)
+    return _end_depth_reversals(paths, sp, r, obj_lookup, bshape)
 
 
 def _fix_sigmoids(paths, pts, half_w, sp, obj_lookup, bshape):
@@ -1999,7 +2000,10 @@ def _fix_sigmoids(paths, pts, half_w, sp, obj_lookup, bshape):
         return [o for o in out if len(o)], n_done
 
     def bridge_blobs(P):
-        """Join a fibre that goes into a double blob and one that comes out of it, on the same line."""
+        """Join a fibre that goes into a double blob and one that comes out of it, on the same line.
+
+        "On the same line" allows for the passing path's own climb or dip between the two contacts:
+        a fibre that runs through the blob alongside it changes depth with it."""
         from skimage.graph import MCP_Geometric
         X = [p_ * sp for p_ in P]
         L = [float(arc(x)[-1]) if len(x) > 1 else 0.0 for x in X]
@@ -2046,7 +2050,11 @@ def _fix_sigmoids(paths, pts, half_w, sp, obj_lookup, bshape):
                     n_ = ua - ub
                     n_ = n_ / np.linalg.norm(n_)
                     mid = 0.5 * (ea_ + eb_)
-                    shift = float(np.linalg.norm((ca + ua * (((mid - ca) @ n_) / (ua @ n_))) - (cb + ub * (((mid - cb) @ n_) / (ub @ n_)))))
+                    dv_ = (ca + ua * (((mid - ca) @ n_) / (ua @ n_))) - (cb + ub * (((mid - cb) @ n_) / (ub @ n_)))
+                    # Two fibres that run through a blob together climb or dip together: the depth the
+                    # passing path changes by between the two contacts is no offset between the pieces.
+                    dz_i = float(X[i][ka][0] - X[i][kb][0])
+                    shift = min(float(np.linalg.norm(dv_)), float(np.linalg.norm(dv_ - np.array([dz_i, 0.0, 0.0]))))
                     if shift > _BRIDGE_SHIFT_UM:
                         continue
                     lo_, hi_ = sorted((ka, kb))
@@ -2234,7 +2242,7 @@ def _rejoin_at_bends(paths, sp, r, obj_lookup):
     return [o for o in out if len(o)]
 
 
-def _end_depth_reversals(paths, sp, obj_lookup, bshape):
+def _end_depth_reversals(paths, sp, r, obj_lookup, bshape):
     """End a dive at the dead end it goes into, instead of turning it back up.
 
     A fibre that dips (or climbs) steeply into a contact keeps going that way. Where the tracer
@@ -2246,7 +2254,8 @@ def _end_depth_reversals(paths, sp, obj_lookup, bshape):
     within _JOIN_SKIP_UM of its tip), the incoming leg is continued into that piece and ends
     there. The outgoing leg is left as a path of its own, starting at the turn. Only paths of at
     least _DIVE_PATH_UM are repaired, and not where the piece runs to within _DIVE_EDGE_SLICES of
-    the top or bottom of the box, where the fibre may leave the volume rather than end.
+    the top or bottom of the box, where the fibre may leave the volume rather than end. The
+    released legs are then mended (`_mend_breaks`) to the pieces they continue, if any.
 
     Every path takes part in at most one such repair. Paths without one are returned untouched.
     """
@@ -2348,7 +2357,11 @@ def _end_depth_reversals(paths, sp, obj_lookup, bshape):
         out[f] = P[f][:0]
         extra.append(tail)
         touched.update((i, f))
-    return [o for o in out + extra if len(o)]
+    if not extra:
+        return P
+    kept = [o for o in out if len(o)]
+    # The released legs end where the dive was: mend them like any other break (only they may join).
+    return _mend_breaks(kept + extra, sp, r, obj_lookup, focus=range(len(kept), len(kept) + len(extra)), bshape=bshape)
 
 
 def _end_course(pv, which, sp):
@@ -2371,7 +2384,7 @@ def _end_course(pv, which, sp):
     return x[-1], c, u
 
 
-def _mend_breaks(chains, sp, r, obj_lookup, extras=None):
+def _mend_breaks(chains, sp, r, obj_lookup, extras=None, focus=None, bshape=None):
     """Join the pieces of one fibre that a contact left apart, comparing them on their
     courses rather than on their ends (see the comment below). Returns the paths.
 
@@ -2395,6 +2408,36 @@ def _mend_breaks(chains, sp, r, obj_lookup, extras=None):
     if extras:
         chains = list(chains) + list(extras)
     is_extra = [i >= n_real for i in range(len(chains))]
+    # With `focus` (indices into `chains`) only pairs with at least one end on those paths may join,
+    # and a path made by a join takes no further part: the rest was mended already.
+    # Such a join may also follow the mask around a corner (with `bshape`, the box's shape): where
+    # the straight link leaves the mask for too long, the shortest route through the mask between
+    # the ends is used instead, if it is no longer than _MEND_ROUTE_RATIO times the gap and leaves
+    # the mask for no longer than the straight link may.
+    is_focus = [focus is None or i in set(focus) for i in range(len(chains))]
+    routes = {}
+
+    def mask_route(va, vb, max_out):
+        from skimage.graph import MCP_Geometric
+        lo = np.maximum(np.minimum(va, vb) - np.array([6, 25, 25]), 0)
+        hi = np.minimum(np.maximum(va, vb) + np.array([7, 26, 26]), np.asarray(bshape))
+        gz, gy, gx = np.meshgrid(*[np.arange(lo[k], hi[k]) for k in range(3)], indexing="ij")
+        inside = obj_lookup(np.stack([gz.ravel(), gy.ravel(), gx.ravel()], 1)).reshape(gz.shape)
+        m_ = MCP_Geometric(np.where(inside, 1.0, 12.0), fully_connected=True, sampling=tuple(sp))
+        m_.find_costs([tuple(va - lo)], [tuple(vb - lo)])
+        try:
+            route = np.array(m_.traceback(tuple(vb - lo))) + lo
+        except ValueError:
+            return None
+        st = np.r_[0.0, np.linalg.norm(np.diff(route * sp, axis=0), axis=1)]
+        if st.sum() > _MEND_ROUTE_RATIO * float(np.linalg.norm((vb - va) * sp)):
+            return None
+        out_ = ~obj_lookup(route)
+        run_ = longest_ = 0.0
+        for k in range(1, len(route)):
+            run_ = run_ + st[k] if out_[k] else 0.0
+            longest_ = max(longest_, run_)
+        return route if longest_ <= max_out else None
     cos_turn = math.cos(math.radians(_MAX_TURN_DEG))
     # Two reaches, the shorter first: within 10 r, then within _JOIN_FAR_R r, where the pieces
     # must continue each other more straightly. At both, the mask may be missing along the
@@ -2408,6 +2451,7 @@ def _mend_breaks(chains, sp, r, obj_lookup, extras=None):
         if extras:
             mask_gap = reach        # leftover skeleton on the far side is itself the evidence of fibre there
         for _round in range(64):
+            routes.clear()                  # keyed by path indices, which change every round
             ends = []                       # (path index, which end 0|1, end point, centroid, direction)
             for i, pv in enumerate(chains):
                 for which in (0, 1):
@@ -2422,6 +2466,8 @@ def _mend_breaks(chains, sp, r, obj_lookup, extras=None):
                 ia, wa, ea, ca, ua = ends[a]
                 ib, wb, eb, cb, ub = ends[b]
                 if ia == ib or -float(ua @ ub) < tier_cos or (extras and is_extra[ia] == is_extra[ib]):
+                    continue
+                if not (is_focus[ia] or is_focus[ib]):
                     continue
                 g = eb - ea
                 n = ua - ub
@@ -2443,7 +2489,12 @@ def _mend_breaks(chains, sp, r, obj_lookup, extras=None):
                         run = run + step[k] if gone[k] else 0.0
                         longest = max(longest, run)
                     if longest > mask_gap:
-                        continue            # the mask is missing for too long between them
+                        route = None
+                        if focus is not None and bshape is not None:
+                            route = mask_route(np.round(ea / sp).astype(np.int64), np.round(eb / sp).astype(np.int64), mask_gap)
+                        if route is None:
+                            continue        # the mask is missing for too long between them
+                        routes[(ia, wa, ib, wb)] = route
                 cost = shift + 0.3 * float(np.linalg.norm(g))
                 cand.setdefault(a, []).append((cost, b))
                 cand.setdefault(b, []).append((cost, a))
@@ -2469,11 +2520,19 @@ def _mend_breaks(chains, sp, r, obj_lookup, extras=None):
                 kb = np.nonzero((pb_seq * sp - mid) @ n >= 0)[0]
                 if len(ka) and len(kb):
                     pa_seq, pb_seq = pa_seq[:ka[-1] + 1], pb_seq[kb[0]:]
-                link = _line_voxels(pa_seq[-1], pb_seq[0])
-                link = link[obj_lookup(link)]
+                rt = routes.get((ia, wa, ib, wb))
+                if rt is None and (ib, wb, ia, wa) in routes:
+                    rt = routes[(ib, wb, ia, wa)][::-1]
+                if rt is not None:
+                    link = rt[obj_lookup(rt)]
+                    pa_seq, pb_seq = (chains[ia] if wa == 1 else chains[ia][::-1]), (chains[ib] if wb == 0 else chains[ib][::-1])
+                else:
+                    link = _line_voxels(pa_seq[-1], pb_seq[0])
+                    link = link[obj_lookup(link)]
                 merged.append(np.concatenate([pa_seq, link, pb_seq]))
                 drop.update((ia, ib))
             is_extra = [f for i, f in enumerate(is_extra) if i not in drop] + [False] * len(merged)
+            is_focus = [f for i, f in enumerate(is_focus) if i not in drop] + [focus is None] * len(merged)
             chains = [pv for i, pv in enumerate(chains) if i not in drop] + merged
 
     if extras:
