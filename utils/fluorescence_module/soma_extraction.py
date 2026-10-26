@@ -783,6 +783,8 @@ _BRIDGE_BLOB_SHARE = 0.6   # with at least this share of the stretch between the
 _BLOB_COURSES = ((6, 16), (8, 20), (12, 28), (16, 32))   # or: courses taken this far before the contact (um, so that the bend into
 _BLOB_COURSE_MED = 0.2     # the contact stays out of them), extrapolated across the blob, miss it at most this share (median) of the
 _BLOB_COURSE_ALL = 0.4     # other's miss, and at most this share in every window
+_BLOB_LEVEL_DEG = 10.0     # depth ranges are compared only for courses this close to level: one that climbs or dips
+#                            more steeply is at another depth at the contact than over the stretch before it
 _SWAP_MIN_SHIFT_UM = 0.9  # crossing fibres (`_fix_sigmoids`): both steps are at least a fibre width (2 r),
 _SWAP_FIT_RATIO = 0.5    # and each swapped course misses by at most this fraction of what the original did
 # Bend repair (`_rejoin_at_bends`): a path that turns by more than _BEND_MIN_DEG (judged on its courses
@@ -795,6 +797,15 @@ _BEND_MIN_DEG = 20.0
 _BEND_HOOK_UM = 8.0
 _BEND_LINE_DEG = 12.0
 _BEND_LINE_RATIO = 0.5
+_DIVE_IN_DEG = 16.0      # a path that dips (or climbs) into a contact at least this steeply (`_end_depth_reversals`)
+_DIVE_OUT_DEG = 8.0      # and leaves it climbing (or dipping) back at least this steeply,
+_DIVE_LEG_UM = 8.0       # both courses measured over this much path on either side,
+_DIVE_NEAR_UM = 3.5      # with a piece too short to be a fibre (< _SIG_MIN_FIBRE_UM) within this of the turn,
+_DIVE_AIM_DEG = 30.0     # starting where the incoming course points and running along it (both to within this), on its far side in depth,
+_DIVE_MIN_UM = 2.5       # reaching at least this far along the incoming course (and no further than _DIVE_REACH_UM),
+_DIVE_REACH_UM = 8.0     # and ending free, goes on into that piece and ends there; the outgoing leg is a path of its own
+_DIVE_PATH_UM = 30.0     # only paths at least this long are repaired (both legs must stand as fibres afterwards)
+_DIVE_EDGE_SLICES = 2    # and not where the piece runs to within this many slices of the top or bottom of the box
 
 
 # ---- tiling ------------------------------------------------------------------ #
@@ -1471,7 +1482,8 @@ def _paths_from_skeleton(pts, half_w, bshape, spacing, r, obj_lookup):
         paths = _mend_breaks(paths, sp, r, obj_lookup, extras=leftover)
     # Only now are the pieces of every fibre in place, so a bend that a greedy choice at a contact
     # left in one path, while another path carries straight on from it, can be told apart.
-    return _rejoin_at_bends(paths, sp, r, obj_lookup)
+    paths = _rejoin_at_bends(paths, sp, r, obj_lookup)
+    return _end_depth_reversals(paths, sp, obj_lookup, bshape)
 
 
 def _fix_sigmoids(paths, pts, half_w, sp, obj_lookup, bshape):
@@ -1857,7 +1869,10 @@ def _fix_sigmoids(paths, pts, half_w, sp, obj_lookup, bshape):
 
         The path carries on through the blob (it coexists there with the fibre that ends against
         it) and is cut where the blob ends; the fibre that ends takes the rest. Both depth ranges
-        are those of the fibres' own courses 12 to 2 um before the contact."""
+        are those of the fibres' own courses 12 to 2 um before the contact; they are
+        compared only when both courses are within _BLOB_LEVEL_DEG of level there, since a
+        course that climbs or dips is at another depth at the contact. Otherwise the courses
+        decide."""
         X = [p_ * sp for p_ in P]
         L = [float(arc(x)[-1]) if len(x) > 1 else 0.0 for x in X]
         ends = [(i, w, x[0] if w == 0 else x[-1]) for i, x in enumerate(X) if len(x) >= 6 for w in (0, 1)]
@@ -1867,6 +1882,7 @@ def _fix_sigmoids(paths, pts, half_w, sp, obj_lookup, bshape):
         owner = np.concatenate([[k] * len(x) for k, x in enumerate(X)])
         first = np.concatenate([[0], np.cumsum([len(x) for x in X])[:-1]])
         ptree = cKDTree(allp)
+        sin_level = float(np.sin(np.radians(_BLOB_LEVEL_DEG)))
         found = {}
         for q, wq, pe in ends:
             if L[q] < _SIG_MIN_FIBRE_UM:
@@ -1925,7 +1941,7 @@ def _fix_sigmoids(paths, pts, half_w, sp, obj_lookup, bshape):
                     continue                                          # no single fibre comes out of it
                 depth_ok, gain = False, 0.0
                 Ac = xo[(ao >= s0o - 12.0) & (ao <= s0o - 2.0)]
-                if len(Ac) >= 8:
+                if len(Ac) >= 8 and all(abs(fit(c_)[1][0]) <= sin_level for c_ in (Ac, Qc)):
                     dB = depth_range([st[b_] for b_ in beyond[:8]])
                     dQ = depth_range(section_stats(Qc))
                     dA = depth_range(section_stats(Ac))
@@ -2216,6 +2232,123 @@ def _rejoin_at_bends(paths, sp, r, obj_lookup):
         out[i] = rest
         touched.update((i, j))
     return [o for o in out if len(o)]
+
+
+def _end_depth_reversals(paths, sp, obj_lookup, bshape):
+    """End a dive at the dead end it goes into, instead of turning it back up.
+
+    A fibre that dips (or climbs) steeply into a contact keeps going that way. Where the tracer
+    instead turns the path back in depth (in at least _DIVE_IN_DEG, out at least _DIVE_OUT_DEG
+    the other way, over _DIVE_LEG_UM either side), and the skeleton beyond the turn holds a
+    piece too short to be traced as a fibre of its own (< _SIG_MIN_FIBRE_UM) that starts within
+    _DIVE_NEAR_UM of the turn, lies where the incoming course points and runs along it (both
+    within _DIVE_AIM_DEG) on its far side in depth, reaches at least _DIVE_MIN_UM along it and ends free (no other fibre
+    within _JOIN_SKIP_UM of its tip), the incoming leg is continued into that piece and ends
+    there. The outgoing leg is left as a path of its own, starting at the turn. Only paths of at
+    least _DIVE_PATH_UM are repaired, and not where the piece runs to within _DIVE_EDGE_SLICES of
+    the top or bottom of the box, where the fibre may leave the volume rather than end.
+
+    Every path takes part in at most one such repair. Paths without one are returned untouched.
+    """
+    from scipy.spatial import cKDTree
+    sp = np.asarray(sp, float)
+    P = [np.asarray(p_) for p_ in paths]
+    if not P:
+        return P
+    X = [p_ * sp for p_ in P]
+    L = [float(_arc_points(x, None)[-1]) if len(x) > 1 else 0.0 for x in X]
+    frag = [i for i in range(len(P)) if len(P[i]) and L[i] < _SIG_MIN_FIBRE_UM]
+    big = [i for i in range(len(P)) if L[i] >= _SIG_MIN_FIBRE_UM]
+    if not frag or not big:
+        return P
+    fowner = np.concatenate([[i] * len(X[i]) for i in frag])
+    ftree = cKDTree(np.vstack([X[i] for i in frag]))
+    bowner = np.concatenate([[i] * len(X[i]) for i in big])
+    btree = cKDTree(np.vstack([X[i] for i in big]))
+
+    def fit(q):
+        c = q.mean(0)
+        return c, np.linalg.svd(q - c, full_matrices=False)[2][0]
+
+    def towards(u, f, t):
+        return u if u @ (t - f) >= 0 else -u
+
+    s_in = np.sin(np.radians(_DIVE_IN_DEG))
+    s_out = np.sin(np.radians(_DIVE_OUT_DEG))
+    c_aim = np.cos(np.radians(_DIVE_AIM_DEG))
+    gap, part = 1.0, 3.0
+    found = []
+    z_last = int(bshape[0]) - 1
+    for i in big:
+        if L[i] < _DIVE_PATH_UM:
+            continue
+        for rev in (False, True):
+            x = X[i][::-1] if rev else X[i]
+            a = _arc_points(x, None)
+            best = None
+            for s in np.arange(_DIVE_LEG_UM, a[-1] - _DIVE_LEG_UM, _SIG_STEP_UM):
+                Aq = x[(a >= s - _DIVE_LEG_UM) & (a <= s - gap)]
+                Bq = x[(a >= s + gap) & (a <= s + _DIVE_LEG_UM)]
+                if len(Aq) < 6 or len(Bq) < 6:
+                    continue
+                uA = towards(fit(Aq)[1], Aq[0], Aq[-1])
+                uB = towards(fit(Bq)[1], Bq[0], Bq[-1])
+                if not (abs(uA[0]) >= s_in and abs(uB[0]) >= s_out and uA[0] * uB[0] < 0):
+                    continue                                  # the path does not turn back in depth here
+                p = x[min(int(np.searchsorted(a, s)), len(x) - 1)]
+                for f in sorted(set(int(fowner[h]) for h in ftree.query_ball_point(p, _DIVE_NEAR_UM))):
+                    U = X[f]
+                    fw = (U - p) @ uA
+                    U = U[(fw > 0) & (fw <= _DIVE_REACH_UM) & ((U[:, 0] - p[0]) * np.sign(uA[0]) > 0)]
+                    if len(U) < 6:
+                        continue
+                    fU = (U - p) @ uA
+                    d = U[fU <= fU.min() + part].mean(0) - p
+                    nd = float(np.linalg.norm(d))
+                    aim = float(d @ uA) / nd if nd > 0 else 1.0
+                    if aim < c_aim or float(fU.max()) < _DIVE_MIN_UM:
+                        continue
+                    if len(X[f]) >= 3 and abs(float(fit(X[f])[1] @ uA)) < c_aim:
+                        continue                              # a spur standing across the course, not its continuation
+                    tip = U[int(np.argmax(fU))]
+                    if set(int(bowner[h]) for h in btree.query_ball_point(tip, _JOIN_SKIP_UM)) - {i}:
+                        continue                              # the piece leads on to another fibre
+                    zt = float(X[f][:, 0].min() if uA[0] < 0 else X[f][:, 0].max()) / sp[0]
+                    if zt <= _DIVE_EDGE_SLICES or zt >= z_last - _DIVE_EDGE_SLICES:
+                        continue                              # it runs out of the volume: where it ends is unknown
+                    score = float(fU.max()) * aim
+                    if best is None or score > best[0]:
+                        best = (score, s, f, rev, p, uA)
+            if best is not None:
+                found.append((best[0], i) + best[1:])
+    touched, out, extra = set(), list(P), []
+    for _sc, i, s, f, rev, p, uA in sorted(found, key=lambda t: -t[0]):
+        if i in touched or f in touched:
+            continue
+        Pi = P[i][::-1] if rev else P[i]
+        a = _arc_points(Pi * sp, None)
+        head, tail = Pi[:int(np.searchsorted(a, s))], Pi[int(np.searchsorted(a, s + gap)):]
+        if len(head) < 6 or len(tail) < 6:
+            continue
+        U = P[f]
+        fw = (U * sp - p) @ uA
+        keep = (fw > 0) & (fw <= _DIVE_REACH_UM) & ((U[:, 0] * sp[0] - p[0]) * np.sign(uA[0]) > 0)
+        U, fw = U[keep], fw[keep]
+        bins = np.floor(fw / sp.min()).astype(int)
+        seq, prev = [head], head[-1]
+        for b in np.unique(bins):                             # the piece's centre line, along the course
+            v = np.round(U[bins == b].mean(0)).astype(int)
+            lk = _line_voxels(prev, v)
+            lk = lk[obj_lookup(lk)] if len(lk) else lk
+            if len(lk):
+                seq.append(lk)
+            prev = v
+        new = np.concatenate(seq)
+        out[i] = new[np.r_[True, np.any(np.diff(new, axis=0) != 0, axis=1)]]
+        out[f] = P[f][:0]
+        extra.append(tail)
+        touched.update((i, f))
+    return [o for o in out + extra if len(o)]
 
 
 def _end_course(pv, which, sp):
