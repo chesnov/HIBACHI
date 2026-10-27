@@ -787,6 +787,7 @@ _BLOB_COURSE_ALL = 0.4     # other's miss, and at most this share in every windo
 _BLOB_LONG_SCAN_UM = 24.0  # a blob that outlasts the first 16 um is looked for this far, against the lone fibre that comes out of it;
 _BLOB_INSIDE_UM = 4.0      # a fibre that ends inside a blob (double over this much before its end) goes on through it with
 _BLOB_SIDE_UM = 4.0        # the passing fibre and takes what comes out, if the two lie in layers at least this far apart in depth
+_BLOB_LAYER_INSET_UM = 0.5 # the passing fibre then keeps to its own layer of the blob, this far inside the mask's edge
 _BLOB_SIDE_MATCH_UM = 0.5  # and what comes out is at the ending fibre's own depth, to within this; a blob found only by the
 #                            longer scan is handed over on this evidence alone (and only such a blob is)
 _BLOB_LEVEL_DEG = 10.0     # depth ranges are compared only for courses this close to level: one that climbs or dips
@@ -817,6 +818,15 @@ _ORDER_SPAN_UM = 8.0     # along no more than this much of their length,
 _ORDER_PAR_DEG = 20.0    # parallel within this on both sides of the contact (courses 2 to 12 um away),
 _ORDER_SIDE_UM = 0.9     # and on opposite sides of each other before and after it, at least this far apart,
 _ORDER_TURN_DEG = 20.0   # swap their continuations if each then turns by no more than this: parallel fibres keep their order
+_CLIMB_DEG = 40.0        # a path of at least 30 um that, after a course within _CLIMB_LEVEL_DEG of level over 12 um,
+_CLIMB_LEVEL_DEG = 20.0  # climbs or dips at least this steeply (over 2 um steps) through at least _CLIMB_DEPTH_UM of depth
+_CLIMB_DEPTH_UM = 3.0    # to its end has cut across the layers (`_cut_climbs`): it is cut where the climb starts,
+_CLIMB_NEAR_UM = 5.0     # and it, and the paths that end within this of the climb, go on along their own courses
+_MARCH_STEP_UM = 0.5     # through mask that no other path claims: steps of this length, each centred on the free mask
+_MARCH_DISC_UM = 1.2     # within this of the course (across it), at least _MARCH_CLEAR_UM from every other path,
+_MARCH_CLEAR_UM = 0.9    # turning at most _MARCH_TURN_DEG per step, until no free mask is left ahead (at most _MARCH_MAX_UM)
+_MARCH_TURN_DEG = 10.0
+_MARCH_MAX_UM = 60.0
 
 
 # ---- tiling ------------------------------------------------------------------ #
@@ -1495,7 +1505,8 @@ def _paths_from_skeleton(pts, half_w, bshape, spacing, r, obj_lookup):
     # left in one path, while another path carries straight on from it, can be told apart.
     paths = _rejoin_at_bends(paths, sp, r, obj_lookup)
     paths = _end_depth_reversals(paths, sp, r, obj_lookup, bshape)
-    return _keep_order_at_crossings(paths, sp, obj_lookup)
+    paths = _keep_order_at_crossings(paths, sp, obj_lookup)
+    return _cut_climbs(paths, sp, obj_lookup, bshape)
 
 
 def _fix_sigmoids(paths, pts, half_w, sp, obj_lookup, bshape):
@@ -1973,7 +1984,7 @@ def _fix_sigmoids(paths, pts, half_w, sp, obj_lookup, bshape):
                 # the passing fibre's own depth (where that runs alone, upstream), and the fibre that
                 # comes out lies as far from it, at the ending fibre's depth (_BLOB_SIDE_MATCH_UM),
                 # the ending fibre takes it: the passing path had hopped layers inside the blob.
-                side_ok = False
+                side_ok, side_layer = False, None
                 up_ = xo[(ao >= s0o - _BLOB_LONG_SCAN_UM) & (ao <= s0o)]
                 st_up = section_stats(up_) if long_det and len(up_) >= 20 else []
                 if len(st_up) >= 7:
@@ -1992,6 +2003,7 @@ def _fix_sigmoids(paths, pts, half_w, sp, obj_lookup, bshape):
                                        and (zx_ - zi_) * sg_ * sp[0] >= _BLOB_SIDE_UM
                                        and abs(zx_ - zq_) * sp[0] <= _BLOB_SIDE_MATCH_UM)
                             side_gain = 100.0 + abs(zx_ - zi_)
+                            side_layer = (s0o, float(sg_))
                 depth_ok, gain = False, 0.0
                 Ac = xo[(ao >= s0o - 12.0) & (ao <= s0o - 2.0)]
                 if len(Ac) >= 8 and all(abs(fit(c_)[1][0]) <= sin_level for c_ in (Ac, Qc)):
@@ -2036,9 +2048,26 @@ def _fix_sigmoids(paths, pts, half_w, sp, obj_lookup, bshape):
                 if not (depth_ok or course_ok or side_ok):
                     continue
                 if (q, i) not in found or gain > found[(q, i)][0]:
-                    found[(q, i)] = (gain, wq, fwd, s0o + float(s_k[run_end]))
+                    found[(q, i)] = (gain, wq, fwd, s0o + float(s_k[run_end]), side_layer if side_ok else None)
+
+        def to_own_layer(seg_, side):
+            """Move a stretch of path to the passing fibre's own layer of a two-layer blob: the
+            mask's edge in depth on that layer's side (`side` = -1 shallower, +1 deeper), kept
+            _BLOB_LAYER_INSET_UM inside it."""
+            off = max(1, int(round(_BLOB_LAYER_INSET_UM / sp[0])))
+            moved = []
+            for v in seg_:
+                z_ = int(v[0])
+                while 0 <= z_ + side < bshape[0] and obj_lookup(np.array([[z_ + side, v[1], v[2]]]))[0]:
+                    z_ += side
+                z_ -= side * off
+                if (z_ - int(v[0])) * side < 0:               # the mask is no thicker than that here
+                    z_ = int(v[0])
+                moved.append([z_, v[1], v[2]])
+            return np.array(moved, dtype=seg_.dtype)
+
         touched, out, n_done = set(), list(P), 0
-        for (q, i), (_g, wq, fwd, s_b) in sorted(found.items(), key=lambda kv: -kv[1][0]):
+        for (q, i), (_g, wq, fwd, s_b, layer) in sorted(found.items(), key=lambda kv: -kv[1][0]):
             if q in touched or i in touched:
                 continue
             Pi = P[i] if fwd else P[i][::-1]
@@ -2050,6 +2079,23 @@ def _fix_sigmoids(paths, pts, half_w, sp, obj_lookup, bshape):
             link = _line_voxels(incoming[-1], tail[0])
             link = link[obj_lookup(link)] if len(link) else link
             out[q] = np.concatenate([incoming, link, tail])
+            if layer is not None:
+                # The passing path hopped layers inside the blob; keep its rest of the blob on its own side.
+                k0 = int(np.searchsorted(a, layer[0]))
+                if k0 < len(head):
+                    moved = to_own_layer(head[k0:], -int(layer[1]))
+                    seq, prev = [head[:k0]] if k0 else [], (head[k0 - 1] if k0 else None)
+                    for v in moved:
+                        if prev is not None:
+                            lk = _line_voxels(prev, v)
+                            lk = lk[obj_lookup(lk)] if len(lk) else lk
+                            if len(lk):
+                                seq.append(lk)
+                        else:
+                            seq.append(v[None])
+                        prev = v
+                    head = np.concatenate(seq)
+                    head = head[np.r_[True, np.any(np.diff(head, axis=0) != 0, axis=1)]]
             out[i] = head
             touched.update((q, i))
             n_done += 1
@@ -2516,6 +2562,145 @@ def _keep_order_at_crossings(paths, sp, obj_lookup):
         out[i], out[j] = new
         touched.update((i, j))
     return out
+
+
+def _cut_climbs(paths, sp, obj_lookup, bshape):
+    """Cut a path where it leaves its course to climb (or dip) through the layers, and let it,
+    and the paths it cut off, go on along their own courses.
+
+    In a bundle too thick to be split by the skeleton, the tracer can follow a skeleton branch
+    that crosses the layers, carrying a fibre steeply up or down out of its course. A path of at
+    least 30 um that, after a course within _CLIMB_LEVEL_DEG of level over its last 12 um,
+    climbs or dips at least _CLIMB_DEG steeply through at least _CLIMB_DEPTH_UM of depth, to
+    (near) its end, is cut where the climb starts and the climb is dropped. That path, and every
+    path of at least _SIG_MIN_FIBRE_UM that ends within _CLIMB_NEAR_UM of the dropped climb, is
+    then marched on along its course through mask no other path claims (`_MARCH_*`).
+    Paths without a climb near them are returned untouched.
+    """
+    from scipy.spatial import cKDTree
+    sp = np.asarray(sp, float)
+    bsh = np.asarray(bshape)
+    P = [np.asarray(p_) for p_ in paths]
+    X = [p_ * sp for p_ in P]
+    A = [_arc_points(x, None) if len(x) > 1 else np.zeros(len(x)) for x in X]
+    L = [float(a[-1]) if len(a) else 0.0 for a in A]
+
+    def fit_dir(q):
+        c = q.mean(0)
+        u = np.linalg.svd(q - c, full_matrices=False)[2][0]
+        return u if u @ (q[-1] - q[0]) >= 0 else -u
+
+    s_climb = np.sin(np.radians(_CLIMB_DEG))
+    s_level = np.sin(np.radians(_CLIMB_LEVEL_DEG))
+    win, course_um = 2.0, _JOIN_WINDOW_UM
+    cuts = []
+    for i in range(len(P)):
+        if L[i] < 30.0:
+            continue
+        for rev in (False, True):
+            x = X[i][::-1] if rev else X[i]
+            a = _arc_points(x, None)
+            n, k, found = len(x), 0, False
+            while k < n and not found:
+                k2 = int(np.searchsorted(a, a[k] + win))
+                if k2 >= n:
+                    break
+                d = x[k2] - x[k]
+                nd = float(np.linalg.norm(d))
+                if nd > 0 and abs(d[0]) / nd >= s_climb and a[k] >= course_um:
+                    uc = fit_dir(x[(a >= a[k] - course_um) & (a <= a[k])])
+                    if abs(uc[0]) <= s_level:
+                        j, sgn = k, np.sign(d[0])
+                        while j < n - 1:
+                            j2 = int(np.searchsorted(a, a[j] + win))
+                            if j2 >= n:
+                                j = n - 1
+                                break
+                            dd = x[j2] - x[j]
+                            ndd = float(np.linalg.norm(dd))
+                            j_prev, j = j, j2
+                            if ndd == 0 or np.sign(dd[0]) != sgn or abs(dd[0]) / ndd < s_climb:
+                                break
+                        if abs(x[j][0] - x[k][0]) >= _CLIMB_DEPTH_UM and n - 1 - j < 20:
+                            cuts.append((i, rev, k, uc))
+                            found = True
+                k += 1
+            if found:
+                break
+    if not cuts:
+        return P
+    out, released, removed = list(P), [], []
+    for i, rev, k, uc in cuts:
+        Pi = P[i][::-1] if rev else P[i]
+        removed.append(Pi[k + 1:])
+        out[i] = Pi[:k + 1]
+        released.append((i, uc, False))
+    rtree = cKDTree(np.vstack(removed) * sp)
+    cut_ids = {c[0] for c in cuts}
+    for m in range(len(out)):
+        if m in cut_ids or L[m] < _SIG_MIN_FIBRE_UM:
+            continue
+        for at_start in (False, True):
+            x = out[m] * sp if not at_start else (out[m] * sp)[::-1]
+            if rtree.query(x[-1])[0] <= _CLIMB_NEAR_UM:
+                a = _arc_points(x, None)
+                released.append((m, fit_dir(x[a >= a[-1] - course_um]), at_start))
+    others = [k for k in range(len(out)) if L[k] >= _SIG_MIN_FIBRE_UM]
+    g = np.arange(-_MARCH_DISC_UM, _MARCH_DISC_UM + 1e-9, float(sp.min()))
+    grid = np.stack(np.meshgrid(g, g, indexing="ij"), -1).reshape(-1, 2)
+    grid = grid[np.linalg.norm(grid, axis=1) <= _MARCH_DISC_UM]
+    cos_t, sin_t = np.cos(np.radians(_MARCH_TURN_DEG)), np.sin(np.radians(_MARCH_TURN_DEG))
+    trails = []
+    for i, u, at_start in released:
+        Pi = out[i][::-1] if at_start else out[i]
+        if len(Pi) < 2:
+            continue
+        tree = cKDTree(np.vstack([out[k] * sp for k in others if k != i] + trails))
+        p, d = Pi[-1] * sp, u / np.linalg.norm(u)
+        trail, total = [], 0.0
+        while total < _MARCH_MAX_UM:
+            c = p + d * _MARCH_STEP_UM
+            n1 = np.array([0.0, -d[2], d[1]])
+            n1 /= np.linalg.norm(n1) + 1e-12
+            n2 = np.cross(d, n1)
+            cand = c + grid[:, :1] * n1 + grid[:, 1:] * n2
+            vox = np.round(cand / sp).astype(np.int64)
+            ok = np.all((vox >= 0) & (vox < bsh), axis=1)
+            if not ok.any():
+                break
+            vox, cand = vox[ok], cand[ok]
+            free = obj_lookup(vox) & (tree.query(cand)[0] >= _MARCH_CLEAR_UM)
+            if free.sum() < 4:
+                break                                         # no free mask ahead: the fibre ends here
+            nc = cand[free].mean(0)
+            nd = (nc - p) / (np.linalg.norm(nc - p) + 1e-12)
+            if nd @ d < cos_t:                                # turn at most _MARCH_TURN_DEG per step
+                ax = nd - (nd @ d) * d
+                ax /= np.linalg.norm(ax) + 1e-12
+                nd = cos_t * d + sin_t * ax
+                nc = p + nd * _MARCH_STEP_UM
+            trail.append(nc)
+            total += float(np.linalg.norm(nc - p))
+            p = nc
+            d = 0.8 * d + 0.2 * nd
+            d /= np.linalg.norm(d)
+        if not trail:
+            continue
+        seq, prev = [Pi], Pi[-1]
+        for t in trail:
+            v = np.round(t / sp).astype(np.int64)
+            if np.all(v == prev):
+                continue
+            lk = _line_voxels(prev, v)
+            lk = lk[obj_lookup(lk)] if len(lk) else lk
+            if len(lk):
+                seq.append(lk)
+            prev = v
+        new = np.concatenate(seq)
+        new = new[np.r_[True, np.any(np.diff(new, axis=0) != 0, axis=1)]]
+        out[i] = new[::-1] if at_start else new
+        trails.append(np.array(trail))
+    return [o for o in out if len(o)]
 
 
 def _end_course(pv, which, sp):
