@@ -832,6 +832,14 @@ _HAND_SIDE_UM = 0.9      # that path having run beside it at least this far off 
 _HAND_ON_RATIO = 0.6     # while a third path starts within 3 um of there on the passing path's own line (missing it by at
 #                          most this share of that offset, and by less than the passing path's own rest does): the passing
 #                          path goes on into the third path, and the ending one into the passing path's rest
+_LINE_GAP_UM = 20.0      # two path ends at most this far apart (`_join_lined_up_ends`), facing each other,
+_LINE_TURN_DEG = 15.0    # whose courses continue each other within this (_LINE_LONG_TURN_DEG beyond _JOIN_FAR_R * r),
+_LINE_LONG_TURN_DEG = 10.0
+_LINE_SHIFT_UM = 2.0     # and lie on one line to within this midway, are joined along the mask (a route at most
+_LINE_ROUTE_RATIO = 1.5  # this many times the gap, out of the mask for at most _JOIN_MASK_GAP_R * r, and at least
+_LINE_CLEAR_UM = 0.9     # this far from other paths over _LINE_CLEAR_SHARE of it), or, if no longer than _JOIN_FAR_R * r
+_LINE_CLEAR_SHARE = 0.8  # and on one line to within _LINE_STRAIGHT_UM, straight across a gap in the mask. An end may
+_LINE_STRAIGHT_UM = 1.2  # first drop a tail of up to 6 um that runs past the other piece (a hook off the course).
 
 
 # ---- tiling ------------------------------------------------------------------ #
@@ -1512,7 +1520,8 @@ def _paths_from_skeleton(pts, half_w, bshape, spacing, r, obj_lookup):
     paths = _end_depth_reversals(paths, sp, r, obj_lookup, bshape)
     paths = _keep_order_at_crossings(paths, sp, obj_lookup)
     paths = _cut_climbs(paths, sp, obj_lookup, bshape)
-    return _hand_on_at_ends(paths, sp, obj_lookup)
+    paths = _hand_on_at_ends(paths, sp, obj_lookup)
+    return _join_lined_up_ends(paths, sp, r, obj_lookup, bshape)
 
 
 def _fix_sigmoids(paths, pts, half_w, sp, obj_lookup, bshape):
@@ -2823,6 +2832,147 @@ def _hand_on_at_ends(paths, sp, obj_lookup):
         out[kk] = P[kk][:0]
         touched.update((i, j, kk))
     return [o for o in out if len(o)]
+
+
+def _join_lined_up_ends(paths, sp, r, obj_lookup, bshape):
+    """Join path ends that line up across a gap the earlier mending left open.
+
+    `_mend_breaks` joins ends within _JOIN_FAR_R * r whose straight link stays in the mask. Two
+    ends can line up as well across a longer gap, along a mask that curves, or across a short gap
+    in the mask; or one end can carry a short hook that runs past the other piece. Ends that face
+    each other within _LINE_GAP_UM, continue each other's course within _LINE_TURN_DEG
+    (_LINE_LONG_TURN_DEG for gaps beyond _JOIN_FAR_R * r) and lie on one line to within
+    _LINE_SHIFT_UM are joined, each with its best partner (mutually), along the shortest route
+    through the mask (see the constants), or straight if the gap is short and the ends lie on one
+    line to within _LINE_STRAIGHT_UM. An end may first drop up to 6 um of tail, but only if that
+    tail runs past the other piece. Repeated for up to three rounds, so a piece can be joined at
+    both ends.
+    """
+    from scipy.spatial import cKDTree
+    from skimage.graph import MCP_Geometric
+    sp = np.asarray(sp, float)
+    bsh = np.asarray(bshape)
+    far_um, mask_gap = _JOIN_FAR_R * r, _JOIN_MASK_GAP_R * r
+    P = [np.asarray(p_) for p_ in paths]
+
+    def fit(q):
+        c = q.mean(0)
+        return c, np.linalg.svd(q - c, full_matrices=False)[2][0]
+
+    cos_t = math.cos(math.radians(_LINE_TURN_DEG))
+    cos_long = math.cos(math.radians(_LINE_LONG_TURN_DEG))
+    W, G = _JOIN_WINDOW_UM, _JOIN_SKIP_UM
+    for _round in range(3):
+        X = [p_ * sp for p_ in P]
+        A = [_arc_points(x, None) if len(x) > 1 else np.zeros(len(x)) for x in X]
+        L = [float(a[-1]) if len(a) else 0.0 for a in A]
+        ends = []
+        for i in range(len(P)):
+            if L[i] < _SIG_MIN_FIBRE_UM:
+                continue
+            for w in (0, 1):
+                x = X[i] if w == 1 else X[i][::-1]
+                a = A[i] if w == 1 else _arc_points(x, None)
+                for t in (0.0, 3.0, 6.0):
+                    if a[-1] - t < W:
+                        continue
+                    kc = int(np.searchsorted(a, a[-1] - t, side="right")) - 1
+                    q = x[(a >= a[kc] - W) & (a <= a[kc] - G)]
+                    if len(q) < 8:
+                        continue
+                    c, u = fit(q)
+                    u = u if u @ (q[-1] - q[0]) >= 0 else -u
+                    ends.append((i, w, t, x[kc], c, u, kc, x[-1]))
+        if len(ends) < 2:
+            break
+        E = np.array([e[3] for e in ends])
+        etree = cKDTree(E)
+        keep = [k for k in range(len(P)) if L[k] >= _SIG_MIN_FIBRE_UM]
+        owner = np.concatenate([[k] * len(X[k]) for k in keep])
+        ptree = cKDTree(np.vstack([X[k] for k in keep]))
+        cands = []
+        for a_, ea in enumerate(ends):
+            for b_ in etree.query_ball_point(ea[3], _LINE_GAP_UM):
+                if b_ <= a_:
+                    continue
+                eb = ends[b_]
+                if ea[0] == eb[0]:
+                    continue
+                g = eb[3] - ea[3]
+                gap = float(np.linalg.norm(g))
+                if gap < 1e-6 or g @ ea[5] <= 0 or -g @ eb[5] <= 0:
+                    continue
+                cosab = -float(ea[5] @ eb[5])
+                if cosab < cos_t:
+                    continue
+                if gap > far_um and (ea[2] or eb[2] or cosab < cos_long):
+                    continue
+                ok = True
+                for e_, o_ in ((ea, eb), (eb, ea)):
+                    if e_[2] and (o_[3] - e_[7]) @ e_[5] > 0:
+                        ok = False                            # a dropped tail must run past the other piece
+                if not ok:
+                    continue
+                n = ea[5] - eb[5]
+                n = n / np.linalg.norm(n)
+                mid = 0.5 * (ea[3] + eb[3])
+                dv = (ea[4] + ea[5] * (((mid - ea[4]) @ n) / (ea[5] @ n))) - (eb[4] + eb[5] * (((mid - eb[4]) @ n) / (eb[5] @ n)))
+                shift = float(np.linalg.norm(dv))
+                if shift > _LINE_SHIFT_UM:
+                    continue
+                cands.append((shift + 0.05 * gap + 0.3 * (ea[2] + eb[2]), a_, b_, gap, shift))
+        cands.sort()
+        best_of = {}
+        for sc, a_, b_, gap, shift in cands:
+            for e in (a_, b_):
+                best_of.setdefault(ends[e][:2], (a_, b_))
+        touched, out, n_done = set(), list(P), 0
+        for sc, a_, b_, gap, shift in cands:
+            ea, eb = ends[a_], ends[b_]
+            if best_of.get(ea[:2]) != (a_, b_) or best_of.get(eb[:2]) != (a_, b_):
+                continue
+            if ea[0] in touched or eb[0] in touched:
+                continue
+            va = np.round(ea[3] / sp).astype(np.int64)
+            vb = np.round(eb[3] / sp).astype(np.int64)
+            lo = np.maximum(np.minimum(va, vb) - np.array([6, 25, 25]), 0)
+            hi = np.minimum(np.maximum(va, vb) + np.array([7, 26, 26]), bsh)
+            gz, gy, gx = np.meshgrid(*[np.arange(lo[k], hi[k]) for k in range(3)], indexing="ij")
+            inside = obj_lookup(np.stack([gz.ravel(), gy.ravel(), gx.ravel()], 1)).reshape(gz.shape)
+            m_ = MCP_Geometric(np.where(inside, 1.0, 12.0), fully_connected=True, sampling=tuple(sp))
+            m_.find_costs([tuple(va - lo)], [tuple(vb - lo)])
+            try:
+                route = np.array(m_.traceback(tuple(vb - lo))) + lo
+            except ValueError:
+                continue
+            st = np.r_[0.0, np.linalg.norm(np.diff(route * sp, axis=0), axis=1)]
+            out_ = ~obj_lookup(route)
+            run_ = longest = 0.0
+            for k in range(1, len(route)):
+                run_ = run_ + st[k] if out_[k] else 0.0
+                longest = max(longest, run_)
+            dd, hh = ptree.query(route * sp)
+            clear = float(np.mean((dd >= _LINE_CLEAR_UM) | np.isin(owner[hh], [ea[0], eb[0]])))
+            routed = st.sum() <= _LINE_ROUTE_RATIO * gap and longest <= mask_gap and clear >= _LINE_CLEAR_SHARE
+            straight = gap <= far_um and shift <= _LINE_STRAIGHT_UM
+            if not (routed or straight):
+                continue
+            Pa = P[ea[0]] if ea[1] == 1 else P[ea[0]][::-1]
+            Pb = P[eb[0]] if eb[1] == 1 else P[eb[0]][::-1]
+            Pa, Pb = Pa[:ea[6] + 1], Pb[:eb[6] + 1][::-1]
+            if routed:
+                link = route[obj_lookup(route)]
+            else:
+                link = _line_voxels(Pa[-1], Pb[0])
+                link = link[obj_lookup(link)] if len(link) else link
+            out[ea[0]] = np.concatenate([Pa, link, Pb])
+            out[eb[0]] = P[eb[0]][:0]
+            touched.update((ea[0], eb[0]))
+            n_done += 1
+        P = [o for o in out if len(o)]
+        if not n_done:
+            break
+    return P
 
 
 def _end_course(pv, which, sp):
