@@ -786,7 +786,9 @@ _BLOB_COURSE_MED = 0.2     # the contact stays out of them), extrapolated across
 _BLOB_COURSE_ALL = 0.4     # other's miss, and at most this share in every window
 _BLOB_LONG_SCAN_UM = 24.0  # a blob that outlasts the first 16 um is looked for this far, against the lone fibre that comes out of it;
 _BLOB_INSIDE_UM = 4.0      # a fibre that ends inside a blob (double over this much before its end) goes on through it with
-_BLOB_SIDE_UM = 1.0        # the passing fibre and takes what comes out on its own side in depth, by at least this
+_BLOB_SIDE_UM = 4.0        # the passing fibre and takes what comes out, if the two lie in layers at least this far apart in depth
+_BLOB_SIDE_MATCH_UM = 0.5  # and what comes out is at the ending fibre's own depth, to within this; a blob found only by the
+#                            longer scan is handed over on this evidence alone (and only such a blob is)
 _BLOB_LEVEL_DEG = 10.0     # depth ranges are compared only for courses this close to level: one that climbs or dips
 #                            more steeply is at another depth at the contact than over the stretch before it
 _SWAP_MIN_SHIFT_UM = 0.9  # crossing fibres (`_fix_sigmoids`): both steps are at least a fibre width (2 r),
@@ -1960,19 +1962,20 @@ def _fix_sigmoids(paths, pts, half_w, sp, obj_lookup, bshape):
                     beyond = [b for b in range(run_end + 1, len(big)) if not big[b]]
                     if len(beyond) < 3 or s_k[beyond[0]] - s_k[run_end] > 2.0:
                         continue                                      # no single fibre comes out of it
-                    det = (down, st, s_k, run_end, beyond, thin_a)
+                    det = (down, st, s_k, run_end, beyond, thin_a, long_)
                     break
                 if det is None:
                     continue
-                down, st, s_k, run_end, beyond, thin_a = det
+                down, st, s_k, run_end, beyond, thin_a, long_det = det
                 # Is the fibre that ends here already inside the blob before it ends (the passing
                 # path's section double over the last _BLOB_INSIDE_UM before the contact)? Then the
-                # two run through it as a pair, and the one that comes out goes by their order in
-                # depth: the ending fibre takes it if it lies on the ending fibre's side of the
-                # passing fibre's own depth (where that runs alone, upstream), by _BLOB_SIDE_UM.
+                # two run through it as a pair. If the ending fibre lies at least _BLOB_SIDE_UM from
+                # the passing fibre's own depth (where that runs alone, upstream), and the fibre that
+                # comes out lies as far from it, at the ending fibre's depth (_BLOB_SIDE_MATCH_UM),
+                # the ending fibre takes it: the passing path had hopped layers inside the blob.
                 side_ok = False
                 up_ = xo[(ao >= s0o - _BLOB_LONG_SCAN_UM) & (ao <= s0o)]
-                st_up = section_stats(up_) if len(up_) >= 20 else []
+                st_up = section_stats(up_) if long_det and len(up_) >= 20 else []
                 if len(st_up) >= 7:
                     s_up = arc(up_)[np.array([r_[0] for r_ in st_up])]
                     a_up = np.array([r_[1] for r_ in st_up])
@@ -1986,7 +1989,8 @@ def _fix_sigmoids(paths, pts, half_w, sp, obj_lookup, bshape):
                             zi_, zx_ = 0.5 * (dI[0] + dI[1]), 0.5 * (dX[0] + dX[1])
                             sg_ = np.sign(zq_ - zi_)
                             side_ok = (abs(zq_ - zi_) * sp[0] >= _BLOB_SIDE_UM
-                                       and (zx_ - zi_) * sg_ * sp[0] >= _BLOB_SIDE_UM)
+                                       and (zx_ - zi_) * sg_ * sp[0] >= _BLOB_SIDE_UM
+                                       and abs(zx_ - zq_) * sp[0] <= _BLOB_SIDE_MATCH_UM)
                             side_gain = 100.0 + abs(zx_ - zi_)
                 depth_ok, gain = False, 0.0
                 Ac = xo[(ao >= s0o - 12.0) & (ao <= s0o - 2.0)]
@@ -2025,6 +2029,8 @@ def _fix_sigmoids(paths, pts, half_w, sp, obj_lookup, bshape):
                                  and float(np.median(ratios)) <= _BLOB_COURSE_MED)
                     if course_ok:
                         gain = 10.0 * (1.0 - float(np.median(ratios)))
+                if long_det:
+                    depth_ok = course_ok = False                      # past 16 um only a pair in clearly separate layers is handed over
                 if side_ok:
                     gain = side_gain                                  # a pair already in the blob comes first
                 if not (depth_ok or course_ok or side_ok):
