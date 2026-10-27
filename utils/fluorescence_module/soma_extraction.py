@@ -827,6 +827,11 @@ _MARCH_DISC_UM = 1.2     # within this of the course (across it), at least _MARC
 _MARCH_CLEAR_UM = 0.9    # turning at most _MARCH_TURN_DEG per step, until no free mask is left ahead (at most _MARCH_MAX_UM)
 _MARCH_TURN_DEG = 10.0
 _MARCH_MAX_UM = 60.0
+_HAND_TOUCH_UM = 1.5     # a path of at least 30 um passing within this of where a parallel path ends (`_hand_on_at_ends`),
+_HAND_SIDE_UM = 0.9      # that path having run beside it at least this far off its course,
+_HAND_ON_RATIO = 0.6     # while a third path starts within 3 um of there on the passing path's own line (missing it by at
+#                          most this share of that offset, and by less than the passing path's own rest does): the passing
+#                          path goes on into the third path, and the ending one into the passing path's rest
 
 
 # ---- tiling ------------------------------------------------------------------ #
@@ -1506,7 +1511,8 @@ def _paths_from_skeleton(pts, half_w, bshape, spacing, r, obj_lookup):
     paths = _rejoin_at_bends(paths, sp, r, obj_lookup)
     paths = _end_depth_reversals(paths, sp, r, obj_lookup, bshape)
     paths = _keep_order_at_crossings(paths, sp, obj_lookup)
-    return _cut_climbs(paths, sp, obj_lookup, bshape)
+    paths = _cut_climbs(paths, sp, obj_lookup, bshape)
+    return _hand_on_at_ends(paths, sp, obj_lookup)
 
 
 def _fix_sigmoids(paths, pts, half_w, sp, obj_lookup, bshape):
@@ -2700,6 +2706,122 @@ def _cut_climbs(paths, sp, obj_lookup, bshape):
         new = new[np.r_[True, np.any(np.diff(new, axis=0) != 0, axis=1)]]
         out[i] = new[::-1] if at_start else new
         trails.append(np.array(trail))
+    return [o for o in out if len(o)]
+
+
+def _hand_on_at_ends(paths, sp, obj_lookup):
+    """Re-pair three paths that meet where one ends and another starts.
+
+    A long path i (at least 30 um) passes within _HAND_TOUCH_UM of where a parallel path j ends
+    (within _ORDER_PAR_DEG, at least _HAND_SIDE_UM to the side of i's course before the contact).
+    If i's rest, after the contact, lies on j's line (within _HAND_ON_RATIO of that offset), and a
+    path k starts within 3 um of the contact on i's own line (missing it by no more than
+    _HAND_ON_RATIO of the offset, by less than it misses j's line, and by no more than i's own rest
+    misses i's line), then i stepped onto j's course there: i goes on into k, and j into i's rest.
+    Every path takes part in at most one such repair.
+    """
+    from scipy.spatial import cKDTree
+    sp = np.asarray(sp, float)
+    P = [np.asarray(p_) for p_ in paths]
+    X = [p_ * sp for p_ in P]
+    A = [_arc_points(x, None) if len(x) > 1 else np.zeros(len(x)) for x in X]
+    L = [float(a[-1]) if len(a) else 0.0 for a in A]
+    ends = [(j, w) for j in range(len(P)) if L[j] >= _SIG_MIN_FIBRE_UM for w in (0, -1)]
+    if len(ends) < 3:
+        return P
+    epts = np.array([X[j][w] for j, w in ends])
+    etree = cKDTree(epts)
+
+    def fit(q):
+        c = q.mean(0)
+        return c, np.linalg.svd(q - c, full_matrices=False)[2][0]
+
+    def tow(u, f, t):
+        return u if u @ (t - f) >= 0 else -u
+
+    def miss(c, u, pts):
+        w = pts - c
+        return float(np.median(np.linalg.norm(w - np.outer(w @ u, u), axis=1)))
+
+    W, G, near = _JOIN_WINDOW_UM, _JOIN_SKIP_UM, 3.0
+    c_par = np.cos(np.radians(_ORDER_PAR_DEG))
+    c_turn = np.cos(np.radians(_ORDER_TURN_DEG))
+    found = []
+    for i in range(len(P)):
+        if L[i] < 30.0:
+            continue
+        ti = cKDTree(X[i])
+        for h in sorted(set(h_ for hs in etree.query_ball_point(X[i], _HAND_TOUCH_UM) for h_ in hs)):
+            j, wj = ends[h]
+            pe = epts[h]
+            if j == i:
+                continue
+            s = float(A[i][int(ti.query(pe)[1])])
+            for rev in (False, True):
+                xi = X[i][::-1] if rev else X[i]
+                ai = _arc_points(xi, None)
+                si = float(ai[-1] - s) if rev else s
+                Ai = xi[(ai >= si - W) & (ai <= si - G)]
+                Bi = xi[(ai >= si + G) & (ai <= si + W)]
+                if len(Ai) < 8 or len(Bi) < 8:
+                    continue
+                cA, uA = fit(Ai)
+                uA = tow(uA, Ai[0], Ai[-1])
+                xj = X[j] if wj == -1 else X[j][::-1]
+                aj = _arc_points(xj, None)
+                Qj = xj[aj >= aj[-1] - W + G]
+                if len(Qj) < 6:
+                    continue
+                cQ, uQ = fit(Qj)
+                uQ = tow(uQ, Qj[0], Qj[-1])
+                if uQ @ uA < c_par:
+                    continue                                  # j does not run along i before the contact
+                side = float(np.linalg.norm((cQ - cA) - ((cQ - cA) @ uA) * uA))
+                if side < _HAND_SIDE_UM:
+                    continue
+                mBj, mBi = miss(cQ, uQ, Bi), miss(cA, uA, Bi)
+                if mBj > _HAND_ON_RATIO * side:
+                    continue                                  # i's rest is not on j's line
+                best = None
+                for h2 in etree.query_ball_point(pe, near + W):
+                    kk, wk = ends[h2]
+                    if kk in (i, j):
+                        continue
+                    xk = X[kk] if wk == 0 else X[kk][::-1]
+                    if np.linalg.norm(xk[0] - pe) > near or (xk[0] - pe) @ uA < -near:
+                        continue
+                    ak = _arc_points(xk, None)
+                    Rk = xk[(ak >= G / 2) & (ak <= W)]
+                    if len(Rk) < 8:
+                        continue
+                    uk = tow(fit(Rk)[1], Rk[0], Rk[-1])
+                    mki, mkj = miss(cA, uA, Rk), miss(cQ, uQ, Rk)
+                    if uk @ uA < c_turn or mki > _HAND_ON_RATIO * side or mki >= mkj or mki > mBi:
+                        continue
+                    if best is None or mki < best[0]:
+                        best = (mki, kk, wk)
+                if best is not None:
+                    found.append((side, i, rev, si, j, wj, best[1], best[2]))
+    touched, out = set(), list(P)
+
+    def join(a, b):
+        lk = _line_voxels(a[-1], b[0])
+        lk = lk[obj_lookup(lk)] if len(lk) else lk
+        return np.concatenate([a, lk, b])
+
+    for _side, i, rev, si, j, wj, kk, wk in sorted(found, key=lambda t: -t[0]):
+        if touched & {i, j, kk}:
+            continue
+        Pi = P[i][::-1] if rev else P[i]
+        ai = _arc_points(Pi * sp, None)
+        head = Pi[:int(np.searchsorted(ai, si - G / 2))]
+        tail = Pi[int(np.searchsorted(ai, si + G / 2)):]
+        if min(len(head), len(tail)) < 6:
+            continue
+        out[i] = join(head, P[kk] if wk == 0 else P[kk][::-1])
+        out[j] = join(P[j] if wj == -1 else P[j][::-1], tail)
+        out[kk] = P[kk][:0]
+        touched.update((i, j, kk))
     return [o for o in out if len(o)]
 
 
