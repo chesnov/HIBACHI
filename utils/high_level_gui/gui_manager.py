@@ -609,6 +609,7 @@ class DynamicGUIManager(QObject):
         # Initialize Persistent Log Widget
         self.log_widget: Optional[QTextEdit] = None
         self._init_persistent_log()
+        self._init_label_filter()
 
         # Project Paths
         self.inputdir = os.path.dirname(self.file_loc)
@@ -685,6 +686,16 @@ class DynamicGUIManager(QObject):
         self.viewer.window.add_dock_widget(
             self.log_widget, area="right", name="Process Log"
         )
+
+    def _init_label_filter(self) -> None:
+        """Adds 'Label Filter...' to the Layers menu: a small floating window that
+        shows only, or hides, chosen labels of a Labels layer (view only; the
+        segmentation is not changed)."""
+        try:
+            from .label_filter import install_label_filter_menu
+            install_label_filter_menu(self.viewer)
+        except Exception as e:  # a missing view helper must never stop the app
+            print(f"Label filter unavailable: {e}")
 
     # =========================================================================
     # ROI / SUB-REGION SELECTION

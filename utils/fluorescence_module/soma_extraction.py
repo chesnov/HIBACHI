@@ -840,6 +840,10 @@ _LINE_ROUTE_RATIO = 1.5  # this many times the gap, out of the mask for at most 
 _LINE_CLEAR_UM = 0.9     # this far from other paths over _LINE_CLEAR_SHARE of it), or, if no longer than _JOIN_FAR_R * r
 _LINE_CLEAR_SHARE = 0.8  # and on one line to within _LINE_STRAIGHT_UM, straight across a gap in the mask. An end may
 _LINE_STRAIGHT_UM = 1.2  # first drop a tail of up to 6 um that runs past the other piece (a hook off the course).
+_SIDE_TURN_DEG = 10.0    # a path end and the end of a parallel path (within this) beside it (`_join_side_by_side`),
+_SIDE_OFF_UM = 3.5       # at most this far to the side, overlapping it by up to _SIDE_OVERLAP_UM or at most
+_SIDE_OVERLAP_UM = 10.0  # _SIDE_AHEAD_UM ahead of it, are one fibre with a sideways jog: joined through the mask (a route
+_SIDE_AHEAD_UM = 3.0     # at most 1.6 x the direct distance + 1.5 um, clear of other paths), dropping the overlap
 
 
 # ---- tiling ------------------------------------------------------------------ #
@@ -1521,7 +1525,8 @@ def _paths_from_skeleton(pts, half_w, bshape, spacing, r, obj_lookup):
     paths = _keep_order_at_crossings(paths, sp, obj_lookup)
     paths = _cut_climbs(paths, sp, obj_lookup, bshape)
     paths = _hand_on_at_ends(paths, sp, obj_lookup)
-    return _join_lined_up_ends(paths, sp, r, obj_lookup, bshape)
+    paths = _join_lined_up_ends(paths, sp, r, obj_lookup, bshape)
+    return _join_side_by_side(paths, sp, r, obj_lookup, bshape)
 
 
 def _fix_sigmoids(paths, pts, half_w, sp, obj_lookup, bshape):
@@ -2966,6 +2971,126 @@ def _join_lined_up_ends(paths, sp, r, obj_lookup, bshape):
                 link = _line_voxels(Pa[-1], Pb[0])
                 link = link[obj_lookup(link)] if len(link) else link
             out[ea[0]] = np.concatenate([Pa, link, Pb])
+            out[eb[0]] = P[eb[0]][:0]
+            touched.update((ea[0], eb[0]))
+            n_done += 1
+        P = [o for o in out if len(o)]
+        if not n_done:
+            break
+    return P
+
+
+def _join_side_by_side(paths, sp, r, obj_lookup, bshape):
+    """Join a path end to a parallel path that starts beside it.
+
+    Two pieces of one fibre can be left side by side, offset sideways (up to _SIDE_OFF_UM) and
+    overlapping by up to _SIDE_OVERLAP_UM or a little apart, when the skeleton splits a fibre that
+    jogs sideways in a dense bundle. An end and the oppositely-facing end of a parallel path
+    (within _SIDE_TURN_DEG) placed like that, each the other's best such partner, are joined along
+    the shortest route through the mask between them (at most 1.6 x their direct distance plus
+    1.5 um, out of the mask for at most _JOIN_MASK_GAP_R * r, and clear of other paths over
+    _LINE_CLEAR_SHARE of it); the second piece's part beside the first is dropped. Pieces that
+    simply line up are left to `_join_lined_up_ends`. Repeated for up to three rounds.
+    """
+    from scipy.spatial import cKDTree
+    from skimage.graph import MCP_Geometric
+    sp = np.asarray(sp, float)
+    bsh = np.asarray(bshape)
+    mask_gap = _JOIN_MASK_GAP_R * r
+    W, G = _JOIN_WINDOW_UM, _JOIN_SKIP_UM
+    cos_t = math.cos(math.radians(_SIDE_TURN_DEG))
+    P = [np.asarray(p_) for p_ in paths]
+
+    def fit(q):
+        c = q.mean(0)
+        return c, np.linalg.svd(q - c, full_matrices=False)[2][0]
+
+    for _round in range(3):
+        X = [p_ * sp for p_ in P]
+        L = [float(_arc_points(x, None)[-1]) if len(x) > 1 else 0.0 for x in X]
+        ends = []
+        for i in range(len(P)):
+            if L[i] < _SIG_MIN_FIBRE_UM:
+                continue
+            for w in (0, 1):
+                x = X[i] if w == 1 else X[i][::-1]
+                a = _arc_points(x, None)
+                q = x[(a >= a[-1] - W) & (a <= a[-1] - G)]
+                if len(q) < 8:
+                    continue
+                c, u = fit(q)
+                ends.append((i, w, x[-1], c, u if u @ (q[-1] - q[0]) >= 0 else -u))
+        if len(ends) < 2:
+            break
+        etree = cKDTree(np.array([e[2] for e in ends]))
+        keep = [k for k in range(len(P)) if L[k] >= _SIG_MIN_FIBRE_UM]
+        owner = np.concatenate([[k] * len(X[k]) for k in keep])
+        ptree = cKDTree(np.vstack([X[k] for k in keep]))
+        cands = []
+        for a_, ea in enumerate(ends):
+            for b_ in etree.query_ball_point(ea[2], _SIDE_OVERLAP_UM + _SIDE_OFF_UM):
+                if b_ <= a_:
+                    continue
+                eb = ends[b_]
+                if ea[0] == eb[0] or -float(ea[4] @ eb[4]) < cos_t:
+                    continue
+                u = ea[4] - eb[4]
+                u = u / np.linalg.norm(u)
+                g = eb[2] - ea[2]
+                along = float(g @ u)
+                if along < -_SIDE_OVERLAP_UM or along > _SIDE_AHEAD_UM:
+                    continue
+                d = eb[3] - ea[3]
+                off = float(np.linalg.norm(d - (d @ u) * u))
+                if off > _SIDE_OFF_UM or (along > 0 and off < 2.0):
+                    continue                                  # too far aside, or simply lined up
+                cands.append((off + 0.1 * abs(along), a_, b_, along))
+        cands.sort()
+        best_of = {}
+        for _sc, a_, b_, _al in cands:
+            for e in (a_, b_):
+                best_of.setdefault(ends[e][:2], (a_, b_))
+        touched, out, n_done = set(), list(P), 0
+        for _sc, a_, b_, along in cands:
+            ea, eb = ends[a_], ends[b_]
+            if best_of.get(ea[:2]) != (a_, b_) or best_of.get(eb[:2]) != (a_, b_):
+                continue
+            if ea[0] in touched or eb[0] in touched:
+                continue
+            u = ea[4] - eb[4]
+            u = u / np.linalg.norm(u)
+            Pa = P[ea[0]] if ea[1] == 1 else P[ea[0]][::-1]
+            Pb = P[eb[0]] if eb[1] == 0 else P[eb[0]][::-1]   # starts at b's end
+            if along < 0:                                     # drop b's part beside a
+                ahead = ((Pb * sp - ea[2]) @ u) >= 0
+                if not ahead.any():
+                    continue
+                Pb = Pb[int(np.argmax(ahead)):]
+            if len(Pb) < 6:
+                continue
+            va, vb = Pa[-1], Pb[0]
+            lo = np.maximum(np.minimum(va, vb) - np.array([6, 25, 25]), 0)
+            hi = np.minimum(np.maximum(va, vb) + np.array([7, 26, 26]), bsh)
+            gz, gy, gx = np.meshgrid(*[np.arange(lo[k], hi[k]) for k in range(3)], indexing="ij")
+            inside = obj_lookup(np.stack([gz.ravel(), gy.ravel(), gx.ravel()], 1)).reshape(gz.shape)
+            m_ = MCP_Geometric(np.where(inside, 1.0, 12.0), fully_connected=True, sampling=tuple(sp))
+            m_.find_costs([tuple(va - lo)], [tuple(vb - lo)])
+            try:
+                route = np.array(m_.traceback(tuple(vb - lo))) + lo
+            except ValueError:
+                continue
+            st = np.r_[0.0, np.linalg.norm(np.diff(route * sp, axis=0), axis=1)]
+            out_ = ~obj_lookup(route)
+            run_ = longest = 0.0
+            for k in range(1, len(route)):
+                run_ = run_ + st[k] if out_[k] else 0.0
+                longest = max(longest, run_)
+            dd, hh = ptree.query(route * sp)
+            clear = float(np.mean((dd >= _LINE_CLEAR_UM) | np.isin(owner[hh], [ea[0], eb[0]])))
+            direct = float(np.linalg.norm((vb - va) * sp))
+            if st.sum() > 1.6 * direct + 1.5 or longest > mask_gap or clear < _LINE_CLEAR_SHARE:
+                continue
+            out[ea[0]] = np.concatenate([Pa, route[obj_lookup(route)], Pb])
             out[eb[0]] = P[eb[0]][:0]
             touched.update((ea[0], eb[0]))
             n_done += 1
