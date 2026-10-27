@@ -784,6 +784,9 @@ _BRIDGE_BLOB_SHARE = 0.6   # with at least this share of the stretch between the
 _BLOB_COURSES = ((6, 16), (8, 20), (12, 28), (16, 32))   # or: courses taken this far before the contact (um, so that the bend into
 _BLOB_COURSE_MED = 0.2     # the contact stays out of them), extrapolated across the blob, miss it at most this share (median) of the
 _BLOB_COURSE_ALL = 0.4     # other's miss, and at most this share in every window
+_BLOB_LONG_SCAN_UM = 24.0  # a blob that outlasts the first 16 um is looked for this far, against the lone fibre that comes out of it;
+_BLOB_INSIDE_UM = 4.0      # a fibre that ends inside a blob (double over this much before its end) goes on through it with
+_BLOB_SIDE_UM = 1.0        # the passing fibre and takes what comes out on its own side in depth, by at least this
 _BLOB_LEVEL_DEG = 10.0     # depth ranges are compared only for courses this close to level: one that climbs or dips
 #                            more steeply is at another depth at the contact than over the stretch before it
 _SWAP_MIN_SHIFT_UM = 0.9  # crossing fibres (`_fix_sigmoids`): both steps are at least a fibre width (2 r),
@@ -807,6 +810,11 @@ _DIVE_MIN_UM = 2.5       # reaching at least this far along the incoming course 
 _DIVE_REACH_UM = 8.0     # and ending free, goes on into that piece and ends there; the outgoing leg is a path of its own
 _DIVE_PATH_UM = 30.0     # only paths at least this long are repaired (both legs must stand as fibres afterwards)
 _DIVE_EDGE_SLICES = 2    # and not where the piece runs to within this many slices of the top or bottom of the box
+_ORDER_TOUCH_UM = 1.0    # two paths of at least 30 um that touch (come within this; `_keep_order_at_crossings`)
+_ORDER_SPAN_UM = 8.0     # along no more than this much of their length,
+_ORDER_PAR_DEG = 20.0    # parallel within this on both sides of the contact (courses 2 to 12 um away),
+_ORDER_SIDE_UM = 0.9     # and on opposite sides of each other before and after it, at least this far apart,
+_ORDER_TURN_DEG = 20.0   # swap their continuations if each then turns by no more than this: parallel fibres keep their order
 
 
 # ---- tiling ------------------------------------------------------------------ #
@@ -1484,7 +1492,8 @@ def _paths_from_skeleton(pts, half_w, bshape, spacing, r, obj_lookup):
     # Only now are the pieces of every fibre in place, so a bend that a greedy choice at a contact
     # left in one path, while another path carries straight on from it, can be told apart.
     paths = _rejoin_at_bends(paths, sp, r, obj_lookup)
-    return _end_depth_reversals(paths, sp, r, obj_lookup, bshape)
+    paths = _end_depth_reversals(paths, sp, r, obj_lookup, bshape)
+    return _keep_order_at_crossings(paths, sp, obj_lookup)
 
 
 def _fix_sigmoids(paths, pts, half_w, sp, obj_lookup, bshape):
@@ -1919,27 +1928,66 @@ def _fix_sigmoids(paths, pts, half_w, sp, obj_lookup, bshape):
                 s0o = s0 if fwd else float(ai[-1] - s0)
                 if ao[-1] - s0o < 12.0:
                     continue
-                down = xo[(ao >= s0o) & (ao <= s0o + 16.0)]
-                if len(down) < 20:
+                det = None
+                for scan_, long_ in ((16.0, False), (_BLOB_LONG_SCAN_UM, True)):
+                    down = xo[(ao >= s0o) & (ao <= s0o + scan_)]
+                    if len(down) < 20:
+                        break
+                    st = section_stats(down)
+                    if len(st) < 7:
+                        break
+                    s_k = arc(down)[np.array([r_[0] for r_ in st])]
+                    ar = np.array([r_[1] for r_ in st])
+                    thin_a = float(np.percentile(ar, 25))
+                    if long_:
+                        # A blob can outlast the 16 um scan, which then holds no lone fibre to compare
+                        # with: scan further, take the lone section from the far end of the scan (where
+                        # the single fibre has come out), and let one thin section not break the blob.
+                        far_ = ar[s_k >= s_k[-1] * 2.0 / 3.0]
+                        if len(far_) >= 3:
+                            thin_a = min(thin_a, float(np.percentile(far_, 25)))
+                    big = ar >= _BLOB_RATIO * thin_a
+                    if long_ and len(big) > 2:
+                        big[1:-1] |= big[:-2] & big[2:]
+                    near = np.nonzero(big & (s_k <= 6.0))[0]
+                    if not len(near):
+                        continue
+                    run_end = int(near[0])
+                    while run_end + 1 < len(big) and big[run_end + 1]:
+                        run_end += 1
+                    if s_k[run_end] - s_k[near[0]] < _BLOB_MIN_UM:
+                        continue
+                    beyond = [b for b in range(run_end + 1, len(big)) if not big[b]]
+                    if len(beyond) < 3 or s_k[beyond[0]] - s_k[run_end] > 2.0:
+                        continue                                      # no single fibre comes out of it
+                    det = (down, st, s_k, run_end, beyond, thin_a)
+                    break
+                if det is None:
                     continue
-                st = section_stats(down)
-                if len(st) < 7:
-                    continue
-                s_k = arc(down)[np.array([r_[0] for r_ in st])]
-                ar = np.array([r_[1] for r_ in st])
-                thin_a = float(np.percentile(ar, 25))
-                big = ar >= _BLOB_RATIO * thin_a
-                near = np.nonzero(big & (s_k <= 6.0))[0]
-                if not len(near):
-                    continue
-                run_end = int(near[0])
-                while run_end + 1 < len(big) and big[run_end + 1]:
-                    run_end += 1
-                if s_k[run_end] - s_k[near[0]] < _BLOB_MIN_UM:
-                    continue
-                beyond = [b for b in range(run_end + 1, len(big)) if not big[b]]
-                if len(beyond) < 3 or s_k[beyond[0]] - s_k[run_end] > 2.0:
-                    continue                                          # no single fibre comes out of it
+                down, st, s_k, run_end, beyond, thin_a = det
+                # Is the fibre that ends here already inside the blob before it ends (the passing
+                # path's section double over the last _BLOB_INSIDE_UM before the contact)? Then the
+                # two run through it as a pair, and the one that comes out goes by their order in
+                # depth: the ending fibre takes it if it lies on the ending fibre's side of the
+                # passing fibre's own depth (where that runs alone, upstream), by _BLOB_SIDE_UM.
+                side_ok = False
+                up_ = xo[(ao >= s0o - _BLOB_LONG_SCAN_UM) & (ao <= s0o)]
+                st_up = section_stats(up_) if len(up_) >= 20 else []
+                if len(st_up) >= 7:
+                    s_up = arc(up_)[np.array([r_[0] for r_ in st_up])]
+                    a_up = np.array([r_[1] for r_ in st_up])
+                    last_ = s_up >= s_up[-1] - _BLOB_INSIDE_UM
+                    lone_up = [r_ for r_ in st_up if r_[1] < _BLOB_RATIO * thin_a]
+                    if last_.sum() >= 2 and np.mean(a_up[last_] >= _BLOB_RATIO * thin_a) >= 0.6 and len(lone_up) >= 3:
+                        dI = depth_range(lone_up)
+                        dX = depth_range([st[b_] for b_ in beyond[:8]])
+                        zq_ = float(np.mean(xq[aq >= aq[-1] - 3.0][:, 0])) / sp[0]
+                        if dI is not None and dX is not None:
+                            zi_, zx_ = 0.5 * (dI[0] + dI[1]), 0.5 * (dX[0] + dX[1])
+                            sg_ = np.sign(zq_ - zi_)
+                            side_ok = (abs(zq_ - zi_) * sp[0] >= _BLOB_SIDE_UM
+                                       and (zx_ - zi_) * sg_ * sp[0] >= _BLOB_SIDE_UM)
+                            side_gain = 100.0 + abs(zx_ - zi_)
                 depth_ok, gain = False, 0.0
                 Ac = xo[(ao >= s0o - 12.0) & (ao <= s0o - 2.0)]
                 if len(Ac) >= 8 and all(abs(fit(c_)[1][0]) <= sin_level for c_ in (Ac, Qc)):
@@ -1977,7 +2025,9 @@ def _fix_sigmoids(paths, pts, half_w, sp, obj_lookup, bshape):
                                  and float(np.median(ratios)) <= _BLOB_COURSE_MED)
                     if course_ok:
                         gain = 10.0 * (1.0 - float(np.median(ratios)))
-                if not (depth_ok or course_ok):
+                if side_ok:
+                    gain = side_gain                                  # a pair already in the blob comes first
+                if not (depth_ok or course_ok or side_ok):
                     continue
                 if (q, i) not in found or gain > found[(q, i)][0]:
                     found[(q, i)] = (gain, wq, fwd, s0o + float(s_k[run_end]))
@@ -2362,6 +2412,104 @@ def _end_depth_reversals(paths, sp, r, obj_lookup, bshape):
     kept = [o for o in out if len(o)]
     # The released legs end where the dive was: mend them like any other break (only they may join).
     return _mend_breaks(kept + extra, sp, r, obj_lookup, focus=range(len(kept), len(kept) + len(extra)), bshape=bshape)
+
+
+def _keep_order_at_crossings(paths, sp, obj_lookup):
+    """Swap the continuations of two parallel paths that cross where they touch.
+
+    Fibres that run parallel through a bundle keep their order. Where two long paths (at least
+    30 um) touch along no more than _ORDER_SPAN_UM, are parallel on both sides of the contact
+    (within _ORDER_PAR_DEG, courses 2 to 12 um away from it) and swap sides there (at least
+    _ORDER_SIDE_UM apart before and after, on opposite sides), the tracer has carried each onto
+    the other. Their continuations are swapped if each then turns by no more than _ORDER_TURN_DEG.
+    Every path takes part in at most one swap.
+    """
+    from scipy.spatial import cKDTree
+    sp = np.asarray(sp, float)
+    P = [np.asarray(p_) for p_ in paths]
+    X = [p_ * sp for p_ in P]
+    A = [_arc_points(x, None) if len(x) > 1 else np.zeros(len(x)) for x in X]
+    L = [float(a[-1]) if len(a) else 0.0 for a in A]
+    big = [i for i in range(len(P)) if L[i] >= 30.0]
+    if len(big) < 2:
+        return P
+
+    def fit(q):
+        c = q.mean(0)
+        return c, np.linalg.svd(q - c, full_matrices=False)[2][0]
+
+    def towards(u, f, t):
+        return u if u @ (t - f) >= 0 else -u
+
+    def legs(x, a, s):
+        Aq = x[(a >= s - _JOIN_WINDOW_UM) & (a <= s - _JOIN_SKIP_UM)]
+        Bq = x[(a >= s + _JOIN_SKIP_UM) & (a <= s + _JOIN_WINDOW_UM)]
+        if len(Aq) < 8 or len(Bq) < 8:
+            return None
+        cA, uA = fit(Aq)
+        cB, uB = fit(Bq)
+        return cA, towards(uA, Aq[0], Aq[-1]), cB, towards(uB, Bq[0], Bq[-1])
+
+    def side(c1, u1, c2, u2):
+        m = u1 + u2
+        m = m / np.linalg.norm(m)
+        d = c2 - c1
+        return d - (d @ m) * m
+
+    c_par = np.cos(np.radians(_ORDER_PAR_DEG))
+    c_turn = np.cos(np.radians(_ORDER_TURN_DEG))
+    boxes = {i: (X[i].min(0) - _ORDER_TOUCH_UM, X[i].max(0) + _ORDER_TOUCH_UM) for i in big}
+    trees = {}
+    found = {}
+    for n_, i in enumerate(big):
+        for j in big[n_ + 1:]:
+            if np.any(boxes[i][1] < boxes[j][0]) or np.any(boxes[j][1] < boxes[i][0]):
+                continue
+            if i not in trees:
+                trees[i] = cKDTree(X[i])
+            d, k = trees[i].query(X[j], distance_upper_bound=_ORDER_TOUCH_UM)
+            kj = np.nonzero(np.isfinite(d))[0]
+            if not len(kj) or A[j][kj].max() - A[j][kj].min() > _ORDER_SPAN_UM:
+                continue                                      # apart, or running together rather than crossing
+            m = int(kj[np.argmin(d[kj])])
+            si, sj = float(A[i][int(k[m])]), float(A[j][m])
+            li, lj = legs(X[i], A[i], si), legs(X[j], A[j], sj)
+            if li is None or lj is None:
+                continue
+            cAi, uAi, cBi, uBi = li
+            cAj, uAj, cBj, uBj = lj
+            revj = bool(uAi @ uAj < 0)
+            if revj:                                          # j runs the other way
+                cAj, uAj, cBj, uBj = cBj, -uBj, cAj, -uAj
+            if uAi @ uAj < c_par or uBi @ uBj < c_par:
+                continue                                      # not two parallel fibres
+            db, da = side(cAi, uAi, cAj, uAj), side(cBi, uBi, cBj, uBj)
+            if min(np.linalg.norm(db), np.linalg.norm(da)) < _ORDER_SIDE_UM or db @ da >= 0:
+                continue                                      # they keep their order already
+            if uAi @ uBj < c_turn or uAj @ uBi < c_turn:
+                continue
+            found[(i, j)] = (si, sj, revj, float(min(np.linalg.norm(db), np.linalg.norm(da))))
+    touched, out = set(), list(P)
+    half = 0.5 * _JOIN_SKIP_UM
+    for (i, j), (si, sj, revj, _sc) in sorted(found.items(), key=lambda t: -t[1][3]):
+        if i in touched or j in touched:
+            continue
+        Pj = P[j][::-1] if revj else P[j]
+        sj_ = float(A[j][-1] - sj) if revj else sj
+        aj = _arc_points(Pj * sp, None)
+        ai = A[i]
+        hi_, ti_ = P[i][:int(np.searchsorted(ai, si - half))], P[i][int(np.searchsorted(ai, si + half)):]
+        hj_, tj_ = Pj[:int(np.searchsorted(aj, sj_ - half))], Pj[int(np.searchsorted(aj, sj_ + half)):]
+        if min(len(hi_), len(ti_), len(hj_), len(tj_)) < 6:
+            continue
+        new = []
+        for h, t in ((hi_, tj_), (hj_, ti_)):
+            lk = _line_voxels(h[-1], t[0])
+            lk = lk[obj_lookup(lk)] if len(lk) else lk
+            new.append(np.concatenate([h, lk, t]))
+        out[i], out[j] = new
+        touched.update((i, j))
+    return out
 
 
 def _end_course(pv, which, sp):
