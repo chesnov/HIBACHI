@@ -158,6 +158,7 @@ _ORDER_SIDE_UM = 0.9     # and on opposite sides of each other before and after 
 _ORDER_TURN_DEG = 20.0   # swap their continuations if each then turns by no more than this: parallel fibres keep their order
 _CLIMB_DEG = 40.0        # a path of at least 30 um that, after a course within _CLIMB_LEVEL_DEG of level over 12 um,
 _CLIMB_LEVEL_DEG = 20.0  # climbs or dips at least this steeply (over 2 um steps) through at least _CLIMB_DEPTH_UM of depth
+_HOP_LEVEL_DEG = 10.0    # a climb in mid-path is a hop between two fibres if the path runs within this of level, 12 um before and after
 _CLIMB_DEPTH_UM = 3.0    # to its end has cut across the layers (`_cut_climbs`): it is cut where the climb starts,
 _CLIMB_NEAR_UM = 5.0     # and it, and the paths that end within this of the climb, go on along their own courses
 _MARCH_STEP_UM = 0.5     # through mask that no other path claims: steps of this length, each centred on the free mask
@@ -1935,7 +1936,10 @@ def _cut_climbs(paths, sp, obj_lookup, bshape):
     that crosses the layers, carrying a fibre steeply up or down out of its course. A path of at
     least 30 um that, after a course within _CLIMB_LEVEL_DEG of level over its last 12 um,
     climbs or dips at least _CLIMB_DEG steeply through at least _CLIMB_DEPTH_UM of depth, to
-    (near) its end, is cut where the climb starts and the climb is dropped. That path, and every
+    (near) its end, is cut where the climb starts and the climb is dropped. If instead the path
+    goes on past the climb for at least 12 um, and runs within _HOP_LEVEL_DEG of level over
+    12 um both before and after it, it hopped from one fibre onto another: the climb is dropped and the rest
+    becomes a path of its own. That path, and every
     path of at least _SIG_MIN_FIBRE_UM that ends within _CLIMB_NEAR_UM of the dropped climb, is
     then marched on along its course through mask no other path claims (`_MARCH_*`).
     Paths without a climb near them are returned untouched.
@@ -1955,6 +1959,7 @@ def _cut_climbs(paths, sp, obj_lookup, bshape):
 
     s_climb = np.sin(np.radians(_CLIMB_DEG))
     s_level = np.sin(np.radians(_CLIMB_LEVEL_DEG))
+    s_hop = np.sin(np.radians(_HOP_LEVEL_DEG))
     win, course_um = 2.0, _JOIN_WINDOW_UM
     cuts = []
     for i in range(len(P)):
@@ -1984,18 +1989,30 @@ def _cut_climbs(paths, sp, obj_lookup, bshape):
                             j = j2
                             if ndd == 0 or np.sign(dd[0]) != sgn or abs(dd[0]) / ndd < s_climb:
                                 break
-                        if abs(x[j][0] - x[k][0]) >= _CLIMB_DEPTH_UM and n - 1 - j < 20:
-                            cuts.append((i, rev, k, uc))
-                            found = True
+                        if abs(x[j][0] - x[k][0]) >= _CLIMB_DEPTH_UM:
+                            if n - 1 - j < 20:
+                                cuts.append((i, rev, k, uc, None))   # the climb runs to the end
+                                found = True
+                            elif a[-1] - a[j] >= course_um and abs(uc[0]) <= s_hop:
+                                # The path goes on, level again, in another layer: it hopped from
+                                # one fibre onto another. Its rest is a fibre of its own.
+                                after = x[(a >= a[j]) & (a <= a[j] + course_um)]
+                                if len(after) >= 6 and abs(fit_dir(after)[0]) <= s_hop:
+                                    cuts.append((i, rev, k, uc, j))
+                                    found = True
                 k += 1
             if found:
                 break
     if not cuts:
         return P
-    out, released, removed = list(P), [], []
-    for i, rev, k, uc in cuts:
+    out, released, removed, hopped = list(P), [], [], []
+    for i, rev, k, uc, j in cuts:
         Pi = P[i][::-1] if rev else P[i]
-        removed.append(Pi[k + 1:])
+        if j is None:
+            removed.append(Pi[k + 1:])
+        else:
+            removed.append(Pi[k + 1:j])
+            hopped.append(Pi[j:])
         out[i] = Pi[:k + 1]
         released.append((i, uc, False))
     rtree = cKDTree(np.vstack(removed) * sp)
@@ -2063,7 +2080,7 @@ def _cut_climbs(paths, sp, obj_lookup, bshape):
         new = new[np.r_[True, np.any(np.diff(new, axis=0) != 0, axis=1)]]
         out[i] = new[::-1] if at_start else new
         trails.append(np.array(trail))
-    return [o for o in out if len(o)]
+    return [o for o in out + hopped if len(o)]
 
 
 def _hand_on_at_ends(paths, sp, obj_lookup):
