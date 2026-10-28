@@ -2851,7 +2851,7 @@ def _stitch_paths(paths, sp, r, obj_lookup):
     return _mend_breaks(chains, sp, r, obj_lookup)
 
 
-def _elongated_label_candidates(lbl, sl, segmentation_mask, intensity_image,
+def _elongated_fibre_candidates(lbl, sl, segmentation_mask, intensity_image,
                                 params: "_CandidateParams"):
     """Seeds for spindle- or fibre-shaped cells, from the MASK's skeleton.
 
@@ -3223,3 +3223,33 @@ def _elongated_label_candidates(lbl, sl, segmentation_mask, intensity_image,
         return candidates, diag
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
+
+
+def _elongated_label_candidates(lbl, sl, segmentation_mask, intensity_image, params):
+    """Seed candidates for one object in elongated mode.
+
+    The object's fibres (`_elongated_fibre_candidates`). An object none of whose fibre pieces
+    reaches the minimum seed size, but which is itself at least that large, becomes one seed
+    as a whole: it is a short piece of fibre the trimming cut off from its neighbours, and
+    leaving it without a soma would drop it from the segmentation.
+    """
+    candidates, diag = _elongated_fibre_candidates(lbl, sl, segmentation_mask, intensity_image, params)
+    if candidates:
+        return candidates, diag
+    own = np.asarray(segmentation_mask[tuple(sl)]) == lbl
+    n = int(own.sum())
+    if n < int(params.min_seed_vol):
+        return candidates, diag
+    cc = (np.argwhere(own) + np.array([s_.start for s_ in sl])).astype(np.int32)
+    candidates = [{
+        "coords": cc,
+        "peak_coord": np.asarray(cc[len(cc) // 2]),
+        "vol": n,
+        "score": 1.0,
+        "strat_name": "WholeObject",
+        "frag_max_thick": 0.0,
+        "family": "Fibre",
+        "dt_vals": np.zeros(n, np.float32),
+        "rank_vals": np.zeros(n, np.float32),
+    }]
+    return candidates, diag
