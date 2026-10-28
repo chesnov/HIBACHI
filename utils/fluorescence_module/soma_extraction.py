@@ -846,6 +846,7 @@ _FREE_MARCH_MIN_UM = 8.0 # a free path end then goes on through mask nobody clai
 _SIDE_TURN_DEG = 10.0    # a path end and the end of a parallel path (within this) beside it (`_join_side_by_side`),
 _SIDE_OFF_UM = 3.5       # at most this far to the side, overlapping it by up to _SIDE_OVERLAP_UM or at most
 _SIDE_OVERLAP_UM = 10.0  # _SIDE_AHEAD_UM ahead of it, are one fibre with a sideways jog: joined through the mask (a route
+_SIDE_ROUTE_RATIO = 2.5  # (the route through the mask between them may be up to this many times their distance + 1.5 um)
 _SIDE_AHEAD_UM = 3.0     # at most 1.6 x the direct distance + 1.5 um, clear of other paths), dropping the overlap
 
 
@@ -3000,9 +3001,10 @@ def _join_side_by_side(paths, sp, r, obj_lookup, bshape):
     overlapping by up to _SIDE_OVERLAP_UM or a little apart, when the skeleton splits a fibre that
     jogs sideways in a dense bundle. An end and the oppositely-facing end of a parallel path
     (within _SIDE_TURN_DEG) placed like that, each the other's best such partner, are joined along
-    the shortest route through the mask between them (at most 1.6 x their direct distance plus
-    1.5 um, out of the mask for at most _JOIN_MASK_GAP_R * r, and clear of other paths over
-    _LINE_CLEAR_SHARE of it); the second piece's part beside the first is dropped. Pieces that
+    the shortest route through the mask between them (at most _SIDE_ROUTE_RATIO x their direct
+    distance plus 1.5 um, out of the mask for at most _JOIN_MASK_GAP_R * r, and clear of other paths over
+    _LINE_CLEAR_SHARE of it). Where they overlap, of the two stretches beside each other the one
+    that bends further off its own piece's course is dropped, as it belongs to another fibre. Pieces that
     simply line up are left to `_join_lined_up_ends`. Repeated for up to three rounds.
     """
     from scipy.spatial import cKDTree
@@ -3074,11 +3076,32 @@ def _join_side_by_side(paths, sp, r, obj_lookup, bshape):
             u = u / np.linalg.norm(u)
             Pa = P[ea[0]] if ea[1] == 1 else P[ea[0]][::-1]
             Pb = P[eb[0]] if eb[1] == 0 else P[eb[0]][::-1]   # starts at b's end
-            if along < 0:                                     # drop b's part beside a
-                ahead = ((Pb * sp - ea[2]) @ u) >= 0
+            if along < 0:
+                # The two pieces overlap. Of the two stretches that lie beside each other, the one
+                # that bends off its own piece's course belongs to another fibre: drop that one.
+                ahead = ((Pb * sp - ea[2]) @ u) >= 0          # b's points past a's end
+                past = ((Pa * sp - eb[2]) @ u) > 0            # a's points past b's end
                 if not ahead.any():
                     continue
-                Pb = Pb[int(np.argmax(ahead)):]
+                k0 = int(np.argmax(ahead))
+                k1 = int(np.argmax(past)) if past.any() else len(Pa)
+
+                def tail_miss(body, tail):
+                    if len(body) < 8 or len(tail) < 3:
+                        return 0.0
+                    bx = body * sp
+                    ab = _arc_points(bx, None)
+                    q = bx[ab >= ab[-1] - W] if len(bx) else bx
+                    c_, u_ = fit(q)
+                    w_ = tail * sp - c_
+                    return float(np.median(np.linalg.norm(w_ - np.outer(w_ @ u_, u_), axis=1)))
+
+                miss_a = tail_miss(Pa[:k1], Pa[k1:])
+                miss_b = tail_miss(Pb[k0:][::-1], Pb[:k0][::-1])
+                if miss_a > miss_b and k1 >= 6:
+                    Pa = Pa[:k1]                              # a's stretch beside b bends off: drop it
+                else:
+                    Pb = Pb[k0:]                              # b's stretch beside a bends off: drop it
             if len(Pb) < 6:
                 continue
             va, vb = Pa[-1], Pb[0]
@@ -3101,7 +3124,7 @@ def _join_side_by_side(paths, sp, r, obj_lookup, bshape):
             dd, hh = ptree.query(route * sp)
             clear = float(np.mean((dd >= _LINE_CLEAR_UM) | np.isin(owner[hh], [ea[0], eb[0]])))
             direct = float(np.linalg.norm((vb - va) * sp))
-            if st.sum() > 1.6 * direct + 1.5 or longest > mask_gap or clear < _LINE_CLEAR_SHARE:
+            if st.sum() > _SIDE_ROUTE_RATIO * direct + 1.5 or longest > mask_gap or clear < _LINE_CLEAR_SHARE:
                 continue
             out[ea[0]] = np.concatenate([Pa, route[obj_lookup(route)], Pb])
             out[eb[0]] = P[eb[0]][:0]
