@@ -222,47 +222,68 @@ from contextlib import contextmanager
 try:
     from ..fluorescence_module.resource_budget import (
         ProcessingCancelled,
+        bind_run as _bind_run,
         clear_cancel as _cancel_clear,
+        new_run_token as _new_run_token,
         request_cancel as _cancel_request,
+        unbind_run as _unbind_run,
     )
 except ImportError:  # pragma: no cover - direct script execution
     from resource_budget import (
         ProcessingCancelled,
+        bind_run as _bind_run,
         clear_cancel as _cancel_clear,
+        new_run_token as _new_run_token,
         request_cancel as _cancel_request,
+        unbind_run as _unbind_run,
     )
 
 _orphan_threads = []
 _quit_hook_connected = False
 
 def _cleanup_all_orphans():
-    """Forcefully terminate any lingering background threads on app exit to prevent C++ aborts."""
+    """Stop every lingering step at app exit, so no copy of the app stays behind.
+
+    Ask first, kill the step's worker processes, then wait. Never
+    `QThread.terminate()`: stopping a thread that is running Python at an
+    arbitrary instruction can leave the interpreter lock held, and the process
+    then hangs on exit -- the window is gone but the app keeps running in the
+    background until it is killed. If a thread still has not stopped after the
+    grace period, the process exits hard instead (logs flushed first).
+    """
     pending = [w for w in _orphan_threads if w is not None]
     if pending:
         lifecycle("orphan_threads.cleanup", {"count": len(pending)})
-    # Ask first, then wait, then force. `terminate()` alone was the whole
-    # policy, and it stops a thread at an arbitrary instruction -- mid-write to
-    # a memmap, or inside a C extension where it aborts the process. Requesting
-    # cancellation gives the step a chance to stop at a boundary it chose; the
-    # wait below is what makes that chance real.
-    _cancel_request()
+    _cancel_request()                        # every run, and code outside one
+    for worker in pending:
+        tok = getattr(worker, "cancel_token", None)
+        if tok is not None:
+            _cancel_request(tok)
+    try:
+        _terminate_new_children(set())       # all of this app's worker processes
+    except Exception:
+        log.exception("Error stopping worker processes")
     deadline_ms = 10_000
-    for worker in list(_orphan_threads):
+    stuck = []
+    for worker in list(pending):
         try:
-            if worker is not None and worker.isRunning():
+            if worker.isRunning():
                 log.warning("Waiting for orphan worker thread to stop: %r", worker)
                 if not worker.wait(deadline_ms):
-                    log.warning("Orphan worker did not stop in %ss; terminating: %r",
-                                deadline_ms // 1000, worker)
-                    worker.terminate()
-                    worker.wait(200)  # Give it time to cleanly exit C++ scope
-                # Only the FIRST thread gets the full grace period. Several
-                # orphans each waiting ten seconds would make closing the window
-                # feel broken.
+                    stuck.append(worker)
+                # Only the FIRST thread gets the full grace period.
                 deadline_ms = 1_000
         except Exception:
             log.exception("Error stopping orphan thread")
     _orphan_threads.clear()
+    if stuck:
+        log.warning("%d worker thread(s) did not stop; exiting without waiting for them.", len(stuck))
+        try:
+            import logging as _lg
+            _lg.shutdown()
+        except Exception:
+            pass
+        os._exit(0)
 
 def _register_quit_hook():
     global _quit_hook_connected
@@ -480,13 +501,20 @@ class StepWorker(QThread):
         self.step_index = step_index
         self.image_stack = image_stack
         self.params = params
+        # This run's own cancellation token: stopping it cannot be undone by
+        # the next step's launch, and cancelling another run does not touch it.
+        self.cancel_token = _new_run_token()
 
     def run(self) -> None:
         # Held for the life of the step and released however it ends (success,
         # error, cancel). Done here rather than around `start()` so an orphaned
         # worker that keeps running after its window closes is still covered.
-        with keep_awake("HIBACHI is processing"):
-            self._run_step()
+        _bind_run(self.cancel_token)
+        try:
+            with keep_awake("HIBACHI is processing"):
+                self._run_step()
+        finally:
+            _unbind_run()
 
     def _run_step(self) -> None:
         lifecycle("worker.run.start", {"step": self.step_index})
@@ -2027,7 +2055,9 @@ class DynamicGUIManager(QObject):
             # detached, and it went on to run the entire step -- holding a core
             # and several GB long after the window was gone. The flag is checked
             # at chunk boundaries, so the step stops somewhere its data is in a
-            # known state.
+            # known state. The worker's own token is set, so the run stays
+            # cancelled even after the next step is launched.
+            _cancel_request(getattr(self.worker, "cancel_token", None))
             _cancel_request()
 
             # Then kill the multiprocessing.Pool workers this step spawned, for

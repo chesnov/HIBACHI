@@ -1029,6 +1029,7 @@ def extract_soma_masks(
         temp_dir=memmap_dir,
     )
 
+    resource_budget.check_cancelled()     # before spawning any worker
     _pool = None
     if _gen_workers > 1:
         try:
@@ -1045,18 +1046,28 @@ def extract_soma_masks(
         for _w0 in range(0, len(valid_labels), _gen_window):
             _batch = valid_labels[_w0:_w0 + _gen_window]
 
+            resource_budget.check_cancelled()
             if _pool is None:
-                _results = [
-                    (lb, _generate_label_candidates(
+                _results = []
+                for lb in _batch:
+                    resource_budget.check_cancelled()
+                    _results.append((lb, _generate_label_candidates(
                         lb, slices[lb - 1], segmentation_mask, intensity_image,
-                        _gen_params), None)
-                    for lb in _batch
-                ]
+                        _gen_params), None))
             else:
-                _results = _pool.map(
+                # Waited on in short slices, not with a blocking `map`: a blocking
+                # map can neither see a cancellation request nor return if a
+                # worker is killed (the pool replaces the worker and the lost task
+                # never completes), which left a closed window's step running in
+                # the background. On cancel, the `finally` below terminates the pool.
+                _async = _pool.map_async(
                     _soma_worker,
                     [(lb, slices[lb - 1], _gen_params) for lb in _batch],
                 )
+                while not _async.ready():
+                    _async.wait(0.5)
+                    resource_budget.check_cancelled()
+                _results = _async.get()
 
             for lbl, _payload, _err in _results:
                 if _err is not None:

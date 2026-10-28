@@ -88,10 +88,13 @@ except ImportError:  # pragma: no cover - psutil is in environment.yml
 __all__ = [
     "GB",
     "ProcessingCancelled",
+    "bind_run",
     "cancel_requested",
     "check_cancelled",
     "clear_cancel",
+    "new_run_token",
     "request_cancel",
+    "unbind_run",
     "MIN_RAM_GB",
     "PINNED",
     "BlockPlan",
@@ -1300,10 +1303,16 @@ def describe_environment(settings: Optional[ResourceSettings] = None) -> str:
 # written so far either complete, or about to be deleted by the caller. Do not
 # put one between two writes that must both land.
 #
-# Process-global, deliberately: one window runs one step at a time, and
-# threading a token through five modules' call signatures would touch far more
-# code than the problem is worth. It is not inherited by multiprocessing
-# children -- those are still stopped by killing them, which stays correct.
+# One token per run. The flag used to be a single process-global Event, cleared
+# whenever a step was launched. That broke the case it exists for: a step the
+# user left is detached and keeps unwinding in its thread, and when the user
+# started the step again, `clear_cancel()` reset the shared flag -- so the
+# detached run carried on to the end, alongside the new one, writing the same
+# artifacts. Each run now binds its own token to its thread (`bind_run`), and
+# `check_cancelled()` reads that token; starting a new run cannot un-cancel an
+# old one. Code running outside a bound run (no token in this thread) still
+# sees the process-wide flag, as before. Not inherited by multiprocessing
+# children -- those are stopped by terminating their pool.
 
 class ProcessingCancelled(Exception):
     """Raised by `check_cancelled()` when the user has asked the current step to stop.
@@ -1314,32 +1323,66 @@ class ProcessingCancelled(Exception):
     """
 
 
-_cancelled = threading.Event()
+_cancelled = threading.Event()          # process-wide: for code outside a bound run
+_run_local = threading.local()          # .token: this thread's run token, if any
+_active_tokens: "set" = set()
+_tokens_lock = threading.Lock()
 
 
-def request_cancel() -> None:
-    """Ask the running step to stop at its next cancellation point."""
+def new_run_token() -> threading.Event:
+    """A fresh cancellation token for one run (set it to cancel that run only)."""
+    return threading.Event()
+
+
+def bind_run(token: threading.Event) -> None:
+    """Make `token` the cancellation token of the calling thread's run."""
+    _run_local.token = token
+    with _tokens_lock:
+        _active_tokens.add(token)
+
+
+def unbind_run() -> None:
+    """End the calling thread's run (its token is no longer cancelled by a global request)."""
+    tok = getattr(_run_local, "token", None)
+    _run_local.token = None
+    if tok is not None:
+        with _tokens_lock:
+            _active_tokens.discard(tok)
+
+
+def request_cancel(token: Optional[threading.Event] = None) -> None:
+    """Ask a run to stop at its next cancellation point.
+
+    With a token, only that run is cancelled. Without one, every bound run is,
+    and so is code outside a run (the process-wide flag).
+    """
+    if token is not None:
+        token.set()
+        return
     _cancelled.set()
+    with _tokens_lock:
+        for tok in list(_active_tokens):
+            tok.set()
 
 
 def clear_cancel() -> None:
-    """Reset before starting a step.
+    """Reset the process-wide flag before starting a step.
 
-    Called when a step is launched, not when one finishes: a step that ended by
-    being cancelled must leave the flag set until the next one starts, or a
-    second step queued behind it would run with a stale request.
+    Runs that were cancelled keep their own token set: clearing here cannot
+    revive a detached run that is still unwinding.
     """
     _cancelled.clear()
 
 
 def cancel_requested() -> bool:
-    """True when cancellation has been asked for. Does not raise."""
-    return _cancelled.is_set()
+    """True when the calling thread's run (or, outside a run, the process) was asked to stop."""
+    tok = getattr(_run_local, "token", None)
+    return tok.is_set() if tok is not None else _cancelled.is_set()
 
 
 def check_cancelled() -> None:
     """Raise `ProcessingCancelled` if cancellation has been requested."""
-    if _cancelled.is_set():
+    if cancel_requested():
         raise ProcessingCancelled("processing cancelled by the user")
 
 
