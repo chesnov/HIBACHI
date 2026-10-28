@@ -840,6 +840,9 @@ _LINE_ROUTE_RATIO = 1.5  # this many times the gap, out of the mask for at most 
 _LINE_CLEAR_UM = 0.9     # this far from other paths over _LINE_CLEAR_SHARE of it), or, if no longer than _JOIN_FAR_R * r
 _LINE_CLEAR_SHARE = 0.8  # and on one line to within _LINE_STRAIGHT_UM, straight across a gap in the mask. An end may
 _LINE_STRAIGHT_UM = 1.2  # first drop a tail of up to 6 um that runs past the other piece (a hook off the course).
+_LINE_OVERLAP_UM = 3.0   # ends that run past each other by up to this, on one line to within _LINE_STRAIGHT_UM and
+_LINE_OVERLAP_TURN_DEG = 22.0  # continuing each other's course within this, are joined too
+_FREE_MARCH_MIN_UM = 8.0 # a free path end then goes on through mask nobody claims (`_march_free_ends`), if that is this long
 _SIDE_TURN_DEG = 10.0    # a path end and the end of a parallel path (within this) beside it (`_join_side_by_side`),
 _SIDE_OFF_UM = 3.5       # at most this far to the side, overlapping it by up to _SIDE_OVERLAP_UM or at most
 _SIDE_OVERLAP_UM = 10.0  # _SIDE_AHEAD_UM ahead of it, are one fibre with a sideways jog: joined through the mask (a route
@@ -1526,7 +1529,8 @@ def _paths_from_skeleton(pts, half_w, bshape, spacing, r, obj_lookup):
     paths = _cut_climbs(paths, sp, obj_lookup, bshape)
     paths = _hand_on_at_ends(paths, sp, obj_lookup)
     paths = _join_lined_up_ends(paths, sp, r, obj_lookup, bshape)
-    return _join_side_by_side(paths, sp, r, obj_lookup, bshape)
+    paths = _join_side_by_side(paths, sp, r, obj_lookup, bshape)
+    return _march_free_ends(paths, sp, obj_lookup, bshape)
 
 
 def _fix_sigmoids(paths, pts, half_w, sp, obj_lookup, bshape):
@@ -2866,6 +2870,7 @@ def _join_lined_up_ends(paths, sp, r, obj_lookup, bshape):
 
     cos_t = math.cos(math.radians(_LINE_TURN_DEG))
     cos_long = math.cos(math.radians(_LINE_LONG_TURN_DEG))
+    cos_overlap = math.cos(math.radians(_LINE_OVERLAP_TURN_DEG))
     W, G = _JOIN_WINDOW_UM, _JOIN_SKIP_UM
     for _round in range(3):
         X = [p_ * sp for p_ in P]
@@ -2905,10 +2910,17 @@ def _join_lined_up_ends(paths, sp, r, obj_lookup, bshape):
                     continue
                 g = eb[3] - ea[3]
                 gap = float(np.linalg.norm(g))
-                if gap < 1e-6 or g @ ea[5] <= 0 or -g @ eb[5] <= 0:
+                if gap < 1e-6:
                     continue
                 cosab = -float(ea[5] @ eb[5])
-                if cosab < cos_t:
+                overlap = g @ ea[5] <= 0 or -g @ eb[5] <= 0
+                if overlap:
+                    # Ends that run past each other by up to _LINE_OVERLAP_UM, on one line to within
+                    # _LINE_STRAIGHT_UM: one fibre whose two pieces overlap at the break.
+                    if (ea[2] or eb[2] or g @ ea[5] < -_LINE_OVERLAP_UM or -g @ eb[5] < -_LINE_OVERLAP_UM
+                            or cosab < cos_overlap):
+                        continue
+                elif cosab < cos_t:
                     continue
                 if gap > far_um and (ea[2] or eb[2] or cosab < cos_long):
                     continue
@@ -2923,16 +2935,16 @@ def _join_lined_up_ends(paths, sp, r, obj_lookup, bshape):
                 mid = 0.5 * (ea[3] + eb[3])
                 dv = (ea[4] + ea[5] * (((mid - ea[4]) @ n) / (ea[5] @ n))) - (eb[4] + eb[5] * (((mid - eb[4]) @ n) / (eb[5] @ n)))
                 shift = float(np.linalg.norm(dv))
-                if shift > _LINE_SHIFT_UM:
+                if shift > (_LINE_STRAIGHT_UM if overlap else _LINE_SHIFT_UM):
                     continue
-                cands.append((shift + 0.05 * gap + 0.3 * (ea[2] + eb[2]), a_, b_, gap, shift))
+                cands.append((shift + 0.05 * gap + 0.3 * (ea[2] + eb[2]), a_, b_, gap, shift, overlap))
         cands.sort()
         best_of = {}
-        for sc, a_, b_, gap, shift in cands:
+        for sc, a_, b_, gap, shift, _ov in cands:
             for e in (a_, b_):
                 best_of.setdefault(ends[e][:2], (a_, b_))
         touched, out, n_done = set(), list(P), 0
-        for sc, a_, b_, gap, shift in cands:
+        for sc, a_, b_, gap, shift, overlap in cands:
             ea, eb = ends[a_], ends[b_]
             if best_of.get(ea[:2]) != (a_, b_) or best_of.get(eb[:2]) != (a_, b_):
                 continue
@@ -2958,8 +2970,9 @@ def _join_lined_up_ends(paths, sp, r, obj_lookup, bshape):
                 longest = max(longest, run_)
             dd, hh = ptree.query(route * sp)
             clear = float(np.mean((dd >= _LINE_CLEAR_UM) | np.isin(owner[hh], [ea[0], eb[0]])))
-            routed = st.sum() <= _LINE_ROUTE_RATIO * gap and longest <= mask_gap and clear >= _LINE_CLEAR_SHARE
-            straight = gap <= far_um and shift <= _LINE_STRAIGHT_UM
+            routed = (st.sum() <= _LINE_ROUTE_RATIO * gap + (1.5 if overlap else 0.0)
+                      and longest <= mask_gap and clear >= _LINE_CLEAR_SHARE)
+            straight = gap <= far_um and shift <= _LINE_STRAIGHT_UM and not overlap
             if not (routed or straight):
                 continue
             Pa = P[ea[0]] if ea[1] == 1 else P[ea[0]][::-1]
@@ -3098,6 +3111,95 @@ def _join_side_by_side(paths, sp, r, obj_lookup, bshape):
         if not n_done:
             break
     return P
+
+
+def _march_free_ends(paths, sp, obj_lookup, bshape):
+    """Carry free path ends on through mask that no path claims.
+
+    In a thick bundle the skeleton can leave a fibre's continuation without a branch of its own
+    (it runs alongside or under another fibre), so its path stops although the mask goes on. Each
+    end of a path of at least _SIG_MIN_FIBRE_UM is marched on along its course as in
+    `_cut_climbs` (steps centred on mask at least _MARCH_CLEAR_UM from every other path, turning at
+    most _MARCH_TURN_DEG per step); the extension is kept if it reaches _FREE_MARCH_MIN_UM.
+    Longer paths march first, and each extension is avoided by those that follow.
+    """
+    from scipy.spatial import cKDTree
+    sp = np.asarray(sp, float)
+    bsh = np.asarray(bshape)
+    P = [np.asarray(p_) for p_ in paths]
+    X = [p_ * sp for p_ in P]
+    L = [float(_arc_points(x, None)[-1]) if len(x) > 1 else 0.0 for x in X]
+    keep = [k for k in range(len(P)) if L[k] >= _SIG_MIN_FIBRE_UM]
+    if not keep:
+        return P
+    g = np.arange(-_MARCH_DISC_UM, _MARCH_DISC_UM + 1e-9, float(sp.min()))
+    grid = np.stack(np.meshgrid(g, g, indexing="ij"), -1).reshape(-1, 2)
+    grid = grid[np.linalg.norm(grid, axis=1) <= _MARCH_DISC_UM]
+    cos_t, sin_t = np.cos(np.radians(_MARCH_TURN_DEG)), np.sin(np.radians(_MARCH_TURN_DEG))
+    base = np.vstack([X[k] for k in keep])
+    base_owner = np.concatenate([[k] * len(X[k]) for k in keep])
+    trails = []
+    out = list(P)
+    for i in sorted(keep, key=lambda k: -L[k]):
+        for at_start in (False, True):
+            Pi = out[i][::-1] if at_start else out[i]
+            x = Pi * sp
+            a = _arc_points(x, None)
+            q = x[a >= a[-1] - _JOIN_WINDOW_UM]
+            if len(q) < 6:
+                continue
+            c_ = q.mean(0)
+            u = np.linalg.svd(q - c_, full_matrices=False)[2][0]
+            u = u if u @ (q[-1] - q[0]) >= 0 else -u
+            pts = base[base_owner != i]
+            if trails:
+                pts = np.vstack([pts] + trails)
+            tree = cKDTree(pts)
+            p, dvec = x[-1], u
+            trail, total = [], 0.0
+            while total < _MARCH_MAX_UM:
+                c = p + dvec * _MARCH_STEP_UM
+                n1 = np.array([0.0, -dvec[2], dvec[1]])
+                n1 /= np.linalg.norm(n1) + 1e-12
+                n2 = np.cross(dvec, n1)
+                cand = c + grid[:, :1] * n1 + grid[:, 1:] * n2
+                vox = np.round(cand / sp).astype(np.int64)
+                ok = np.all((vox >= 0) & (vox < bsh), axis=1)
+                if not ok.any():
+                    break
+                vox, cand = vox[ok], cand[ok]
+                free = obj_lookup(vox) & (tree.query(cand)[0] >= _MARCH_CLEAR_UM)
+                if free.sum() < 4:
+                    break
+                nc = cand[free].mean(0)
+                nd = (nc - p) / (np.linalg.norm(nc - p) + 1e-12)
+                if nd @ dvec < cos_t:
+                    ax = nd - (nd @ dvec) * dvec
+                    ax /= np.linalg.norm(ax) + 1e-12
+                    nd = cos_t * dvec + sin_t * ax
+                    nc = p + nd * _MARCH_STEP_UM
+                trail.append(nc)
+                total += float(np.linalg.norm(nc - p))
+                p = nc
+                dvec = 0.8 * dvec + 0.2 * nd
+                dvec /= np.linalg.norm(dvec)
+            if total < _FREE_MARCH_MIN_UM:
+                continue
+            seq, prev = [Pi], Pi[-1]
+            for t in trail:
+                v = np.round(t / sp).astype(np.int64)
+                if np.all(v == prev):
+                    continue
+                lk = _line_voxels(prev, v)
+                lk = lk[obj_lookup(lk)] if len(lk) else lk
+                if len(lk):
+                    seq.append(lk)
+                prev = v
+            new = np.concatenate(seq)
+            new = new[np.r_[True, np.any(np.diff(new, axis=0) != 0, axis=1)]]
+            out[i] = new[::-1] if at_start else new
+            trails.append(np.array(trail))
+    return out
 
 
 def _end_course(pv, which, sp):
