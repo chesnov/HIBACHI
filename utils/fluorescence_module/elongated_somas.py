@@ -166,6 +166,13 @@ _MARCH_DISC_UM = 1.2     # within this of the course (across it), at least _MARC
 _MARCH_CLEAR_UM = 0.9    # turning at most _MARCH_TURN_DEG per step, until no free mask is left ahead (at most _MARCH_MAX_UM)
 _MARCH_TURN_DEG = 10.0
 _MARCH_MAX_UM = 60.0
+_STEP_LEG_UM = 8.0       # a path of at least 30 um that steps sideways (`_split_overlapping_steps`) between two
+_STEP_PAR_DEG = 10.0     # straight stretches of this length (median miss <= _STEP_STRAIGHT_UM), parallel within this,
+_STEP_STRAIGHT_UM = 0.3
+_STEP_SHIFT_UM = (0.6, 1.5)  # offset by this much at the step, where a short dead-end piece of skeleton (3 to 8 um)
+_STEP_NEAR_UM = 2.0      # lies within this of the step, parallel within _STEP_PIECE_DEG, and carries the old line on
+_STEP_PIECE_DEG = 20.0   # past the step (or the new one back before it), clearly (miss < _STEP_RATIO of the other
+_STEP_RATIO = 0.7        # line's): two fibres overlap there, and the path is split at the step
 _HAND_TOUCH_UM = 1.5     # a path of at least 30 um passing within this of where a parallel path ends (`_hand_on_at_ends`),
 _HAND_SIDE_UM = 0.9      # that path having run beside it at least this far off its course,
 _HAND_ON_RATIO = 0.6     # while a third path starts within 3 um of there on the passing path's own line (missing it by at
@@ -870,7 +877,8 @@ def _paths_from_skeleton(pts, half_w, bshape, spacing, r, obj_lookup):
     paths = _hand_on_at_ends(paths, sp, obj_lookup)
     paths = _join_lined_up_ends(paths, sp, r, obj_lookup, bshape)
     paths = _join_side_by_side(paths, sp, r, obj_lookup, bshape)
-    return _march_free_ends(paths, sp, obj_lookup, bshape)
+    paths = _march_free_ends(paths, sp, obj_lookup, bshape)
+    return _split_overlapping_steps(paths, sp, obj_lookup)
 
 
 def _fix_sigmoids(paths, pts, half_w, sp, obj_lookup, bshape):
@@ -2578,6 +2586,110 @@ def _march_free_ends(paths, sp, obj_lookup, bshape):
             out[i] = new[::-1] if at_start else new
             trails.append(np.array(trail))
     return out
+
+
+def _split_overlapping_steps(paths, sp, obj_lookup):
+    """Split a path at a sideways step where two fibres overlap.
+
+    Where one fibre ends and another starts beside it, overlapping it for a few micrometres,
+    the tracer follows one into the other with a small sideways step, and the overlapping
+    end of one of them is left as a short dead-end piece of skeleton. A path of at least
+    30 um that steps sideways (offset `_STEP_SHIFT_UM`) between two straight stretches of
+    `_STEP_LEG_UM` that run parallel (within `_STEP_PAR_DEG`), with such a piece (3 to 8 um)
+    within `_STEP_NEAR_UM` of the step that either carries the old line on past the step or
+    the new line back before it (missing that line by less than `_STEP_RATIO` of the
+    other's), is split at the step; the piece goes to the fibre whose line it carries.
+    Every path and piece takes part in at most one split.
+    """
+    from scipy.spatial import cKDTree
+    sp = np.asarray(sp, float)
+    P = [np.asarray(p_) for p_ in paths]
+    X = [p_ * sp for p_ in P]
+    L = [float(_arc_points(x, None)[-1]) if len(x) > 1 else 0.0 for x in X]
+    pieces = [k for k in range(len(P)) if 3.0 <= L[k] < _SIG_MIN_FIBRE_UM]
+    if not pieces:
+        return P
+    fowner = np.concatenate([[k] * len(X[k]) for k in pieces])
+    ftree = cKDTree(np.vstack([X[k] for k in pieces]))
+    c_par = np.cos(np.radians(_STEP_PAR_DEG))
+    c_piece = np.cos(np.radians(_STEP_PIECE_DEG))
+    gap = 0.75
+
+    def fit(q):
+        c = q.mean(0)
+        u = np.linalg.svd(q - c, full_matrices=False)[2][0]
+        return c, (u if u @ (q[-1] - q[0]) >= 0 else -u)
+
+    def miss(c, u, q):
+        w = q - c
+        return np.linalg.norm(w - np.outer(w @ u, u), axis=1)
+
+    found = []
+    for i in range(len(P)):
+        if L[i] < 30.0:
+            continue
+        x = X[i]
+        a = _arc_points(x, None)
+        best = None
+        for s in np.arange(_STEP_LEG_UM + gap, a[-1] - _STEP_LEG_UM - gap, _SIG_STEP_UM):
+            Aq = x[(a >= s - _STEP_LEG_UM - gap) & (a <= s - gap)]
+            Bq = x[(a >= s + gap) & (a <= s + _STEP_LEG_UM + gap)]
+            if len(Aq) < 8 or len(Bq) < 8:
+                continue
+            cA, uA = fit(Aq)
+            cB, uB = fit(Bq)
+            if uA @ uB < c_par:
+                continue
+            if np.median(miss(cA, uA, Aq)) > _STEP_STRAIGHT_UM or np.median(miss(cB, uB, Bq)) > _STEP_STRAIGHT_UM:
+                continue
+            pt = x[min(int(np.searchsorted(a, s)), len(x) - 1)]
+            m = (uA + uB) / np.linalg.norm(uA + uB)
+            d = (cB + ((pt - cB) @ uB) * uB) - (cA + ((pt - cA) @ uA) * uA)
+            shift = float(np.linalg.norm(d - (d @ m) * m))
+            if not (_STEP_SHIFT_UM[0] <= shift <= _STEP_SHIFT_UM[1]):
+                continue
+            for f in sorted(set(int(fowner[h]) for h in ftree.query_ball_point(pt, _STEP_NEAR_UM))):
+                F = X[f]
+                if abs(fit(F)[1] @ uA) < c_piece:
+                    continue
+                mA, mB = float(np.median(miss(cA, uA, F))), float(np.median(miss(cB, uB, F)))
+                back = float((((F - pt) @ uA) < 0).mean())
+                if back >= 0.7 and mB < _STEP_RATIO * mA:
+                    case = "B"                                # the new fibre started before the step
+                elif back <= 0.3 and mA < _STEP_RATIO * mB:
+                    case = "A"                                # the old fibre carries on past it
+                else:
+                    continue
+                score = min(mA, mB) / max(mA, mB)
+                if best is None or score < best[0]:
+                    best = (score, s, f, case, uA)
+        if best is not None:
+            found.append((best[0], i) + best[1:])
+    used, out, extra = set(), list(P), []
+    for _sc, i, s, f, case, uA in sorted(found, key=lambda t: t[0]):
+        if i in used or f in used:
+            continue
+        a = _arc_points(X[i], None)
+        head = P[i][:int(np.searchsorted(a, s - gap))]
+        tail = P[i][int(np.searchsorted(a, s + gap)):]
+        if len(head) < 6 or len(tail) < 6:
+            continue
+        F = P[f][np.argsort((X[f] - X[i][0]) @ uA)]          # the piece, in the path's direction
+
+        def join(p1, p2):
+            lk = _line_voxels(p1[-1], p2[0])
+            lk = lk[obj_lookup(lk)] if len(lk) else lk
+            return np.concatenate([p1, lk, p2])
+
+        if case == "A":
+            head = join(head, F)
+        else:
+            tail = join(F, tail)
+        out[i] = head
+        out[f] = P[f][:0]
+        extra.append(tail)
+        used.update((i, f))
+    return [o for o in out + extra if len(o)]
 
 
 def _end_course(pv, which, sp):
