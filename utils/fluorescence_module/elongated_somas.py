@@ -166,6 +166,7 @@ _MARCH_DISC_UM = 1.2     # within this of the course (across it), at least _MARC
 _MARCH_CLEAR_UM = 0.9    # turning at most _MARCH_TURN_DEG per step, until no free mask is left ahead (at most _MARCH_MAX_UM)
 _MARCH_TURN_DEG = 10.0
 _MARCH_MAX_UM = 60.0
+_LOOP_BACK_UM = 1.0      # a path that runs back against its own course (`_cut_loops`) by more than this has a loop
 _STEP_LEG_UM = 8.0       # a path of at least 30 um that steps sideways (`_split_overlapping_steps`) between two
 _STEP_PAR_DEG = 10.0     # straight stretches of this length (median miss <= _STEP_STRAIGHT_UM), parallel within this,
 _STEP_STRAIGHT_UM = 0.3
@@ -878,6 +879,7 @@ def _paths_from_skeleton(pts, half_w, bshape, spacing, r, obj_lookup):
     paths = _join_lined_up_ends(paths, sp, r, obj_lookup, bshape)
     paths = _join_side_by_side(paths, sp, r, obj_lookup, bshape)
     paths = _march_free_ends(paths, sp, obj_lookup, bshape)
+    paths = _cut_loops(paths, sp, obj_lookup)
     return _split_overlapping_steps(paths, sp, obj_lookup)
 
 
@@ -2585,6 +2587,65 @@ def _march_free_ends(paths, sp, obj_lookup, bshape):
             new = new[np.r_[True, np.any(np.diff(new, axis=0) != 0, axis=1)]]
             out[i] = new[::-1] if at_start else new
             trails.append(np.array(trail))
+    return out
+
+
+def _cut_loops(paths, sp, obj_lookup):
+    """Cut out stretches where a path doubles back on itself.
+
+    A fibre does not run backwards. Joins of overlapping pieces, and links across
+    knots of skeleton, can leave a path that goes forward, back by a few micrometres
+    (often along a neighbour's track) and forward again. Walking along the path, its
+    direction is taken from the 6 um it has just covered; a stretch whose progress along
+    that direction falls more than `_LOOP_BACK_UM` behind the furthest point reached is
+    dropped, up to where the path passes that point again, and the two ends are linked.
+    """
+    sp = np.asarray(sp, float)
+    out = []
+    for p_ in paths:
+        p_ = np.asarray(p_)
+        x = p_ * sp
+        if len(x) < 20:
+            out.append(p_)
+            continue
+        a = _arc_points(x, None)
+        keep = np.ones(len(x), bool)
+        k = 1
+        while k < len(x):
+            ref = x[(a >= a[k] - 6.0) & (a <= a[k])]
+            if len(ref) < 4 or a[k] < 6.0:
+                k += 1
+                continue
+            u = ref[-1] - ref[0]
+            nu = float(np.linalg.norm(u))
+            if nu < 1e-6:
+                k += 1
+                continue
+            u = u / nu
+            front = x[k - 1]
+            j = k
+            while j < len(x) and float((x[j] - front) @ u) < 0.3:
+                j += 1
+            if j > k and float(np.min((x[k:j] - front) @ u)) < -_LOOP_BACK_UM:
+                keep[k:j] = False                         # back and forth: cut out
+                k = j
+            else:
+                k += 1
+        if keep.all():
+            out.append(p_)
+            continue
+        q = p_[keep]
+        seq = [q[:1]]
+        for v in q[1:]:
+            prev = seq[-1][-1]
+            if np.abs(v - prev).max() > 1:
+                lk = _line_voxels(prev, v)
+                lk = lk[obj_lookup(lk)] if len(lk) else lk
+                if len(lk):
+                    seq.append(lk)
+            seq.append(v[None])
+        q = np.concatenate(seq)
+        out.append(q[np.r_[True, np.any(np.diff(q, axis=0) != 0, axis=1)]])
     return out
 
 
