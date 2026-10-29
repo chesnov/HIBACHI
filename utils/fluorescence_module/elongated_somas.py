@@ -2598,7 +2598,8 @@ def _split_overlapping_steps(paths, sp, obj_lookup):
     `_STEP_LEG_UM` that run parallel (within `_STEP_PAR_DEG`), with such a piece (3 to 8 um)
     within `_STEP_NEAR_UM` of the step that either carries the old line on past the step or
     the new line back before it (missing that line by less than `_STEP_RATIO` of the
-    other's), is split at the step; the piece goes to the fibre whose line it carries.
+    other's), and that keeps clear (`_MARCH_CLEAR_UM`) of every other fibre's path over most
+    of its length (a piece lying along another path is that fibre's spur), is split at the step; the piece goes to the fibre whose line it carries.
     Every path and piece takes part in at most one split.
     """
     from scipy.spatial import cKDTree
@@ -2611,6 +2612,22 @@ def _split_overlapping_steps(paths, sp, obj_lookup):
         return P
     fowner = np.concatenate([[k] * len(X[k]) for k in pieces])
     ftree = cKDTree(np.vstack([X[k] for k in pieces]))
+    longs = [k for k in range(len(P)) if L[k] >= _SIG_MIN_FIBRE_UM]
+    if not longs:
+        return P
+    lowner = np.concatenate([[k] * len(X[k]) for k in longs])
+    ltree = cKDTree(np.vstack([X[k] for k in longs]))
+
+    def clear_of_others(f, i):
+        # A piece lying along another fibre's path is a spur of that fibre, not the end of one here.
+        d, h = ltree.query(X[f], k=min(4, len(lowner)))
+        d, h = d.reshape(len(X[f]), -1), h.reshape(len(X[f]), -1)
+        far = np.ones(len(X[f]), bool)
+        for col in range(d.shape[1]):
+            other = lowner[np.minimum(h[:, col], len(lowner) - 1)] != i
+            far &= ~((d[:, col] < _MARCH_CLEAR_UM) & other)
+        return float(far.mean()) >= 0.8
+
     c_par = np.cos(np.radians(_STEP_PAR_DEG))
     c_piece = np.cos(np.radians(_STEP_PIECE_DEG))
     gap = 0.75
@@ -2650,7 +2667,7 @@ def _split_overlapping_steps(paths, sp, obj_lookup):
                 continue
             for f in sorted(set(int(fowner[h]) for h in ftree.query_ball_point(pt, _STEP_NEAR_UM))):
                 F = X[f]
-                if abs(fit(F)[1] @ uA) < c_piece:
+                if abs(fit(F)[1] @ uA) < c_piece or not clear_of_others(f, i):
                     continue
                 mA, mB = float(np.median(miss(cA, uA, F))), float(np.median(miss(cB, uB, F)))
                 back = float((((F - pt) @ uA) < 0).mean())
