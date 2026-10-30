@@ -2766,7 +2766,8 @@ def _split_overlapping_steps(paths, sp, obj_lookup):
     `_STEP_LEG_UM` that run parallel (within `_STEP_PAR_DEG`), with such a piece (3 to 8 um)
     within `_STEP_NEAR_UM` of the step that either carries the old line on past the step or
     the new line back before it (missing that line by less than `_STEP_RATIO` of the
-    other's), where the path does not jump a gap in the mask at the step, and that keeps clear (`_MARCH_CLEAR_UM`) of every other fibre's path over most
+    other's), where the path does not jump a gap in the mask at the step nor come within
+    `_MARCH_CLEAR_UM` of another fibre's path within 2 um of it, and that keeps clear (`_MARCH_CLEAR_UM`) of every other fibre's path over most
     of its length (a piece lying along another path is that fibre's spur), is split at the step; the piece goes to the fibre whose line it carries.
     Every path and piece takes part in at most one split.
     """
@@ -2836,6 +2837,11 @@ def _split_overlapping_steps(paths, sp, obj_lookup):
             near_step = np.nonzero((a >= s - 1.5) & (a <= s + 1.5))[0]
             if len(near_step) > 1 and np.abs(np.diff(P[i][near_step], axis=0)).max() > 1:
                 continue                                      # the step jumps a gap in the mask: one fibre
+            around = x[(a >= s - 2.0) & (a <= s + 2.0)]
+            dd, hh = ltree.query(around, k=min(8, len(lowner)))
+            dd, hh = dd.reshape(len(around), -1), hh.reshape(len(around), -1)
+            if np.any((dd < _MARCH_CLEAR_UM) & (lowner[np.minimum(hh, len(lowner) - 1)] != i)):
+                continue                                      # the step touches another fibre: a contact, not an overlap
             for f in sorted(set(int(fowner[h]) for h in ftree.query_ball_point(pt, _STEP_NEAR_UM))):
                 F = X[f]
                 if abs(fit(F)[1] @ uA) < c_piece or not clear_of_others(f, i):
