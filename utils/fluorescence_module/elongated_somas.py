@@ -182,6 +182,12 @@ _CONTACT_LEG_UM = 8.0    # out on the other's continuation (nearer than _CONTACT
 _CONTACT_EXTRA_UM = 10.0 # within _CONTACT_HIT_UM of it), the two continuations are swapped
 _CONTACT_RATIO = 0.7
 _CONTACT_HIT_UM = 1.0
+_REACH_UM = 12.0         # a free end of a path of at least 15 um (`_reach_across_gaps`) whose course, carried straight
+_REACH_GAP_UM = 2.0      # on, crosses a gap in the mask of at least this, starting within 1.5 um of the end, and then
+_REACH_HIT_UM = 1.0      # meets another fibre's path (within this) where the mask resumes, at most _REACH_UM ahead, is
+_REACH_SIGNAL = 0.9      # carried on to it if the image along the gap is at least this bright relative to the fibre itself
+_END_FRAGMENT_UM = 3.0   # an unclaimed piece of mask touching a fibre within this of its end (`_claim_end_fragments`)
+_END_FRAGMENT_VOX = 2000 # and no bigger than this joins that fibre
 _LOOP_BACK_UM = 1.0      # a path that runs back against its own course (`_cut_loops`) by more than this has a loop
 _STEP_LEG_UM = 8.0       # a path of at least 30 um that steps sideways (`_split_overlapping_steps`) between two
 _STEP_PAR_DEG = 10.0     # straight stretches of this length (median miss <= _STEP_STRAIGHT_UM), parallel within this,
@@ -2845,6 +2851,110 @@ def _resolve_contacts_by_intensity(paths, sp, obj_lookup, intensity_box):
     return out
 
 
+def _reach_across_gaps(paths, sp, obj_lookup, intensity_box, bshape):
+    """Carry a fibre's free end across a gap in the mask to the bundle it runs into.
+
+    The trimmed mask can miss a stretch of a fibre that is still plainly bright in the
+    image; its path then stops at the gap, short of the bundle it joins. A free end of a
+    path of at least 15 um whose straight course (its last 10 um) leaves the mask within
+    1.5 um, stays out of it for at least `_REACH_GAP_UM`, and then meets another fibre's path
+    (within `_REACH_HIT_UM`) where the mask resumes, at most `_REACH_UM` ahead, is carried
+    straight on to that point, provided the smoothed image along the gap is at least
+    `_REACH_SIGNAL` as bright as the fibre's own last 10 um. The extension follows the
+    mask between the two (cheapest route, avoiding other fibres' paths), so it picks up
+    the unclaimed mask on the way, at whatever depth it lies; only mask voxels are added.
+    """
+    from scipy.spatial import cKDTree
+    sp = np.asarray(sp, float)
+    P = [np.asarray(p_) for p_ in paths]
+    X = [p_ * sp for p_ in P]
+    L = [float(_arc_points(x, None)[-1]) if len(x) > 1 else 0.0 for x in X]
+    longs = [k for k in range(len(P)) if L[k] >= _SIG_MIN_FIBRE_UM]
+    if len(longs) < 2:
+        return P
+    own = np.concatenate([[k] * len(X[k]) for k in longs])
+    tree = cKDTree(np.vstack([X[k] for k in longs]))
+    out = list(P)
+    ts = np.arange(0.5, _REACH_UM + 1e-9, 0.5)
+    for i in range(len(P)):
+        if L[i] < 15.0:
+            continue
+        for at_start in (False, True):
+            Pi = out[i][::-1] if at_start else out[i]
+            x = Pi * sp
+            a = _arc_points(x, None)
+            q = x[a >= a[-1] - 10.0]
+            if len(q) < 6:
+                continue
+            c = q.mean(0)
+            u = np.linalg.svd(q - c, full_matrices=False)[2][0]
+            u = u if u @ (q[-1] - q[0]) >= 0 else -u
+            e = x[-1]
+            pts = e + np.outer(ts, u)
+            vox = np.round(pts / sp).astype(np.int64)
+            inside = np.all((vox >= 0) & (vox < np.asarray(bshape)), axis=1)
+            n_in = int(np.argmin(inside)) if not inside.all() else len(inside)
+            pts, vox = pts[:n_in], vox[:n_in]
+            if len(pts) < 4:
+                continue
+            m = obj_lookup(vox)
+            if m[:3].all():
+                continue                                  # the mask goes on: not a gap
+            dd, hh = tree.query(pts, k=min(8, len(own)))
+            dd, hh = dd.reshape(len(pts), -1), hh.reshape(len(pts), -1)
+            d = np.where(own[np.minimum(hh, len(own) - 1)] != i, dd, np.inf).min(1)
+            hit = np.nonzero((d <= _REACH_HIT_UM) & m)[0]
+            if not len(hit):
+                continue
+            h = int(hit[0])
+            if (~m[:h]).sum() * 0.5 < _REACH_GAP_UM:
+                continue
+            gap_pts = pts[:h][~m[:h]]
+            allp = np.vstack([q, gap_pts])
+            lo = np.floor(allp.min(0) / sp).astype(np.int64) - 4
+            hi = np.ceil(allp.max(0) / sp).astype(np.int64) + 5
+            img, org = intensity_box(lo, hi)
+            if img.size == 0:
+                continue
+            img = ndimage.gaussian_filter(img, (0.7, 1.2, 1.2))
+
+            def sample(pp):
+                v = np.clip(np.round(pp / sp).astype(np.int64) - org, 0, np.array(img.shape) - 1)
+                return img[tuple(v.T)]
+
+            if float(np.median(sample(gap_pts))) < _REACH_SIGNAL * float(np.median(sample(q))):
+                continue                                  # the image is dark there too: the fibre ends
+            # Follow the mask rather than the straight line: the unclaimed mask the fibre runs
+            # through can sit higher or lower than its course, especially in a bunched-up bundle.
+            from skimage.graph import MCP_Geometric
+            va, vb = Pi[-1], vox[h]
+            lo2 = np.maximum(np.minimum(va, vb) - np.array([8, 20, 20]), 0)
+            hi2 = np.minimum(np.maximum(va, vb) + np.array([9, 21, 21]), np.asarray(bshape))
+            gz, gy, gx = np.meshgrid(*[np.arange(lo2[k], hi2[k]) for k in range(3)], indexing="ij")
+            cells = np.stack([gz.ravel(), gy.ravel(), gx.ravel()], 1)
+            inside_m = obj_lookup(cells)
+            dd2, hh2 = tree.query(cells * sp, k=min(4, len(own)))
+            dd2, hh2 = dd2.reshape(len(cells), -1), hh2.reshape(len(cells), -1)
+            near_other = np.any((dd2 < _MARCH_CLEAR_UM) & (own[np.minimum(hh2, len(own) - 1)] != i), axis=1)
+            cost = np.where(inside_m, np.where(near_other, 6.0, 1.0), 12.0).reshape(gz.shape)
+            mcp = MCP_Geometric(cost, fully_connected=True, sampling=tuple(sp))
+            mcp.find_costs([tuple(va - lo2)], [tuple(vb - lo2)])
+            try:
+                route = np.array(mcp.traceback(tuple(vb - lo2))) + lo2
+            except ValueError:
+                route = _line_voxels(va, vb)
+            st_ = np.linalg.norm(np.diff(route * sp, axis=0), axis=1).sum() if len(route) > 1 else 0.0
+            if st_ > 2.0 * float(np.linalg.norm((vb - va) * sp)) + 1.0:
+                route = _line_voxels(va, vb)
+            lk = route[obj_lookup(route)] if len(route) else route
+            if not len(lk):
+                continue
+            new = np.concatenate([Pi, lk])
+            new = new[np.r_[True, np.any(np.diff(new, axis=0) != 0, axis=1)]]
+            out[i] = new[::-1] if at_start else new
+    return out
+
+
 def _cut_loops(paths, sp, obj_lookup):
     """Cut out stretches where a path doubles back on itself.
 
@@ -3496,6 +3606,7 @@ def _elongated_fibre_candidates(lbl, sl, segmentation_mask, intensity_image,
                                       bshape, sp, r, obj_lookup)
         if intensity_image is not None and is_stack:
             paths_ = _resolve_contacts_by_intensity(paths_, sp, obj_lookup, intensity_box)
+            paths_ = _reach_across_gaps(paths_, sp, obj_lookup, intensity_box, bshape)
         return paths_
 
     def skeleton_with_cut(cut):
@@ -3701,6 +3812,7 @@ def _elongated_label_candidates(lbl, sl, segmentation_mask, intensity_image, par
     """
     candidates, diag = _elongated_fibre_candidates(lbl, sl, segmentation_mask, intensity_image, params)
     if candidates:
+        _claim_end_fragments(candidates, lbl, sl, segmentation_mask, params)
         return candidates, diag
     own = np.asarray(segmentation_mask[tuple(sl)]) == lbl
     n = int(own.sum())
@@ -3719,3 +3831,59 @@ def _elongated_label_candidates(lbl, sl, segmentation_mask, intensity_image, par
         "rank_vals": np.zeros(n, np.float32),
     }]
     return candidates, diag
+
+def _claim_end_fragments(candidates, lbl, sl, segmentation_mask, params):
+    """Give a fibre the piece of unclaimed mask its end runs into.
+
+    Where a fibre ends in a bunched-up part of the mask, the tube around its path can stop
+    short of the end of the fibre itself, leaving a piece of mask that no seed takes. A
+    connected piece of the object's mask outside every candidate (`_END_FRAGMENT_VOX`
+    voxels at most) that touches exactly one candidate within `_END_FRAGMENT_UM` of that
+    candidate's end (along its own long axis) joins that candidate. Pieces touching no end,
+    or the ends of several candidates, stay unclaimed.
+    """
+    sp = np.asarray(params.spacing, float)
+    if len(sp) != 3:
+        return
+    off = np.array([s_.start for s_ in sl])
+    own = np.asarray(segmentation_mask[tuple(sl)]) == lbl
+    owner = np.zeros(own.shape, np.int32)
+    for n_, c in enumerate(candidates, 1):
+        q = np.asarray(c["coords"]) - off
+        ok = np.all((q >= 0) & (q < own.shape), axis=1)
+        owner[tuple(q[ok].T)] = n_
+    free = own & (owner == 0)
+    if not free.any():
+        return
+    comp, n_comp = ndimage.label(free, structure=np.ones((3, 3, 3)))
+    if not n_comp:
+        return
+    # each candidate's end zones: voxels within _END_FRAGMENT_UM of its extremes along its axis
+    end_zone = np.zeros(own.shape, np.int32)
+    for n_, c in enumerate(candidates, 1):
+        q = np.asarray(c["coords"]) - off
+        x = q * sp
+        cen = x.mean(0)
+        u = np.linalg.svd(x[:: max(1, len(x) // 2000)] - cen, full_matrices=False)[2][0]
+        t = (x - cen) @ u
+        near_end = (t <= t.min() + _END_FRAGMENT_UM) | (t >= t.max() - _END_FRAGMENT_UM)
+        e = q[near_end]
+        end_zone[tuple(e.T)] = np.where(end_zone[tuple(e.T)] == 0, n_, -1)
+    grown = ndimage.grey_dilation(np.where(end_zone > 0, end_zone, 0), size=(3, 3, 3))
+    sizes = np.bincount(comp.ravel())
+    for k in range(1, n_comp + 1):
+        if sizes[k] > _END_FRAGMENT_VOX:
+            continue
+        m = comp == k
+        touch = np.unique(grown[m])
+        touch = touch[touch > 0]
+        if len(touch) != 1:
+            continue
+        n_ = int(touch[0])
+        add = (np.argwhere(m) + off).astype(np.asarray(candidates[n_ - 1]["coords"]).dtype)
+        c = candidates[n_ - 1]
+        c["coords"] = np.concatenate([np.asarray(c["coords"]), add])
+        for key in ("dt_vals", "rank_vals"):
+            if key in c and c[key] is not None and len(c[key]) == len(c["coords"]) - len(add):
+                c[key] = np.concatenate([np.asarray(c[key]), np.zeros(len(add), np.asarray(c[key]).dtype)])
+        c["vol"] = int(len(c["coords"]))
