@@ -174,6 +174,14 @@ _OWN_RIDE_UM = 0.8       # a gap in the mask (_OWN_GAP_SHARE of it outside) and 
 _OWN_RIDE_LEN_UM = 2.5   # _OWN_VEER_UM of another fibre's path
 _OWN_GAP_SHARE = 0.6
 _OWN_VEER_UM = 1.3
+_CONTACT_UM = 1.0        # two paths of at least 30 um that touch (within this, `_resolve_contacts_by_intensity`)
+_CONTACT_SPAN_UM = 10.0  # along at most this much of each, at most _CONTACT_DEG apart, are each followed through the
+_CONTACT_DEG = 45.0      # contact by their bright core: from the _CONTACT_LEG_UM of path that ends _CONTACT_GAP_UM
+_CONTACT_GAP_UM = 4.0    # before it, for the contact's length + _CONTACT_GAP_UM + _CONTACT_EXTRA_UM. If each core comes
+_CONTACT_LEG_UM = 8.0    # out on the other's continuation (nearer than _CONTACT_RATIO of its distance to its own, and
+_CONTACT_EXTRA_UM = 10.0 # within _CONTACT_HIT_UM of it), the two continuations are swapped
+_CONTACT_RATIO = 0.7
+_CONTACT_HIT_UM = 1.0
 _LOOP_BACK_UM = 1.0      # a path that runs back against its own course (`_cut_loops`) by more than this has a loop
 _STEP_LEG_UM = 8.0       # a path of at least 30 um that steps sideways (`_split_overlapping_steps`) between two
 _STEP_PAR_DEG = 10.0     # straight stretches of this length (median miss <= _STEP_STRAIGHT_UM), parallel within this,
@@ -2697,6 +2705,146 @@ def _follow_own_line(paths, sp, obj_lookup):
     return out
 
 
+def _resolve_contacts_by_intensity(paths, sp, obj_lookup, intensity_box):
+    """Let the image decide which way two fibres go where their paths touch.
+
+    Where two fibres cross at a shallow angle in a thick part of the mask, the skeleton
+    gives them a short shared stretch and the path shapes alone cannot tell whether they
+    crossed or touched and turned back, so the tracer may hand each the other's
+    continuation. Each fibre's bright core is then followed through the contact: from the
+    straight course of its path just before it (`_CONTACT_LEG_UM`, ending `_CONTACT_GAP_UM`
+    before the contact), step by step (0.5 um, at most 8 degrees of turn), each step centred
+    on the smoothed intensity across the course, for the contact's length plus
+    `_CONTACT_GAP_UM` + `_CONTACT_EXTRA_UM`. If both cores come out on the other path's
+    continuation (nearer than `_CONTACT_RATIO` of their distance to their own, and within
+    `_CONTACT_HIT_UM` of it), the continuations are swapped. Geometry alone decides
+    everywhere else.
+    """
+    from scipy.spatial import cKDTree
+    sp = np.asarray(sp, float)
+    P = [np.asarray(p_) for p_ in paths]
+    X = [p_ * sp for p_ in P]
+    A = [_arc_points(x, None) if len(x) > 1 else np.zeros(len(x)) for x in X]
+    L = [float(a[-1]) if len(a) else 0.0 for a in A]
+    big = [k for k in range(len(P)) if L[k] >= 30.0]
+    if len(big) < 2:
+        return P
+    c_ang = np.cos(np.radians(_CONTACT_DEG))
+    disc = 0.9
+    g = np.arange(-disc, disc + 1e-9, 0.15)
+    grid = np.stack(np.meshgrid(g, g, indexing="ij"), -1).reshape(-1, 2)
+    grid = grid[np.linalg.norm(grid, axis=1) <= disc]
+    c8, s8 = np.cos(np.radians(8.0)), np.sin(np.radians(8.0))
+
+    def fit(q):
+        c = q.mean(0)
+        u = np.linalg.svd(q - c, full_matrices=False)[2][0]
+        return c, (u if u @ (q[-1] - q[0]) >= 0 else -u)
+
+    def follow(start, n_steps, img, org):
+        _, d = fit(start)
+        p = start[-1].copy()
+        out = []
+        for _ in range(n_steps):
+            n1 = np.array([0.0, -d[2], d[1]])
+            n1 /= np.linalg.norm(n1) + 1e-12
+            n2 = np.cross(d, n1)
+            cand = p + d * 0.5 + grid[:, :1] * n1 + grid[:, 1:] * n2
+            v = np.round(cand / sp).astype(np.int64) - org
+            v = np.clip(v, 0, np.array(img.shape) - 1)
+            w = img[tuple(v.T)]
+            w = np.clip(w - np.percentile(w, 30), 0, None)
+            if w.sum() <= 0:
+                break
+            nc = (cand * w[:, None]).sum(0) / w.sum()
+            nd = (nc - p) / (np.linalg.norm(nc - p) + 1e-12)
+            if nd @ d < c8:
+                ax = nd - (nd @ d) * d
+                ax /= np.linalg.norm(ax) + 1e-12
+                nd = c8 * d + s8 * ax
+                nc = p + nd * 0.5
+            p = nc
+            d = 0.85 * d + 0.15 * nd
+            d /= np.linalg.norm(d)
+            out.append(p.copy())
+        return np.array(out)
+
+    found = []
+    for n_, i in enumerate(big):
+        ti = cKDTree(X[i])
+        for j in big[n_ + 1:]:
+            d, k = ti.query(X[j], distance_upper_bound=_CONTACT_UM)
+            ks = np.nonzero(np.isfinite(d))[0]
+            if not len(ks):
+                continue
+            sj0, sj1 = float(A[j][ks].min()), float(A[j][ks].max())
+            si = A[i][k[ks]]
+            si0, si1 = float(si.min()), float(si.max())
+            if sj1 - sj0 > _CONTACT_SPAN_UM or si1 - si0 > _CONTACT_SPAN_UM:
+                continue
+            xi, xj, ai, aj = X[i], X[j], A[i], A[j]
+            ui = xi[min(int(np.searchsorted(ai, si1)), len(xi) - 1)] - xi[int(np.searchsorted(ai, si0))]
+            uj = xj[min(int(np.searchsorted(aj, sj1)), len(xj) - 1)] - xj[int(np.searchsorted(aj, sj0))]
+            rev = float(ui @ uj) < 0
+            G, W = _CONTACT_GAP_UM, _CONTACT_LEG_UM
+            i_in = xi[(ai >= si0 - G - W) & (ai <= si0 - G)]
+            i_out = xi[(ai >= si1 + 1.0) & (ai <= si1 + 25.0)]
+            if rev:
+                j_in = xj[(aj <= sj1 + G + W) & (aj >= sj1 + G)][::-1]
+                j_out = xj[(aj <= sj0 - 1.0) & (aj >= sj0 - 25.0)][::-1]
+            else:
+                j_in = xj[(aj >= sj0 - G - W) & (aj <= sj0 - G)]
+                j_out = xj[(aj >= sj1 + 1.0) & (aj <= sj1 + 25.0)]
+            if min(len(i_in), len(i_out), len(j_in), len(j_out)) < 6:
+                continue
+            if abs(fit(i_in)[1] @ fit(j_in)[1]) < c_ang:
+                continue
+            n_steps = int((max(si1 - si0, sj1 - sj0) + G + _CONTACT_EXTRA_UM) / 0.5)
+            allp = np.vstack([i_in, j_in, i_out, j_out])
+            lo = np.floor(allp.min(0) / sp).astype(np.int64) - 12
+            hi = np.ceil(allp.max(0) / sp).astype(np.int64) + 13
+            img, org = intensity_box(lo, hi)
+            if img.size == 0:
+                continue
+            img = ndimage.gaussian_filter(img, (0.7, 1.2, 1.2))
+            res = []
+            for inc, own, oth in ((i_in, i_out, j_out), (j_in, j_out, i_out)):
+                tr = follow(inc, n_steps, img, org)
+                if not len(tr):
+                    res = None
+                    break
+                e = tr[-1]
+                res.append((float(np.linalg.norm(own - e, axis=1).min()),
+                            float(np.linalg.norm(oth - e, axis=1).min())))
+            if res is None:
+                continue
+            if all(b <= _CONTACT_RATIO * a and b <= _CONTACT_HIT_UM for a, b in res):
+                found.append((max(b / a for a, b in res), i, j, si0, si1, sj0, sj1, rev))
+    used, out = set(), list(P)
+    for _sc, i, j, si0, si1, sj0, sj1, rev in sorted(found):
+        if i in used or j in used:
+            continue
+        mi = 0.5 * (si0 + si1)
+        mj = 0.5 * (sj0 + sj1)
+        ki = int(np.searchsorted(A[i], mi))
+        kj = int(np.searchsorted(A[j], mj))
+        head_i, tail_i = P[i][:ki], P[i][ki:]
+        if rev:
+            head_j, tail_j = P[j][kj:][::-1], P[j][:kj][::-1]
+        else:
+            head_j, tail_j = P[j][:kj], P[j][kj:]
+        if min(len(head_i), len(tail_i), len(head_j), len(tail_j)) < 6:
+            continue
+        new = []
+        for h, t in ((head_i, tail_j), (head_j, tail_i)):
+            lk = _line_voxels(h[-1], t[0])
+            lk = lk[obj_lookup(lk)] if len(lk) else lk
+            new.append(np.concatenate([h, lk, t]))
+        out[i], out[j] = new
+        used.update((i, j))
+    return out
+
+
 def _cut_loops(paths, sp, obj_lookup):
     """Cut out stretches where a path doubles back on itself.
 
@@ -3329,14 +3477,26 @@ def _elongated_fibre_candidates(lbl, sl, segmentation_mask, intensity_image,
         g = coords + boff
         return np.asarray(seg[tuple(g.T)]) == lbl
 
+    full_shape = np.asarray(segmentation_mask.shape)
+
+    def intensity_box(lo, hi):
+        """The intensity image over box coordinates [lo, hi) (clipped to the image)."""
+        g0 = np.maximum(np.asarray(lo) + boff, 0)
+        g1 = np.minimum(np.asarray(hi) + boff, full_shape)
+        return np.asarray(intensity_image[tuple(slice(int(a), int(b)) for a, b in zip(g0, g1))],
+                          np.float32), g0 - boff
+
     def trace(skel):
         """The whole object's graph, decomposed into paths."""
         found = [t_ for t_ in skel if t_ is not None]
         if not found:
             return []
-        return _paths_from_skeleton(np.concatenate([t_[0] for t_ in found]),
-                                    np.concatenate([t_[1] for t_ in found]),
-                                    bshape, sp, r, obj_lookup)
+        paths_ = _paths_from_skeleton(np.concatenate([t_[0] for t_ in found]),
+                                      np.concatenate([t_[1] for t_ in found]),
+                                      bshape, sp, r, obj_lookup)
+        if intensity_image is not None and is_stack:
+            paths_ = _resolve_contacts_by_intensity(paths_, sp, obj_lookup, intensity_box)
+        return paths_
 
     def skeleton_with_cut(cut):
         """The tiles' skeletons with `cut` removed; tiles whose halo misses it are reused."""
