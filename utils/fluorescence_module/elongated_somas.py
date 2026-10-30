@@ -166,6 +166,14 @@ _MARCH_DISC_UM = 1.2     # within this of the course (across it), at least _MARC
 _MARCH_CLEAR_UM = 0.9    # turning at most _MARCH_TURN_DEG per step, until no free mask is left ahead (at most _MARCH_MAX_UM)
 _MARCH_TURN_DEG = 10.0
 _MARCH_MAX_UM = 60.0
+_OWN_DEV_UM = 0.8        # a stretch where a path leaves its own line (`_follow_own_line`) by more than this
+_OWN_FLANK_UM = 7.0      # (the line through this much path on either side, straight within 0.45 um, parallel within
+_OWN_PAR_DEG = 15.0      # this), up to _OWN_MAX_UM long, is put back on its line if it rides along another fibre's
+_OWN_MAX_UM = 15.0       # path (within _OWN_RIDE_UM) for at least _OWN_RIDE_LEN_UM, or if the line there runs through
+_OWN_RIDE_UM = 0.8       # a gap in the mask (_OWN_GAP_SHARE of it outside) and the stretch veers to within
+_OWN_RIDE_LEN_UM = 2.5   # _OWN_VEER_UM of another fibre's path
+_OWN_GAP_SHARE = 0.6
+_OWN_VEER_UM = 1.3
 _LOOP_BACK_UM = 1.0      # a path that runs back against its own course (`_cut_loops`) by more than this has a loop
 _STEP_LEG_UM = 8.0       # a path of at least 30 um that steps sideways (`_split_overlapping_steps`) between two
 _STEP_PAR_DEG = 10.0     # straight stretches of this length (median miss <= _STEP_STRAIGHT_UM), parallel within this,
@@ -879,6 +887,7 @@ def _paths_from_skeleton(pts, half_w, bshape, spacing, r, obj_lookup):
     paths = _join_lined_up_ends(paths, sp, r, obj_lookup, bshape)
     paths = _join_side_by_side(paths, sp, r, obj_lookup, bshape)
     paths = _march_free_ends(paths, sp, obj_lookup, bshape)
+    paths = _follow_own_line(paths, sp, obj_lookup)
     paths = _cut_loops(paths, sp, obj_lookup)
     return _split_overlapping_steps(paths, sp, obj_lookup)
 
@@ -2590,6 +2599,104 @@ def _march_free_ends(paths, sp, obj_lookup, bshape):
     return out
 
 
+def _follow_own_line(paths, sp, obj_lookup):
+    """Put a path back on its own line where it strays onto a neighbour.
+
+    Where the mask along a fibre is thin or broken, the skeleton (and so the path) can
+    swing onto the track of the fibre next to it and come back, so the soma takes a bite of
+    its neighbour. A stretch (up to `_OWN_MAX_UM`) that leaves the line through the path on
+    either side by more than `_OWN_DEV_UM`, where that line is straight and the two sides run
+    parallel, is replaced by the line itself if it rides along another fibre's path (within
+    `_OWN_RIDE_UM`, for at least `_OWN_RIDE_LEN_UM`), or if the line there crosses a gap in
+    the mask and the stretch veers to within `_OWN_VEER_UM` of another fibre: across a gap
+    the fibre jumps straight rather than detouring into its neighbour. Only mask voxels of
+    the line are kept.
+    """
+    from scipy.spatial import cKDTree
+    sp = np.asarray(sp, float)
+    P = [np.asarray(p_) for p_ in paths]
+    X = [p_ * sp for p_ in P]
+    L = [float(_arc_points(x, None)[-1]) if len(x) > 1 else 0.0 for x in X]
+    longs = [k for k in range(len(P)) if L[k] >= _SIG_MIN_FIBRE_UM]
+    if len(longs) < 2:
+        return P
+    own = np.concatenate([[k] * len(X[k]) for k in longs])
+    tree = cKDTree(np.vstack([X[k] for k in longs]))
+    c_par = np.cos(np.radians(_OWN_PAR_DEG))
+
+    def fit(q):
+        c = q.mean(0)
+        return c, np.linalg.svd(q - c, full_matrices=False)[2][0]
+
+    def miss(c, u, q):
+        w = q - c
+        return np.linalg.norm(w - np.outer(w @ u, u), axis=1)
+
+    out = list(P)
+    for i in range(len(P)):
+        if L[i] < 30.0:
+            continue
+        x = X[i]
+        a = _arc_points(x, None)
+        ss = np.arange(10.0, a[-1] - 10.0, 0.5)
+        dev = np.zeros(len(ss))
+        for n, s in enumerate(ss):
+            q = x[((a >= s - 10.0) & (a <= s - 3.0)) | ((a >= s + 3.0) & (a <= s + 10.0))]
+            if len(q) < 8:
+                continue
+            c, u = fit(q)
+            dev[n] = miss(c, u, x[min(int(np.searchsorted(a, s)), len(x) - 1)][None])[0]
+        runs, n = [], 0
+        while n < len(ss):
+            if dev[n] > _OWN_DEV_UM:
+                m = n
+                while m + 1 < len(ss) and dev[m + 1] > _OWN_DEV_UM:
+                    m += 1
+                runs.append((ss[n] - 1.0, ss[m] + 1.0))
+                n = m + 1
+            else:
+                n += 1
+        reps = []
+        for s0, s1 in runs:
+            if s1 - s0 > _OWN_MAX_UM:
+                continue
+            A = x[(a >= s0 - _OWN_FLANK_UM) & (a < s0)]
+            B = x[(a > s1) & (a <= s1 + _OWN_FLANK_UM)]
+            if len(A) < 6 or len(B) < 6 or abs(fit(A)[1] @ fit(B)[1]) < c_par:
+                continue
+            c, u = fit(np.vstack([A, B]))
+            if np.median(miss(c, u, np.vstack([A, B]))) > 0.45:
+                continue
+            S = x[(a >= s0) & (a <= s1)]
+            dd, hh = tree.query(S, k=min(12, len(own)))
+            dd, hh = dd.reshape(len(S), -1), hh.reshape(len(S), -1)
+            d = np.where(own[np.minimum(hh, len(own) - 1)] != i, dd, np.inf).min(1)
+            ride = float((d < _OWN_RIDE_UM).mean()) * (s1 - s0)
+            ts = np.linspace(float((S[0] - c) @ u), float((S[-1] - c) @ u), max(4, len(S)))
+            gap = 1.0 - float(obj_lookup(np.round((c + np.outer(ts, u)) / sp).astype(np.int64)).mean())
+            if ride >= _OWN_RIDE_LEN_UM or (gap >= _OWN_GAP_SHARE and float(d.min()) <= _OWN_VEER_UM):
+                reps.append((s0, s1))
+        if not reps:
+            continue
+        p_ = P[i]
+        seq, k = [], 0
+        for s0, s1 in reps:
+            k0 = int(np.searchsorted(a, s0))
+            k1 = min(int(np.searchsorted(a, s1)), len(p_) - 1)
+            if k0 < k:
+                continue
+            seq.append(p_[k:k0])
+            lk = _line_voxels(p_[max(k0 - 1, 0)], p_[k1])
+            lk = lk[obj_lookup(lk)] if len(lk) else lk
+            if len(lk):
+                seq.append(lk)
+            k = k1
+        seq.append(p_[k:])
+        q = np.concatenate([s_ for s_ in seq if len(s_)])
+        out[i] = q[np.r_[True, np.any(np.diff(q, axis=0) != 0, axis=1)]]
+    return out
+
+
 def _cut_loops(paths, sp, obj_lookup):
     """Cut out stretches where a path doubles back on itself.
 
@@ -2659,7 +2766,7 @@ def _split_overlapping_steps(paths, sp, obj_lookup):
     `_STEP_LEG_UM` that run parallel (within `_STEP_PAR_DEG`), with such a piece (3 to 8 um)
     within `_STEP_NEAR_UM` of the step that either carries the old line on past the step or
     the new line back before it (missing that line by less than `_STEP_RATIO` of the
-    other's), and that keeps clear (`_MARCH_CLEAR_UM`) of every other fibre's path over most
+    other's), where the path does not jump a gap in the mask at the step, and that keeps clear (`_MARCH_CLEAR_UM`) of every other fibre's path over most
     of its length (a piece lying along another path is that fibre's spur), is split at the step; the piece goes to the fibre whose line it carries.
     Every path and piece takes part in at most one split.
     """
@@ -2726,6 +2833,9 @@ def _split_overlapping_steps(paths, sp, obj_lookup):
             shift = float(np.linalg.norm(d - (d @ m) * m))
             if not (_STEP_SHIFT_UM[0] <= shift <= _STEP_SHIFT_UM[1]):
                 continue
+            near_step = np.nonzero((a >= s - 1.5) & (a <= s + 1.5))[0]
+            if len(near_step) > 1 and np.abs(np.diff(P[i][near_step], axis=0)).max() > 1:
+                continue                                      # the step jumps a gap in the mask: one fibre
             for f in sorted(set(int(fowner[h]) for h in ftree.query_ball_point(pt, _STEP_NEAR_UM))):
                 F = X[f]
                 if abs(fit(F)[1] @ uA) < c_piece or not clear_of_others(f, i):
