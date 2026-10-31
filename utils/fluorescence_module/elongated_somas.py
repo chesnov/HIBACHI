@@ -185,7 +185,6 @@ _CONTACT_HIT_UM = 1.0
 _REACH_UM = 12.0         # a free end of a path of at least 15 um (`_reach_across_gaps`) whose course, carried straight
 _REACH_GAP_UM = 2.0      # on, crosses a gap in the mask of at least this, starting within 1.5 um of the end, and then
 _REACH_HIT_UM = 1.0      # meets another fibre's path (within this) where the mask resumes, at most _REACH_UM ahead, is
-_REACH_KEEP_OUT_UM = 4.0 # (the extension leaves out its stretch within this of another fibre's free end, on its far side)
 _REACH_SIGNAL = 0.9      # carried on to it if the image along the gap is at least this bright relative to the fibre itself
 _END_FRAGMENT_UM = 3.0   # an unclaimed piece of mask touching a fibre within this of its end (`_claim_end_fragments`)
 _END_FRAGMENT_VOX = 2000 # and no bigger than this joins that fibre
@@ -2863,9 +2862,12 @@ def _reach_across_gaps(paths, sp, obj_lookup, intensity_box, bshape):
     straight on to that point, provided the smoothed image along the gap is at least
     `_REACH_SIGNAL` as bright as the fibre's own last 10 um. The extension follows the
     mask between the two (cheapest route, avoiding other fibres' paths), so it picks up
-    the unclaimed mask on the way, at whatever depth it lies; only mask voxels are added,
-    and not those within `_REACH_KEEP_OUT_UM` beyond another fibre's free end, which is that
-    fibre's continuation.
+    the unclaimed mask on the way, at whatever depth it lies; only mask voxels are added.
+    The whole route is kept, also where it passes just beyond another fibre's free end: a
+    path with a stretch left out jumps there, and its tube cannot cover the mask in the jump
+    (that mask then went to the other fibre's end through `_claim_end_fragments`). What lies
+    beside the other fibre's end, off the route, still goes to that fibre (tubes take the
+    nearest path, and `_claim_end_fragments` the rest).
     """
     from scipy.spatial import cKDTree
     sp = np.asarray(sp, float)
@@ -2879,21 +2881,6 @@ def _reach_across_gaps(paths, sp, obj_lookup, intensity_box, bshape):
     tree = cKDTree(np.vstack([X[k] for k in longs]))
     out = list(P)
     ts = np.arange(0.5, _REACH_UM + 1e-9, 0.5)
-    ends_ = []
-    for k in longs:
-        for at_s in (False, True):
-            xk = X[k][::-1] if at_s else X[k]
-            ak = _arc_points(xk, None)
-            qk = xk[ak >= ak[-1] - 6.0]
-            if len(qk) < 4:
-                continue
-            uk = qk[-1] - qk[0]
-            nk = float(np.linalg.norm(uk))
-            if nk > 0:
-                ends_.append((k, xk[-1], uk / nk))
-
-    def other_ends(i_):
-        return [(e_, u_) for k_, e_, u_ in ends_ if k_ != i_]
     for i in range(len(P)):
         if L[i] < 15.0:
             continue
@@ -2965,15 +2952,9 @@ def _reach_across_gaps(paths, sp, obj_lookup, intensity_box, bshape):
             if st_ > 2.0 * float(np.linalg.norm((vb - va) * sp)) + 1.0:
                 route = _line_voxels(va, vb)
             lk = route[obj_lookup(route)] if len(route) else route
-            # Leave out the stretch that passes just beyond another fibre's free end: that
-            # mask is where the other fibre carries on (`_claim_end_fragments` gives it to it).
-            if len(lk):
-                lx = lk * sp
-                keep = np.ones(len(lk), bool)
-                for e_o, u_o in other_ends(i):
-                    w_ = lx - e_o
-                    keep &= ~((np.linalg.norm(w_, axis=1) < _REACH_KEEP_OUT_UM) & ((w_ @ u_o) > -0.5))
-                lk = lk[keep]
+            # The route is kept whole, also where it passes just beyond another fibre's free
+            # end: leaving that stretch out made the path jump there (one case: 4.9 um), and
+            # the mask in the jump, out of reach of the tube, went to the other fibre's end.
             if not len(lk):
                 continue
             new = np.concatenate([Pi, lk])
