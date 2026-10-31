@@ -185,6 +185,7 @@ _CONTACT_HIT_UM = 1.0
 _REACH_UM = 12.0         # a free end of a path of at least 15 um (`_reach_across_gaps`) whose course, carried straight
 _REACH_GAP_UM = 2.0      # on, crosses a gap in the mask of at least this, starting within 1.5 um of the end, and then
 _REACH_HIT_UM = 1.0      # meets another fibre's path (within this) where the mask resumes, at most _REACH_UM ahead, is
+_REACH_KEEP_OUT_UM = 4.0 # (the extension leaves out its stretch within this of another fibre's free end, on its far side)
 _REACH_SIGNAL = 0.9      # carried on to it if the image along the gap is at least this bright relative to the fibre itself
 _END_FRAGMENT_UM = 3.0   # an unclaimed piece of mask touching a fibre within this of its end (`_claim_end_fragments`)
 _END_FRAGMENT_VOX = 2000 # and no bigger than this joins that fibre
@@ -2862,7 +2863,9 @@ def _reach_across_gaps(paths, sp, obj_lookup, intensity_box, bshape):
     straight on to that point, provided the smoothed image along the gap is at least
     `_REACH_SIGNAL` as bright as the fibre's own last 10 um. The extension follows the
     mask between the two (cheapest route, avoiding other fibres' paths), so it picks up
-    the unclaimed mask on the way, at whatever depth it lies; only mask voxels are added.
+    the unclaimed mask on the way, at whatever depth it lies; only mask voxels are added,
+    and not those within `_REACH_KEEP_OUT_UM` beyond another fibre's free end, which is that
+    fibre's continuation.
     """
     from scipy.spatial import cKDTree
     sp = np.asarray(sp, float)
@@ -2876,6 +2879,21 @@ def _reach_across_gaps(paths, sp, obj_lookup, intensity_box, bshape):
     tree = cKDTree(np.vstack([X[k] for k in longs]))
     out = list(P)
     ts = np.arange(0.5, _REACH_UM + 1e-9, 0.5)
+    ends_ = []
+    for k in longs:
+        for at_s in (False, True):
+            xk = X[k][::-1] if at_s else X[k]
+            ak = _arc_points(xk, None)
+            qk = xk[ak >= ak[-1] - 6.0]
+            if len(qk) < 4:
+                continue
+            uk = qk[-1] - qk[0]
+            nk = float(np.linalg.norm(uk))
+            if nk > 0:
+                ends_.append((k, xk[-1], uk / nk))
+
+    def other_ends(i_):
+        return [(e_, u_) for k_, e_, u_ in ends_ if k_ != i_]
     for i in range(len(P)):
         if L[i] < 15.0:
             continue
@@ -2947,6 +2965,15 @@ def _reach_across_gaps(paths, sp, obj_lookup, intensity_box, bshape):
             if st_ > 2.0 * float(np.linalg.norm((vb - va) * sp)) + 1.0:
                 route = _line_voxels(va, vb)
             lk = route[obj_lookup(route)] if len(route) else route
+            # Leave out the stretch that passes just beyond another fibre's free end: that
+            # mask is where the other fibre carries on (`_claim_end_fragments` gives it to it).
+            if len(lk):
+                lx = lk * sp
+                keep = np.ones(len(lk), bool)
+                for e_o, u_o in other_ends(i):
+                    w_ = lx - e_o
+                    keep &= ~((np.linalg.norm(w_, axis=1) < _REACH_KEEP_OUT_UM) & ((w_ @ u_o) > -0.5))
+                lk = lk[keep]
             if not len(lk):
                 continue
             new = np.concatenate([Pi, lk])
@@ -3836,11 +3863,12 @@ def _claim_end_fragments(candidates, lbl, sl, segmentation_mask, params):
     """Give a fibre the piece of unclaimed mask its end runs into.
 
     Where a fibre ends in a bunched-up part of the mask, the tube around its path can stop
-    short of the end of the fibre itself, leaving a piece of mask that no seed takes. A
-    connected piece of the object's mask outside every candidate (`_END_FRAGMENT_VOX`
-    voxels at most) that touches exactly one candidate within `_END_FRAGMENT_UM` of that
-    candidate's end (along its own long axis) joins that candidate. Pieces touching no end,
-    or the ends of several candidates, stay unclaimed.
+    short of the end of the fibre itself, leaving mask that no seed takes. A connected piece
+    of the object's mask outside every candidate (`_END_FRAGMENT_VOX` voxels at most) that
+    touches candidates within `_END_FRAGMENT_UM` of their ends (along their long axis) is
+    shared out voxel by voxel: each voxel goes to the nearest of those ends that it lies
+    beyond (on the far side of the end, along the fibre's outward axis), and voxels beyond
+    none of them stay unclaimed.
     """
     sp = np.asarray(params.spacing, float)
     if len(sp) != 3:
@@ -3858,32 +3886,49 @@ def _claim_end_fragments(candidates, lbl, sl, segmentation_mask, params):
     comp, n_comp = ndimage.label(free, structure=np.ones((3, 3, 3)))
     if not n_comp:
         return
-    # each candidate's end zones: voxels within _END_FRAGMENT_UM of its extremes along its axis
-    end_zone = np.zeros(own.shape, np.int32)
-    for n_, c in enumerate(candidates, 1):
+    end_zone = np.zeros(own.shape, np.int32)                  # end id + 1 (two per candidate)
+    ends = []                                                 # (candidate index, end point, outward axis)
+    for n_, c in enumerate(candidates):
         q = np.asarray(c["coords"]) - off
         x = q * sp
         cen = x.mean(0)
         u = np.linalg.svd(x[:: max(1, len(x) // 2000)] - cen, full_matrices=False)[2][0]
         t = (x - cen) @ u
-        near_end = (t <= t.min() + _END_FRAGMENT_UM) | (t >= t.max() - _END_FRAGMENT_UM)
-        e = q[near_end]
-        end_zone[tuple(e.T)] = np.where(end_zone[tuple(e.T)] == 0, n_, -1)
-    grown = ndimage.grey_dilation(np.where(end_zone > 0, end_zone, 0), size=(3, 3, 3))
+        for sgn, sel in ((-1.0, t <= t.min() + _END_FRAGMENT_UM), (1.0, t >= t.max() - _END_FRAGMENT_UM)):
+            e = q[sel]
+            ends.append((n_, x[sel].mean(0), sgn * u))
+            end_zone[tuple(e.T)] = len(ends)
+    grown = ndimage.grey_dilation(end_zone, size=(3, 3, 3))
     sizes = np.bincount(comp.ravel())
+    adds = {}
     for k in range(1, n_comp + 1):
         if sizes[k] > _END_FRAGMENT_VOX:
             continue
         m = comp == k
         touch = np.unique(grown[m])
-        touch = touch[touch > 0]
-        if len(touch) != 1:
+        touch = [int(t_) - 1 for t_ in touch if t_ > 0]
+        if not touch:
             continue
-        n_ = int(touch[0])
-        add = (np.argwhere(m) + off).astype(np.asarray(candidates[n_ - 1]["coords"]).dtype)
-        c = candidates[n_ - 1]
+        vox = np.argwhere(m)
+        vx = vox * sp
+        best_d = np.full(len(vox), np.inf)
+        best_c = np.full(len(vox), -1)
+        for e_id in touch:
+            n_, ep, o = ends[e_id]
+            w = vx - ep
+            d = np.linalg.norm(w, axis=1)
+            beyond = (w @ o) > -0.5
+            better = beyond & (d < best_d)
+            best_d[better] = d[better]
+            best_c[better] = n_
+        for n_ in np.unique(best_c[best_c >= 0]):
+            adds.setdefault(int(n_), []).append(vox[best_c == n_] + off)
+    for n_, parts in adds.items():
+        c = candidates[n_]
+        add = np.concatenate(parts).astype(np.asarray(c["coords"]).dtype)
+        n0 = len(c["coords"])
         c["coords"] = np.concatenate([np.asarray(c["coords"]), add])
         for key in ("dt_vals", "rank_vals"):
-            if key in c and c[key] is not None and len(c[key]) == len(c["coords"]) - len(add):
+            if key in c and c[key] is not None and len(c[key]) == n0:
                 c[key] = np.concatenate([np.asarray(c[key]), np.zeros(len(add), np.asarray(c[key]).dtype)])
         c["vol"] = int(len(c["coords"]))
