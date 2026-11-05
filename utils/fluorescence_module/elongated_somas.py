@@ -188,6 +188,12 @@ _REACH_HIT_UM = 1.0      # meets another fibre's path (within this) where the ma
 _REACH_SIGNAL = 0.9      # carried on to it if the image along the gap is at least this bright relative to the fibre itself
 _END_FRAGMENT_UM = 3.0   # an unclaimed piece of mask touching a fibre within this of its end (`_claim_end_fragments`)
 _END_FRAGMENT_VOX = 2000 # and no bigger than this joins that fibre
+_END_PAIR_DEG = 20.0     # two fibre ends whose courses (_END_COURSE_UM before the end) are parallel within this
+_END_COURSE_UM = (2.0, 12.0)
+_END_PAIR_LINE_UM = 0.6  # where one fibre's end lies on the other's course carried on (within this of its line,
+_END_PAIR_AHEAD_UM = (1.0, 6.0)  # this far ahead of the other's end) while its path passes the other's end
+_END_PAIR_BESIDE_UM = 1.5  # within this: the end pieces of both are shared by distance to each fibre's
+_END_PAIR_RAY_UM = 10.0  # path carried straight on this far past its end (parallel fibres keep their order)
 _LOOP_BACK_UM = 1.0      # a path that runs back against its own course (`_cut_loops`) by more than this has a loop
 _STEP_LEG_UM = 8.0       # a path of at least 30 um that steps sideways (`_split_overlapping_steps`) between two
 _STEP_PAR_DEG = 10.0     # straight stretches of this length (median miss <= _STEP_STRAIGHT_UM), parallel within this,
@@ -3793,7 +3799,10 @@ def _elongated_fibre_candidates(lbl, sl, segmentation_mask, intensity_image,
             pk = cc[len(cc) // 2]
             if not is_stack:
                 cc, pk = cc[:, 1:], pk[1:]
+            # The path, in image coordinates, for `_claim_end_fragments`; dropped after it.
+            pth = (np.asarray(paths[rt - 1]) + boff).astype(np.int32)
             candidates.append({
+                "path": pth if is_stack else pth[:, 1:],
                 "coords": cc.astype(np.int32),
                 "peak_coord": np.asarray(pk),
                 "vol": int(len(cc)),
@@ -3821,6 +3830,8 @@ def _elongated_label_candidates(lbl, sl, segmentation_mask, intensity_image, par
     candidates, diag = _elongated_fibre_candidates(lbl, sl, segmentation_mask, intensity_image, params)
     if candidates:
         _claim_end_fragments(candidates, lbl, sl, segmentation_mask, params)
+        for c in candidates:
+            c.pop("path", None)
         return candidates, diag
     own = np.asarray(segmentation_mask[tuple(sl)]) == lbl
     n = int(own.sum())
@@ -3850,6 +3861,15 @@ def _claim_end_fragments(candidates, lbl, sl, segmentation_mask, params):
     shared out voxel by voxel: each voxel goes to the nearest of those ends that it lies
     beyond (on the far side of the end, along the fibre's outward axis), and voxels beyond
     none of them stay unclaimed.
+
+    Two parallel fibres that end side by side are the exception. Where one fibre's end lies
+    on the other's course carried on (within `_END_PAIR_LINE_UM` of its line, 1 to 6 um ahead
+    of its end) while its path passes beside the other's end (within `_END_PAIR_BESIDE_UM`),
+    the nearest-end rule hands each of them a piece that lies on the other's line. Of what
+    either of the two would take, each voxel goes instead to the one whose path, carried
+    straight on past its end, passes nearer: parallel fibres keep their order. Courses come
+    from the candidates' paths (key "path", image coordinates), taken `_END_COURSE_UM` before
+    the end so that a hook at the very end does not set the direction.
     """
     sp = np.asarray(params.spacing, float)
     if len(sp) != 3:
@@ -3879,6 +3899,7 @@ def _claim_end_fragments(candidates, lbl, sl, segmentation_mask, params):
             e = q[sel]
             ends.append((n_, x[sel].mean(0), sgn * u))
             end_zone[tuple(e.T)] = len(ends)
+    partner = _side_by_side_ends(candidates, ends, off, sp)
     grown = ndimage.grey_dilation(end_zone, size=(3, 3, 3))
     sizes = np.bincount(comp.ravel())
     adds = {}
@@ -3893,7 +3914,7 @@ def _claim_end_fragments(candidates, lbl, sl, segmentation_mask, params):
         vox = np.argwhere(m)
         vx = vox * sp
         best_d = np.full(len(vox), np.inf)
-        best_c = np.full(len(vox), -1)
+        best_e = np.full(len(vox), -1)
         for e_id in touch:
             n_, ep, o = ends[e_id]
             w = vx - ep
@@ -3901,7 +3922,15 @@ def _claim_end_fragments(candidates, lbl, sl, segmentation_mask, params):
             beyond = (w @ o) > -0.5
             better = beyond & (d < best_d)
             best_d[better] = d[better]
-            best_c[better] = n_
+            best_e[better] = e_id
+        for e_id in [int(e_) for e_ in np.unique(best_e) if e_ in partner]:
+            group = [e_id] + [g_ for g_ in partner[e_id] if g_ != e_id]
+            sel = np.flatnonzero(np.isin(best_e, group))
+            dist = np.stack([partner[g_][g_].query(vx[sel])[0] for g_ in group])
+            best_e[sel] = np.asarray(group)[dist.argmin(0)]
+        best_c = np.full(len(vox), -1)
+        has = best_e >= 0
+        best_c[has] = np.array([ends[int(e_)][0] for e_ in best_e[has]], int)
         for n_ in np.unique(best_c[best_c >= 0]):
             adds.setdefault(int(n_), []).append(vox[best_c == n_] + off)
     for n_, parts in adds.items():
@@ -3913,3 +3942,57 @@ def _claim_end_fragments(candidates, lbl, sl, segmentation_mask, params):
             if key in c and c[key] is not None and len(c[key]) == n0:
                 c[key] = np.concatenate([np.asarray(c[key]), np.zeros(len(add), np.asarray(c[key]).dtype)])
         c["vol"] = int(len(c["coords"]))
+
+
+def _side_by_side_ends(candidates, ends, off, sp):
+    """Pairs of `ends` (as built in `_claim_end_fragments`) of two parallel fibres where one
+    fibre's end lies on the other's course carried on and its path passes beside the other's
+    end. Returns {end id: {end id: KD-tree of that fibre's path + its straight continuation}}
+    for every end in such a pair, the end itself and its partners as keys."""
+    from scipy.spatial import cKDTree
+    course = {}
+    for e_id, (n_, ep, _o) in enumerate(ends):
+        p = candidates[n_].get("path")
+        if p is None or len(p) < 4:
+            continue
+        px = (np.asarray(p) - off) * sp
+        pe = px if np.linalg.norm(px[0] - ep) <= np.linalg.norm(px[-1] - ep) else px[::-1]
+        a = _arc_points(pe, None)
+        w = pe[(a >= _END_COURSE_UM[0]) & (a <= _END_COURSE_UM[1])]
+        if len(w) < 4:
+            continue
+        cc = w.mean(0)
+        d = np.linalg.svd(w - cc, full_matrices=False)[2][0]
+        d = d if d @ (pe[0] - pe[-1]) >= 0 else -d                # pointing out of the end
+        course[e_id] = (pe, d)
+    pairs = []
+    ids = sorted(course)
+    for a_i, i in enumerate(ids):
+        for j in ids[a_i + 1:]:
+            if ends[i][0] == ends[j][0]:
+                continue
+            (pi, di), (pj, dj) = course[i], course[j]
+            if di @ dj < math.cos(math.radians(_END_PAIR_DEG)):
+                continue
+            for (pa, da), (pb, db) in (((pi, di), (pj, dj)), ((pj, dj), (pi, di))):
+                w = pb[0] - pa[0]
+                ahead = float(w @ da)
+                if not (_END_PAIR_AHEAD_UM[0] <= ahead <= _END_PAIR_AHEAD_UM[1]):
+                    continue
+                if np.linalg.norm(w - ahead * da) > _END_PAIR_LINE_UM:
+                    continue                      # b's end is not on a's line
+                if np.min(np.linalg.norm(pb - pa[0], axis=1)) > _END_PAIR_BESIDE_UM:
+                    continue                      # b's path does not pass a's end
+                pairs.append((i, j))
+                break
+    out = {}
+    trees = {}
+    for i, j in pairs:
+        for e_ in (i, j):
+            if e_ not in trees:
+                pe, d = course[e_]
+                ray = pe[0] + np.outer(np.arange(0.0, _END_PAIR_RAY_UM + 1e-9, 0.2), d)
+                trees[e_] = cKDTree(np.vstack([pe, ray]))
+        out.setdefault(i, {i: trees[i]})[j] = trees[j]
+        out.setdefault(j, {j: trees[j]})[i] = trees[i]
+    return out
