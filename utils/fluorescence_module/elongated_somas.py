@@ -194,6 +194,11 @@ _CORE_GAP_UM = 2.0       # if it leaves the mask for at least this, comes back i
 _CORE_INTO_UM = 1.0      # (beyond _REACH_HIT_UM) for at least this, and then meets another fibre's path (within
                          # _REACH_HIT_UM, at most _REACH_UM on), the path follows the core there -- provided the
 _CORE_OFF_PATH_UM = 0.6  # core was at least this far off the path before the gap (the path's end turned away from it)
+_DETOUR_END_UM = 1.5     # a leftover piece of path (3 um to _SIG_MIN_FIBRE_UM long) whose two ends lie within this
+_DETOUR_LEN = (0.8, 2.0) # of a fibre's path, where the stretch between is this many times the piece's length and
+_DETOUR_STRAY_UM = 1.0   # strays at least this far from it, replaces that stretch (`_take_leftover_detours`) if the
+_DETOUR_DARK = 1.5       # piece's darkest point is at least this times brighter than the stretch's and the piece
+                         # keeps _MARCH_CLEAR_UM (median) from every other fibre's path
 _END_FRAGMENT_UM = 3.0   # an unclaimed piece of mask touching a fibre within this of its end (`_claim_end_fragments`)
 _END_FRAGMENT_VOX = 2000 # and no bigger than this joins that fibre
 _LOOP_BACK_UM = 1.0      # a path that runs back against its own course (`_cut_loops`) by more than this has a loop
@@ -3103,6 +3108,78 @@ def _follow_cores_across_gaps(paths, sp, obj_lookup, intensity_box, bshape):
     return out
 
 
+def _take_leftover_detours(paths, sp, intensity_box):
+    """Route a fibre through a leftover piece of path that follows its core, not around it.
+
+    Where a fibre crosses a dark or crowded stretch, the tracer can link its two sides by a
+    detour through neighbouring fibres while the piece of skeleton that really follows the
+    fibre is left over, too short to become a seed of its own (one case: 6 um along the core,
+    the detour 9 um through two other fibres and a dark gap). A leftover piece (3 um to
+    `_SIG_MIN_FIBRE_UM` long) whose two ends lie within `_DETOUR_END_UM` of a path of at least
+    15 um, away from its ends, where the path's stretch between them is `_DETOUR_LEN` times the
+    piece's length and strays at least `_DETOUR_STRAY_UM` from it, replaces that stretch when
+    (a) the piece keeps a median `_MARCH_CLEAR_UM` from every other fibre's path (it is not a
+    crumb of a neighbour) and (b) its darkest point in the smoothed image is at least
+    `_DETOUR_DARK` times brighter than the stretch's (the stretch crosses dark ground; the
+    piece stays on the fibre). The piece is removed as a path of its own.
+    """
+    from scipy.spatial import cKDTree
+    sp = np.asarray(sp, float)
+    P = [np.asarray(p_) for p_ in paths]
+    X = [p_ * sp for p_ in P]
+    L = [float(_arc_points(x, None)[-1]) if len(x) > 1 else 0.0 for x in X]
+    longs = [k for k in range(len(P)) if L[k] >= 15.0]
+    shorts = [k for k in range(len(P)) if 3.0 <= L[k] < _SIG_MIN_FIBRE_UM]
+    if not longs or not shorts:
+        return P
+    own = np.concatenate([[k] * len(X[k]) for k in longs])
+    tree = cKDTree(np.vstack([X[k] for k in longs]))
+    used, out = set(), list(P)
+    for b in shorts:
+        xb = X[b]
+        for a in longs:
+            if a in used:
+                continue
+            xa = np.asarray(out[a]) * sp
+            ta = cKDTree(xa)
+            d0, i0 = ta.query(xb[0])
+            d1, i1 = ta.query(xb[-1])
+            if d0 > _DETOUR_END_UM or d1 > _DETOUR_END_UM or i0 == i1:
+                continue
+            s_ = _arc_points(xa, None)
+            lo, hi = sorted((int(i0), int(i1)))
+            if s_[lo] < 1.0 or s_[hi] > s_[-1] - 1.0:
+                continue                                  # at an end: not a detour
+            if not (_DETOUR_LEN[0] * L[b] <= s_[hi] - s_[lo] <= _DETOUR_LEN[1] * L[b]):
+                continue
+            if float(cKDTree(xb).query(xa[lo:hi + 1])[0].max()) < _DETOUR_STRAY_UM:
+                continue                                  # the stretch follows the piece anyway
+            dd, hh = tree.query(xb, k=min(4, len(own)))
+            dd, hh = dd.reshape(len(xb), -1), hh.reshape(len(xb), -1)
+            if float(np.median(np.where(own[np.minimum(hh, len(own) - 1)] != a, dd, np.inf).min(1))) < _MARCH_CLEAR_UM:
+                continue                                  # a crumb of a neighbouring fibre
+            pa = np.asarray(out[a])
+            allp = np.vstack([pa[lo:hi + 1], P[b]])
+            lo_b = np.maximum(allp.min(0) - 4, 0)
+            hi_b = allp.max(0) + 5
+            img, org = intensity_box(lo_b, hi_b)
+            if img.size == 0:
+                continue
+            img = ndimage.gaussian_filter(img, (0.7, 1.2, 1.2))
+            top = np.array(img.shape) - 1
+            va = img[tuple(np.clip(pa[lo:hi + 1] - org, 0, top).T)]
+            vb = img[tuple(np.clip(P[b] - org, 0, top).T)]
+            if float(vb.min()) < _DETOUR_DARK * max(float(va.min()), 1e-6):
+                continue                                  # the stretch is no darker than the piece
+            pb = P[b] if i0 <= i1 else P[b][::-1]
+            new = np.concatenate([pa[:lo], pb, pa[hi + 1:]])
+            out[a] = new[np.r_[True, np.any(np.diff(new, axis=0) != 0, axis=1)]]
+            out[b] = None
+            used.add(a)
+            break
+    return [p_ for p_ in out if p_ is not None]
+
+
 def _cut_loops(paths, sp, obj_lookup):
     """Cut out stretches where a path doubles back on itself.
 
@@ -3756,6 +3833,7 @@ def _elongated_fibre_candidates(lbl, sl, segmentation_mask, intensity_image,
             paths_ = _resolve_contacts_by_intensity(paths_, sp, obj_lookup, intensity_box)
             paths_ = _reach_across_gaps(paths_, sp, obj_lookup, intensity_box, bshape)
             paths_ = _follow_cores_across_gaps(paths_, sp, obj_lookup, intensity_box, bshape)
+            paths_ = _take_leftover_detours(paths_, sp, intensity_box)
         return paths_
 
     def skeleton_with_cut(cut):
