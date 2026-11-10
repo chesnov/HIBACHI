@@ -199,6 +199,10 @@ _DETOUR_LEN = (0.8, 2.0) # of a fibre's path, where the stretch between is this 
 _DETOUR_STRAY_UM = 1.0   # strays at least this far from it, replaces that stretch (`_take_leftover_detours`) if the
 _DETOUR_DARK = 1.5       # piece's darkest point is at least this times brighter than the stretch's and the piece
                          # keeps _MARCH_CLEAR_UM (median) from every other fibre's path
+_DEPTH_TOUCH_UM = 1.0    # two paths of at least 15 um that touch (within this; `_keep_depth_order`), lie at
+_DEPTH_DZ_UM = 0.5       # different depths (at least this, median over 1-4 um before the contact), reverse that
+_DEPTH_NEAR_UM = 2.5     # depth order after it for at least _DEPTH_REV_UM while running alongside (within this)
+_DEPTH_REV_UM = 8.0      # and then restore it: the two middle stretches are swapped (one passes over the other)
 _END_FRAGMENT_UM = 3.0   # an unclaimed piece of mask touching a fibre within this of its end (`_claim_end_fragments`)
 _END_FRAGMENT_VOX = 2000 # and no bigger than this joins that fibre
 _LOOP_BACK_UM = 1.0      # a path that runs back against its own course (`_cut_loops`) by more than this has a loop
@@ -3180,6 +3184,116 @@ def _take_leftover_detours(paths, sp, intensity_box):
     return [p_ for p_ in out if p_ is not None]
 
 
+def _keep_depth_order(paths, sp):
+    """Swap back the middle stretches of two fibres that change depth order twice.
+
+    Where two fibres cross or run together, one passes over the other: their order in depth
+    (z) stays the same. The tracer can instead carry each onto the other where they touch and
+    back again further on, so that each label dives under the other fibre for a stretch and
+    then climbs back (one case: 78/37, reversed for 17 um; the label had a long gap in the z
+    slices there). For two paths of at least 15 um that touch (within `_DEPTH_TOUCH_UM`) and
+    lie at different depths just before the contact (median z difference at least
+    `_DEPTH_DZ_UM` over 1 to 4 um before it), if the depth order is then reversed for at least
+    `_DEPTH_REV_UM` while they stay within `_DEPTH_NEAR_UM` of each other and is afterwards
+    restored, the stretches between the contact and the point where the order is restored
+    are exchanged. Each path takes part in at most one exchange. Brief reversals (where one
+    fibre just rises to the other's level as they cross, or ends against it) are shorter
+    than `_DEPTH_REV_UM` and are left alone.
+    """
+    from scipy.spatial import cKDTree
+    sp = np.asarray(sp, float)
+    P = [np.asarray(p_) for p_ in paths]
+    X = [p_ * sp for p_ in P]
+    S_ = [_arc_points(x, None) if len(x) > 1 else np.zeros(len(x)) for x in X]
+    L = [float(a[-1]) if len(a) else 0.0 for a in S_]
+    longs = [k for k in range(len(P)) if L[k] >= 15.0]
+    if len(longs) < 2:
+        return P
+    trees = {k: cKDTree(X[k]) for k in longs}
+    done = set()
+    out = list(P)
+    for a in longs:
+        if a in done:
+            continue
+        xa, s = X[a], S_[a]
+        for b in longs:
+            if b == a or b in done:
+                continue
+            d, j = trees[b].query(xa)
+            if d.min() > _DEPTH_TOUCH_UM:
+                continue
+            zd = xa[:, 0] - X[b][j, 0]
+            idx = np.flatnonzero(d <= _DEPTH_TOUCH_UM)
+            found = None
+            for run in np.split(idx, np.flatnonzero(np.diff(idx) > 1) + 1):
+                c = int(run[np.argmin(d[run])])
+                for dirn in (1, -1):
+                    rel = dirn * (s - s[c])
+                    bef = (rel <= -1.0) & (rel >= -4.0) & (d <= 3.0)
+                    if bef.sum() < 3 or abs(float(np.median(zd[bef]))) < _DEPTH_DZ_UM:
+                        continue
+                    sgn = np.sign(float(np.median(zd[bef])))
+                    order = np.argsort(rel)
+                    state, s_rev0, back = "wait", None, None
+                    for k in order:
+                        if rel[k] < 1.0:
+                            continue
+                        if rel[k] > 25.0 or d[k] > _DEPTH_NEAR_UM:
+                            break
+                        sg = np.sign(zd[k]) if abs(zd[k]) >= _DEPTH_DZ_UM else 0
+                        if state == "wait":
+                            if sg == -sgn:
+                                state, s_rev0 = "rev", s[k]
+                            elif sg == sgn:
+                                break
+                        elif sg == sgn:
+                            if abs(s[k] - s_rev0) >= _DEPTH_REV_UM:
+                                back = int(k)
+                            break
+                    if back is not None:
+                        # exchange up to where the reversal first ends (depth difference back to
+                        # zero), not where the order is clear again: side by side at one depth,
+                        # the difference flickers around zero for a while
+                        k2 = back
+                        for k in order:
+                            if rel[k] > rel[back]:
+                                break
+                            if dirn * (s[k] - s_rev0) > 0 and zd[k] * sgn >= 0:
+                                k2 = int(k)
+                                break
+                        found = (c, k2)
+                        break
+                if found:
+                    break
+            if not found:
+                continue
+            c, k2 = found
+            a0, a1 = sorted((c, k2))
+            # The contact is matched to the nearest point of the other path (they touch there);
+            # the other end of the exchange to the point level with it along the course (the two
+            # run apart there, and the nearest point can lie well ahead).
+            jc = int(j[c])
+            u = xa[k2] - xa[c]
+            u = u / max(float(np.linalg.norm(u)), 1e-9)
+            near = np.flatnonzero(np.linalg.norm(X[b] - xa[k2], axis=1) <= 3.0)
+            jk = int(near[np.argmin(np.abs((X[b][near] - xa[k2]) @ u))]) if len(near) else int(j[k2])
+            jb0, jb1 = (jc, jk) if c <= k2 else (jk, jc)
+            pa, pb = out[a], out[b]
+            rev_b = jb1 < jb0
+            if rev_b:
+                pb = pb[::-1]
+                jb0, jb1 = len(pb) - 1 - jb0, len(pb) - 1 - jb1
+            new_a = np.concatenate([pa[:a0], pb[jb0:jb1 + 1], pa[a1 + 1:]])
+            new_b = np.concatenate([pb[:jb0], pa[a0:a1 + 1], pb[jb1 + 1:]])
+            new_a = new_a[np.r_[True, np.any(np.diff(new_a, axis=0) != 0, axis=1)]]
+            new_b = new_b[np.r_[True, np.any(np.diff(new_b, axis=0) != 0, axis=1)]]
+            out[a] = new_a
+            out[b] = new_b[::-1] if rev_b else new_b
+            done.update((a, b))
+            break
+    return out
+
+
 def _cut_loops(paths, sp, obj_lookup):
     """Cut out stretches where a path doubles back on itself.
 
@@ -3834,6 +3948,7 @@ def _elongated_fibre_candidates(lbl, sl, segmentation_mask, intensity_image,
             paths_ = _reach_across_gaps(paths_, sp, obj_lookup, intensity_box, bshape)
             paths_ = _follow_cores_across_gaps(paths_, sp, obj_lookup, intensity_box, bshape)
             paths_ = _take_leftover_detours(paths_, sp, intensity_box)
+            paths_ = _keep_depth_order(paths_, sp)
         return paths_
 
     def skeleton_with_cut(cut):
