@@ -97,4 +97,8 @@ def _elongated_label_candidates(lbl, sl, segmentation_mask, intensity_image, par
         del v
         cost = _flow_cost(t, region, anchors, sp)
         score = np.exp(-cost[own] / REACH_UM).astype(np.float32)
+        outside = region & ~own
+        return [{"coords": coords, "vol": len(coords), "score": 1.0, "rank_vals": score,
+                 "heat_coords": (np.argwhere(outside) + np.array([s.start for s in box])).astype(np.int32),
+                 "heat_vals": np.exp(-cost[outside] / REACH_UM).astype(np.float32)}], {}
     return [{"coords": coords, "vol": len(coords), "score": 1.0, "rank_vals": score}], {}
