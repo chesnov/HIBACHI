@@ -161,6 +161,9 @@ class FluorescenceStrategy(ProcessingStrategy):
         ("trimmed_segmentation", "trimmed_segmentation_{p}.dat",
          "trimmed_segmentation*.dat"),
         ("cell_bodies", "cell_bodies.dat", "cell_bodies*.dat"),
+        # Elongated mode only: each seeded voxel's confidence score in [0, 1],
+        # float32 at the image's shape. For review; nothing downstream reads it.
+        ("soma_confidence", "soma_confidence.dat", "soma_confidence*.dat"),
         ("final_segmentation", "final_segmentation_{p}.dat",
          "final_segmentation*.dat"),
         ("skeleton_array", "skeleton_array_{p}.dat", "skeleton_array*.dat"),
@@ -174,7 +177,7 @@ class FluorescenceStrategy(ProcessingStrategy):
     STEP_ARTIFACTS = {
         1: ("raw_segmentation", "corrected_image"),
         2: ("trimmed_segmentation", "edge_mask"),
-        3: ("cell_bodies",),
+        3: ("cell_bodies", "soma_confidence"),
         4: ("final_segmentation",),
         5: ("skeleton_array", "metrics_df", "branch_data",
             "distances_matrix", "points_matrix", "metrics_fcs"),
@@ -184,7 +187,7 @@ class FluorescenceStrategy(ProcessingStrategy):
     STEP_LAYERS = {
         1: ("Raw Intermediate Segmentation",),
         2: ("Trimmed Intermediate Segmentation", "Edge Mask"),
-        3: ("Cell bodies",),
+        3: ("Cell bodies", "Soma confidence"),
         4: ("Final segmentation",),
         5: ("Skeletons", "Neighbor Connections"),
     }
@@ -629,6 +632,10 @@ class FluorescenceStrategy(ProcessingStrategy):
                 return self._quantify_whole_objects(
                     viewer, trimmed_seg_path, cell_bodies_path)
 
+            soma_shape = str(params.get("soma_shape", "compact") or "compact")
+            confidence_path = files.get("soma_confidence")
+            confidence_tmp = (os.path.join(self.temp_dir, "soma_confidence_tmp.mmp")
+                              if soma_shape == "elongated" and confidence_path else None)
             cell_bodies = extract_soma_masks(
                 trimmed_labels_memmap, image_stack, self.spacing_checked,
                 min_fragment_size=int(_require(params, "min_fragment_size", int)),
@@ -654,7 +661,10 @@ class FluorescenceStrategy(ProcessingStrategy):
                 # neutral_default, so a project set up before it existed has no
                 # such key and must behave exactly as it did. "compact" is that
                 # behaviour.
-                soma_shape=str(params.get("soma_shape", "compact") or "compact"),
+                soma_shape=soma_shape,
+                # Elongated mode writes each seeded voxel's confidence here; it
+                # is copied to the `soma_confidence` artifact below.
+                confidence_output_path=confidence_tmp,
                 # Where the result memmap is written before being copied to
                 # `cell_bodies_path`. This used to be passed as
                 # `temp_root_path`, which `extract_soma_masks` has no parameter
@@ -678,6 +688,14 @@ class FluorescenceStrategy(ProcessingStrategy):
                 cb_memmap[:] = cell_bodies[:]
                 self._close_memmap(cb_memmap)
                 del cell_bodies
+
+            # The confidence heatmap (elongated mode). Any other mode removes an
+            # old one, so the viewer never shows a heatmap of an earlier run.
+            if confidence_tmp and os.path.exists(confidence_tmp):
+                copy_artifact(confidence_tmp, confidence_path)
+                os.remove(confidence_tmp)
+            elif confidence_path and os.path.exists(confidence_path):
+                os.remove(confidence_path)
 
             if viewer is not None:
                 cb_display = np.memmap(
@@ -1105,6 +1123,12 @@ class FluorescenceStrategy(ProcessingStrategy):
             )
         if checkpoint_step >= 3:
             load_and_add("cell_bodies", "Cell bodies")
+            # Elongated mode's per-voxel confidence (0 = unsure or not analysed,
+            # 1 = certain); absent for the other modes and for older runs.
+            load_and_add(
+                "soma_confidence", "Soma confidence", dtype=np.float32,
+                layer_type='image', colormap='inferno', contrast_limits=[0.0, 1.0],
+            )
         if checkpoint_step >= 4:
             load_and_add("final_segmentation", "Final segmentation")
         if checkpoint_step >= 5:

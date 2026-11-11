@@ -779,6 +779,7 @@ def extract_soma_masks(
     memmap_voxel_threshold: int = 25_000_000,
     tile_size: Optional[Sequence[int]] = None,
     soma_shape: str = "compact",
+    confidence_output_path: Optional[str] = None,
 ) -> np.ndarray:
     """
     Memory-efficient 3D Soma Extraction logic.
@@ -830,6 +831,10 @@ def extract_soma_masks(
             its object-sized working arrays as memmaps in `memmap_dir` (the
             system temp folder when that is None); see
             `_elongated_label_candidates`.
+        confidence_output_path: elongated mode only. If given, a float32 volume of
+            the image's shape is written there: each seeded voxel's confidence
+            score in [0, 1] (the candidates' "rank_vals"), 0 elsewhere. Ignored
+            in the other modes.
 
     Returns:
         np.ndarray: 3D labeled mask containing extracted soma seeds.
@@ -926,6 +931,16 @@ def extract_soma_masks(
                   f"{_ram_gb:.2f} GB output mask in RAM. Pass a memmap_dir to "
                   f"stream it to disk instead.")
         final_seed_mask = np.zeros_like(segmentation_mask, dtype=np.int32)
+
+    # Per-voxel confidence of the elongated seeds, for review (see the docstring).
+    confidence = None
+    if confidence_output_path is not None and elongated:
+        os.makedirs(os.path.dirname(os.path.abspath(confidence_output_path)), exist_ok=True)
+        confidence = np.memmap(
+            confidence_output_path, dtype="float32", mode="w+", shape=segmentation_mask.shape
+        )
+        confidence[:] = 0
+        print(f"  Initialized confidence memmap at: {confidence_output_path}")
 
     next_label_id = 1
     # Global spatial hash of placed peaks (physical units), cell size =
@@ -1101,6 +1116,10 @@ def extract_soma_masks(
                                 diag_stats["spatial_overlap_rejected"] += 1
                                 continue
                             final_seed_mask[idx_tuple] = next_label_id
+                            if confidence is not None:
+                                rv = cand.get("rank_vals")
+                                if rv is not None and len(rv) == len(coords):
+                                    confidence[idx_tuple] = rv
                             next_label_id += 1
                             continue
                         peak_phys = cand["peak_coord"] * np.array(spacing)
@@ -1184,5 +1203,8 @@ def extract_soma_masks(
     # Final cleanup and persistence
     if isinstance(final_seed_mask, np.memmap):
         final_seed_mask.flush()
+    if confidence is not None:
+        confidence.flush()
+        del confidence
 
     return final_seed_mask

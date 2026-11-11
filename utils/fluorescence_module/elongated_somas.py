@@ -81,7 +81,9 @@ def _elongated_label_candidates(lbl, sl, segmentation_mask, intensity_image, par
 
     Fibre seeds plus the object's uncertain seed cover every voxel of the object. An object
     without any fibre seed (also every 2D object, and any object when no intensity image is
-    given) becomes one seed as a whole. Each candidate's "rank_vals" holds its voxels' scores.
+    given) becomes one seed as a whole. Each candidate's "rank_vals" holds its voxels' scores
+    (0 where no fibre analysis was possible); `soma_extraction` writes them to the
+    confidence heatmap.
     """
     sp = np.asarray(params.spacing, float)
     diag = {}
@@ -92,7 +94,7 @@ def _elongated_label_candidates(lbl, sl, segmentation_mask, intensity_image, par
         return [], diag
     min_vol = int(params.min_seed_vol)
     if len(sp) != 3 or intensity_image is None or own.ndim != 3:
-        return _whole_object(own, off, min_vol), diag
+        return _whole_object(own, off, None), diag
     field = _direction_field(own, box, intensity_image, sp)
     ridge = _ridge_points(field, own, sp)
     fibres = []
@@ -114,7 +116,7 @@ def _elongated_label_candidates(lbl, sl, segmentation_mask, intensity_image, par
         seeded |= sel
         candidates.append(_candidate(vox[sel] + off, score[sel], "Fibre", 1.0))
     if not candidates:
-        return _whole_object(own, off, min_vol), diag
+        return _whole_object(own, off, score), diag
     rest = ~seeded
     if rest.any():
         candidates.append(_candidate(vox[rest] + off, score[rest], "Uncertain", 0.0))
@@ -129,12 +131,14 @@ def _candidate(coords, score, kind, priority):
             "dt_vals": np.zeros(n, np.float32), "rank_vals": np.asarray(score, np.float32)}
 
 
-def _whole_object(own, off, min_vol):
-    """The whole object as one seed, whatever its size (every mask voxel gets a soma)."""
+def _whole_object(own, off, score):
+    """The whole object as one seed, whatever its size (every mask voxel gets a soma).
+    `score`: the voxels' scores if the fibre analysis ran, else None (scores 0: not analysed)."""
     n = int(own.sum())
     if n == 0:
         return []
-    return [_candidate(np.argwhere(own) + off, np.ones(n, np.float32), "WholeObject", 1.0)]
+    sc = np.zeros(n, np.float32) if score is None else np.asarray(score, np.float32)
+    return [_candidate(np.argwhere(own) + off, sc, "WholeObject", 1.0)]
 
 
 # --------------------------------------------------------------------------- field
