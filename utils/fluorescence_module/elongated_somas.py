@@ -3,6 +3,7 @@ from scipy import ndimage
 
 SOMA_SHAPES = ("compact", "elongated")
 SIGMA_UM = (0.5, 0.25, 0.25)
+MIN_T = 0.1
 
 
 def _hessian(img, region, sp):
@@ -31,6 +32,7 @@ def _centreline(t, v, region, sp):
     keep = t > 0
     for k in (1, 2):
         step = v[:, :, k] * np.asarray(SIGMA_UM) / sp
+        step /= np.abs(step).max(axis=1, keepdims=True)
         for sgn in (-1.0, 1.0):
             keep &= t >= ndimage.map_coordinates(dense, (pts + sgn * step).T, order=1)
     return keep
@@ -52,5 +54,7 @@ def _elongated_label_candidates(lbl, sl, segmentation_mask, intensity_image, par
         line = _centreline(t, v, region, sp)
         inside = own[region]
         t, line = t[inside], line[inside]
-        score = np.where(line, np.clip(t / max(float(np.percentile(t, 99)), 1e-6), 0, 1), 0).astype(np.float32)
+        t = t / max(float(np.percentile(t, 99)), 1e-6)
+        line &= t >= MIN_T
+        score = np.where(line, np.clip(t, 0, 1), 0).astype(np.float32)
     return [{"coords": coords, "vol": len(coords), "score": 1.0, "rank_vals": score}], {}
