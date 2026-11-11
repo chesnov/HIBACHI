@@ -16,7 +16,7 @@ SIGNAL = 2.0
 MIN_LINE = 12
 
 
-def _hessian(img, region, sp):
+def _hessian(img, region, sp, inner, cval):
     sig = np.asarray(SIGMA_UM)
     h = np.empty((int(region.sum()), 3, 3), np.float32)
     for i in range(3):
@@ -24,7 +24,8 @@ def _hessian(img, region, sp):
             order = [0, 0, 0]
             order[i] += 1
             order[j] += 1
-            v = ndimage.gaussian_filter(img, sig / sp, order=order)[region] * sig[i] * sig[j] / (sp[i] * sp[j])
+            v = ndimage.gaussian_filter(img, sig / sp, order=order, mode="constant", cval=cval)[inner][region]
+            v = v * sig[i] * sig[j] / (sp[i] * sp[j])
             h[:, i, j] = v
             h[:, j, i] = v
     w, v = np.linalg.eigh(h)
@@ -109,17 +110,21 @@ def _elongated_label_candidates(lbl, sl, segmentation_mask, intensity_image, par
     score = np.zeros(len(coords), np.float32)
     if intensity_image is not None and own.ndim == 3:
         sp = np.asarray(params.spacing, float)
-        img = np.asarray(intensity_image[box], np.float32)
-        img /= max(float(np.percentile(img[own], 99.5)), 1e-6)
-        sm = ndimage.gaussian_filter(img, np.asarray(SIGMA_UM) / sp)
-        bg = float(np.median(sm[np.asarray(segmentation_mask[box]) == 0]))
-        dt = ndimage.distance_transform_edt(own, sampling=sp).astype(np.float32)
-        img += MASK_W * dt / max(float(np.percentile(dt[own], 99)), 1e-6)
+        pad = [int(np.ceil(4 * s / q)) for s, q in zip(SIGMA_UM, sp)]
+        big = tuple(slice(max(0, b.start - p), min(m, b.stop + p)) for b, p, m in zip(box, pad, segmentation_mask.shape))
+        inner = tuple(slice(b.start - g.start, b.stop - g.start) for b, g in zip(box, big))
+        own_b = np.asarray(segmentation_mask[big]) == lbl
+        img = np.asarray(intensity_image[big], np.float32)
+        img /= max(float(np.percentile(img[own_b], 99.5)), 1e-6)
+        sm = ndimage.gaussian_filter(img, np.asarray(SIGMA_UM) / sp)[inner]
         seg = np.asarray(segmentation_mask[box])
+        bg = float(np.median(sm[seg == 0]))
+        dt = ndimage.distance_transform_edt(own_b, sampling=sp).astype(np.float32)
+        img += MASK_W * dt / max(float(np.percentile(dt[own_b], 99)), 1e-6)
         grow = ndimage.binary_dilation(own, iterations=2) | ((sm >= SIGNAL * bg) & (seg == 0))
         comp = ndimage.label(grow, np.ones((3, 3, 3)))[0]
         region = np.isin(comp, np.unique(comp[own]))
-        t, v = _hessian(img, region, sp)
+        t, v = _hessian(img, region, sp, inner, bg)
         line = _centreline(t, v, region, sp)
         dense = np.zeros(own.shape, bool)
         dense[region] = line
