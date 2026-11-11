@@ -13,6 +13,7 @@ FACE_COS = 0.87
 MISS_UM = 0.5
 DIP = 0.3
 SIGNAL = 2.0
+MIN_LINE = 12
 
 
 def _hessian(img, region, sp):
@@ -120,16 +121,22 @@ def _elongated_label_candidates(lbl, sl, segmentation_mask, intensity_image, par
         for a, b in _links(lab, ends, dirs, sm, bg, sp):
             ra, rb = root[lab[tuple(ends[a])]], root[lab[tuple(ends[b])]]
             root[root == ra] = rb
-        fibre = root[lab[own]] * (lab[own] > 0)
+        ids = root[lab] * (lab > 0)
+        ids[(np.bincount(ids.ravel()) < MIN_LINE)[ids]] = 0
+        if not ids.any():
+            return [{"coords": coords, "vol": len(coords), "score": 1.0, "rank_vals": score}], {}
+        pts = np.argwhere(ids > 0)
+        near = cKDTree(pts * sp).query(np.argwhere(own) * sp)[1]
+        fibre = ids[tuple(pts[near].T)]
         inside = own[region]
         t_all = t
         t = t[inside]
-        score = np.where(fibre > 0, np.clip(t / max(float(np.percentile(t, 99)), 1e-6), 0, 1), 0).astype(np.float32)
+        on_line = ids[own] > 0
+        score = np.where(on_line, np.clip(t / max(float(np.percentile(t, 99)), 1e-6), 0, 1), 0).astype(np.float32)
         out = []
         for f in np.unique(fibre):
             sel = fibre == f
-            out.append({"coords": coords[sel], "vol": int(sel.sum()), "score": 1.0 if f else 0.0,
-                        "rank_vals": score[sel]})
+            out.append({"coords": coords[sel], "vol": int(sel.sum()), "score": 1.0, "rank_vals": score[sel]})
         outside = dense & ~own
         tv = np.zeros(own.shape, np.float32)
         tv[region] = t_all
