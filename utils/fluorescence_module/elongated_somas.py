@@ -1,5 +1,6 @@
 import numpy as np
 from scipy import ndimage
+from skimage.graph import MCP_Geometric
 from skimage.morphology import skeletonize
 
 SOMA_SHAPES = ("compact", "elongated")
@@ -7,6 +8,10 @@ SIGMA_UM = (0.5, 0.25, 0.25)
 MAX_TILT = 0.7
 MASK_W = 1.0
 SIGNAL = 2.0
+EPS = 0.05
+REACH_UM = 2.0
+TILE = 256
+HALO_UM = 10.0
 
 
 def _hessian(img, region, sp, inner, cval):
@@ -46,6 +51,23 @@ def _anchors(t, v, region, sp):
     return ndimage.label(line & (nb < 4), np.ones((3, 3, 3)))[0]
 
 
+def _flow_cost(t, region, anchors, sp):
+    out = np.full(region.shape, np.inf, np.float32)
+    costs = np.full(region.shape, np.inf, np.float32)
+    costs[region] = 1.0 / (EPS + t / max(float(np.percentile(t, 99)), 1e-6))
+    h = [int(np.ceil(HALO_UM / q)) for q in sp[1:]]
+    for y0 in range(0, region.shape[1], TILE):
+        for x0 in range(0, region.shape[2], TILE):
+            ys = slice(max(0, y0 - h[0]), min(region.shape[1], y0 + TILE + h[0]))
+            xs = slice(max(0, x0 - h[1]), min(region.shape[2], x0 + TILE + h[1]))
+            a = anchors[:, ys, xs]
+            if not a.any():
+                continue
+            cum = MCP_Geometric(costs[:, ys, xs].astype(np.float64), sampling=tuple(sp)).find_costs(np.argwhere(a))[0]
+            out[:, y0:y0 + TILE, x0:x0 + TILE] = cum[:, y0 - ys.start:y0 - ys.start + TILE, x0 - xs.start:x0 - xs.start + TILE]
+    return out
+
+
 def _elongated_label_candidates(lbl, sl, segmentation_mask, intensity_image, params):
     box = tuple(sl)
     own = np.asarray(segmentation_mask[box]) == lbl
@@ -70,8 +92,9 @@ def _elongated_label_candidates(lbl, sl, segmentation_mask, intensity_image, par
         comp = ndimage.label(grow, np.ones((3, 3, 3)))[0]
         region = np.isin(comp, np.unique(comp[own]))
         t, v = _hessian(img, region, sp, inner, bg)
-        anchors = _anchors(t, v, region, sp)
-        tv = np.zeros(own.shape, np.float32)
-        tv[region] = t
-        score = np.where(anchors[own] > 0, np.clip(tv[own] / max(float(np.percentile(tv[own], 99)), 1e-6), 0, 1), 0).astype(np.float32)
+        del img, dt, sm, grow, comp, own_b, seg
+        anchors = _anchors(t, v, region, sp) > 0
+        del v
+        cost = _flow_cost(t, region, anchors, sp)
+        score = np.exp(-cost[own] / REACH_UM).astype(np.float32)
     return [{"coords": coords, "vol": len(coords), "score": 1.0, "rank_vals": score}], {}
