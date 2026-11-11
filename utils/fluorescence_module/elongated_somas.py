@@ -52,6 +52,8 @@ def _centreline(t, v, region, sp):
 
 def _ends(line, sp):
     nb = ndimage.convolve(line.astype(np.uint8), np.ones((3, 3, 3), np.uint8), mode="constant")
+    line = line & (nb < 4)
+    nb = ndimage.convolve(line.astype(np.uint8), np.ones((3, 3, 3), np.uint8), mode="constant")
     lab, n = ndimage.label(line, np.ones((3, 3, 3)))
     pts = np.argwhere(line)
     ends = np.argwhere(line & (nb == 2))
