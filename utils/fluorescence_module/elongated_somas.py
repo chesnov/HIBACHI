@@ -50,21 +50,26 @@ def _centreline(t, v, region, sp):
     return skeletonize(ridge)[region]
 
 
-def _ends(line, sp):
+def _ends(line, sp, flat, d):
     nb = ndimage.convolve(line.astype(np.uint8), np.ones((3, 3, 3), np.uint8), mode="constant")
     line = line & (nb < 4)
     nb = ndimage.convolve(line.astype(np.uint8), np.ones((3, 3, 3), np.uint8), mode="constant")
     lab, n = ndimage.label(line, np.ones((3, 3, 3)))
     pts = np.argwhere(line)
-    ends = np.argwhere(line & (nb == 2))
     tree = cKDTree(pts * sp)
-    dirs = []
-    for e in ends:
+    ends, dirs = [], []
+    for e in np.argwhere(line & (nb <= 2)):
+        u = d[np.searchsorted(flat, np.ravel_multi_index(tuple(e), line.shape))]
+        u = u / max(np.linalg.norm(u), 1e-6)
         near = pts[tree.query_ball_point(e * sp, END_UM)]
         near = near[lab[tuple(near.T)] == lab[tuple(e)]]
-        d = (e - near.mean(0)) * sp
-        dirs.append(d / max(np.linalg.norm(d), 1e-6))
-    return lab, n, ends, np.array(dirs).reshape(-1, 3)
+        if len(near) > 1:
+            ends.append(e)
+            dirs.append(u if u @ ((e - near.mean(0)) * sp) >= 0 else -u)
+        else:
+            ends += [e, e]
+            dirs += [u, -u]
+    return lab, n, np.array(ends).reshape(-1, 3), np.array(dirs).reshape(-1, 3)
 
 
 def _links(lab, ends, dirs, sm, bg, sp):
@@ -118,7 +123,7 @@ def _elongated_label_candidates(lbl, sl, segmentation_mask, intensity_image, par
         line = _centreline(t, v, region, sp)
         dense = np.zeros(own.shape, bool)
         dense[region] = line
-        lab, n, ends, dirs = _ends(dense, sp)
+        lab, n, ends, dirs = _ends(dense, sp, np.flatnonzero(region), v[:, :, 0] * np.asarray(SIGMA_UM))
         root = np.arange(n + 1)
         for a, b in _links(lab, ends, dirs, sm, bg, sp):
             ra, rb = root[lab[tuple(ends[a])]], root[lab[tuple(ends[b])]]
