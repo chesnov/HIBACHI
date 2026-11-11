@@ -25,14 +25,20 @@ version -- skeleton tracing plus repair passes -- is in the repository history):
    removal costs little (below `_FLOW_MARGIN`) is not trusted: both ends stop there.
 5. Votes. Every mask voxel votes for the fibres whose centreline (segments and their
    junction connections) passes near it, weighted by distance and by agreement between the
-   voxel's own direction and the fibre's. A voxel goes to a fibre only if that fibre has at
-   least `_FLOW_CONFIDENT` of the votes; otherwise it stays unassigned (uncertain).
+   voxel's own direction and the fibre's. Each voxel's score is the winning fibre's share of
+   its votes (0 if no centreline is near). A voxel goes to that fibre if the score is at
+   least `_FLOW_CONFIDENT`.
 
-Seeds are the confident voxels of each fibre. Uncertain voxels are left without a soma for
-now, on purpose: they mark where the method is unsure.
+Every voxel of the object's mask ends up in exactly one seed. Fibre seeds are the confident
+voxels of each fibre (fibres of at least the minimum seed size). All remaining voxels of the
+object -- below `_FLOW_CONFIDENT`, without votes, or of fibres too small for a seed of their
+own -- form one more seed, the object's "uncertain" seed (strat_name "Uncertain", placed
+after the fibres). It marks where the method is unsure, so that each uncertain part can be
+looked at and given its own heuristic later. An object without any fibre seed is one seed
+as a whole, whatever its size.
 
-Units: micrometres. 3D only: a 2D object becomes one seed as a whole (if it is at least
-the minimum seed size). Seeds may only contain the object's own mask voxels.
+Units: micrometres. 3D only: a 2D object becomes one seed as a whole. Seeds contain only,
+and together all, of the object's own mask voxels.
 """
 import math
 
@@ -73,9 +79,9 @@ _FLOW_CONFIDENT = 0.7                     # share of the votes a fibre needs to 
 def _elongated_label_candidates(lbl, sl, segmentation_mask, intensity_image, params):
     """Seed candidates for one object in elongated mode (see the module docstring).
 
-    An object without any fibre seed of the minimum size, but itself at least that large,
-    becomes one seed as a whole (also every 2D object, and any object when no intensity
-    image is given): leaving it without a soma would drop it from the segmentation.
+    Fibre seeds plus the object's uncertain seed cover every voxel of the object. An object
+    without any fibre seed (also every 2D object, and any object when no intensity image is
+    given) becomes one seed as a whole. Each candidate's "rank_vals" holds its voxels' scores.
     """
     sp = np.asarray(params.spacing, float)
     diag = {}
@@ -93,36 +99,42 @@ def _elongated_label_candidates(lbl, sl, segmentation_mask, intensity_image, par
     if len(ridge["x"]) >= 8:
         segs, zones = _segments(ridge, sp)
         fibres = _resolve_junctions(segs, zones, ridge, field, sp)
-    labels = _vote(own, field, fibres, sp) if fibres else np.zeros(int(own.sum()), np.int32)
+    if fibres:
+        labels, score = _vote(own, field, fibres, sp)
+    else:
+        labels, score = np.zeros(int(own.sum()), np.int32), np.zeros(int(own.sum()), np.float32)
     vox = np.argwhere(own)
     candidates = []
+    seeded = np.zeros(len(vox), bool)
     for f in range(1, len(fibres) + 1):
         sel = labels == f
         n = int(sel.sum())
         if n < min_vol:
             continue
-        cc = (vox[sel] + off).astype(np.int32)
-        candidates.append({
-            "coords": cc, "peak_coord": np.asarray(cc[len(cc) // 2]), "vol": n, "score": 1.0,
-            "strat_name": "Fibre", "frag_max_thick": 0.0, "family": "Fibre",
-            "dt_vals": np.zeros(n, np.float32), "rank_vals": np.zeros(n, np.float32),
-        })
+        seeded |= sel
+        candidates.append(_candidate(vox[sel] + off, score[sel], "Fibre", 1.0))
     if not candidates:
-        candidates = _whole_object(own, off, min_vol)
+        return _whole_object(own, off, min_vol), diag
+    rest = ~seeded
+    if rest.any():
+        candidates.append(_candidate(vox[rest] + off, score[rest], "Uncertain", 0.0))
     return candidates, diag
 
 
+def _candidate(coords, score, kind, priority):
+    cc = coords.astype(np.int32)
+    n = len(cc)
+    return {"coords": cc, "peak_coord": np.asarray(cc[n // 2]), "vol": n, "score": priority,
+            "strat_name": kind, "frag_max_thick": 0.0, "family": "Fibre",
+            "dt_vals": np.zeros(n, np.float32), "rank_vals": np.asarray(score, np.float32)}
+
+
 def _whole_object(own, off, min_vol):
-    """The whole object as one seed, if it is at least the minimum seed size."""
+    """The whole object as one seed, whatever its size (every mask voxel gets a soma)."""
     n = int(own.sum())
-    if n < min_vol:
+    if n == 0:
         return []
-    cc = (np.argwhere(own) + off).astype(np.int32)
-    return [{
-        "coords": cc, "peak_coord": np.asarray(cc[n // 2]), "vol": n, "score": 1.0,
-        "strat_name": "WholeObject", "frag_max_thick": 0.0, "family": "Fibre",
-        "dt_vals": np.zeros(n, np.float32), "rank_vals": np.zeros(n, np.float32),
-    }]
+    return [_candidate(np.argwhere(own) + off, np.ones(n, np.float32), "WholeObject", 1.0)]
 
 
 # --------------------------------------------------------------------------- field
@@ -491,7 +503,8 @@ def _ridge_brightness(e, img, off, sp, norm):
 
 # --------------------------------------------------------------------------- votes
 def _vote(own, field, fibres, sp):
-    """Per object voxel: the fibre it belongs to (1-based), or 0 if uncertain."""
+    """Per object voxel: the fibre it belongs to (1-based, 0 below `_FLOW_CONFIDENT`) and its
+    score (the winning fibre's share of the votes; 0 without votes)."""
     vox = np.argwhere(own)
     x = vox * sp
     pts = np.vstack([f[0] for f in fibres])
@@ -518,8 +531,9 @@ def _vote(own, field, fibres, sp):
     keep = wi > 0
     vi, fi, wi = vi[keep], fi[keep], wi[keep]
     out = np.zeros(len(x), np.int32)
+    score = np.zeros(len(x), np.float32)
     if not len(vi):
-        return out
+        return out, score
     o = np.lexsort((fi, vi))
     vi, fi, wi = vi[o], fi[o], wi[o]
     new = np.r_[True, (vi[1:] != vi[:-1]) | (fi[1:] != fi[:-1])]
@@ -534,6 +548,7 @@ def _vote(own, field, fibres, sp):
     rank = np.lexsort((-wmax, v_))
     first = rank[np.r_[True, v_[rank][1:] != v_[rank][:-1]]]
     share = top / np.maximum(tot, 1e-9)
+    score[v_[vst]] = share
     ok = share >= _FLOW_CONFIDENT
     out[v_[vst][ok]] = f_[first][ok] + 1
-    return out
+    return out, score
