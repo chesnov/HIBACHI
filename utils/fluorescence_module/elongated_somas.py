@@ -23,11 +23,18 @@ version -- skeleton tracing plus repair passes -- is in the repository history):
    gap length and brightness along the connection; an end may also stop in the zone. The
    pairing with the lowest total cost is taken (assignment, not greedy). A pair whose
    removal costs little (below `_FLOW_MARGIN`) is not trusted: both ends stop there.
+   A continuation lies ahead of an end, not beside it: two segments that run side by side
+   (at least `_FLOW_SIDE_UM` of one within `_FLOW_SIDE_GAP` of the other, alongside it rather
+   than beyond its ends) are never paired, and pieces are never joined into one fibre if that
+   would put two such segments into it -- stacked or parallel fibres stay apart.
 5. Votes. Every mask voxel votes for the fibres whose centreline (segments and their
    junction connections) passes near it, weighted by distance and by agreement between the
    voxel's own direction and the fibre's. Each voxel's score is the winning fibre's share of
-   its votes (0 if no centreline is near). A voxel goes to that fibre if the score is at
-   least `_FLOW_CONFIDENT`.
+   its votes times how well that fibre explains it in depth (1 within `_FLOW_FIT_DZ_UM` of
+   the fibre's centreline in z, falling off beyond), 0 if no centreline is near: a voxel with
+   no competing fibre is still uncertain if its fibre runs well above or below it (the second
+   of two stacked fibres whose own centreline was not found). A voxel goes to that fibre if
+   the score is at least `_FLOW_CONFIDENT`.
 
 Every voxel of the object's mask ends up in exactly one seed. Fibre seeds are the confident
 voxels of each fibre (fibres of at least the minimum seed size). All remaining voxels of the
@@ -71,9 +78,15 @@ _FLOW_END_UM = 2.5                        # an end's direction is taken over thi
 _FLOW_PAIR_MAX_DEG = 60.0                 # ends are only paired if they turn by less than this
 _FLOW_COST_END = 1.8                      # cost of an end stopping in a zone (relative to the pair cost terms)
 _FLOW_MARGIN = 0.5                        # a pair is trusted only if the next-best pairing costs at least this more
+_FLOW_SIDE_UM = 1.0                       # two segments that run side by side for at least this
+_FLOW_SIDE_GAP = (0.5, 2.5)               # this far apart (um) are two fibres (stacked or parallel): never one fibre
 _FLOW_SIGMA_UM = 0.5                      # vote weight falls off with this distance
 _FLOW_VOTE_MAX_UM = 1.5                   # votes come from centrelines within this
-_FLOW_CONFIDENT = 0.7                     # share of the votes a fibre needs to get the voxel
+_FLOW_CONFIDENT = 0.7                     # score a voxel needs to go to its fibre (score = share x fit)
+_FLOW_FIT_DZ_UM = 0.7                     # fit: a voxel within this of its fibre's centreline in z is explained
+                                          # (half a single fibre's height in the mask: median 5 slices = 1.4 um);
+_FLOW_FIT_FALL_UM = 0.25                  # beyond it the fit falls off with this (Gaussian): the second of two
+                                          # stacked fibres, 1-3 um away in z, is not explained by the first
 
 
 def _elongated_label_candidates(lbl, sl, segmentation_mask, intensity_image, params):
@@ -412,11 +425,49 @@ def _resolve_junctions(segs, zones, ridge, field, sp):
     """Pair the segment ends in each zone; returns fibres as lists of point arrays."""
     live = [i for i, s in enumerate(segs) if not s.get("absorbed")]
     parent = {i: i for i in live}
+    members = {i: [i] for i in live}
+    X = ridge["x"]
+    trees = {}
 
     def find(a):
         while parent[a] != a:
             a = parent[a]
         return a
+
+    def tree(i):
+        if i not in trees:
+            trees[i] = cKDTree(X[segs[i]["idx"]])
+        return trees[i]
+
+    side_cache = {}
+
+    def side_by_side(i, j):
+        """Do segments i and j run alongside each other (two fibres)?"""
+        key = (min(i, j), max(i, j))
+        if key not in side_cache:
+            res = False
+            for a_, b_ in ((i, j), (j, i)):
+                pa = X[segs[a_]["idx"]]
+                xb = X[segs[b_]["idx"]]
+                d_, h_ = tree(b_).query(pa)
+                # a's points whose nearest point on b lies inside b (not at its ends)
+                tb = (xb - xb.mean(0)) @ np.linalg.svd(xb - xb.mean(0), full_matrices=False)[2][0]
+                lo, hi = tb.min() + 0.3, tb.max() - 0.3
+                inside = (tb[h_] > lo) & (tb[h_] < hi)
+                near = inside & (d_ >= _FLOW_SIDE_GAP[0]) & (d_ <= _FLOW_SIDE_GAP[1])
+                if near.sum() >= 2:
+                    q = pa[near]
+                    ext = np.linalg.norm(q.max(0) - q.min(0))
+                    if ext >= _FLOW_SIDE_UM:
+                        res = True
+                        break
+            side_cache[key] = res
+        return side_cache[key]
+
+    def conflict(ga, gb):
+        return any(side_by_side(i, j) for i in members[ga] for j in members[gb])
+
+    accepted = []
     connectors = []
     img = field["img"]                       # box crop, already normalised
     off = np.zeros(3)
@@ -434,7 +485,7 @@ def _resolve_junctions(segs, zones, ridge, field, sp):
         C = np.full((len(A), len(B)), np.inf)
         for a, (ia, ka) in enumerate(A):
             for b, (ib, kb) in enumerate(B):
-                if ia == ib:
+                if ia == ib or side_by_side(ia, ib):
                     continue
                 C[a, b] = _pair_cost(segs[ia]["ends"][ka], segs[ib]["ends"][kb], segs[ia], segs[ib],
                                      img, off, sp, 1.0)
@@ -456,11 +507,18 @@ def _resolve_junctions(segs, zones, ridge, field, sp):
             if M2[r2, c2].sum() - total < _FLOW_MARGIN:
                 continue                                    # not trusted: both ends stop here
             (ia, ka), (ib, kb) = A[a], B[b]
-            parent[find(ia)] = find(ib)
-            p1, p2 = segs[ia]["ends"][ka]["p"], segs[ib]["ends"][kb]["p"]
-            nstep = max(2, int(np.linalg.norm(p2 - p1) / 0.2))
-            t = np.linspace(0, 1, nstep)[:, None]
-            connectors.append((ia, p1 + (p2 - p1) * t, (p2 - p1) / (np.linalg.norm(p2 - p1) + 1e-9)))
+            accepted.append((float(M[a, b]), ia, ka, ib, kb))
+    # join pieces into fibres, cheapest pair first; never two side-by-side segments in one fibre
+    for _c, ia, ka, ib, kb in sorted(accepted):
+        ga, gb = find(ia), find(ib)
+        if ga == gb or conflict(ga, gb):
+            continue
+        parent[ga] = gb
+        members[gb].extend(members.pop(ga))
+        p1, p2 = segs[ia]["ends"][ka]["p"], segs[ib]["ends"][kb]["p"]
+        nstep = max(2, int(np.linalg.norm(p2 - p1) / 0.2))
+        t = np.linspace(0, 1, nstep)[:, None]
+        connectors.append((ia, p1 + (p2 - p1) * t, (p2 - p1) / (np.linalg.norm(p2 - p1) + 1e-9)))
     groups = {}
     for i in live:
         groups.setdefault(find(i), []).append(i)
@@ -531,18 +589,20 @@ def _vote(own, field, fibres, sp):
     w = np.where(valid, w, 0.0)
     f = fid[hh]
     vi = np.repeat(np.arange(len(x)), w.shape[1])
-    fi, wi = f.ravel(), w.ravel()
+    dz = np.abs(x[:, None, 0] - pts[hh][:, :, 0])           # depth offset to each nearby centreline point
+    fi, wi, di = f.ravel(), w.ravel(), np.where(valid, dz, np.inf).ravel()
     keep = wi > 0
-    vi, fi, wi = vi[keep], fi[keep], wi[keep]
+    vi, fi, wi, di = vi[keep], fi[keep], wi[keep], di[keep]
     out = np.zeros(len(x), np.int32)
     score = np.zeros(len(x), np.float32)
     if not len(vi):
         return out, score
     o = np.lexsort((fi, vi))
-    vi, fi, wi = vi[o], fi[o], wi[o]
+    vi, fi, wi, di = vi[o], fi[o], wi[o], di[o]
     new = np.r_[True, (vi[1:] != vi[:-1]) | (fi[1:] != fi[:-1])]
     st = np.flatnonzero(new)
     wmax = np.maximum.reduceat(wi, st)                     # each fibre's best vote per voxel
+    dmin = np.minimum.reduceat(di, st)                     # and its depth offset from that fibre
     v_, f_ = vi[st], fi[st]
     vs = np.r_[True, v_[1:] != v_[:-1]]
     vst = np.flatnonzero(vs)
@@ -552,6 +612,9 @@ def _vote(own, field, fibres, sp):
     rank = np.lexsort((-wmax, v_))
     first = rank[np.r_[True, v_[rank][1:] != v_[rank][:-1]]]
     share = top / np.maximum(tot, 1e-9)
+    over = np.maximum(0.0, dmin[first] - _FLOW_FIT_DZ_UM)
+    fit = np.exp(-over ** 2 / (2 * _FLOW_FIT_FALL_UM ** 2))
+    share = share * fit
     score[v_[vst]] = share
     ok = share >= _FLOW_CONFIDENT
     out[v_[vst][ok]] = f_[first][ok] + 1
