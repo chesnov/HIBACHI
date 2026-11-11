@@ -203,6 +203,9 @@ _DEPTH_TOUCH_UM = 1.0    # two paths of at least 15 um that touch (within this; 
 _DEPTH_DZ_UM = 0.5       # different depths (at least this, median over 1-4 um before the contact), reverse that
 _DEPTH_NEAR_UM = 2.5     # depth order after it for at least _DEPTH_REV_UM while running alongside (within this)
 _DEPTH_REV_UM = 8.0      # and then restore it: the two middle stretches are swapped (one passes over the other)
+_DEPTH_SWAP_TAILS = True # True: swap everything after the contact (each keeps the tracer's own continuous route
+                         # from the touching point on); False: swap only the middle stretch and reconnect each to
+                         # its old tail (sideways steps where the middles end)
 _END_FRAGMENT_UM = 3.0   # an unclaimed piece of mask touching a fibre within this of its end (`_claim_end_fragments`)
 _END_FRAGMENT_VOX = 2000 # and no bigger than this joins that fibre
 _LOOP_BACK_UM = 1.0      # a path that runs back against its own course (`_cut_loops`) by more than this has a loop
@@ -3196,7 +3199,11 @@ def _keep_depth_order(paths, sp):
     `_DEPTH_DZ_UM` over 1 to 4 um before it), if the depth order is then reversed for at least
     `_DEPTH_REV_UM` while they stay within `_DEPTH_NEAR_UM` of each other and is afterwards
     restored, the stretches between the contact and the point where the order is restored
-    are exchanged. Each path takes part in at most one exchange. Brief reversals (where one
+    are exchanged (`_DEPTH_SWAP_TAILS` False), or everything after the contact is
+    (`_DEPTH_SWAP_TAILS` True, the default: each fibre then keeps the tracer's own continuous
+    route from the touching point on; for 76/39 this reads the two as parallel fibres that
+    touch and never cross, as the image's cores suggest). Each path takes part in at most
+    one exchange. Brief reversals (where one
     fibre just rises to the other's level as they cross, or ends against it) are shorter
     than `_DEPTH_REV_UM` and are left alone.
     """
@@ -3283,8 +3290,18 @@ def _keep_depth_order(paths, sp):
             if rev_b:
                 pb = pb[::-1]
                 jb0, jb1 = len(pb) - 1 - jb0, len(pb) - 1 - jb1
-            new_a = np.concatenate([pa[:a0], pb[jb0:jb1 + 1], pa[a1 + 1:]])
-            new_b = np.concatenate([pb[:jb0], pa[a0:a1 + 1], pb[jb1 + 1:]])
+            if _DEPTH_SWAP_TAILS:
+                # swap the continuations at the contact (the side the reversal lies on)
+                if c <= k2:
+                    new_a = np.concatenate([pa[:c], pb[jc if not rev_b else len(pb) - 1 - jc:]])
+                    new_b = np.concatenate([pb[:jc if not rev_b else len(pb) - 1 - jc], pa[c:]])
+                else:
+                    jj = jc if not rev_b else len(pb) - 1 - jc
+                    new_a = np.concatenate([pb[:jj + 1], pa[c + 1:]])
+                    new_b = np.concatenate([pa[:c + 1], pb[jj + 1:]])
+            else:
+                new_a = np.concatenate([pa[:a0], pb[jb0:jb1 + 1], pa[a1 + 1:]])
+                new_b = np.concatenate([pb[:jb0], pa[a0:a1 + 1], pb[jb1 + 1:]])
             new_a = new_a[np.r_[True, np.any(np.diff(new_a, axis=0) != 0, axis=1)]]
             new_b = new_b[np.r_[True, np.any(np.diff(new_b, axis=0) != 0, axis=1)]]
             out[a] = new_a
