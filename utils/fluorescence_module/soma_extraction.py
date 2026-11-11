@@ -833,8 +833,9 @@ def extract_soma_masks(
             `_elongated_label_candidates`.
         confidence_output_path: elongated mode only. If given, a float32 volume of
             the image's shape is written there: each seeded voxel's confidence
-            score in [0, 1] (the candidates' "rank_vals"), 0 elsewhere. Ignored
-            in the other modes.
+            score in [0, 1] (the candidates' "rank_vals"), 0 elsewhere. A
+            candidate may add heatmap-only voxels outside its seed ("heat_coords",
+            "heat_vals"), e.g. centrelines outside the mask. Ignored in the other modes.
 
     Returns:
         np.ndarray: 3D labeled mask containing extracted soma seeds.
@@ -1120,6 +1121,9 @@ def extract_soma_masks(
                                 rv = cand.get("rank_vals")
                                 if rv is not None and len(rv) == len(coords):
                                     confidence[idx_tuple] = rv
+                                hc = cand.get("heat_coords")
+                                if hc is not None and len(hc):
+                                    confidence[tuple(np.asarray(hc).T)] = cand["heat_vals"]
                             next_label_id += 1
                             continue
                         peak_phys = cand["peak_coord"] * np.array(spacing)

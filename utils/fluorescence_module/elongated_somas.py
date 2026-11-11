@@ -12,6 +12,7 @@ END_UM = 1.0
 FACE_COS = 0.87
 MISS_UM = 0.5
 DIP = 0.3
+SIGNAL = 2.0
 
 
 def _hessian(img, region, sp):
@@ -106,7 +107,10 @@ def _elongated_label_candidates(lbl, sl, segmentation_mask, intensity_image, par
         bg = float(np.median(sm[np.asarray(segmentation_mask[box]) == 0]))
         dt = ndimage.distance_transform_edt(own, sampling=sp).astype(np.float32)
         img += MASK_W * dt / max(float(np.percentile(dt[own], 99)), 1e-6)
-        region = ndimage.binary_dilation(own, iterations=2)
+        seg = np.asarray(segmentation_mask[box])
+        grow = ndimage.binary_dilation(own, iterations=2) | ((sm >= SIGNAL * bg) & (seg == 0))
+        comp = ndimage.label(grow, np.ones((3, 3, 3)))[0]
+        region = np.isin(comp, np.unique(comp[own]))
         t, v = _hessian(img, region, sp)
         line = _centreline(t, v, region, sp)
         dense = np.zeros(own.shape, bool)
@@ -118,6 +122,7 @@ def _elongated_label_candidates(lbl, sl, segmentation_mask, intensity_image, par
             root[root == ra] = rb
         fibre = root[lab[own]] * (lab[own] > 0)
         inside = own[region]
+        t_all = t
         t = t[inside]
         score = np.where(fibre > 0, np.clip(t / max(float(np.percentile(t, 99)), 1e-6), 0, 1), 0).astype(np.float32)
         out = []
@@ -125,5 +130,10 @@ def _elongated_label_candidates(lbl, sl, segmentation_mask, intensity_image, par
             sel = fibre == f
             out.append({"coords": coords[sel], "vol": int(sel.sum()), "score": 1.0 if f else 0.0,
                         "rank_vals": score[sel]})
+        outside = dense & ~own
+        tv = np.zeros(own.shape, np.float32)
+        tv[region] = t_all
+        out[0]["heat_coords"] = (np.argwhere(outside) + np.array([s.start for s in box])).astype(np.int32)
+        out[0]["heat_vals"] = np.clip(tv[outside] / max(float(np.percentile(t, 99)), 1e-6), 0, 1)
         return out, {}
     return [{"coords": coords, "vol": len(coords), "score": 1.0, "rank_vals": score}], {}
