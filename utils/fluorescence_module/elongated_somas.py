@@ -2,26 +2,23 @@ import numpy as np
 from scipy import ndimage
 
 SOMA_SHAPES = ("compact", "elongated")
-SCALES = (0.25, 0.35, 0.5, 0.7)
+SIGMA_UM = (0.5, 0.25, 0.25)
 
 
 def _tubeness(img, own, sp):
-    best = np.zeros(int(own.sum()), np.float32)
-    for s in SCALES:
-        h = np.empty((len(best), 3, 3), np.float32)
-        for i in range(3):
-            for j in range(i, 3):
-                order = [0, 0, 0]
-                order[i] += 1
-                order[j] += 1
-                v = ndimage.gaussian_filter(img, s / sp, order=order)[own] * s * s / (sp[i] * sp[j])
-                h[:, i, j] = v
-                h[:, j, i] = v
-        w = np.linalg.eigvalsh(h)
-        w = np.take_along_axis(w, np.argsort(np.abs(w), axis=1), 1)
-        t = np.where((w[:, 1] < 0) & (w[:, 2] < 0), np.sqrt(w[:, 1] * w[:, 2]), 0)
-        best = np.maximum(best, t)
-    return best
+    sig = np.asarray(SIGMA_UM)
+    h = np.empty((int(own.sum()), 3, 3), np.float32)
+    for i in range(3):
+        for j in range(i, 3):
+            order = [0, 0, 0]
+            order[i] += 1
+            order[j] += 1
+            v = ndimage.gaussian_filter(img, sig / sp, order=order)[own] * sig[i] * sig[j] / (sp[i] * sp[j])
+            h[:, i, j] = v
+            h[:, j, i] = v
+    w = np.linalg.eigvalsh(h)
+    w = np.take_along_axis(w, np.argsort(np.abs(w), axis=1), 1)
+    return np.where((w[:, 1] < 0) & (w[:, 2] < 0), np.sqrt(w[:, 1] * w[:, 2]), 0)
 
 
 def _elongated_label_candidates(lbl, sl, segmentation_mask, intensity_image, params):
