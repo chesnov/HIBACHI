@@ -4,6 +4,7 @@ from scipy import ndimage
 SOMA_SHAPES = ("compact", "elongated")
 SIGMA_UM = (0.5, 0.25, 0.25)
 MAX_TILT = 0.7
+MASK_W = 1.0
 
 
 def _hessian(img, region, sp):
@@ -50,6 +51,8 @@ def _elongated_label_candidates(lbl, sl, segmentation_mask, intensity_image, par
         sp = np.asarray(params.spacing, float)
         img = np.asarray(intensity_image[box], np.float32)
         img /= max(float(np.percentile(img[own], 99.5)), 1e-6)
+        dt = ndimage.distance_transform_edt(own, sampling=sp).astype(np.float32)
+        img += MASK_W * dt / max(float(np.percentile(dt[own], 99)), 1e-6)
         region = ndimage.binary_dilation(own, iterations=2)
         t, v = _hessian(img, region, sp)
         line = _centreline(t, v, region, sp)
