@@ -1,5 +1,6 @@
 import numpy as np
 from scipy import ndimage
+from skimage.morphology import skeletonize
 
 SOMA_SHAPES = ("compact", "elongated")
 SIGMA_UM = (0.5, 0.25, 0.25)
@@ -34,10 +35,11 @@ def _centreline(t, v, region, sp):
     keep = (t > 0) & (np.abs(d[:, 0]) <= MAX_TILT * np.linalg.norm(d, axis=1))
     for k in (1, 2):
         step = v[:, :, k] * np.asarray(SIGMA_UM) / sp
-        step /= np.abs(step).max(axis=1, keepdims=True)
         for sgn in (-1.0, 1.0):
             keep &= t >= ndimage.map_coordinates(dense, (pts + sgn * step).T, order=1)
-    return keep
+    ridge = np.zeros(region.shape, bool)
+    ridge[region] = keep
+    return skeletonize(ridge)[region]
 
 
 def _elongated_label_candidates(lbl, sl, segmentation_mask, intensity_image, params):
