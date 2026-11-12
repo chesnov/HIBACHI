@@ -21,6 +21,24 @@ MISS_UM = 1.0
 MARGIN = 1.0
 BEHIND_UM = 0.5
 MEET_COS = 0.7
+EDT_CHUNK = 128
+BRIGHT_UM = 2.0
+
+
+def _edt(mask, sp):
+    out = np.zeros(mask.shape, np.float32)
+    n = mask.shape[2]
+    for a in range(0, n, EDT_CHUNK):
+        b = min(n, a + EDT_CHUNK)
+        m = 16
+        while True:
+            lo, hi = max(0, a - m), min(n, b + m)
+            d = ndimage.distance_transform_edt(mask[:, :, lo:hi], sampling=sp)[:, :, a - lo:b - lo]
+            if (lo == 0 and hi == n) or d.max() <= m * sp[2]:
+                break
+            m *= 2
+        out[:, :, a:b] = d
+    return out
 
 
 def _hessian(img, region, sp, inner, cval):
@@ -91,32 +109,37 @@ def _seeds(anchors, sp):
     return np.asarray(seeds, int)
 
 
-def _grow(anchors, seeds, sp):
+def _grow(anchors, seeds, sp, sm):
     owner = np.zeros(int(anchors.max()) + 1, np.int64)
     if not len(seeds):
         return owner
     pts = np.argwhere(anchors > 0)
     lab = anchors[tuple(pts.T)]
     x = pts * sp
+    br = np.log(np.maximum(sm[tuple(pts.T)], 1e-6))
     pdir = np.zeros((len(owner), 3))
+    pbr = np.zeros(len(owner))
     o = np.argsort(lab, kind="stable")
     members = {}
     for idx in np.split(o, np.flatnonzero(np.diff(lab[o])) + 1):
         members[int(lab[idx[0]])] = idx
+        pbr[lab[idx[0]]] = np.median(br[idx])
         if len(idx) >= 3:
             pdir[lab[idx[0]]] = np.linalg.svd(x[idx] - x[idx].mean(0), full_matrices=False)[2][0]
+    spread = max(float(np.median([np.median(np.abs(br[members[int(k)]] - pbr[k])) for k in seeds])), 1e-6)
     ends = []
     for k in seeds:
         owner[k] = k
-        xk = x[members[int(k)]]
+        mk = members[int(k)]
+        xk = x[mk]
         u = pdir[k]
         t = (xk - xk.mean(0)) @ u
-        ends.append([k, xk[np.argmax(t)], u])
-        ends.append([k, xk[np.argmin(t)], -u])
+        for p, uu in ((xk[np.argmax(t)], u), (xk[np.argmin(t)], -u)):
+            ends.append([k, p, uu, mk[np.linalg.norm(xk - p, axis=1) <= BRIGHT_UM]])
     tree = cKDTree(x)
     while True:
         offers = {}
-        for e, (f, p, u) in enumerate(ends):
+        for e, (f, p, u, r) in enumerate(ends):
             nb = np.asarray(tree.query_ball_point(p, GAP_UM))
             if not len(nb):
                 continue
@@ -135,7 +158,7 @@ def _grow(anchors, seeds, sp):
             flat = ~np.any(d, axis=1)
             d[flat] = g[flat] / np.maximum(np.linalg.norm(g[flat], axis=1, keepdims=True), 1e-6)
             turn = np.degrees(np.arccos(np.minimum(1.0, np.abs(d @ u))))
-            c = miss / 0.5 + turn / 30.0 + np.hypot(ahead, miss) / GAP_UM
+            c = miss / 0.5 + turn / 30.0 + np.hypot(ahead, miss) / GAP_UM + np.abs(pbr[k] - np.median(br[r])) / spread
             order = np.argsort(c)
             uk, first = np.unique(k[order], return_index=True)
             for kk, j in zip(uk, order[first]):
@@ -153,16 +176,17 @@ def _grow(anchors, seeds, sp):
         if not best_for_end:
             break
         for e, (c, k, q) in best_for_end.items():
-            f, p, u = ends[e]
+            f, p, u, r = ends[e]
             owner[k] = f
             xk = x[members[k]]
             far = xk[np.argmax((xk - p) @ u)]
             d = pdir[k] if np.any(pdir[k]) else (far - p) / max(np.linalg.norm(far - p), 1e-6)
             d = d if d @ u >= 0 else -d
             nu = u + d
-            ends[e] = [f, far, nu / max(np.linalg.norm(nu), 1e-6)]
+            idx = np.concatenate([r, members[k]])
+            ends[e] = [f, far, nu / max(np.linalg.norm(nu), 1e-6), idx[np.linalg.norm(x[idx] - far, axis=1) <= BRIGHT_UM]]
     blocked = {}
-    for e, (f, p, u) in enumerate(ends):
+    for e, (f, p, u, r) in enumerate(ends):
         nb = np.asarray(tree.query_ball_point(p, GAP_UM))
         if not len(nb):
             continue
@@ -175,7 +199,7 @@ def _grow(anchors, seeds, sp):
         ok = (ahead > 0) & (miss <= MISS_UM)
         best = None
         for kk in np.unique(lab[nb[ok]]):
-            if np.min((x[members[int(kk)]] - p) @ u) >= -GAP_UM:
+            if np.min((x[members[int(kk)]] - p) @ u) >= -BEHIND_UM:
                 sel = ok & (lab[nb] == kk)
                 c = float(np.min(miss[sel] / 0.5 + np.hypot(ahead[sel], miss[sel]) / GAP_UM))
                 if best is None or c < best[0]:
@@ -217,17 +241,18 @@ def _elongated_label_candidates(lbl, sl, segmentation_mask, intensity_image, par
         sm = ndimage.gaussian_filter(img, np.asarray(SIGMA_UM) / sp)[inner]
         seg = np.asarray(segmentation_mask[box])
         bg = float(np.median(sm[seg == 0]))
-        dt = ndimage.distance_transform_edt(own_b, sampling=sp).astype(np.float32)
+        dt = _edt(own_b, sp)
         img += MASK_W * dt / max(float(np.percentile(dt[own_b], 99)), 1e-6)
         grow = ndimage.binary_dilation(own, iterations=2) | ((sm >= SIGNAL * bg) & (seg == 0))
         comp = ndimage.label(grow, np.ones((3, 3, 3)))[0]
         region = np.isin(comp, np.unique(comp[own]))
         t, v = _hessian(img, region, sp, inner, bg)
-        del img, dt, sm, grow, comp, own_b, seg
+        del img, dt, grow, comp, own_b, seg
         anchors = _anchors(t, v, region, sp)
         del v
         seeds = _seeds(anchors, sp)
-        owner = _grow(anchors, seeds, sp)
+        owner = _grow(anchors, seeds, sp, sm)
+        del sm
         view = np.where(np.isin(anchors, seeds), 1.0, np.where(owner[anchors] > 0, 0.7, np.where(anchors > 0, 0.35, 0.0))).astype(np.float32)
         score = view[own]
         outside = (anchors > 0) & ~own
