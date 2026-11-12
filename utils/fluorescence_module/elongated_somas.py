@@ -20,6 +20,7 @@ GAP_UM = 3.0
 MISS_UM = 1.0
 MARGIN = 1.0
 BEHIND_UM = 0.5
+MEET_COS = 0.7
 
 
 def _hessian(img, region, sp, inner, cval):
@@ -160,7 +161,13 @@ def _grow(anchors, seeds, sp):
             d = d if d @ u >= 0 else -d
             nu = u + d
             ends[e] = [f, far, nu / max(np.linalg.norm(nu), 1e-6)]
-    return owner
+    root = np.arange(len(owner))
+    pos = np.array([p for f, p, u in ends])
+    for a, b in cKDTree(pos).query_pairs(GAP_UM):
+        fa, fb = root[ends[a][0]], root[ends[b][0]]
+        if fa != fb and ends[a][2] @ ends[b][2] <= -MEET_COS:
+            root[root == fa] = fb
+    return root[owner]
 
 
 def _assign(t, region, anchors, owner, own):
