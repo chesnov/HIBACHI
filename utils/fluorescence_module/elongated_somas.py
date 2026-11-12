@@ -19,6 +19,7 @@ EPS = 0.05
 GAP_UM = 3.0
 MISS_UM = 1.0
 MARGIN = 1.0
+BEHIND_UM = 0.5
 
 
 def _hessian(img, region, sp, inner, cval):
@@ -90,20 +91,23 @@ def _seeds(anchors, sp):
 
 
 def _grow(anchors, seeds, sp):
+    owner = np.zeros(int(anchors.max()) + 1, np.int64)
+    if not len(seeds):
+        return owner
     pts = np.argwhere(anchors > 0)
     lab = anchors[tuple(pts.T)]
     x = pts * sp
-    n = int(anchors.max())
-    owner = np.zeros(n + 1, np.int64)
-    pdir = np.zeros((n + 1, 3))
+    pdir = np.zeros((len(owner), 3))
     o = np.argsort(lab, kind="stable")
+    members = {}
     for idx in np.split(o, np.flatnonzero(np.diff(lab[o])) + 1):
+        members[int(lab[idx[0]])] = idx
         if len(idx) >= 3:
             pdir[lab[idx[0]]] = np.linalg.svd(x[idx] - x[idx].mean(0), full_matrices=False)[2][0]
     ends = []
     for k in seeds:
         owner[k] = k
-        xk = x[lab == k]
+        xk = x[members[int(k)]]
         u = pdir[k]
         t = (xk - xk.mean(0)) @ u
         ends.append([k, xk[np.argmax(t)], u])
@@ -134,7 +138,8 @@ def _grow(anchors, seeds, sp):
             order = np.argsort(c)
             uk, first = np.unique(k[order], return_index=True)
             for kk, j in zip(uk, order[first]):
-                offers.setdefault(int(kk), {})[e] = (float(c[j]), int(q[j]))
+                if np.min((x[members[int(kk)]] - p) @ u) >= -BEHIND_UM:
+                    offers.setdefault(int(kk), {})[e] = (float(c[j]), int(q[j]))
         best_for_end = {}
         for k, by_end in offers.items():
             ranked = sorted((c, e, q) for e, (c, q) in by_end.items())
@@ -149,7 +154,7 @@ def _grow(anchors, seeds, sp):
         for e, (c, k, q) in best_for_end.items():
             f, p, u = ends[e]
             owner[k] = f
-            xk = x[lab == k]
+            xk = x[members[k]]
             far = xk[np.argmax((xk - p) @ u)]
             d = pdir[k] if np.any(pdir[k]) else (far - p) / max(np.linalg.norm(far - p), 1e-6)
             d = d if d @ u >= 0 else -d
