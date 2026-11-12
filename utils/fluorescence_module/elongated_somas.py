@@ -1,6 +1,6 @@
 import numpy as np
 from scipy import ndimage
-from skimage.graph import MCP_Geometric
+from scipy.spatial import cKDTree
 from skimage.morphology import skeletonize
 
 SOMA_SHAPES = ("compact", "elongated")
@@ -8,10 +8,12 @@ SIGMA_UM = (0.5, 0.25, 0.25)
 MAX_TILT = 0.7
 MASK_W = 1.0
 SIGNAL = 2.0
-EPS = 0.05
-REACH_UM = 2.0
-TILE = 256
-HALO_UM = 10.0
+SEED_UM = 3.0
+STRAIGHT = 0.9
+ALONE_UM = 1.5
+LATERAL_UM = 0.4
+CROWD = 0.1
+NOISE_VOX = 10
 
 
 def _hessian(img, region, sp, inner, cval):
@@ -51,21 +53,35 @@ def _anchors(t, v, region, sp):
     return ndimage.label(line & (nb < 4), np.ones((3, 3, 3)))[0]
 
 
-def _flow_cost(t, region, anchors, sp):
-    out = np.full(region.shape, np.inf, np.float32)
-    costs = np.full(region.shape, np.inf, np.float32)
-    costs[region] = 1.0 / (EPS + t / max(float(np.percentile(t, 99)), 1e-6))
-    h = [int(np.ceil(HALO_UM / q)) for q in sp[1:]]
-    for y0 in range(0, region.shape[1], TILE):
-        for x0 in range(0, region.shape[2], TILE):
-            ys = slice(max(0, y0 - h[0]), min(region.shape[1], y0 + TILE + h[0]))
-            xs = slice(max(0, x0 - h[1]), min(region.shape[2], x0 + TILE + h[1]))
-            a = anchors[:, ys, xs]
-            if not a.any():
-                continue
-            cum = MCP_Geometric(costs[:, ys, xs].astype(np.float64), sampling=tuple(sp)).find_costs(np.argwhere(a))[0]
-            out[:, y0:y0 + TILE, x0:x0 + TILE] = cum[:, y0 - ys.start:y0 - ys.start + TILE, x0 - xs.start:x0 - xs.start + TILE]
-    return out
+def _seeds(anchors, sp):
+    pts = np.argwhere(anchors > 0)
+    lab = anchors[tuple(pts.T)]
+    x = pts * sp
+    tree = cKDTree(x)
+    sizes = np.bincount(lab)
+    o = np.argsort(lab, kind="stable")
+    cuts = np.flatnonzero(np.diff(lab[o])) + 1
+    seeds = []
+    for idx in np.split(o, cuts):
+        if len(idx) < 4:
+            continue
+        xk = x[idx]
+        c = xk.mean(0)
+        _, sv, vt = np.linalg.svd(xk - c, full_matrices=False)
+        u = vt[0]
+        if sv[0] ** 2 < STRAIGHT * np.sum(sv ** 2) or np.ptp((xk - c) @ u) < SEED_UM:
+            continue
+        crowded = 0
+        for p, nb in zip(xk, tree.query_ball_point(xk, ALONE_UM)):
+            nb = np.asarray(nb)
+            nb = nb[(lab[nb] != lab[idx[0]]) & (sizes[lab[nb]] >= NOISE_VOX)]
+            if len(nb):
+                w = x[nb] - p
+                if np.any(np.linalg.norm(w - np.outer(w @ u, u), axis=1) > LATERAL_UM):
+                    crowded += 1
+        if crowded <= CROWD * len(idx):
+            seeds.append(lab[idx[0]])
+    return np.asarray(seeds, int)
 
 
 def _elongated_label_candidates(lbl, sl, segmentation_mask, intensity_image, params):
@@ -93,12 +109,12 @@ def _elongated_label_candidates(lbl, sl, segmentation_mask, intensity_image, par
         region = np.isin(comp, np.unique(comp[own]))
         t, v = _hessian(img, region, sp, inner, bg)
         del img, dt, sm, grow, comp, own_b, seg
-        anchors = _anchors(t, v, region, sp) > 0
+        anchors = _anchors(t, v, region, sp)
         del v
-        cost = _flow_cost(t, region, anchors, sp)
-        score = np.exp(-cost[own] / REACH_UM).astype(np.float32)
-        outside = region & ~own
+        view = np.where(np.isin(anchors, _seeds(anchors, sp)), 1.0, np.where(anchors > 0, 0.35, 0.0)).astype(np.float32)
+        score = view[own]
+        outside = (anchors > 0) & ~own
         return [{"coords": coords, "vol": len(coords), "score": 1.0, "rank_vals": score,
                  "heat_coords": (np.argwhere(outside) + np.array([s.start for s in box])).astype(np.int32),
-                 "heat_vals": np.exp(-cost[outside] / REACH_UM).astype(np.float32)}], {}
+                 "heat_vals": view[outside]}], {}
     return [{"coords": coords, "vol": len(coords), "score": 1.0, "rank_vals": score}], {}
