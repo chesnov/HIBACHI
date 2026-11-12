@@ -2,6 +2,7 @@ import numpy as np
 from scipy import ndimage
 from scipy.spatial import cKDTree
 from skimage.morphology import skeletonize
+from skimage.segmentation import watershed
 
 SOMA_SHAPES = ("compact", "elongated")
 SIGMA_UM = (0.5, 0.25, 0.25)
@@ -14,6 +15,8 @@ ALONE_UM = 1.5
 LATERAL_UM = 0.4
 CROWD = 0.1
 NOISE_VOX = 10
+EPS = 0.05
+REACH_UM = 1.0
 
 
 def _hessian(img, region, sp, inner, cval):
@@ -84,6 +87,19 @@ def _seeds(anchors, sp):
     return np.asarray(seeds, int)
 
 
+def _seed_somas(t, region, anchors, seeds, own, sp):
+    lab = np.where(np.isin(anchors, seeds), anchors, 0)
+    if not lab.any():
+        return np.zeros(int(own.sum()), np.int64)
+    costs = np.zeros(region.shape, np.float32)
+    costs[region] = 1.0 / (EPS + t / max(float(np.percentile(t, 99)), 1e-6))
+    basin = watershed(costs, lab, mask=region)[own]
+    pts = np.argwhere(lab > 0)
+    dist, near = cKDTree(pts * sp).query(np.argwhere(own) * sp)
+    nearest = lab[tuple(pts[near].T)]
+    return np.where((dist <= REACH_UM) & (basin == nearest), nearest, 0)
+
+
 def _elongated_label_candidates(lbl, sl, segmentation_mask, intensity_image, params):
     box = tuple(sl)
     own = np.asarray(segmentation_mask[box]) == lbl
@@ -111,10 +127,16 @@ def _elongated_label_candidates(lbl, sl, segmentation_mask, intensity_image, par
         del img, dt, sm, grow, comp, own_b, seg
         anchors = _anchors(t, v, region, sp)
         del v
-        view = np.where(np.isin(anchors, _seeds(anchors, sp)), 1.0, np.where(anchors > 0, 0.35, 0.0)).astype(np.float32)
+        seeds = _seeds(anchors, sp)
+        view = np.where(np.isin(anchors, seeds), 1.0, np.where(anchors > 0, 0.35, 0.0)).astype(np.float32)
         score = view[own]
         outside = (anchors > 0) & ~own
-        return [{"coords": coords, "vol": len(coords), "score": 1.0, "rank_vals": score,
-                 "heat_coords": (np.argwhere(outside) + np.array([s.start for s in box])).astype(np.int32),
-                 "heat_vals": view[outside]}], {}
+        fibre = _seed_somas(t, region, anchors, seeds, own, sp)
+        out = []
+        for k in np.unique(fibre):
+            sel = fibre == k
+            out.append({"coords": coords[sel], "vol": int(sel.sum()), "score": 1.0 if k else 0.0, "rank_vals": score[sel]})
+        out[0]["heat_coords"] = (np.argwhere(outside) + np.array([s.start for s in box])).astype(np.int32)
+        out[0]["heat_vals"] = view[outside]
+        return out, {}
     return [{"coords": coords, "vol": len(coords), "score": 1.0, "rank_vals": score}], {}
