@@ -21,7 +21,6 @@ MISS_UM = 1.0
 MARGIN = 1.0
 BEHIND_UM = 0.5
 MEET_COS = 0.7
-MEET_SIDE_UM = 1.5
 
 
 def _hessian(img, region, sp, inner, cval):
@@ -162,14 +161,35 @@ def _grow(anchors, seeds, sp):
             d = d if d @ u >= 0 else -d
             nu = u + d
             ends[e] = [f, far, nu / max(np.linalg.norm(nu), 1e-6)]
+    blocked = {}
+    for e, (f, p, u) in enumerate(ends):
+        nb = np.asarray(tree.query_ball_point(p, GAP_UM))
+        if not len(nb):
+            continue
+        nb = nb[(owner[lab[nb]] > 0) & (owner[lab[nb]] != f)]
+        if not len(nb):
+            continue
+        g = x[nb] - p
+        ahead = g @ u
+        miss = np.linalg.norm(g - np.outer(ahead, u), axis=1)
+        ok = (ahead > 0) & (miss <= MISS_UM)
+        best = None
+        for kk in np.unique(lab[nb[ok]]):
+            if np.min((x[members[int(kk)]] - p) @ u) >= -GAP_UM:
+                sel = ok & (lab[nb] == kk)
+                c = float(np.min(miss[sel] / 0.5 + np.hypot(ahead[sel], miss[sel]) / GAP_UM))
+                if best is None or c < best[0]:
+                    best = (c, int(owner[kk]))
+        if best:
+            blocked[e] = best[1]
     root = np.arange(len(owner))
-    pos = np.array([p for f, p, u in ends])
-    for a, b in cKDTree(pos).query_pairs(GAP_UM):
-        fa, fb = root[ends[a][0]], root[ends[b][0]]
-        g = pos[b] - pos[a]
-        side = max(np.linalg.norm(g - (g @ ends[a][2]) * ends[a][2]), np.linalg.norm(g - (g @ ends[b][2]) * ends[b][2]))
-        if fa != fb and ends[a][2] @ ends[b][2] <= -MEET_COS and side <= MEET_SIDE_UM:
-            root[root == fa] = fb
+    for e, fb in blocked.items():
+        fa = ends[e][0]
+        for e2, fb2 in blocked.items():
+            if ends[e2][0] == fb and fb2 == fa and ends[e][2] @ ends[e2][2] <= -MEET_COS:
+                ra, rb = root[fa], root[fb]
+                if ra != rb:
+                    root[root == ra] = rb
     return root[owner]
 
 
