@@ -16,7 +16,9 @@ LATERAL_UM = 0.4
 CROWD = 0.1
 NOISE_VOX = 10
 EPS = 0.05
-REACH_UM = 1.0
+GAP_UM = 3.0
+MISS_UM = 1.0
+MARGIN = 1.0
 
 
 def _hessian(img, region, sp, inner, cval):
@@ -87,17 +89,79 @@ def _seeds(anchors, sp):
     return np.asarray(seeds, int)
 
 
-def _seed_somas(t, region, anchors, seeds, own, sp):
-    lab = np.where(np.isin(anchors, seeds), anchors, 0)
-    if not lab.any():
-        return np.zeros(int(own.sum()), np.int64)
+def _grow(anchors, seeds, sp):
+    pts = np.argwhere(anchors > 0)
+    lab = anchors[tuple(pts.T)]
+    x = pts * sp
+    n = int(anchors.max())
+    owner = np.zeros(n + 1, np.int64)
+    pdir = np.zeros((n + 1, 3))
+    o = np.argsort(lab, kind="stable")
+    for idx in np.split(o, np.flatnonzero(np.diff(lab[o])) + 1):
+        if len(idx) >= 3:
+            pdir[lab[idx[0]]] = np.linalg.svd(x[idx] - x[idx].mean(0), full_matrices=False)[2][0]
+    ends = []
+    for k in seeds:
+        owner[k] = k
+        xk = x[lab == k]
+        u = pdir[k]
+        t = (xk - xk.mean(0)) @ u
+        ends.append([k, xk[np.argmax(t)], u])
+        ends.append([k, xk[np.argmin(t)], -u])
+    tree = cKDTree(x)
+    while True:
+        offers = {}
+        for e, (f, p, u) in enumerate(ends):
+            nb = np.asarray(tree.query_ball_point(p, GAP_UM))
+            if not len(nb):
+                continue
+            nb = nb[owner[lab[nb]] == 0]
+            if not len(nb):
+                continue
+            g = x[nb] - p
+            ahead = g @ u
+            miss = np.linalg.norm(g - np.outer(ahead, u), axis=1)
+            ok = (ahead > 0) & (miss <= MISS_UM)
+            if not ok.any():
+                continue
+            q, g, ahead, miss = nb[ok], g[ok], ahead[ok], miss[ok]
+            k = lab[q]
+            d = pdir[k].copy()
+            flat = ~np.any(d, axis=1)
+            d[flat] = g[flat] / np.maximum(np.linalg.norm(g[flat], axis=1, keepdims=True), 1e-6)
+            turn = np.degrees(np.arccos(np.minimum(1.0, np.abs(d @ u))))
+            c = miss / 0.5 + turn / 30.0 + np.hypot(ahead, miss) / GAP_UM
+            order = np.argsort(c)
+            uk, first = np.unique(k[order], return_index=True)
+            for kk, j in zip(uk, order[first]):
+                offers.setdefault(int(kk), {})[e] = (float(c[j]), int(q[j]))
+        best_for_end = {}
+        for k, by_end in offers.items():
+            ranked = sorted((c, e, q) for e, (c, q) in by_end.items())
+            c1, e1, q1 = ranked[0]
+            rivals = [c for c, e, q in ranked[1:] if ends[e][0] != ends[e1][0]]
+            if rivals and rivals[0] - c1 < MARGIN:
+                continue
+            if e1 not in best_for_end or c1 < best_for_end[e1][0]:
+                best_for_end[e1] = (c1, k, q1)
+        if not best_for_end:
+            break
+        for e, (c, k, q) in best_for_end.items():
+            f, p, u = ends[e]
+            owner[k] = f
+            xk = x[lab == k]
+            far = xk[np.argmax((xk - p) @ u)]
+            d = pdir[k] if np.any(pdir[k]) else (far - p) / max(np.linalg.norm(far - p), 1e-6)
+            d = d if d @ u >= 0 else -d
+            nu = u + d
+            ends[e] = [f, far, nu / max(np.linalg.norm(nu), 1e-6)]
+    return owner
+
+
+def _assign(t, region, anchors, owner, own):
     costs = np.zeros(region.shape, np.float32)
     costs[region] = 1.0 / (EPS + t / max(float(np.percentile(t, 99)), 1e-6))
-    basin = watershed(costs, lab, mask=region)[own]
-    pts = np.argwhere(lab > 0)
-    dist, near = cKDTree(pts * sp).query(np.argwhere(own) * sp)
-    nearest = lab[tuple(pts[near].T)]
-    return np.where((dist <= REACH_UM) & (basin == nearest), nearest, 0)
+    return owner[watershed(costs, anchors, mask=region)[own]]
 
 
 def _elongated_label_candidates(lbl, sl, segmentation_mask, intensity_image, params):
@@ -128,10 +192,11 @@ def _elongated_label_candidates(lbl, sl, segmentation_mask, intensity_image, par
         anchors = _anchors(t, v, region, sp)
         del v
         seeds = _seeds(anchors, sp)
-        view = np.where(np.isin(anchors, seeds), 1.0, np.where(anchors > 0, 0.35, 0.0)).astype(np.float32)
+        owner = _grow(anchors, seeds, sp)
+        view = np.where(np.isin(anchors, seeds), 1.0, np.where(owner[anchors] > 0, 0.7, np.where(anchors > 0, 0.35, 0.0))).astype(np.float32)
         score = view[own]
         outside = (anchors > 0) & ~own
-        fibre = _seed_somas(t, region, anchors, seeds, own, sp)
+        fibre = _assign(t, region, anchors, owner, own)
         out = []
         for k in np.unique(fibre):
             sel = fibre == k
