@@ -1,8 +1,9 @@
+import heapq
+import numba
 import numpy as np
 from scipy import ndimage
 from scipy.spatial import cKDTree
 from skimage.morphology import skeletonize
-from skimage.segmentation import watershed
 
 SOMA_SHAPES = ("compact", "elongated")
 SIGMA_UM = (0.5, 0.25, 0.25)
@@ -16,13 +17,8 @@ LATERAL_UM = 0.4
 CROWD = 0.1
 NOISE_VOX = 10
 EPS = 0.05
-GAP_UM = 3.0
-MISS_UM = 1.0
-MARGIN = 1.0
-BEHIND_UM = 0.5
-MEET_COS = 0.7
+CONF = 0.5
 EDT_CHUNK = 128
-BRIGHT_UM = 2.0
 
 
 def _edt(mask, sp):
@@ -87,6 +83,7 @@ def _seeds(anchors, sp):
     o = np.argsort(lab, kind="stable")
     cuts = np.flatnonzero(np.diff(lab[o])) + 1
     seeds = []
+    lines = []
     for idx in np.split(o, cuts):
         if len(idx) < 4:
             continue
@@ -96,6 +93,7 @@ def _seeds(anchors, sp):
         u = vt[0]
         if sv[0] ** 2 < STRAIGHT * np.sum(sv ** 2) or np.ptp((xk - c) @ u) < SEED_UM:
             continue
+        lines.append(lab[idx[0]])
         crowded = 0
         for p, nb in zip(xk, tree.query_ball_point(xk, ALONE_UM)):
             nb = np.asarray(nb)
@@ -106,121 +104,106 @@ def _seeds(anchors, sp):
                     crowded += 1
         if crowded <= CROWD * len(idx):
             seeds.append(lab[idx[0]])
-    return np.asarray(seeds, int)
+    return np.asarray(seeds, int), np.asarray(lines, int)
 
 
-def _grow(anchors, seeds, sp, sm):
-    owner = np.zeros(int(anchors.max()) + 1, np.int64)
+@numba.njit(cache=True)
+def _march(idx, pos, cost, offs, steps, src, slab):
+    n = len(cost)
+    l1 = np.full(n, -1, np.int64)
+    l2 = np.full(n, -1, np.int64)
+    d1 = np.full(n, np.inf)
+    d2 = np.full(n, np.inf)
+    t1 = np.full(n, -1, np.int64)
+    t2 = np.full(n, -1, np.int64)
+    e1 = np.full(n, np.inf)
+    e2 = np.full(n, np.inf)
+    done = np.zeros(n, np.int64)
+    heap = [(0.0, np.int64(0), np.int64(0))]
+    heap.pop()
+    for i in range(len(src)):
+        heap.append((0.0, src[i], slab[i]))
+    heapq.heapify(heap)
+    sz, sy, sx = idx.shape
+    while len(heap):
+        dc, a, lab = heapq.heappop(heap)
+        if done[a] == 2 or l1[a] == lab or l2[a] == lab:
+            continue
+        if done[a] == 0:
+            l1[a] = lab
+            d1[a] = dc
+        else:
+            l2[a] = lab
+            d2[a] = dc
+        done[a] += 1
+        for k in range(offs.shape[0]):
+            z = pos[a, 0] + offs[k, 0]
+            y = pos[a, 1] + offs[k, 1]
+            x = pos[a, 2] + offs[k, 2]
+            if z < 0 or y < 0 or x < 0 or z >= sz or y >= sy or x >= sx:
+                continue
+            b = idx[z, y, x]
+            if b < 0 or done[b] == 2 or l1[b] == lab:
+                continue
+            nd = dc + steps[k] * (cost[a] + cost[b]) * 0.5
+            if t1[b] == lab:
+                if nd >= e1[b]:
+                    continue
+                e1[b] = nd
+            elif t2[b] == lab:
+                if nd >= e2[b]:
+                    continue
+                e2[b] = nd
+            elif nd < e1[b] or nd < e2[b]:
+                if e1[b] >= e2[b]:
+                    t1[b] = lab
+                    e1[b] = nd
+                else:
+                    t2[b] = lab
+                    e2[b] = nd
+            else:
+                continue
+            heapq.heappush(heap, (nd, np.int64(b), lab))
+    return l1, d1, l2, d2
+
+
+def _vote(t, region, anchors, seeds, lines, sp):
+    pos = np.argwhere(region)
+    idx = -np.ones(region.shape, np.int32)
+    idx[region] = np.arange(len(pos), dtype=np.int32)
     if not len(seeds):
-        return owner
-    pts = np.argwhere(anchors > 0)
-    lab = anchors[tuple(pts.T)]
-    x = pts * sp
-    br = np.log(np.maximum(sm[tuple(pts.T)], 1e-6))
-    pdir = np.zeros((len(owner), 3))
-    pbr = np.zeros(len(owner))
-    o = np.argsort(lab, kind="stable")
-    members = {}
-    for idx in np.split(o, np.flatnonzero(np.diff(lab[o])) + 1):
-        members[int(lab[idx[0]])] = idx
-        pbr[lab[idx[0]]] = np.median(br[idx])
-        if len(idx) >= 3:
-            pdir[lab[idx[0]]] = np.linalg.svd(x[idx] - x[idx].mean(0), full_matrices=False)[2][0]
-    spread = max(float(np.median([np.median(np.abs(br[members[int(k)]] - pbr[k])) for k in seeds])), 1e-6)
-    ends = []
-    for k in seeds:
-        owner[k] = k
-        mk = members[int(k)]
-        xk = x[mk]
-        u = pdir[k]
-        t = (xk - xk.mean(0)) @ u
-        for p, uu in ((xk[np.argmax(t)], u), (xk[np.argmin(t)], -u)):
-            ends.append([k, p, uu, mk[np.linalg.norm(xk - p, axis=1) <= BRIGHT_UM]])
-    tree = cKDTree(x)
+        return idx, np.full(len(pos), -1, np.int64), np.zeros(len(pos), np.float32)
+    cost = (1.0 / (EPS + t / max(float(np.percentile(t, 99)), 1e-6))).astype(np.float64)
+    offs = np.array([(a, b, c) for a in (-1, 0, 1) for b in (-1, 0, 1) for c in (-1, 0, 1) if (a, b, c) != (0, 0, 0)], np.int64)
+    steps = np.linalg.norm(offs * sp, axis=1)
+    apts = np.argwhere(anchors > 0)
+    alab = anchors[tuple(apts.T)]
+    anode = idx[tuple(apts.T)].astype(np.int64)
+    o = np.argsort(alab, kind="stable")
+    nodes = {int(alab[g[0]]): anode[g] for g in np.split(o, np.flatnonzero(np.diff(alab[o])) + 1)}
+
+    def run(groups):
+        src = np.concatenate([nodes[k] for g in groups for k in g])
+        slab = np.concatenate([np.full(sum(len(nodes[k]) for k in g), i, np.int64) for i, g in enumerate(groups)])
+        l1, d1, l2, d2 = _march(idx, pos.astype(np.int64), cost, offs, steps, src, slab)
+        rel = np.where(l1 < 0, 0.0, np.where(l2 < 0, 1.0, (d2 - d1) / np.maximum(d2, 1e-12)))
+        return l1, rel
+
+    kept = [int(k) for k in seeds]
+    rest = [int(k) for k in lines if int(k) not in set(kept)]
     while True:
-        offers = {}
-        for e, (f, p, u, r) in enumerate(ends):
-            nb = np.asarray(tree.query_ball_point(p, GAP_UM))
-            if not len(nb):
-                continue
-            nb = nb[owner[lab[nb]] == 0]
-            if not len(nb):
-                continue
-            g = x[nb] - p
-            ahead = g @ u
-            miss = np.linalg.norm(g - np.outer(ahead, u), axis=1)
-            ok = (ahead > 0) & (miss <= MISS_UM)
-            if not ok.any():
-                continue
-            q, g, ahead, miss = nb[ok], g[ok], ahead[ok], miss[ok]
-            k = lab[q]
-            d = pdir[k].copy()
-            flat = ~np.any(d, axis=1)
-            d[flat] = g[flat] / np.maximum(np.linalg.norm(g[flat], axis=1, keepdims=True), 1e-6)
-            turn = np.degrees(np.arccos(np.minimum(1.0, np.abs(d @ u))))
-            c = miss / 0.5 + turn / 30.0 + np.hypot(ahead, miss) / GAP_UM + np.abs(pbr[k] - np.median(br[r])) / spread
-            order = np.argsort(c)
-            uk, first = np.unique(k[order], return_index=True)
-            for kk, j in zip(uk, order[first]):
-                if np.min((x[members[int(kk)]] - p) @ u) >= -BEHIND_UM:
-                    offers.setdefault(int(kk), {})[e] = (float(c[j]), int(q[j]))
-        best_for_end = {}
-        for k, by_end in offers.items():
-            ranked = sorted((c, e, q) for e, (c, q) in by_end.items())
-            c1, e1, q1 = ranked[0]
-            rivals = [c for c, e, q in ranked[1:] if ends[e][0] != ends[e1][0]]
-            if rivals and rivals[0] - c1 < MARGIN:
-                continue
-            if e1 not in best_for_end or c1 < best_for_end[e1][0]:
-                best_for_end[e1] = (c1, k, q1)
-        if not best_for_end:
+        l1, rel = run([[k] for k in kept])
+        add = [k for k in rest if np.median(rel[nodes[k]]) < CONF]
+        if not add:
             break
-        for e, (c, k, q) in best_for_end.items():
-            f, p, u, r = ends[e]
-            owner[k] = f
-            xk = x[members[k]]
-            far = xk[np.argmax((xk - p) @ u)]
-            d = pdir[k] if np.any(pdir[k]) else (far - p) / max(np.linalg.norm(far - p), 1e-6)
-            d = d if d @ u >= 0 else -d
-            nu = u + d
-            idx = np.concatenate([r, members[k]])
-            ends[e] = [f, far, nu / max(np.linalg.norm(nu), 1e-6), idx[np.linalg.norm(x[idx] - far, axis=1) <= BRIGHT_UM]]
-    blocked = {}
-    for e, (f, p, u, r) in enumerate(ends):
-        nb = np.asarray(tree.query_ball_point(p, GAP_UM))
-        if not len(nb):
-            continue
-        nb = nb[(owner[lab[nb]] > 0) & (owner[lab[nb]] != f)]
-        if not len(nb):
-            continue
-        g = x[nb] - p
-        ahead = g @ u
-        miss = np.linalg.norm(g - np.outer(ahead, u), axis=1)
-        ok = (ahead > 0) & (miss <= MISS_UM)
-        best = None
-        for kk in np.unique(lab[nb[ok]]):
-            if np.min((x[members[int(kk)]] - p) @ u) >= -BEHIND_UM:
-                sel = ok & (lab[nb] == kk)
-                c = float(np.min(miss[sel] / 0.5 + np.hypot(ahead[sel], miss[sel]) / GAP_UM))
-                if best is None or c < best[0]:
-                    best = (c, int(owner[kk]))
-        if best:
-            blocked[e] = best[1]
-    root = np.arange(len(owner))
-    for e, fb in blocked.items():
-        fa = ends[e][0]
-        for e2, fb2 in blocked.items():
-            if ends[e2][0] == fb and fb2 == fa and ends[e][2] @ ends[e2][2] <= -MEET_COS:
-                ra, rb = root[fa], root[fb]
-                if ra != rb:
-                    root[root == ra] = rb
-    return root[owner]
-
-
-def _assign(t, region, anchors, owner, own):
-    costs = np.zeros(region.shape, np.float32)
-    costs[region] = 1.0 / (EPS + t / max(float(np.percentile(t, 99)), 1e-6))
-    return owner[watershed(costs, anchors, mask=region)[own]]
+        kept += add
+        rest = [k for k in rest if k not in set(add)]
+    unknown = [k for k in nodes if k not in set(kept) and np.median(rel[nodes[k]]) < CONF]
+    groups = [[k] for k in kept] + ([unknown] if unknown else [])
+    l1, rel = run(groups)
+    win = np.where((l1 < 0) | (l1 == len(kept)), -1, l1)
+    rel = np.where(win < 0, 0.0, rel)
+    return idx, win, rel.astype(np.float32)
 
 
 def _elongated_label_candidates(lbl, sl, segmentation_mask, intensity_image, params):
@@ -247,21 +230,19 @@ def _elongated_label_candidates(lbl, sl, segmentation_mask, intensity_image, par
         comp = ndimage.label(grow, np.ones((3, 3, 3)))[0]
         region = np.isin(comp, np.unique(comp[own]))
         t, v = _hessian(img, region, sp, inner, bg)
-        del img, dt, grow, comp, own_b, seg
+        del img, dt, sm, grow, comp, own_b, seg
         anchors = _anchors(t, v, region, sp)
         del v
-        seeds = _seeds(anchors, sp)
-        owner = _grow(anchors, seeds, sp, sm)
-        del sm
-        view = np.where(np.isin(anchors, seeds), 1.0, np.where(owner[anchors] > 0, 0.7, np.where(anchors > 0, 0.35, 0.0))).astype(np.float32)
-        score = view[own]
+        seeds, lines = _seeds(anchors, sp)
+        idx, win, rel = _vote(t, region, anchors, seeds, lines, sp)
+        fibre = win[idx[own]] + 1
+        score = rel[idx[own]]
         outside = (anchors > 0) & ~own
-        fibre = _assign(t, region, anchors, owner, own)
         out = []
         for k in np.unique(fibre):
             sel = fibre == k
             out.append({"coords": coords[sel], "vol": int(sel.sum()), "score": 1.0 if k else 0.0, "rank_vals": score[sel]})
         out[0]["heat_coords"] = (np.argwhere(outside) + np.array([s.start for s in box])).astype(np.int32)
-        out[0]["heat_vals"] = view[outside]
+        out[0]["heat_vals"] = rel[idx[outside]]
         return out, {}
     return [{"coords": coords, "vol": len(coords), "score": 1.0, "rank_vals": score}], {}
