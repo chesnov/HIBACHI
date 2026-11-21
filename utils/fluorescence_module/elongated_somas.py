@@ -108,16 +108,12 @@ def _seeds(anchors, sp):
 
 
 @numba.njit(cache=True)
-def _march(idx, pos, cost, offs, steps, src, slab):
+def _march(idx, pos, cost, offs, steps, src, slab, kk):
     n = len(cost)
-    l1 = np.full(n, -1, np.int64)
-    l2 = np.full(n, -1, np.int64)
-    d1 = np.full(n, np.inf)
-    d2 = np.full(n, np.inf)
-    t1 = np.full(n, -1, np.int64)
-    t2 = np.full(n, -1, np.int64)
-    e1 = np.full(n, np.inf)
-    e2 = np.full(n, np.inf)
+    lab_f = np.full((n, kk), -1, np.int64)
+    dist_f = np.full((n, kk), np.inf)
+    lab_t = np.full((n, kk), -1, np.int64)
+    dist_t = np.full((n, kk), np.inf)
     done = np.zeros(n, np.int64)
     heap = [(0.0, np.int64(0), np.int64(0))]
     heap.pop()
@@ -127,14 +123,16 @@ def _march(idx, pos, cost, offs, steps, src, slab):
     sz, sy, sx = idx.shape
     while len(heap):
         dc, a, lab = heapq.heappop(heap)
-        if done[a] == 2 or l1[a] == lab or l2[a] == lab:
+        if done[a] == kk:
             continue
-        if done[a] == 0:
-            l1[a] = lab
-            d1[a] = dc
-        else:
-            l2[a] = lab
-            d2[a] = dc
+        seen = False
+        for j in range(done[a]):
+            if lab_f[a, j] == lab:
+                seen = True
+        if seen:
+            continue
+        lab_f[a, done[a]] = lab
+        dist_f[a, done[a]] = dc
         done[a] += 1
         for k in range(offs.shape[0]):
             z = pos[a, 0] + offs[k, 0]
@@ -143,31 +141,129 @@ def _march(idx, pos, cost, offs, steps, src, slab):
             if z < 0 or y < 0 or x < 0 or z >= sz or y >= sy or x >= sx:
                 continue
             b = idx[z, y, x]
-            if b < 0 or done[b] == 2 or l1[b] == lab:
+            if b < 0 or done[b] == kk:
+                continue
+            seen = False
+            for j in range(done[b]):
+                if lab_f[b, j] == lab:
+                    seen = True
+            if seen:
                 continue
             nd = dc + steps[k] * (cost[a] + cost[b]) * 0.5
-            if t1[b] == lab:
-                if nd >= e1[b]:
+            slot = -1
+            worst = 0
+            for j in range(kk):
+                if lab_t[b, j] == lab:
+                    slot = j
+                if dist_t[b, j] > dist_t[b, worst]:
+                    worst = j
+            if slot >= 0:
+                if nd >= dist_t[b, slot]:
                     continue
-                e1[b] = nd
-            elif t2[b] == lab:
-                if nd >= e2[b]:
-                    continue
-                e2[b] = nd
-            elif nd < e1[b] or nd < e2[b]:
-                if e1[b] >= e2[b]:
-                    t1[b] = lab
-                    e1[b] = nd
-                else:
-                    t2[b] = lab
-                    e2[b] = nd
+                dist_t[b, slot] = nd
+            elif nd < dist_t[b, worst]:
+                lab_t[b, worst] = lab
+                dist_t[b, worst] = nd
             else:
                 continue
             heapq.heappush(heap, (nd, np.int64(b), lab))
-    return l1, d1, l2, d2
+    return lab_f, dist_f
 
 
-def _vote(t, region, anchors, seeds, lines, sp):
+@numba.njit(cache=True)
+def _march_f(idx, pos, cost, offs, steps, unit, src, slab, h0, b0, bri, sig_a, sig_b, mem, kk):
+    n = len(cost)
+    lab_f = np.full((n, kk), -1, np.int64)
+    dist_f = np.full((n, kk), np.inf)
+    h_f = np.zeros((n, kk, 3), np.float32)
+    b_f = np.zeros((n, kk), np.float32)
+    lab_t = np.full((n, kk), -1, np.int64)
+    dist_t = np.full((n, kk), np.inf)
+    h_t = np.zeros((n, kk, 3), np.float32)
+    b_t = np.zeros((n, kk), np.float32)
+    done = np.zeros(n, np.int64)
+    heap = [(0.0, np.int64(0), np.int64(0))]
+    heap.pop()
+    for i in range(len(src)):
+        a = src[i]
+        lab_t[a, 0] = slab[i]
+        dist_t[a, 0] = 0.0
+        h_t[a, 0] = h0[slab[i]]
+        b_t[a, 0] = b0[slab[i]]
+        heap.append((0.0, a, slab[i]))
+    heapq.heapify(heap)
+    sz, sy, sx = idx.shape
+    while len(heap):
+        dc, a, lab = heapq.heappop(heap)
+        if done[a] == kk:
+            continue
+        j0 = -1
+        for j in range(kk):
+            if lab_t[a, j] == lab and dist_t[a, j] == dc:
+                j0 = j
+        if j0 < 0:
+            continue
+        seen = False
+        for j in range(done[a]):
+            if lab_f[a, j] == lab:
+                seen = True
+        if seen:
+            continue
+        f = done[a]
+        lab_f[a, f] = lab
+        dist_f[a, f] = dc
+        h_f[a, f] = h_t[a, j0]
+        b_f[a, f] = b_t[a, j0]
+        done[a] += 1
+        for k in range(offs.shape[0]):
+            z = pos[a, 0] + offs[k, 0]
+            y = pos[a, 1] + offs[k, 1]
+            x = pos[a, 2] + offs[k, 2]
+            if z < 0 or y < 0 or x < 0 or z >= sz or y >= sy or x >= sx:
+                continue
+            b = idx[z, y, x]
+            if b < 0 or done[b] == kk:
+                continue
+            seen = False
+            for j in range(done[b]):
+                if lab_f[b, j] == lab:
+                    seen = True
+            if seen:
+                continue
+            c = unit[k, 0] * h_f[a, f, 0] + unit[k, 1] * h_f[a, f, 1] + unit[k, 2] * h_f[a, f, 2]
+            ang = np.arccos(min(1.0, abs(c))) / sig_a
+            db = (bri[b] - b_f[a, f]) / sig_b
+            nd = dc + steps[k] * ((cost[a] + cost[b]) * 0.5 + 0.5 * ang * ang + 0.5 * db * db)
+            slot = -1
+            worst = 0
+            for j in range(kk):
+                if lab_t[b, j] == lab:
+                    slot = j
+                if dist_t[b, j] > dist_t[b, worst]:
+                    worst = j
+            if slot < 0:
+                if nd >= dist_t[b, worst]:
+                    continue
+                slot = worst
+                lab_t[b, slot] = lab
+            elif nd >= dist_t[b, slot]:
+                continue
+            dist_t[b, slot] = nd
+            g = min(1.0, steps[k] / mem)
+            sg = 1.0 if c >= 0 else -1.0
+            hx = h_f[a, f, 0] * (1 - g) + sg * unit[k, 0] * g
+            hy = h_f[a, f, 1] * (1 - g) + sg * unit[k, 1] * g
+            hz = h_f[a, f, 2] * (1 - g) + sg * unit[k, 2] * g
+            hn = np.sqrt(hx * hx + hy * hy + hz * hz)
+            h_t[b, slot, 0] = hx / hn
+            h_t[b, slot, 1] = hy / hn
+            h_t[b, slot, 2] = hz / hn
+            b_t[b, slot] = b_f[a, f] + g * (bri[b] - b_f[a, f])
+            heapq.heappush(heap, (nd, np.int64(b), lab))
+    return lab_f, dist_f
+
+
+def _vote(t, region, anchors, seeds, lines, sp, bri):
     pos = np.argwhere(region)
     idx = -np.ones(region.shape, np.int32)
     idx[region] = np.arange(len(pos), dtype=np.int32)
@@ -182,26 +278,69 @@ def _vote(t, region, anchors, seeds, lines, sp):
     o = np.argsort(alab, kind="stable")
     nodes = {int(alab[g[0]]): anode[g] for g in np.split(o, np.flatnonzero(np.diff(alab[o])) + 1)}
 
-    def run(groups):
+    def run(groups, kk=2):
         src = np.concatenate([nodes[k] for g in groups for k in g])
         slab = np.concatenate([np.full(sum(len(nodes[k]) for k in g), i, np.int64) for i, g in enumerate(groups)])
-        l1, d1, l2, d2 = _march(idx, pos.astype(np.int64), cost, offs, steps, src, slab)
-        rel = np.where(l1 < 0, 0.0, np.where(l2 < 0, 1.0, (d2 - d1) / np.maximum(d2, 1e-12)))
-        return l1, rel
+        lab, dist = _march(idx, pos.astype(np.int64), cost, offs, steps, src, slab, kk)
+        rel = np.where(lab[:, 0] < 0, 0.0, np.where(lab[:, 1] < 0, 1.0, (dist[:, 1] - dist[:, 0]) / np.maximum(dist[:, 1], 1e-12)))
+        return lab, dist, rel
 
     kept = [int(k) for k in seeds]
     rest = [int(k) for k in lines if int(k) not in set(kept)]
     while True:
-        l1, rel = run([[k] for k in kept])
+        lab, dist, rel = run([[k] for k in kept])
         add = [k for k in rest if np.median(rel[nodes[k]]) < CONF]
         if not add:
             break
         kept += add
         rest = [k for k in rest if k not in set(add)]
-    unknown = [k for k in nodes if k not in set(kept) and np.median(rel[nodes[k]]) < CONF]
-    groups = [[k] for k in kept] + ([unknown] if unknown else [])
-    l1, rel = run(groups)
-    win = np.where((l1 < 0) | (l1 == len(kept)), -1, l1)
+    unit = offs * sp / steps[:, None]
+    h0 = np.zeros((len(kept), 3))
+    b0 = np.zeros(len(kept))
+    for i, k in enumerate(kept):
+        xk = pos[nodes[k]] * sp
+        h0[i] = np.linalg.svd(xk - xk.mean(0), full_matrices=False)[2][0] if len(xk) >= 2 else unit[0]
+        b0[i] = np.median(bri[nodes[k]])
+    sig_b = max(float(np.median(np.concatenate([np.abs(bri[nodes[int(k)]] - np.median(bri[nodes[int(k)]])) for k in seeds]))) / 0.6745, 1e-6)
+    look = -np.ones(int(anchors.max()) + 1, np.int64)
+    look[np.asarray(seeds, int)] = np.arange(len(seeds))
+    ang = []
+    for k in range(13):
+        sh = anchors[max(0, -offs[k, 0]):anchors.shape[0] - max(0, offs[k, 0]), max(0, -offs[k, 1]):anchors.shape[1] - max(0, offs[k, 1]), max(0, -offs[k, 2]):anchors.shape[2] - max(0, offs[k, 2])]
+        nb = anchors[max(0, offs[k, 0]):anchors.shape[0] + min(0, offs[k, 0]), max(0, offs[k, 1]):anchors.shape[1] + min(0, offs[k, 1]), max(0, offs[k, 2]):anchors.shape[2] + min(0, offs[k, 2])]
+        same = (sh > 0) & (sh == nb)
+        q = look[sh[same]]
+        q = q[q >= 0]
+        ang.append(np.abs(h0[q] @ unit[k]))
+    sig_a = max(float(np.median(np.arccos(np.minimum(1.0, np.concatenate(ang))))) / 0.6745, 1e-6)
+    src = np.concatenate([nodes[k] for k in kept])
+    slab = np.concatenate([np.full(len(nodes[k]), i, np.int64) for i, k in enumerate(kept)])
+    lab, dist = _march_f(idx, pos.astype(np.int64), cost, offs, steps, unit, src, slab, h0, b0, bri, sig_a, sig_b, SEED_UM, 3)
+    parent = list(range(len(kept)))
+
+    def find(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    for i in sorted(range(len(kept)), key=lambda i: len(nodes[kept[i]])):
+        nd = nodes[kept[i]]
+        alt = lab[nd, 1]
+        if not np.any(alt >= 0):
+            continue
+        a = int(np.bincount(alt[alt >= 0]).argmax())
+        r = np.where(alt == a, np.where(lab[nd, 2] < 0, 1.0, (dist[nd, 2] - dist[nd, 1]) / np.maximum(dist[nd, 2], 1e-12)), 0.0)
+        if np.median(r) >= CONF:
+            parent[find(i)] = find(a)
+    roots = sorted({find(i) for i in range(len(kept))})
+    groups = [[kept[i] for i in range(len(kept)) if find(i) == r] for r in roots]
+    lab, dist, rel = run(groups)
+    inside = {k for g in groups for k in g}
+    unknown = [k for k in nodes if k not in inside and np.median(rel[nodes[k]]) < CONF]
+    final = groups + ([unknown] if unknown else [])
+    lab, dist, rel = run(final)
+    win = np.where((lab[:, 0] < 0) | (lab[:, 0] == len(groups)), -1, lab[:, 0])
     rel = np.where(win < 0, 0.0, rel)
     return idx, win, rel.astype(np.float32)
 
@@ -230,11 +369,12 @@ def _elongated_label_candidates(lbl, sl, segmentation_mask, intensity_image, par
         comp = ndimage.label(grow, np.ones((3, 3, 3)))[0]
         region = np.isin(comp, np.unique(comp[own]))
         t, v = _hessian(img, region, sp, inner, bg)
+        bri = np.log(np.maximum(sm[region], 1e-6)).astype(np.float32)
         del img, dt, sm, grow, comp, own_b, seg
         anchors = _anchors(t, v, region, sp)
         del v
         seeds, lines = _seeds(anchors, sp)
-        idx, win, rel = _vote(t, region, anchors, seeds, lines, sp)
+        idx, win, rel = _vote(t, region, anchors, seeds, lines, sp, bri)
         fibre = win[idx[own]] + 1
         score = rel[idx[own]]
         outside = (anchors > 0) & ~own
