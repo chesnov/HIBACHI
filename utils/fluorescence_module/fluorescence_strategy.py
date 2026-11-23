@@ -23,6 +23,7 @@ try:
     from .remove_artifacts import apply_hull_trimming
     from .soma_extraction import extract_soma_masks
     from .cell_splitting import separate_multi_soma_cells
+    from .elongated_split import separate_elongated_cells
     from .calculate_features import analyze_segmentation, export_to_fcs
     from .dim_utils import normalise_spacing
 except ImportError as e:
@@ -166,6 +167,12 @@ class FluorescenceStrategy(ProcessingStrategy):
         ("soma_confidence", "soma_confidence.dat", "soma_confidence*.dat"),
         ("final_segmentation", "final_segmentation_{p}.dat",
          "final_segmentation*.dat"),
+        # Elongated mode only (step 4): each voxel's confidence for its fibre,
+        # float32 at the image's shape, and one sparse record per fibre (flat
+        # voxel index, uint8 value, bounding box). For review and for steps
+        # that can use overlapping fibres; the label volume is unchanged.
+        ("fibre_confidence", "fibre_confidence.dat", "fibre_confidence*.dat"),
+        ("fibre_records", "fibre_records.npz", "fibre_records*.npz"),
         ("skeleton_array", "skeleton_array_{p}.dat", "skeleton_array*.dat"),
         ("distances_matrix", "distances_matrix_{p}.csv", "distances_matrix*.csv"),
         ("points_matrix", "points_matrix_{p}.csv", "points_matrix*.csv"),
@@ -178,7 +185,7 @@ class FluorescenceStrategy(ProcessingStrategy):
         1: ("raw_segmentation", "corrected_image"),
         2: ("trimmed_segmentation", "edge_mask"),
         3: ("cell_bodies", "soma_confidence"),
-        4: ("final_segmentation",),
+        4: ("final_segmentation", "fibre_confidence", "fibre_records"),
         5: ("skeleton_array", "metrics_df", "branch_data",
             "distances_matrix", "points_matrix", "metrics_fcs"),
     }
@@ -188,7 +195,7 @@ class FluorescenceStrategy(ProcessingStrategy):
         1: ("Raw Intermediate Segmentation",),
         2: ("Trimmed Intermediate Segmentation", "Edge Mask"),
         3: ("Cell bodies", "Soma confidence"),
-        4: ("Final segmentation",),
+        4: ("Final segmentation", "Fibre confidence"),
         5: ("Skeletons", "Neighbor Connections"),
     }
 
@@ -794,6 +801,42 @@ class FluorescenceStrategy(ProcessingStrategy):
                 print("  Intensity measured on the illumination-corrected "
                       f"image ({intensity_ref.dtype})")
 
+            if self._soma_shape(params) == "elongated":
+                # Elongated track: every mask voxel goes to the step-3 seed
+                # fibre it most likely belongs to, or to its object's "not yet
+                # assigned" label. Reads the raw image, as step 3 does, so seeds
+                # and assignment rest on the same evidence.
+                final_memmap = open_artifact_for_writing(
+                    final_seg_path, np.int32, self.image_shape)
+                conf_memmap = open_artifact_for_writing(
+                    files["fibre_confidence"], np.float32, self.image_shape)
+                records = separate_elongated_cells(
+                    trimmed_labels_memmap, image_stack, cell_bodies_ref,
+                    self.spacing_checked, final_memmap, conf_memmap)
+                final_memmap.flush()
+                conf_memmap.flush()
+                np.savez(
+                    files["fibre_records"],
+                    ids=np.array([r[0] for r in records], np.int32),
+                    starts=np.cumsum([0] + [len(r[1]) for r in records]).astype(np.int64),
+                    index=np.concatenate([r[1] for r in records]) if records else np.zeros(0, np.uint32),
+                    value=np.concatenate([r[2] for r in records]) if records else np.zeros(0, np.uint8),
+                    bbox=np.array([r[3] for r in records], np.int32).reshape(-1, 6),
+                    shape=np.array(self.image_shape, np.int64),
+                )
+                self._close_memmap(final_memmap)
+                self._close_memmap(conf_memmap)
+                if viewer is not None:
+                    self._add_layer_safely(viewer, np.memmap(
+                        final_seg_path, dtype=np.int32, mode='r',
+                        shape=self.image_shape), "Final segmentation")
+                    self._add_layer_safely(viewer, np.memmap(
+                        files["fibre_confidence"], dtype=np.float32, mode='r',
+                        shape=self.image_shape), "Fibre confidence",
+                        layer_type='image', colormap='inferno',
+                        contrast_limits=[0.0, 1.0])
+                return True
+
             final_separated_cells = separate_multi_soma_cells(
                 trimmed_labels_memmap, intensity_input, cell_bodies_ref,
                 self.spacing_checked,
@@ -1131,6 +1174,10 @@ class FluorescenceStrategy(ProcessingStrategy):
             )
         if checkpoint_step >= 4:
             load_and_add("final_segmentation", "Final segmentation")
+            load_and_add(
+                "fibre_confidence", "Fibre confidence", dtype=np.float32,
+                layer_type='image', colormap='inferno', contrast_limits=[0.0, 1.0],
+            )
         if checkpoint_step >= 5:
             path = files.get("skeleton_array")
             if path and os.path.exists(path):
