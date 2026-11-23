@@ -801,7 +801,7 @@ class FluorescenceStrategy(ProcessingStrategy):
                 print("  Intensity measured on the illumination-corrected "
                       f"image ({intensity_ref.dtype})")
 
-            if self._soma_shape(params) == "elongated":
+            if self._soma_shape() == "elongated":
                 # Elongated track: every mask voxel goes to the step-3 seed
                 # fibre it most likely belongs to, or to its object's "not yet
                 # assigned" label. Reads the raw image, as step 3 does, so seeds
