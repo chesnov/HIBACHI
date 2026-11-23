@@ -1,167 +1,276 @@
-import heapq
-
-import numba
 import numpy as np
 from scipy import ndimage
+from scipy.spatial import cKDTree
 
 try:
-    from .elongated_somas import SEED_UM, _anchors, _prepare
+    from .elongated_somas import SEED_UM, SIGMA_UM, _prepare
 except ImportError:
-    from elongated_somas import SEED_UM, _anchors, _prepare
+    from elongated_somas import SEED_UM, SIGMA_UM, _prepare
 
-EPS = 0.05
-CONF = 0.5
-
-
-@numba.njit(cache=True)
-def _march_f(idx, pos, cost, offs, steps, unit, src, slab, sst, h0, b0, bri, sig_a, sig_b, mem, kk):
-    n = len(cost)
-    lab_f = np.full((n, kk), -1, np.int64)
-    dist_f = np.full((n, kk), np.inf)
-    h_f = np.zeros((n, kk, 3), np.float32)
-    b_f = np.zeros((n, kk), np.float32)
-    lab_t = np.full((n, kk), -1, np.int64)
-    dist_t = np.full((n, kk), np.inf)
-    h_t = np.zeros((n, kk, 3), np.float32)
-    b_t = np.zeros((n, kk), np.float32)
-    done = np.zeros(n, np.int64)
-    heap = [(0.0, np.int64(0), np.int64(0))]
-    heap.pop()
-    for i in range(len(src)):
-        a = src[i]
-        lab_t[a, 0] = slab[i]
-        dist_t[a, 0] = 0.0
-        h_t[a, 0] = h0[sst[i]]
-        b_t[a, 0] = b0[sst[i]]
-        heap.append((0.0, a, slab[i]))
-    heapq.heapify(heap)
-    sz, sy, sx = idx.shape
-    while len(heap):
-        dc, a, lab = heapq.heappop(heap)
-        if done[a] == kk:
-            continue
-        j0 = -1
-        for j in range(kk):
-            if lab_t[a, j] == lab and dist_t[a, j] == dc:
-                j0 = j
-        if j0 < 0:
-            continue
-        seen = False
-        for j in range(done[a]):
-            if lab_f[a, j] == lab:
-                seen = True
-        if seen:
-            continue
-        f = done[a]
-        lab_f[a, f] = lab
-        dist_f[a, f] = dc
-        h_f[a, f] = h_t[a, j0]
-        b_f[a, f] = b_t[a, j0]
-        done[a] += 1
-        for k in range(offs.shape[0]):
-            z = pos[a, 0] + offs[k, 0]
-            y = pos[a, 1] + offs[k, 1]
-            x = pos[a, 2] + offs[k, 2]
-            if z < 0 or y < 0 or x < 0 or z >= sz or y >= sy or x >= sx:
-                continue
-            b = idx[z, y, x]
-            if b < 0 or done[b] == kk:
-                continue
-            seen = False
-            for j in range(done[b]):
-                if lab_f[b, j] == lab:
-                    seen = True
-            if seen:
-                continue
-            c = unit[k, 0] * h_f[a, f, 0] + unit[k, 1] * h_f[a, f, 1] + unit[k, 2] * h_f[a, f, 2]
-            ang = np.arccos(min(1.0, abs(c))) / sig_a
-            db = (bri[b] - b_f[a, f]) / sig_b
-            nd = dc + steps[k] * ((cost[a] + cost[b]) * 0.5 + 0.5 * ang * ang + 0.5 * db * db)
-            slot = -1
-            worst = 0
-            for j in range(kk):
-                if lab_t[b, j] == lab:
-                    slot = j
-                if dist_t[b, j] > dist_t[b, worst]:
-                    worst = j
-            if slot < 0:
-                if nd >= dist_t[b, worst]:
-                    continue
-                slot = worst
-                lab_t[b, slot] = lab
-            elif nd >= dist_t[b, slot]:
-                continue
-            dist_t[b, slot] = nd
-            g = min(1.0, steps[k] / mem)
-            sg = 1.0 if c >= 0 else -1.0
-            hx = h_f[a, f, 0] * (1 - g) + sg * unit[k, 0] * g
-            hy = h_f[a, f, 1] * (1 - g) + sg * unit[k, 1] * g
-            hz = h_f[a, f, 2] * (1 - g) + sg * unit[k, 2] * g
-            hn = np.sqrt(hx * hx + hy * hy + hz * hz)
-            h_t[b, slot, 0] = hx / hn
-            h_t[b, slot, 1] = hy / hn
-            h_t[b, slot, 2] = hz / hn
-            b_t[b, slot] = b_f[a, f] + g * (bri[b] - b_f[a, f])
-            heapq.heappush(heap, (nd, np.int64(b), lab))
-    return lab_f, dist_f
+P_GROW = 0.9
+P_LABEL = 0.5
+STEP_UM = 1.0
+NODE_UM = 0.5
+REACH_UM = 4.0
+NONE_PCT = 99.0
 
 
-def _vote(t, region, anchors, seedlab, sp, bri, ldir):
-    pos = np.argwhere(region).astype(np.int64)
+def _phys(vec):
+    p = vec * np.asarray(SIGMA_UM)
+    return p / np.maximum(np.linalg.norm(p, axis=-1, keepdims=True), 1e-12)
+
+
+def _models(seedlab, idx, x, iv, hp, vdir):
+    out = []
+    pts = np.argwhere(seedlab > 0)
+    lab = seedlab[tuple(pts.T)]
+    o = np.argsort(lab, kind="stable")
+    sig = np.asarray(SIGMA_UM)
+    for g in np.split(o, np.flatnonzero(np.diff(lab[o])) + 1) if len(o) else []:
+        nd = idx[tuple(pts[g].T)].astype(np.int64)
+        xk = x[nd]
+        c = xk.mean(0)
+        if len(nd) >= 3:
+            u = np.linalg.svd(xk - c, full_matrices=False)[2][0]
+        else:
+            d = vdir[nd]
+            u = (d * np.sign(d @ d[0])[:, None]).mean(0)
+            u /= max(np.linalg.norm(u), 1e-12)
+        s = (xk - c) @ u
+        if np.ptp(s) < NODE_UM:
+            s = np.array([-NODE_UM / 2, NODE_UM / 2])
+        h = hp[nd] / (sig[:, None] * sig[None, :])
+        w, e = np.linalg.eigh(h)
+        k = np.argsort(np.abs(w), 1)
+        w = np.take_along_axis(w, k, 1)
+        e = np.take_along_axis(e, k[:, None, :], 2)
+        ok = (w[:, 1] < 0) & (w[:, 2] < 0)
+        w1 = float(np.median(np.sqrt(iv[nd][ok] / -w[ok, 1]))) if ok.any() else np.nan
+        w2 = float(np.median(np.sqrt(iv[nd][ok] / -w[ok, 2]))) if ok.any() else np.nan
+        a1 = e[ok][:, :, 1] if ok.any() else e[:, :, 1]
+        a1 = (a1 * np.sign(a1 @ a1[0])[:, None]).mean(0)
+        a1 -= (a1 @ u) * u
+        if np.linalg.norm(a1) < 1e-6:
+            a1 = np.cross(u, [1.0, 0.0, 0.0] if abs(u[0]) < 0.9 else [0.0, 1.0, 0.0])
+        a1 /= np.linalg.norm(a1)
+        n = max(2, int(np.ceil(np.ptp(s) / NODE_UM)) + 1)
+        ss = np.linspace(s.min(), s.max(), n)
+        out.append({"k": int(lab[g[0]]), "nd": nd, "P": c + ss[:, None] * u, "U": np.tile(u, (n, 1)), "A1": np.tile(a1, (n, 1)), "B": np.full(n, float(np.median(np.log(np.maximum(iv[nd], 1e-6))))), "w1": w1, "w2": w2, "grow": [True, True]})
+    w1s = [f["w1"] for f in out if np.isfinite(f["w1"])]
+    w2s = [f["w2"] for f in out if np.isfinite(f["w2"])]
+    for f in out:
+        if not np.isfinite(f["w1"]):
+            f["w1"] = float(np.median(w1s)) if w1s else SIGMA_UM[1] * 2
+            f["w2"] = float(np.median(w2s)) if w2s else SIGMA_UM[1] * 2
+    return out
+
+
+def _geometry(f, x, sa, lo=0, hi=None):
+    hi = len(f["P"]) if hi is None else hi
+    P, U, A1, B = f["P"][lo:hi], f["U"][lo:hi], f["A1"][lo:hi], f["B"][lo:hi]
+    if len(P) < 2:
+        lo, hi = max(0, lo - 1), min(len(f["P"]), hi + 1)
+        P, U, A1, B = f["P"][lo:hi], f["U"][lo:hi], f["A1"][lo:hi], f["B"][lo:hi]
+    seg = P[1:] - P[:-1]
+    l2 = np.maximum((seg ** 2).sum(1), 1e-12)
+    if len(seg) <= 8:
+        cs = np.broadcast_to(np.arange(len(seg)), (len(x), len(seg)))
+    else:
+        nn = cKDTree(P).query(x, k=2)[1]
+        cs = np.clip(np.stack([nn[:, 0] - 1, nn[:, 0], nn[:, 1] - 1, nn[:, 1]], 1), 0, len(seg) - 1)
+    tt = np.clip(np.einsum("nkj,nkj->nk", x[:, None, :] - P[cs], seg[cs]) / l2[cs], 0, 1)
+    near = P[cs] + tt[..., None] * seg[cs]
+    c = ((x[:, None, :] - near) ** 2).sum(2).argmin(1)
+    r = np.arange(len(x))
+    si = cs[r, c]
+    near = near[r, c][:, None, :]
+    tsel = tt[r, c]
+    ni = np.where(tsel < 0.5, si, si + 1)
+    u = U[ni].copy()
+    a1 = A1[ni].copy()
+    b = B[ni].copy()
+    g = x - near[:, 0]
+    e = np.zeros(len(x))
+    ends = ([(0, -U[0])] if lo == 0 else []) + ([(len(P) - 1, U[-1])] if hi == len(f["P"]) else [])
+    for end, out in ends:
+        m = (ni == end) & (((x - P[end]) @ out) > 0)
+        g[m] = x[m] - P[end]
+        e[m] = g[m] @ out
+        g[m] -= e[m][:, None] * out[None]
+        u[m] = out
+    a1 -= np.einsum("ij,ij->i", a1, u)[:, None] * u
+    a1 /= np.maximum(np.linalg.norm(a1, axis=1, keepdims=True), 1e-12)
+    a2 = np.cross(u, a1)
+    v1 = f["w1"] ** 2 + (e * sa) ** 2
+    v2 = f["w2"] ** 2 + (e * sa) ** 2
+    rho = np.einsum("ij,ij->i", g, a1) ** 2 / v1 + np.einsum("ij,ij->i", g, a2) ** 2 / v2
+    return g, e, u, b, v1, v2, rho
+
+
+def _energy(f, ids, x, iv, dtv, inm, vdir, tube, bg, sp_, near=None, reach=0.0):
+    sb, sdt, sa, rad = sp_
+    lo, hi = 0, len(f["P"])
+    if near is not None:
+        dn = np.min(np.linalg.norm(f["P"][:, None, :] - near[None], axis=2), 1)
+        k = np.flatnonzero(dn <= 2 * reach)
+        lo, hi = int(k.min()), int(k.max()) + 1
+    g, e, u, b, v1, v2, rho = _geometry(f, x[ids], sa, lo, hi)
+    pred = np.log(bg + np.maximum(np.exp(b) - bg, 0) * np.exp(-0.5 * rho))
+    en = 0.5 * rho + 0.5 * np.log(v1 * v2) + 0.5 * ((np.log(np.maximum(iv[ids], 1e-6)) - pred) / sb) ** 2
+    ang = np.arccos(np.minimum(1, np.abs(np.einsum("ij,ij->i", vdir[ids], u))))
+    en += np.where(tube[ids], 0.5 * (ang / sa) ** 2, 0)
+    en += np.where(inm[ids], 0.5 * ((dtv[ids] - np.maximum(rad - np.linalg.norm(g, axis=1), 0)) / sdt) ** 2, 0)
+    cb = np.log(np.maximum((iv[ids] - bg) / np.exp(-0.5 * rho) + bg, 1e-6))
+    return en, cb
+
+
+def _vote(seedlab, own, region, t, v, bri, ex, sp):
+    pos = np.argwhere(region)
+    x = pos * sp
     idx = -np.ones(region.shape, np.int32)
     idx[region] = np.arange(len(pos), dtype=np.int32)
-    cost = (1.0 / (EPS + t / max(float(np.percentile(t, 99)), 1e-6))).astype(np.float64)
-    offs = np.array([(a, b, c) for a in (-1, 0, 1) for b in (-1, 0, 1) for c in (-1, 0, 1) if (a, b, c) != (0, 0, 0)], np.int64)
-    steps = np.linalg.norm(offs * sp, axis=1)
-    unit = offs * sp / steps[:, None]
-    nodes = []
-    for vol in (seedlab, np.where(seedlab > 0, 0, anchors)):
-        pts = np.argwhere(vol > 0)
-        lab = vol[tuple(pts.T)]
-        o = np.argsort(lab, kind="stable")
-        groups = np.split(o, np.flatnonzero(np.diff(lab[o])) + 1) if len(o) else []
-        nodes.append([(int(lab[g[0]]), idx[tuple(pts[g].T)].astype(np.int64)) for g in groups])
-    seeds, pieces = nodes
-    src_nodes = [nd for _, nd in seeds] + [nd for _, nd in pieces]
-    h0 = np.zeros((len(src_nodes), 3))
-    b0 = np.zeros(len(src_nodes))
-    for i, nd in enumerate(src_nodes):
-        if len(nd) >= 3:
-            xk = pos[nd] * sp
-            h0[i] = np.linalg.svd(xk - xk.mean(0), full_matrices=False)[2][0]
-        else:
-            d = ldir[nd[0]] * sp
-            h0[i] = d / max(np.linalg.norm(d), 1e-12)
-        b0[i] = np.median(bri[nd])
-    sig_b = max(float(np.median(np.concatenate([np.abs(bri[nd] - b0[i]) for i, (_, nd) in enumerate(seeds)]))) / 0.6745, 1e-6)
-    look = -np.ones(int(seedlab.max()) + 1, np.int64)
-    look[[k for k, _ in seeds]] = np.arange(len(seeds))
-    ang = []
-    for k in range(13):
-        sh = seedlab[max(0, -offs[k, 0]):seedlab.shape[0] - max(0, offs[k, 0]), max(0, -offs[k, 1]):seedlab.shape[1] - max(0, offs[k, 1]), max(0, -offs[k, 2]):seedlab.shape[2] - max(0, offs[k, 2])]
-        nb = seedlab[max(0, offs[k, 0]):seedlab.shape[0] + min(0, offs[k, 0]), max(0, offs[k, 1]):seedlab.shape[1] + min(0, offs[k, 1]), max(0, offs[k, 2]):seedlab.shape[2] + min(0, offs[k, 2])]
-        q = look[sh[(sh > 0) & (sh == nb)]]
-        ang.append(np.abs(h0[q] @ unit[k]))
-    ang = np.concatenate(ang)
-    sig_a = max(float(np.median(np.arccos(np.minimum(1.0, ang)))) / 0.6745, 1e-6) if len(ang) else 0.6
+    iv = np.exp(bri)
+    dtv = ex["dt"]
+    inm = own[region]
+    vdir = _phys(v[:, :, 0])
+    tube = t > 0
+    bg = ex["bg"]
+    fibs = _models(seedlab, idx, x, iv, ex["h"], vdir)
+    tree = cKDTree(x)
+    cnt = np.zeros(len(x), np.int32)
+    who = np.full(len(x), -1, np.int64)
+    for j, f in enumerate(fibs):
+        P, u = f["P"], f["U"][0]
+        ids = np.unique(np.concatenate(tree.query_ball_point(P, 2 * f["w1"] + NODE_UM))).astype(np.int64)
+        if not len(ids):
+            continue
+        s0 = (x[ids] - P[0]) @ u
+        s1 = (x[ids] - P[-1]) @ u
+        lat = np.linalg.norm((x[ids] - P[0]) - np.outer(s0, u), axis=1)
+        m = ids[(s0 >= 0) & (s1 <= 0) & (lat <= 2 * f["w1"])]
+        cnt[m] += 1
+        who[m] = j
+    cal = np.flatnonzero(cnt == 1)
+    rb, rm, ra = [], [], []
+    for j, f in enumerate(fibs):
+        f["R"] = float(np.median(dtv[f["nd"]]))
+        ids = cal[who[cal] == j]
+        if not len(ids):
+            continue
+        g, e, u, b, v1, v2, rho = _geometry(f, x[ids], 0.0)
+        rb.append(np.log(np.maximum(iv[ids], 1e-6)) - np.log(bg + np.maximum(np.exp(b) - bg, 0) * np.exp(-0.5 * rho)))
+        im = inm[ids]
+        rm.append((dtv[ids] - np.maximum(f["R"] - np.linalg.norm(g, axis=1), 0))[im])
+        ra.append(np.arccos(np.minimum(1, np.abs(np.einsum("ij,ij->i", vdir[ids], u))))[tube[ids]])
+    sb = max(float(np.median(np.abs(np.concatenate(rb)))) / 0.6745, 1e-3) if rb else 0.35
+    sdt = max(float(np.median(np.abs(np.concatenate(rm)))) / 0.6745, 1e-3) if rm else 0.25
+    sa = max(float(np.median(np.concatenate(ra))) / 0.6745, 1e-3) if ra else 0.45
+    ent = [None] * len(fibs)
+    tot = np.zeros(len(x))
 
-    def run(groups):
-        src = np.concatenate([src_nodes[i] for g in groups for i in g])
-        slab = np.concatenate([np.full(sum(len(src_nodes[i]) for i in g), j, np.int64) for j, g in enumerate(groups)])
-        sst = np.concatenate([np.full(len(src_nodes[i]), i, np.int64) for g in groups for i in g])
-        lab, dist = _march_f(idx, pos, cost, offs, steps, unit, src, slab, sst, h0, b0, bri, sig_a, sig_b, SEED_UM, 2)
-        d0 = np.where(lab[:, 0] < 0, 0.0, dist[:, 0])
-        d1 = np.where(lab[:, 1] < 0, 1.0, dist[:, 1])
-        rel = np.where(lab[:, 0] < 0, 0.0, np.where(lab[:, 1] < 0, 1.0, (d1 - d0) / np.maximum(d1, 1e-12)))
-        return lab[:, 0], rel
+    def score(j, near=None):
+        f = fibs[j]
+        ids = np.unique(np.concatenate(tree.query_ball_point(f["P"] if near is None else near, REACH_UM + 2 * f["w1"] + STEP_UM))).astype(np.int64)
+        if not len(ids):
+            return
+        en, cb = _energy(f, ids, x, iv, dtv, inm, vdir, tube, bg, (sb, sdt, sa, f["R"]), near, REACH_UM + 2 * f["w1"] + STEP_UM)
+        if ent[j] is None:
+            ent[j] = (ids, en, cb)
+            np.add.at(tot, ids, np.exp(-en))
+            return
+        oi, oe, ocb = ent[j]
+        keep = ~np.isin(oi, ids)
+        np.add.at(tot, oi[~keep], -np.exp(-oe[~keep]))
+        np.add.at(tot, ids, np.exp(-en))
+        ni = np.r_[oi[keep], ids]
+        o = np.argsort(ni, kind="stable")
+        ent[j] = (ni[o], np.r_[oe[keep], en][o], np.r_[ocb[keep], cb][o])
 
-    first = [[i] for i in range(len(seeds))]
-    win, rel = run(first)
-    unknown = [len(seeds) + j for j in range(len(pieces)) if np.median(rel[src_nodes[len(seeds) + j]]) < CONF]
-    win, rel = run(first + ([unknown] if unknown else []))
-    ids = np.array([k for k, _ in seeds] + [0], np.int64)
-    win = np.where((win < 0) | (win >= len(seeds)), len(seeds), win)
-    return idx, ids[win], np.where(ids[win] > 0, rel, 0.0).astype(np.float32)
+    for j in range(len(fibs)):
+        score(j)
+    best = np.full(len(x), np.inf)
+    for j in range(len(fibs)):
+        if ent[j] is not None:
+            np.minimum.at(best, ent[j][0], ent[j][1])
+    ok = np.isfinite(best[cal])
+    e0 = float(np.percentile(best[cal][ok], NONE_PCT)) if ok.any() else 10.0
+    z0 = np.exp(-e0)
+    back = max(1, int(round(SEED_UM / NODE_UM)))
+    rounds = 0
+    while rounds < 200:
+        rounds += 1
+        grown = {}
+        for j, f in enumerate(fibs):
+            if ent[j] is None:
+                continue
+            ei, ee, ecb = ent[j]
+            for end in (0, 1):
+                if not f["grow"][end]:
+                    continue
+                P = f["P"]
+                ep = P[0] if end == 0 else P[-1]
+                out = -f["U"][0] if end == 0 else f["U"][-1]
+                c = np.asarray(tree.query_ball_point(ep, STEP_UM + 2 * f["w1"]), np.int64)
+                k = np.zeros(0, np.int64)
+                if len(c):
+                    d = x[c] - ep
+                    s = d @ out
+                    lat = np.linalg.norm(d - s[:, None] * out, axis=1)
+                    c = c[(s > 0) & (s <= STEP_UM) & (lat <= 2 * f["w1"])]
+                if len(c):
+                    k = np.minimum(np.searchsorted(ei, c), len(ei) - 1)
+                    hit = ei[k] == c
+                    c, k = c[hit], k[hit]
+                    p = np.exp(-ee[k]) / (tot[c] + z0)
+                    c, k = c[p >= P_GROW], k[p >= P_GROW]
+                if len(c) < 3:
+                    f["grow"][end] = False
+                    continue
+                wgt = iv[c]
+                newp = (x[c] * wgt[:, None]).sum(0) / wgt.sum()
+                if np.linalg.norm(newp - ep) < 0.25 * STEP_UM:
+                    f["grow"][end] = False
+                    continue
+                chain = P if end == 1 else P[::-1]
+                nu = newp - chain[max(0, len(chain) - 1 - back)]
+                nu /= max(np.linalg.norm(nu), 1e-12)
+                if nu @ out < 0.5:
+                    f["grow"][end] = False
+                    continue
+                a1 = f["A1"][-1] if end == 1 else f["A1"][0]
+                a1 = a1 - (a1 @ nu) * nu
+                a1 /= max(np.linalg.norm(a1), 1e-12)
+                nb = float(np.median(ecb[k]))
+                if end == 1:
+                    f["P"] = np.vstack([P, newp])
+                    f["U"] = np.vstack([f["U"], nu])
+                    f["A1"] = np.vstack([f["A1"], a1])
+                    f["B"] = np.r_[f["B"], nb]
+                else:
+                    f["P"] = np.vstack([newp, P])
+                    f["U"] = np.vstack([-nu, f["U"]])
+                    f["A1"] = np.vstack([a1, f["A1"]])
+                    f["B"] = np.r_[nb, f["B"]]
+                grown.setdefault(j, []).append(newp)
+        if not grown:
+            break
+        for j, pts in grown.items():
+            score(j, np.array(pts))
+    win = np.full(len(x), -1, np.int64)
+    pw = np.zeros(len(x))
+    recs = []
+    for j, f in enumerate(fibs):
+        if ent[j] is None:
+            continue
+        ei, ee, _ = ent[j]
+        p = np.exp(-ee) / (tot[ei] + z0)
+        m = p > pw[ei]
+        pw[ei[m]] = p[m]
+        win[ei[m]] = f["k"]
+        keep = p >= 1.0 / 255
+        recs.append((f["k"], ei[keep], np.round(p[keep] * 255).astype(np.uint8)))
+    win = np.where(pw >= P_LABEL, win, 0)
+    return pos, idx, win, pw.astype(np.float32), recs
 
 
 def separate_elongated_cells(segmentation_mask, intensity_image, seed_mask, spacing, final, confidence):
@@ -178,28 +287,25 @@ def separate_elongated_cells(segmentation_mask, intensity_image, seed_mask, spac
             out[own] = nxt
             nxt += 1
             continue
-        own, region, t, v, bri = _prepare(lbl, sl, segmentation_mask, intensity_image, sp)
-        anchors = _anchors(t, v, region, sp)
-        ldir = v[:, :, 0].copy()
-        del v
-        idx, fib, rel = _vote(t, region, anchors, seedlab, sp, bri, ldir)
-        del t, anchors
-        ks = np.unique(fib[fib > 0])
-        new = np.zeros(int(fib.max()) + 1, np.int64)
+        own, region, t, v, bri, ex = _prepare(lbl, sl, segmentation_mask, intensity_image, sp)
+        pos, idx, win, pw, recs = _vote(seedlab, own, region, t, v, bri, ex, sp)
+        del t, v, bri, ex
+        top = max([int(win.max())] + [r[0] for r in recs])
+        new = np.zeros(top + 1, np.int64)
+        ks = np.unique([r[0] for r in recs] + [int(k) for k in np.unique(win[win > 0])])
         new[ks] = np.arange(nxt, nxt + len(ks))
         nxt += len(ks)
-        lab = new[fib]
-        w = lab[idx[own]]
+        w = new[np.maximum(win[idx[own]], 0)]
         if np.any(w == 0):
             w = np.where(w == 0, nxt, w)
             nxt += 1
         out[own] = w
         cv = confidence[sl]
-        cv[region] = np.maximum(cv[region], rel)
+        cv[region] = np.maximum(cv[region], np.where(win > 0, pw, 0))
         base = np.array([s.start for s in sl])
-        rp = np.argwhere(region)
-        for k in ks:
-            m = (fib == k) & (rel >= 1.0 / 255)
-            g = rp[m] + base
-            records.append((int(new[k]), np.ravel_multi_index(tuple(g.T), final.shape).astype(np.uint32), np.round(rel[m] * 255).astype(np.uint8), np.r_[g.min(0), g.max(0) + 1].astype(np.int32)))
+        for k, ei, val in recs:
+            if not len(ei):
+                continue
+            g = pos[ei] + base
+            records.append((int(new[k]), np.ravel_multi_index(tuple(g.T), final.shape).astype(np.uint32), val, np.r_[g.min(0), g.max(0) + 1].astype(np.int32)))
     return records

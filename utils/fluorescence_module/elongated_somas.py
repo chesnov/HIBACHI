@@ -6,7 +6,6 @@ from skimage.morphology import skeletonize
 SOMA_SHAPES = ("compact", "elongated")
 SIGMA_UM = (0.5, 0.25, 0.25)
 MAX_TILT = 0.7
-MASK_W = 1.0
 SIGNAL = 2.0
 SEED_UM = 3.0
 STRAIGHT = 0.9
@@ -50,7 +49,7 @@ def _hessian(img, region, sp, inner, cval):
     w = np.take_along_axis(w, o, 1)
     v = np.take_along_axis(v, o[:, None, :], 2)
     t = np.where((w[:, 1] < 0) & (w[:, 2] < 0), np.sqrt(np.abs(w[:, 1] * w[:, 2])), 0).astype(np.float32)
-    return t, v
+    return t, v, h
 
 
 def _anchors(t, v, region, sp):
@@ -115,14 +114,24 @@ def _prepare(lbl, box, segmentation_mask, intensity_image, sp):
     seg = np.asarray(segmentation_mask[box])
     bg = float(np.median(sm[seg == 0]))
     dt = _edt(own_b, sp)
-    img += MASK_W * dt / max(float(np.percentile(dt[own_b], 99)), 1e-6)
+    dtp = dt[inner].copy()
+    dt /= max(float(np.percentile(dt[own_b], 99)), 1e-6)
     grow = ndimage.binary_dilation(own, iterations=2) | ((sm >= SIGNAL * bg) & (seg == 0))
     comp = ndimage.label(grow, np.ones((3, 3, 3)))[0]
     region = np.isin(comp, np.unique(comp[own]))
-    del grow, comp, own_b, seg, dt
-    t, v = _hessian(img, region, sp, inner, bg)
+    del grow, comp, own_b, seg
+    inside = own[region]
+    ti, vi, hi = _hessian(img, region, sp, inner, bg)
+    ti /= max(float(np.percentile(ti[inside], 99)), 1e-6)
+    tm, vm, _ = _hessian(dt, region, sp, inner, 0.0)
+    tm /= max(float(np.percentile(tm[inside], 99)), 1e-6)
+    del dt
+    use = ti >= tm
+    t = np.maximum(ti, tm)
+    v = np.where(use[:, None, None], vi, vm)
+    del ti, vi, tm, vm, use
     bri = np.log(np.maximum(sm[region], 1e-6)).astype(np.float32)
-    return own, region, t, v, bri
+    return own, region, t, v, bri, {"h": hi, "dt": dtp[region], "bg": bg}
 
 
 def _elongated_label_candidates(lbl, sl, segmentation_mask, intensity_image, params):
@@ -134,7 +143,7 @@ def _elongated_label_candidates(lbl, sl, segmentation_mask, intensity_image, par
     score = np.zeros(len(coords), np.float32)
     if intensity_image is not None and own.ndim == 3:
         sp = np.asarray(params.spacing, float)
-        own, region, t, v, _ = _prepare(lbl, box, segmentation_mask, intensity_image, sp)
+        own, region, t, v, _, _ = _prepare(lbl, box, segmentation_mask, intensity_image, sp)
         anchors = _anchors(t, v, region, sp)
         del v, t
         seeds, lines = _seeds(anchors, sp)
