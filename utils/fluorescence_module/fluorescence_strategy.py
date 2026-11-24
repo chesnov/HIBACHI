@@ -812,7 +812,7 @@ class FluorescenceStrategy(ProcessingStrategy):
                     files["fibre_confidence"], np.float32, self.image_shape)
                 # `params.get`: the three are neutral_default in the reference,
                 # so a project set up before they existed keeps these values.
-                records = separate_elongated_cells(
+                records, merged = separate_elongated_cells(
                     trimmed_labels_memmap, image_stack, cell_bodies_ref,
                     self.spacing_checked, final_memmap, conf_memmap,
                     p_label=float(params.get("elongated_assign_probability", 0.5)),
@@ -828,6 +828,9 @@ class FluorescenceStrategy(ProcessingStrategy):
                     value=np.concatenate([r[2] for r in records]) if records else np.zeros(0, np.uint8),
                     bbox=np.array([r[3] for r in records], np.int32).reshape(-1, 6),
                     shape=np.array(self.image_shape, np.int64),
+                    # One row per join of two seed fibres: fibre id in the
+                    # final segmentation, the two step-3 seed ids, tied voxels.
+                    merges=np.array(merged, np.int64).reshape(-1, 4),
                 )
                 self._close_memmap(final_memmap)
                 self._close_memmap(conf_memmap)

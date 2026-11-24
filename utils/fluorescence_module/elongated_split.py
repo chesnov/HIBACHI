@@ -52,7 +52,7 @@ def _models(seedlab, idx, x, iv, hp, vdir):
         a1 /= np.linalg.norm(a1)
         n = max(2, int(np.ceil(np.ptp(s) / NODE_UM)) + 1)
         ss = np.linspace(s.min(), s.max(), n)
-        out.append({"k": int(lab[g[0]]), "nd": nd, "P": c + ss[:, None] * u, "U": np.tile(u, (n, 1)), "A1": np.tile(a1, (n, 1)), "B": np.full(n, float(np.median(np.log(np.maximum(iv[nd], 1e-6))))), "w1": w1, "w2": w2, "grow": [True, True]})
+        out.append({"k": int(lab[g[0]]), "nd": nd, "P": c + ss[:, None] * u, "U": np.tile(u, (n, 1)), "A1": np.tile(a1, (n, 1)), "B": np.full(n, float(np.median(np.log(np.maximum(iv[nd], 1e-6))))), "w1": w1, "w2": w2, "grow": [True, True], "members": [int(lab[g[0]])]})
     w1s = [f["w1"] for f in out if np.isfinite(f["w1"])]
     w2s = [f["w2"] for f in out if np.isfinite(f["w2"])]
     for f in out:
@@ -193,66 +193,145 @@ def _vote(seedlab, own, region, t, v, bri, ex, sp, p_label, p_grow, none_pct):
     e0 = float(np.percentile(best[cal][ok], none_pct)) if ok.any() else 10.0
     z0 = np.exp(-e0)
     back = max(1, int(round(SEED_UM / NODE_UM)))
-    rounds = 0
-    while rounds < 200:
-        rounds += 1
-        grown = {}
-        for j, f in enumerate(fibs):
+
+    def drop(j):
+        oi, oe, _ = ent[j]
+        np.add.at(tot, oi, -np.exp(-oe))
+        ent[j] = None
+
+    def orient(f, flip):
+        if flip:
+            return f["P"][::-1], -f["U"][::-1], f["A1"][::-1], f["B"][::-1]
+        return f["P"], f["U"], f["A1"], f["B"]
+
+    def ties():
+        vs, js, ps = [], [], []
+        for j in range(len(fibs)):
             if ent[j] is None:
                 continue
-            ei, ee, ecb = ent[j]
-            for end in (0, 1):
-                if not f["grow"][end]:
+            ei, ee, _ = ent[j]
+            p = np.exp(-ee) / (tot[ei] + z0)
+            m = p >= 0.05
+            vs.append(ei[m])
+            js.append(np.full(int(m.sum()), j))
+            ps.append(p[m])
+        if not vs:
+            return []
+        v, jj, pp = np.concatenate(vs), np.concatenate(js), np.concatenate(ps)
+        o = np.lexsort((-pp, v))
+        v, jj, pp = v[o], jj[o], pp[o]
+        i1 = np.flatnonzero(np.r_[True, v[1:] != v[:-1]])
+        i2 = np.minimum(i1 + 1, len(v) - 1)
+        ok = (i2 > i1) & (v[i2] == v[i1])
+        tie = ok & (pp[i1] + pp[i2] >= p_grow) & (pp[i1] < p_grow)
+        a, b, tv = np.minimum(jj[i1], jj[i2])[tie], np.maximum(jj[i1], jj[i2])[tie], v[i1][tie]
+        if not len(tv):
+            return []
+        key = a * len(fibs) + b
+        uk, inv, cnt = np.unique(key, return_inverse=True, return_counts=True)
+        out, used = [], set()
+        for q in np.argsort(-cnt):
+            if cnt[q] < 3:
+                break
+            ja, jb = int(uk[q] // len(fibs)), int(uk[q] % len(fibs))
+            if ja in used or jb in used:
+                continue
+            c = x[tv[inv == q]].mean(0)
+            fa, fb = fibs[ja], fibs[jb]
+            ea = 0 if np.linalg.norm(c - fa["P"][0]) <= np.linalg.norm(c - fa["P"][-1]) else 1
+            eb = 0 if np.linalg.norm(c - fb["P"][0]) <= np.linalg.norm(c - fb["P"][-1]) else 1
+            pa, pb = fa["P"][0 if ea == 0 else -1], fb["P"][0 if eb == 0 else -1]
+            oa = -fa["U"][0] if ea == 0 else fa["U"][-1]
+            ob = -fb["U"][0] if eb == 0 else fb["U"][-1]
+            if np.linalg.norm(c - pa) > REACH_UM or np.linalg.norm(c - pb) > REACH_UM:
+                continue
+            if (pb - pa) @ oa <= 0 or (pa - pb) @ ob <= 0:
+                continue
+            used.update((ja, jb))
+            out.append((ja, ea, jb, eb, int(cnt[q])))
+        return out
+
+    def grow():
+        rounds = 0
+        while rounds < 200:
+            rounds += 1
+            grown = {}
+            for j, f in enumerate(fibs):
+                if ent[j] is None:
                     continue
-                P = f["P"]
-                ep = P[0] if end == 0 else P[-1]
-                out = -f["U"][0] if end == 0 else f["U"][-1]
-                c = np.asarray(tree.query_ball_point(ep, STEP_UM + 2 * f["w1"]), np.int64)
-                k = np.zeros(0, np.int64)
-                if len(c):
-                    d = x[c] - ep
-                    s = d @ out
-                    lat = np.linalg.norm(d - s[:, None] * out, axis=1)
-                    c = c[(s > 0) & (s <= STEP_UM) & (lat <= 2 * f["w1"])]
-                if len(c):
-                    k = np.minimum(np.searchsorted(ei, c), len(ei) - 1)
-                    hit = ei[k] == c
-                    c, k = c[hit], k[hit]
-                    p = np.exp(-ee[k]) / (tot[c] + z0)
-                    c, k = c[p >= p_grow], k[p >= p_grow]
-                if len(c) < 3:
-                    f["grow"][end] = False
-                    continue
-                wgt = iv[c]
-                newp = (x[c] * wgt[:, None]).sum(0) / wgt.sum()
-                if np.linalg.norm(newp - ep) < 0.25 * STEP_UM:
-                    f["grow"][end] = False
-                    continue
-                chain = P if end == 1 else P[::-1]
-                nu = newp - chain[max(0, len(chain) - 1 - back)]
-                nu /= max(np.linalg.norm(nu), 1e-12)
-                if nu @ out < 0.5:
-                    f["grow"][end] = False
-                    continue
-                a1 = f["A1"][-1] if end == 1 else f["A1"][0]
-                a1 = a1 - (a1 @ nu) * nu
-                a1 /= max(np.linalg.norm(a1), 1e-12)
-                nb = float(np.median(ecb[k]))
-                if end == 1:
-                    f["P"] = np.vstack([P, newp])
-                    f["U"] = np.vstack([f["U"], nu])
-                    f["A1"] = np.vstack([f["A1"], a1])
-                    f["B"] = np.r_[f["B"], nb]
-                else:
-                    f["P"] = np.vstack([newp, P])
-                    f["U"] = np.vstack([-nu, f["U"]])
-                    f["A1"] = np.vstack([a1, f["A1"]])
-                    f["B"] = np.r_[nb, f["B"]]
-                grown.setdefault(j, []).append(newp)
-        if not grown:
+                ei, ee, ecb = ent[j]
+                for end in (0, 1):
+                    if not f["grow"][end]:
+                        continue
+                    P = f["P"]
+                    ep = P[0] if end == 0 else P[-1]
+                    out = -f["U"][0] if end == 0 else f["U"][-1]
+                    c = np.asarray(tree.query_ball_point(ep, STEP_UM + 2 * f["w1"]), np.int64)
+                    k = np.zeros(0, np.int64)
+                    if len(c):
+                        d = x[c] - ep
+                        s = d @ out
+                        lat = np.linalg.norm(d - s[:, None] * out, axis=1)
+                        c = c[(s > 0) & (s <= STEP_UM) & (lat <= 2 * f["w1"])]
+                    if len(c):
+                        k = np.minimum(np.searchsorted(ei, c), len(ei) - 1)
+                        hit = ei[k] == c
+                        c, k = c[hit], k[hit]
+                        p = np.exp(-ee[k]) / (tot[c] + z0)
+                        c, k = c[p >= p_grow], k[p >= p_grow]
+                    if len(c) < 3:
+                        f["grow"][end] = False
+                        continue
+                    wgt = iv[c]
+                    newp = (x[c] * wgt[:, None]).sum(0) / wgt.sum()
+                    if np.linalg.norm(newp - ep) < 0.25 * STEP_UM:
+                        f["grow"][end] = False
+                        continue
+                    chain = P if end == 1 else P[::-1]
+                    nu = newp - chain[max(0, len(chain) - 1 - back)]
+                    nu /= max(np.linalg.norm(nu), 1e-12)
+                    if nu @ out < 0.5:
+                        f["grow"][end] = False
+                        continue
+                    a1 = f["A1"][-1] if end == 1 else f["A1"][0]
+                    a1 = a1 - (a1 @ nu) * nu
+                    a1 /= max(np.linalg.norm(a1), 1e-12)
+                    nb = float(np.median(ecb[k]))
+                    if end == 1:
+                        f["P"] = np.vstack([P, newp])
+                        f["U"] = np.vstack([f["U"], nu])
+                        f["A1"] = np.vstack([f["A1"], a1])
+                        f["B"] = np.r_[f["B"], nb]
+                    else:
+                        f["P"] = np.vstack([newp, P])
+                        f["U"] = np.vstack([-nu, f["U"]])
+                        f["A1"] = np.vstack([a1, f["A1"]])
+                        f["B"] = np.r_[nb, f["B"]]
+                    grown.setdefault(j, []).append(newp)
+            if not grown:
+                break
+            for j, pts in grown.items():
+                score(j, np.array(pts))
+
+    joins = []
+    grow()
+    while True:
+        pairs = ties()
+        if not pairs:
             break
-        for j, pts in grown.items():
-            score(j, np.array(pts))
+        for ja, ea, jb, eb, n in pairs:
+            fa, fb = fibs[ja], fibs[jb]
+            pa, ua, aa, ba = orient(fa, ea == 0)
+            pb, ub, ab, bb = orient(fb, eb == 1)
+            joins.append((fa["k"], fb["k"], n))
+            fa["P"], fa["U"], fa["A1"], fa["B"] = np.vstack([pa, pb]), np.vstack([ua, ub]), np.vstack([aa, ab]), np.r_[ba, bb]
+            fa["w1"], fa["w2"], fa["R"] = (fa["w1"] + fb["w1"]) / 2, (fa["w2"] + fb["w2"]) / 2, (fa["R"] + fb["R"]) / 2
+            fa["members"] += fb["members"]
+            fa["grow"] = [True, True]
+            drop(ja)
+            drop(jb)
+            score(ja)
+        grow()
     win = np.full(len(x), -1, np.int64)
     pw = np.zeros(len(x))
     recs = []
@@ -267,13 +346,15 @@ def _vote(seedlab, own, region, t, v, bri, ex, sp, p_label, p_grow, none_pct):
         keep = p >= 1.0 / 255
         recs.append((f["k"], ei[keep], np.round(p[keep] * 255).astype(np.uint8)))
     win = np.where(pw >= p_label, win, 0)
-    return pos, idx, win, pw.astype(np.float32), recs
+    owner = {m: f["k"] for j, f in enumerate(fibs) if ent[j] is not None for m in f["members"]}
+    return pos, idx, win, pw.astype(np.float32), recs, [(owner.get(ka, ka), ka, kb, n) for ka, kb, n in joins]
 
 
 def separate_elongated_cells(segmentation_mask, intensity_image, seed_mask, spacing, final, confidence, p_label, p_grow, none_pct):
     sp = np.asarray(spacing, float)
     nxt = 1
     records = []
+    merged = []
     for lbl, sl in enumerate(ndimage.find_objects(np.asarray(segmentation_mask)), 1):
         if sl is None:
             continue
@@ -285,7 +366,7 @@ def separate_elongated_cells(segmentation_mask, intensity_image, seed_mask, spac
             nxt += 1
             continue
         own, region, t, v, bri, ex = _prepare(lbl, sl, segmentation_mask, intensity_image, sp)
-        pos, idx, win, pw, recs = _vote(seedlab, own, region, t, v, bri, ex, sp, p_label, p_grow, none_pct)
+        pos, idx, win, pw, recs, joins = _vote(seedlab, own, region, t, v, bri, ex, sp, p_label, p_grow, none_pct)
         del t, v, bri, ex
         top = max([int(win.max())] + [r[0] for r in recs])
         new = np.zeros(top + 1, np.int64)
@@ -305,4 +386,6 @@ def separate_elongated_cells(segmentation_mask, intensity_image, seed_mask, spac
                 continue
             g = pos[ei] + base
             records.append((int(new[k]), np.ravel_multi_index(tuple(g.T), final.shape).astype(np.uint32), val, np.r_[g.min(0), g.max(0) + 1].astype(np.int32)))
-    return records
+        for k, ka, kb, n in joins:
+            merged.append((int(new[k]) if k < len(new) else 0, ka, kb, n))
+    return records, merged
