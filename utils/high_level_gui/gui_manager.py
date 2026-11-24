@@ -3295,11 +3295,42 @@ class DynamicGUIManager(QObject):
     #: another channel: an editable control that cannot affect the result
     #: invites tuning it.
     _ELONGATED_HIDDEN = (
+        "min_fragment_size",
         "ratios_to_process", "intensity_percentiles_to_process",
         "intensity_smooth_um", "intensity_weight",
         "min_physical_peak_separation", "absolute_min_thickness_um",
         "absolute_max_thickness_um", "max_allowed_core_aspect_ratio",
     )
+
+    #: Step 4 parameters the elongated track reads. In that track they are the
+    #: only ones shown (the watershed's are inert there); in the watershed
+    #: track they are hidden, for the same reason as `_ELONGATED_HIDDEN`.
+    _ELONGATED_SPLIT_PARAMS = (
+        "elongated_assign_probability", "elongated_grow_probability",
+        "elongated_none_percentile",
+    )
+
+    def _split_step_track(self, config_key: str) -> Optional[str]:
+        """For the cell-separation step, the track step 3's soma shape selects
+        ('elongated' or 'watershed'); None for every other step.
+
+        Read from the live config, with the reference as fallback, like the
+        soma-shape dropdown -- the strategy's own copy is only re-synced
+        before a step runs, so it can lag behind a change made in step 3."""
+        strat = getattr(self, "strategy", None)
+        if strat is None or not hasattr(strat, "_soma_shape"):
+            return None
+        try:
+            if config_key != strat.get_config_key("execute_cell_separation"):
+                return None
+            key = strat.get_config_key("execute_soma_extraction")
+        except Exception:
+            return None
+        pconf = ((self.config.get(key) or {}).get("parameters") or {}).get("soma_shape")
+        if not isinstance(pconf, dict):
+            pconf = self._reference_param(key, "soma_shape") or {}
+        value = pconf.get("value") if isinstance(pconf, dict) else pconf
+        return "elongated" if str(value or "compact") == "elongated" else "watershed"
 
     def _add_soma_shape_widget(self, layout, config_key: str,
                                parameters: Dict[str, Any]) -> str:
@@ -3439,6 +3470,8 @@ class DynamicGUIManager(QObject):
             soma_shape = self._add_soma_shape_widget(
                 scroll_l, config_key, parameters)
 
+        split_track = self._split_step_track(config_key)
+
         if isinstance(parameters, dict):
             # Check if Absolute mode is enabled
             is_absolute = False
@@ -3464,6 +3497,9 @@ class DynamicGUIManager(QObject):
                 if soma_shape == "none":
                     continue  # no parameter of this step applies
                 if soma_shape == "elongated" and pname in self._ELONGATED_HIDDEN:
+                    continue
+                if split_track is not None and (
+                        (pname in self._ELONGATED_SPLIT_PARAMS) != (split_track == "elongated")):
                     continue
                 # Mutually exclusive parameter filtering
                 if pname in["scale_profiles", "scale_profiles_percentile"] and is_absolute:

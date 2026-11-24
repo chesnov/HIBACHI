@@ -7,12 +7,9 @@ try:
 except ImportError:
     from elongated_somas import SEED_UM, SIGMA_UM, _prepare
 
-P_GROW = 0.9
-P_LABEL = 0.5
 STEP_UM = 1.0
 NODE_UM = 0.5
 REACH_UM = 4.0
-NONE_PCT = 99.0
 
 
 def _phys(vec):
@@ -124,7 +121,7 @@ def _energy(f, ids, x, iv, dtv, inm, vdir, tube, bg, sp_, near=None, reach=0.0):
     return en, cb
 
 
-def _vote(seedlab, own, region, t, v, bri, ex, sp):
+def _vote(seedlab, own, region, t, v, bri, ex, sp, p_label, p_grow, none_pct):
     pos = np.argwhere(region)
     x = pos * sp
     idx = -np.ones(region.shape, np.int32)
@@ -193,7 +190,7 @@ def _vote(seedlab, own, region, t, v, bri, ex, sp):
         if ent[j] is not None:
             np.minimum.at(best, ent[j][0], ent[j][1])
     ok = np.isfinite(best[cal])
-    e0 = float(np.percentile(best[cal][ok], NONE_PCT)) if ok.any() else 10.0
+    e0 = float(np.percentile(best[cal][ok], none_pct)) if ok.any() else 10.0
     z0 = np.exp(-e0)
     back = max(1, int(round(SEED_UM / NODE_UM)))
     rounds = 0
@@ -222,7 +219,7 @@ def _vote(seedlab, own, region, t, v, bri, ex, sp):
                     hit = ei[k] == c
                     c, k = c[hit], k[hit]
                     p = np.exp(-ee[k]) / (tot[c] + z0)
-                    c, k = c[p >= P_GROW], k[p >= P_GROW]
+                    c, k = c[p >= p_grow], k[p >= p_grow]
                 if len(c) < 3:
                     f["grow"][end] = False
                     continue
@@ -269,11 +266,11 @@ def _vote(seedlab, own, region, t, v, bri, ex, sp):
         win[ei[m]] = f["k"]
         keep = p >= 1.0 / 255
         recs.append((f["k"], ei[keep], np.round(p[keep] * 255).astype(np.uint8)))
-    win = np.where(pw >= P_LABEL, win, 0)
+    win = np.where(pw >= p_label, win, 0)
     return pos, idx, win, pw.astype(np.float32), recs
 
 
-def separate_elongated_cells(segmentation_mask, intensity_image, seed_mask, spacing, final, confidence):
+def separate_elongated_cells(segmentation_mask, intensity_image, seed_mask, spacing, final, confidence, p_label, p_grow, none_pct):
     sp = np.asarray(spacing, float)
     nxt = 1
     records = []
@@ -288,7 +285,7 @@ def separate_elongated_cells(segmentation_mask, intensity_image, seed_mask, spac
             nxt += 1
             continue
         own, region, t, v, bri, ex = _prepare(lbl, sl, segmentation_mask, intensity_image, sp)
-        pos, idx, win, pw, recs = _vote(seedlab, own, region, t, v, bri, ex, sp)
+        pos, idx, win, pw, recs = _vote(seedlab, own, region, t, v, bri, ex, sp, p_label, p_grow, none_pct)
         del t, v, bri, ex
         top = max([int(win.max())] + [r[0] for r in recs])
         new = np.zeros(top + 1, np.int64)

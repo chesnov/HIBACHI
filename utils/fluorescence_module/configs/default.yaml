@@ -220,11 +220,17 @@ execute_soma_extraction:
       description: >-
         'compact' finds a round core per cell (nuclei, cell bodies) by peeling
         intensity and distance thresholds, keeping the tightest core. Choose
-        'elongated' for spindle- or fibre-shaped cells with no compact body:
-        it traces each fibre through the mask's skeleton and seeds it along
-        its full length, never letting a seed branch onto a neighbour, and
-        reads only Min Seed Size. Every scale it uses is derived from the
-        objects' measured fibre radius.
+        'elongated' for spindle- or fibre-shaped cells with no compact body.
+        It also switches Cell Separation (step 4) to its elongated track.
+        Step 3 then places seed fibres: the clear-cut straight centrelines it
+        finds from the intensity and the mask (each used as its own evidence).
+        Step 4 gives every voxel a probability of belonging to each seed fibre,
+        from how well its position, brightness, local direction and mask
+        distance fit that fibre, grows each fibre from its confident voxels,
+        and assigns every mask voxel to its most likely fibre, or to its
+        object's "not yet assigned" cell when no fibre is more likely than not.
+        In this track step 4's watershed settings and Use Corrected Image are
+        not used.
         'none' skips soma identification and cell splitting: every object left
         by artifact removal is quantified whole, which is all a total-area
         analysis needs.
@@ -322,6 +328,48 @@ execute_soma_extraction:
 execute_cell_separation:
   name: Execute Cell Separation
   parameters:
+    elongated_assign_probability:
+      # Elongated track only (step 3 Soma shape = elongated); hidden otherwise.
+      # 0.5 is the value the track used before this was exposed, so an old
+      # config keeps its behaviour without being migrated.
+      neutral_default: true
+      label: Assign Probability (elongated)
+      description: >-
+        Elongated track only. A mask voxel is given its most likely fibre when
+        that fibre's probability reaches this value; otherwise it goes to its
+        object's "not yet assigned" cell. Higher leaves more voxels unassigned
+        and fewer assigned to the wrong fibre.
+      type: float
+      value: 0.5
+      min: 0.0
+      max: 1.0
+      step: 0.01
+    elongated_grow_probability:
+      neutral_default: true
+      label: Grow Probability (elongated)
+      description: >-
+        Elongated track only. A fibre's course grows only through voxels whose
+        probability of belonging to that fibre reaches this value, so its
+        known course extends from its confident voxels. Lower lets fibres
+        reach further through ambiguous stretches.
+      type: float
+      value: 0.9
+      min: 0.0
+      max: 1.0
+      step: 0.01
+    elongated_none_percentile:
+      neutral_default: true
+      label: None-of-these Percentile (elongated)
+      description: >-
+        Elongated track only. A voxel counts as belonging to none of the known
+        fibres when its best fit is worse than this percentile of the fit of
+        voxels lying alongside their own seed. Lower makes "none of these"
+        (not yet assigned) more frequent.
+      type: float
+      value: 99.0
+      min: 50.0
+      max: 100.0
+      step: 0.1
     min_size_threshold:
       # A voxel count, so step stays 1: whole numbers need no decimals.
       label: Min Final Cell Size

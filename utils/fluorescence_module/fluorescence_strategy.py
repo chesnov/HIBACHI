@@ -810,9 +810,14 @@ class FluorescenceStrategy(ProcessingStrategy):
                     final_seg_path, np.int32, self.image_shape)
                 conf_memmap = open_artifact_for_writing(
                     files["fibre_confidence"], np.float32, self.image_shape)
+                # `params.get`: the three are neutral_default in the reference,
+                # so a project set up before they existed keeps these values.
                 records = separate_elongated_cells(
                     trimmed_labels_memmap, image_stack, cell_bodies_ref,
-                    self.spacing_checked, final_memmap, conf_memmap)
+                    self.spacing_checked, final_memmap, conf_memmap,
+                    p_label=float(params.get("elongated_assign_probability", 0.5)),
+                    p_grow=float(params.get("elongated_grow_probability", 0.9)),
+                    none_pct=float(params.get("elongated_none_percentile", 99.0)))
                 final_memmap.flush()
                 conf_memmap.flush()
                 np.savez(
