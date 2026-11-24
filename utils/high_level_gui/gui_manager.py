@@ -2371,20 +2371,71 @@ class DynamicGUIManager(QObject):
         _accept_existing()
 
     def restart_processing(self) -> None:
-        """Delete this channel's computed outputs and start again from step 1.
+        """Ask which step to restart from, then delete that step's results and
+        every later step's.
 
         The viewer's entry point for what used to be the Restart button on the
-        open prompt. That prompt is gone, and this is the deliberate way to ask
-        for the same thing -- deliberate being the point, since it discards
-        every computed output for the channel. `_confirm_restart` does the
-        confirming.
+        open prompt. Choosing step 1 is the full restart (`_confirm_restart`):
+        every computed output goes and the parameters return to the project's.
+        Choosing a later step (`_confirm_restart_from`) keeps the earlier
+        steps' results and the current parameters, so one step can be re-run
+        without changing a parameter just to invalidate it. Only completed
+        steps are offered; the default is the last one.
         """
-        if self.strategy.get_last_completed_step() <= 0:
+        last = self.strategy.get_last_completed_step()
+        if last <= 0:
             QMessageBox.information(
                 None, "Nothing to restart",
                 "This channel has no saved results yet.")
             return
-        self._confirm_restart()
+        from PyQt5.QtWidgets import QInputDialog  # type: ignore
+        labels = [
+            f"Step {i + 1}: {self.step_display_names.get(m, m)}"
+            for i, m in enumerate(self.processing_steps[:last])
+        ]
+        label, ok = QInputDialog.getItem(
+            self.viewer.window._qt_window, "Restart processing",
+            "Restart from which step?\n"
+            "Its results and those of every later step are deleted;\n"
+            "the results of earlier steps are kept.",
+            labels, len(labels) - 1, False,
+        )
+        if not ok:
+            return
+        step = labels.index(label) + 1
+        if step == 1:
+            self._confirm_restart()
+        else:
+            self._confirm_restart_from(step)
+
+    def _confirm_restart_from(self, step: int) -> bool:
+        """Confirm, then delete the results of `step` (1-based) and all later
+        steps, keep the earlier ones, and open `step` for processing.
+
+        Uses the same per-step cleanup as a re-run (`cleanup_step`), so exactly
+        the files and layers each step owns are removed. The parameters and the
+        strategy's intermediate state are kept: that state only holds step 1's
+        outputs, which a restart from step 2 or later still needs. Returns True
+        if anything was deleted.
+        """
+        name = self.step_display_names.get(
+            self.processing_steps[step - 1], self.processing_steps[step - 1])
+        reply = QMessageBox.question(
+            self.viewer.window._qt_window,
+            "Confirm Restart",
+            f"This will delete the results of step {step} ({name}) and of every "
+            f"later step.\nThe results of steps 1-{step - 1} are kept.\n"
+            "Are you sure?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,   # default, and Escape/close, map to No
+        )
+        if reply != QMessageBox.Yes:
+            return False
+        for k in range(step, self.num_steps + 1):
+            self.cleanup_step(k)
+        self.current_step["value"] = step - 1
+        self.create_step_widgets(self.processing_steps[step - 1])
+        return True
 
     def _confirm_restart(self) -> bool:
         """Confirm, then delete old files and restart from Step 1.

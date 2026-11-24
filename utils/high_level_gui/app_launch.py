@@ -852,8 +852,10 @@ def build_segmentation_control_panel(viewer, gui_manager):
     # deliberate rather than in the way.
     btn_restart = _compact_button(
         "\u21ba Restart processing",
-        "Delete this channel's computed results and start from\n"
-        "Step 1. Asks for confirmation. Cannot be undone.",
+        "Choose a step to restart from: its results and those of\n"
+        "every later step are deleted, earlier steps' are kept.\n"
+        "Step 1 restarts from scratch. Asks for confirmation.\n"
+        "Cannot be undone.",
     )
     btn_draw.clicked.connect(gui_manager.draw_roi)
     btn_confirm.clicked.connect(gui_manager.confirm_roi)
