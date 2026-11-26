@@ -38,7 +38,7 @@ def _models(seedlab, idx, x, iv, hp, vdir):
             s = np.array([-NODE_UM / 2, NODE_UM / 2])
         h = hp[nd] / (sig[:, None] * sig[None, :])
         w, e = np.linalg.eigh(h)
-        k = np.argsort(np.abs(w), 1)
+        k = np.argsort(np.abs(w), 1, kind="stable")
         w = np.take_along_axis(w, k, 1)
         e = np.take_along_axis(e, k[:, None, :], 2)
         ok = (w[:, 1] < 0) & (w[:, 2] < 0)
@@ -101,7 +101,7 @@ def _geometry(f, x, sa, lo=0, hi=None):
     v1 = f["w1"] ** 2 + (e * sa) ** 2
     v2 = f["w2"] ** 2 + (e * sa) ** 2
     rho = np.einsum("ij,ij->i", g, a1) ** 2 / v1 + np.einsum("ij,ij->i", g, a2) ** 2 / v2
-    return g, e, u, b, v1, v2, rho
+    return g, e, u, b, v1, v2, rho, a1, a2
 
 
 def _energy(f, ids, x, iv, dtv, inm, vdir, tube, bg, sp_, near=None, reach=0.0):
@@ -111,7 +111,7 @@ def _energy(f, ids, x, iv, dtv, inm, vdir, tube, bg, sp_, near=None, reach=0.0):
         dn = np.min(np.linalg.norm(f["P"][:, None, :] - near[None], axis=2), 1)
         k = np.flatnonzero(dn <= 2 * reach)
         lo, hi = int(k.min()), int(k.max()) + 1
-    g, e, u, b, v1, v2, rho = _geometry(f, x[ids], sa, lo, hi)
+    g, e, u, b, v1, v2, rho, _, _ = _geometry(f, x[ids], sa, lo, hi)
     pred = np.log(bg + np.maximum(np.exp(b) - bg, 0) * np.exp(-0.5 * rho))
     en = 0.5 * rho + 0.5 * np.log(v1 * v2) + 0.5 * ((np.log(np.maximum(iv[ids], 1e-6)) - pred) / sb) ** 2
     ang = np.arccos(np.minimum(1, np.abs(np.einsum("ij,ij->i", vdir[ids], u))))
@@ -154,7 +154,7 @@ def _vote(seedlab, own, region, t, v, bri, ex, sp, p_label, p_grow, none_pct):
         ids = cal[who[cal] == j]
         if not len(ids):
             continue
-        g, e, u, b, v1, v2, rho = _geometry(f, x[ids], 0.0)
+        g, e, u, b, v1, v2, rho, _, _ = _geometry(f, x[ids], 0.0)
         rb.append(np.log(np.maximum(iv[ids], 1e-6)) - np.log(bg + np.maximum(np.exp(b) - bg, 0) * np.exp(-0.5 * rho)))
         im = inm[ids]
         rm.append((dtv[ids] - np.maximum(f["R"] - np.linalg.norm(g, axis=1), 0))[im])
@@ -193,6 +193,23 @@ def _vote(seedlab, own, region, t, v, bri, ex, sp, p_label, p_grow, none_pct):
     e0 = float(np.percentile(best[cal][ok], none_pct)) if ok.any() else 10.0
     z0 = np.exp(-e0)
     back = max(1, int(round(SEED_UM / NODE_UM)))
+    shape = np.array(region.shape)
+
+    def level(pts):
+        v = np.clip(np.round(pts / sp).astype(np.int64), 0, shape - 1)
+        k = idx[v[:, 0], v[:, 1], v[:, 2]]
+        return np.where(k >= 0, iv[np.maximum(k, 0)], bg)
+
+    def dip(a, b):
+        prof = level((a[:, None, :] + np.linspace(0, 1, 15)[None, :, None] * (b - a)[:, None, :]).reshape(-1, 3)).reshape(len(a), 15)
+        return prof.min(1) / np.maximum(np.minimum(prof[:, 0], prof[:, -1]), 1e-12)
+
+    along = []
+    for f in fibs:
+        P = f["P"]
+        if len(P) >= 3:
+            along.append(dip(P[:-2], P[2:]))
+    one_core = float(np.percentile(np.concatenate(along), 100.0 - none_pct)) if along else 0.9
 
     def drop(j):
         oi, oe, _ = ent[j]
@@ -230,25 +247,28 @@ def _vote(seedlab, own, region, t, v, bri, ex, sp, p_label, p_grow, none_pct):
         key = a * len(fibs) + b
         uk, inv, cnt = np.unique(key, return_inverse=True, return_counts=True)
         out, used = [], set()
-        for q in np.argsort(-cnt):
+        for q in np.argsort(-cnt, kind="stable"):
             if cnt[q] < 3:
                 break
             ja, jb = int(uk[q] // len(fibs)), int(uk[q] % len(fibs))
             if ja in used or jb in used:
                 continue
-            c = x[tv[inv == q]].mean(0)
+            xt = x[tv[inv == q]]
             fa, fb = fibs[ja], fibs[jb]
-            ea = 0 if np.linalg.norm(c - fa["P"][0]) <= np.linalg.norm(c - fa["P"][-1]) else 1
-            eb = 0 if np.linalg.norm(c - fb["P"][0]) <= np.linalg.norm(c - fb["P"][-1]) else 1
-            pa, pb = fa["P"][0 if ea == 0 else -1], fb["P"][0 if eb == 0 else -1]
-            oa = -fa["U"][0] if ea == 0 else fa["U"][-1]
-            ob = -fb["U"][0] if eb == 0 else fb["U"][-1]
-            if np.linalg.norm(c - pa) > REACH_UM or np.linalg.norm(c - pb) > REACH_UM:
+            _, _, ua, _, _, _, _, _, _ = _geometry(fa, xt, sa)
+            u = ua.mean(0)
+            u /= max(np.linalg.norm(u), 1e-12)
+            c = xt.mean(0)
+            tt = (xt - c) @ u
+            samp = c + np.arange(tt.min(), tt.max() + 1e-9, STEP_UM)[:, None] * u
+            ga = _geometry(fa, samp, sa)[0]
+            gb = _geometry(fb, samp, sa)[0]
+            if np.median(dip(samp - ga, samp - gb)) < one_core:
                 continue
-            if (pb - pa) @ oa <= 0 or (pa - pb) @ ob <= 0:
-                continue
+            ia = int(np.argmin(np.linalg.norm(fa["P"] - c, axis=1)))
+            ib = int(np.argmin(np.linalg.norm(fb["P"] - c, axis=1)))
             used.update((ja, jb))
-            out.append((ja, ea, jb, eb, int(cnt[q])))
+            out.append((ja, ia, jb, ib, int(cnt[q])))
         return out
 
     def grow():
@@ -319,10 +339,18 @@ def _vote(seedlab, own, region, t, v, bri, ex, sp, p_label, p_grow, none_pct):
         pairs = ties()
         if not pairs:
             break
-        for ja, ea, jb, eb, n in pairs:
+        for ja, ia, jb, ib, n in pairs:
             fa, fb = fibs[ja], fibs[jb]
-            pa, ua, aa, ba = orient(fa, ea == 0)
-            pb, ub, ab, bb = orient(fb, eb == 1)
+            ra = ia >= len(fa["P"]) - 1 - ia
+            rb = ib <= len(fb["P"]) - 1 - ib
+            pa, ua, aa, ba = orient(fa, not ra)
+            pb, ub, ab, bb = orient(fb, not rb)
+            ka = ia if ra else len(fa["P"]) - 1 - ia
+            kb = ib if rb else len(fb["P"]) - 1 - ib
+            pa, ua, aa, ba = pa[:ka + 1], ua[:ka + 1], aa[:ka + 1], ba[:ka + 1]
+            pb, ub, ab, bb = pb[kb + 1:], ub[kb + 1:], ab[kb + 1:], bb[kb + 1:]
+            if len(pa) + len(pb) < 2:
+                pa, ua, aa, ba = orient(fa, not ra)
             joins.append((fa["k"], fb["k"], n))
             fa["P"], fa["U"], fa["A1"], fa["B"] = np.vstack([pa, pb]), np.vstack([ua, ub]), np.vstack([aa, ab]), np.r_[ba, bb]
             fa["w1"], fa["w2"], fa["R"] = (fa["w1"] + fb["w1"]) / 2, (fa["w2"] + fb["w2"]) / 2, (fa["R"] + fb["R"]) / 2

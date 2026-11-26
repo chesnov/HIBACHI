@@ -45,7 +45,7 @@ def _hessian(img, region, sp, inner, cval):
             h[:, i, j] = v
             h[:, j, i] = v
     w, v = np.linalg.eigh(h)
-    o = np.argsort(np.abs(w), axis=1)
+    o = np.argsort(np.abs(w), axis=1, kind="stable")
     w = np.take_along_axis(w, o, 1)
     v = np.take_along_axis(v, o[:, None, :], 2)
     t = np.where((w[:, 1] < 0) & (w[:, 2] < 0), np.sqrt(np.abs(w[:, 1] * w[:, 2])), 0).astype(np.float32)
